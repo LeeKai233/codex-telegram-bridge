@@ -1,0 +1,1190 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+import contextlib
+import fcntl
+import getpass
+import hmac
+import json
+import os
+import re
+import secrets
+import shlex
+import shutil
+import stat
+import sys
+import tempfile
+import time
+from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TextIO
+
+import segno
+from telegram import Bot
+
+from .config import Config, ensure_private_directory, open_private_directory
+from .security import Enrollment, SecurityManager
+from .store import Store
+
+TOKEN_VARIABLE = "TELEGRAM_GPT_BOT_TOKEN"
+FORUM_TOKEN_VARIABLE = "TELEGRAM_426_BOT_TOKEN"
+_ASSIGNMENT = re.compile(rf"^[ \t]*(?:export[ \t]+)?{TOKEN_VARIABLE}[ \t]*=[ \t]*(?P<value>.*)$")
+_TOKEN_SHAPE = re.compile(r"^[0-9]{6,16}:[A-Za-z0-9_-]{20,}$")
+
+
+class CliError(RuntimeError):
+    pass
+
+
+class _AtomicWriteCommittedError(CliError):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class _CredentialSnapshot:
+    path: Path
+    existed: bool
+    content: str = ""
+    mode: int = 0o600
+    device: int = 0
+    inode: int = 0
+
+
+@dataclass(slots=True)
+class _CredentialTarget:
+    path: Path
+    token: str
+    parent_descriptor: int
+    snapshot: _CredentialSnapshot
+    staged_name: str | None = None
+    staged_descriptor: int = -1
+    staged_identity: tuple[int, int] | None = None
+    committed_identity: tuple[int, int] | None = None
+
+
+def _assignment_value_for(line: str, variable: str) -> str | None:
+    assignment = re.compile(
+        rf"^[ \t]*(?:export[ \t]+)?{re.escape(variable)}[ \t]*=[ \t]*(?P<value>.*)$"
+    )
+    match = assignment.match(line.rstrip("\r\n"))
+    if not match:
+        return None
+    lexer = shlex.shlex(match.group("value"), posix=True, punctuation_chars=";")
+    lexer.whitespace_split = True
+    lexer.commenters = "#"
+    try:
+        parts = list(lexer)
+    except ValueError as exc:
+        raise CliError(f"无法静态解析 {variable} 赋值") from exc
+    if parts[-1:] == [";"]:
+        parts.pop()
+    if len(parts) != 1 or not _TOKEN_SHAPE.fullmatch(parts[0]):
+        raise CliError(f"{variable} 必须是直接的 Bot token 赋值，不能包含变量展开或命令")
+    return parts[0]
+
+
+def _read_bashrc_tokens(
+    path: Path,
+    variables: tuple[str, ...] = (TOKEN_VARIABLE, FORUM_TOKEN_VARIABLE),
+    *,
+    require_all: bool = True,
+) -> tuple[dict[str, str], str, str, int]:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError as exc:
+        raise CliError(f"未找到 shell 配置文件：{path}") from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise CliError(f"拒绝从符号链接或非普通文件迁移凭据：{path}")
+    original = path.read_text(encoding="utf-8")
+    kept: list[str] = []
+    candidates: dict[str, list[str]] = {variable: [] for variable in variables}
+    for number, line in enumerate(original.splitlines(keepends=True), start=1):
+        matched = False
+        for variable in variables:
+            try:
+                value = _assignment_value_for(line, variable)
+            except CliError as exc:
+                raise CliError(f"{path}:{number}: {exc}") from None
+            if value is not None:
+                candidates[variable].append(value)
+                matched = True
+                break
+        if not matched:
+            kept.append(line)
+    missing = [variable for variable, values in candidates.items() if not values]
+    if missing and require_all:
+        raise CliError(f"{path} 中没有找到以下直接赋值：{', '.join(missing)}")
+    tokens = {variable: values[-1] for variable, values in candidates.items() if values}
+    return tokens, original, "".join(kept), stat.S_IMODE(metadata.st_mode)
+
+
+def _assignment_value(line: str) -> str | None:
+    """Return a statically parsed token assignment, without evaluating shell code."""
+    match = _ASSIGNMENT.match(line.rstrip("\r\n"))
+    if not match:
+        return None
+    lexer = shlex.shlex(match.group("value"), posix=True, punctuation_chars=";")
+    lexer.whitespace_split = True
+    lexer.commenters = "#"
+    try:
+        parts = list(lexer)
+    except ValueError as exc:
+        raise CliError(f"无法静态解析 {TOKEN_VARIABLE} 赋值") from exc
+    if parts[-1:] == [";"]:
+        parts.pop()
+    if len(parts) != 1 or not _TOKEN_SHAPE.fullmatch(parts[0]):
+        raise CliError(f"{TOKEN_VARIABLE} 必须是直接的 Bot token 赋值，不能包含变量展开或命令")
+    return parts[0]
+
+
+def _read_bashrc_token(path: Path) -> tuple[str, str, str, int]:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError as exc:
+        raise CliError(f"未找到 shell 配置文件：{path}") from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise CliError(f"拒绝从符号链接或非普通文件迁移凭据：{path}")
+
+    original = path.read_text(encoding="utf-8")
+    kept: list[str] = []
+    candidates: list[str] = []
+    for number, line in enumerate(original.splitlines(keepends=True), start=1):
+        try:
+            value = _assignment_value(line)
+        except CliError as exc:
+            raise CliError(f"{path}:{number}: {exc}") from None
+        if value is None:
+            kept.append(line)
+        else:
+            candidates.append(value)
+    if not candidates:
+        raise CliError(f"{path} 中没有找到 {TOKEN_VARIABLE} 的直接赋值")
+    return candidates[-1], original, "".join(kept), stat.S_IMODE(metadata.st_mode)
+
+
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _atomic_write_text(path: Path, content: str, mode: int, *, expected: str | None = None) -> None:
+    if path.is_symlink():
+        raise CliError(f"拒绝替换符号链接：{path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temporary_name)
+    replaced = False
+    try:
+        os.fchmod(descriptor, mode)
+        with os.fdopen(
+            descriptor,
+            "w",
+            encoding="utf-8",
+            newline="",
+            closefd=False,
+        ) as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if stat.S_IMODE(os.fstat(descriptor).st_mode) != mode:
+            raise CliError(f"临时文件权限校验失败，未替换：{path}")
+        if expected is not None:
+            try:
+                current = path.read_text(encoding="utf-8")
+            except FileNotFoundError as exc:
+                raise CliError(f"写入期间文件消失：{path}") from exc
+            if not hmac.compare_digest(current.encode("utf-8"), expected.encode("utf-8")):
+                raise CliError(f"写入期间文件发生变化，未替换：{path}")
+        os.replace(temporary, path)
+        replaced = True
+        _fsync_directory(path.parent)
+    except BaseException:
+        if replaced:
+            raise _AtomicWriteCommittedError(
+                f"文件已替换，但无法确认目录写入已持久化：{path}"
+            ) from None
+        raise
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
+        if not replaced:
+            temporary.unlink(missing_ok=True)
+
+
+def _credential_snapshot_at(path: Path, parent_descriptor: int) -> _CredentialSnapshot:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path.name, flags, dir_fd=parent_descriptor)
+    except FileNotFoundError:
+        return _CredentialSnapshot(path=path, existed=False)
+    except OSError:
+        raise CliError(f"无法安全打开凭据文件：{path}") from None
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise CliError(f"拒绝替换非普通凭据文件：{path}")
+        if metadata.st_uid != os.getuid():
+            raise CliError(f"凭据文件所有者不是当前用户：{path}")
+        if stat.S_IMODE(metadata.st_mode) & 0o077:
+            raise CliError(f"凭据文件权限过宽：{path}")
+        payload = os.read(descriptor, 4097)
+        if len(payload) > 4096:
+            raise CliError(f"凭据文件大小异常：{path}")
+        try:
+            content = payload.decode("utf-8")
+        except UnicodeDecodeError:
+            raise CliError(f"凭据文件不是有效的 UTF-8：{path}") from None
+        return _CredentialSnapshot(
+            path=path,
+            existed=True,
+            content=content,
+            mode=stat.S_IMODE(metadata.st_mode),
+            device=metadata.st_dev,
+            inode=metadata.st_ino,
+        )
+    finally:
+        os.close(descriptor)
+
+
+def _credential_snapshot(path: Path) -> _CredentialSnapshot:
+    parent_descriptor = open_private_directory(path.parent)
+    try:
+        return _credential_snapshot_at(path, parent_descriptor)
+    finally:
+        os.close(parent_descriptor)
+
+
+def _lock_credential_directory(parent_descriptor: int, path: Path) -> int:
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(
+            ".telegram-credentials.lock",
+            flags,
+            0o600,
+            dir_fd=parent_descriptor,
+        )
+    except OSError:
+        raise CliError(f"无法安全打开凭据事务锁：{path}") from None
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid():
+            raise CliError(f"凭据事务锁类型或所有者无效：{path}")
+        os.fchmod(descriptor, 0o600)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _snapshot_matches_current(target: _CredentialTarget) -> bool:
+    current = _credential_snapshot_at(target.path, target.parent_descriptor)
+    snapshot = target.snapshot
+    if current.existed != snapshot.existed:
+        return False
+    if not current.existed:
+        return True
+    return (
+        (current.device, current.inode) == (snapshot.device, snapshot.inode)
+        and current.mode == snapshot.mode
+        and hmac.compare_digest(current.content.encode(), snapshot.content.encode())
+    )
+
+
+def _stage_private_text_at(
+    path: Path,
+    parent_descriptor: int,
+    content: str,
+    mode: int = 0o600,
+) -> tuple[str, int, tuple[int, int]]:
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = -1
+    temporary_name = ""
+    try:
+        for _attempt in range(128):
+            temporary_name = f".{path.name}.{secrets.token_hex(12)}"
+            try:
+                descriptor = os.open(
+                    temporary_name,
+                    flags,
+                    mode,
+                    dir_fd=parent_descriptor,
+                )
+            except FileExistsError:
+                continue
+            break
+        else:  # pragma: no cover - cryptographic names make exhaustion impractical
+            raise CliError(f"无法为凭据创建临时文件：{path}")
+
+        os.fchmod(descriptor, mode)
+        payload = content.encode("utf-8")
+        remaining = memoryview(payload)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written <= 0:  # pragma: no cover - regular-file writes either progress or raise
+                raise OSError("credential write made no progress")
+            remaining = remaining[written:]
+        os.fsync(descriptor)
+        metadata = os.fstat(descriptor)
+        return temporary_name, descriptor, (metadata.st_dev, metadata.st_ino)
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary_name:
+            with contextlib.suppress(OSError):
+                os.unlink(temporary_name, dir_fd=parent_descriptor)
+        raise
+
+
+def _directory_path_matches_descriptor(path: Path, descriptor: int) -> bool:
+    try:
+        current_descriptor = open_private_directory(path, create=False)
+    except (OSError, RuntimeError):
+        return False
+    try:
+        current = os.fstat(current_descriptor)
+        held = os.fstat(descriptor)
+        return (current.st_dev, current.st_ino) == (held.st_dev, held.st_ino)
+    finally:
+        os.close(current_descriptor)
+
+
+def _verify_descriptor_at(
+    target: _CredentialTarget,
+    *,
+    descriptor: int,
+    identity: tuple[int, int],
+    expected: str,
+    mode: int,
+) -> None:
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid():
+        raise CliError(f"凭据文件类型或所有者校验失败：{target.path}")
+    if stat.S_IMODE(metadata.st_mode) != mode:
+        raise CliError(f"凭据文件权限校验失败：{target.path}")
+    if (metadata.st_dev, metadata.st_ino) != identity:
+        raise CliError(f"凭据文件描述符在写入期间发生变化：{target.path}")
+
+    encoded = expected.encode("utf-8")
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    stored = os.read(descriptor, len(encoded) + 1)
+    if not hmac.compare_digest(stored, encoded):
+        raise CliError("凭据文件写入校验失败")
+
+    try:
+        destination = os.stat(
+            target.path.name,
+            dir_fd=target.parent_descriptor,
+            follow_symlinks=False,
+        )
+    except OSError:
+        raise CliError(f"凭据目标在写入期间被替换：{target.path}") from None
+    if not stat.S_ISREG(destination.st_mode) or (
+        destination.st_dev,
+        destination.st_ino,
+    ) != identity:
+        raise CliError(f"凭据目标在写入期间被替换：{target.path}")
+    if not _directory_path_matches_descriptor(target.path.parent, target.parent_descriptor):
+        raise CliError(f"凭据目录在写入期间被替换：{target.path.parent}")
+
+
+def _destination_matches_committed(target: _CredentialTarget) -> bool:
+    if target.committed_identity is None:
+        return False
+    try:
+        metadata = os.stat(
+            target.path.name,
+            dir_fd=target.parent_descriptor,
+            follow_symlinks=False,
+        )
+    except OSError:
+        return False
+    return (metadata.st_dev, metadata.st_ino) == target.committed_identity
+
+
+def _restore_credentials(targets: Sequence[_CredentialTarget]) -> None:
+    for target in reversed(targets):
+        if target.committed_identity is None:
+            continue
+        if not _destination_matches_committed(target):
+            raise CliError(f"回滚时凭据目标已被其他操作替换：{target.path}")
+        snapshot = target.snapshot
+        if snapshot.existed:
+            name, descriptor, identity = _stage_private_text_at(
+                target.path,
+                target.parent_descriptor,
+                snapshot.content,
+                snapshot.mode,
+            )
+            try:
+                os.replace(
+                    name,
+                    target.path.name,
+                    src_dir_fd=target.parent_descriptor,
+                    dst_dir_fd=target.parent_descriptor,
+                )
+                name = ""
+                os.fsync(target.parent_descriptor)
+                _verify_descriptor_at(
+                    target,
+                    descriptor=descriptor,
+                    identity=identity,
+                    expected=snapshot.content,
+                    mode=snapshot.mode,
+                )
+            finally:
+                os.close(descriptor)
+                if name:
+                    with contextlib.suppress(OSError):
+                        os.unlink(name, dir_fd=target.parent_descriptor)
+        else:
+            os.unlink(target.path.name, dir_fd=target.parent_descriptor)
+            os.fsync(target.parent_descriptor)
+        if not _directory_path_matches_descriptor(target.path.parent, target.parent_descriptor):
+            raise CliError(f"回滚时凭据目录已被替换：{target.path.parent}")
+
+
+def _install_token_files(
+    destinations: dict[str, tuple[Path, str]],
+    *,
+    force: bool,
+    finalize: Callable[[], None] | None = None,
+) -> None:
+    paths = [path for path, _token in destinations.values()]
+    if len(set(paths)) != len(paths):
+        raise CliError("两个 Bot token 不能写入同一个凭据文件")
+    targets: list[_CredentialTarget] = []
+    parent_descriptors: dict[Path, int] = {}
+    lock_descriptors: list[int] = []
+    try:
+        for parent in sorted({path.parent for path in paths}, key=os.fspath):
+            parent_descriptor = open_private_directory(parent)
+            parent_descriptors[parent] = parent_descriptor
+            lock_descriptors.append(_lock_credential_directory(parent_descriptor, parent))
+        for path, token in destinations.values():
+            parent_descriptor = parent_descriptors[path.parent]
+            snapshot = _credential_snapshot_at(path, parent_descriptor)
+            targets.append(
+                _CredentialTarget(
+                    path=path,
+                    token=token,
+                    parent_descriptor=parent_descriptor,
+                    snapshot=snapshot,
+                )
+            )
+        if not force and any(target.snapshot.existed for target in targets):
+            raise CliError("Bot token 凭据已存在；确认替换时请添加 --force")
+
+        for target in targets:
+            (
+                target.staged_name,
+                target.staged_descriptor,
+                target.staged_identity,
+            ) = _stage_private_text_at(
+                target.path,
+                target.parent_descriptor,
+                target.token + "\n",
+            )
+        for target in targets:
+            if target.staged_name is None or target.staged_identity is None:
+                raise CliError("凭据文件暂存状态无效")
+            if not _snapshot_matches_current(target):
+                raise CliError(f"凭据文件在配置期间发生变化，未覆盖并发更新：{target.path}")
+            if force:
+                os.replace(
+                    target.staged_name,
+                    target.path.name,
+                    src_dir_fd=target.parent_descriptor,
+                    dst_dir_fd=target.parent_descriptor,
+                )
+            else:
+                try:
+                    os.link(
+                        target.staged_name,
+                        target.path.name,
+                        src_dir_fd=target.parent_descriptor,
+                        dst_dir_fd=target.parent_descriptor,
+                        follow_symlinks=False,
+                    )
+                except FileExistsError:
+                    raise CliError(
+                        f"凭据文件由另一个配置进程创建，未覆盖：{target.path}"
+                    ) from None
+                os.unlink(target.staged_name, dir_fd=target.parent_descriptor)
+            target.staged_name = None
+            target.committed_identity = target.staged_identity
+            os.fsync(target.parent_descriptor)
+            _verify_descriptor_at(
+                target,
+                descriptor=target.staged_descriptor,
+                identity=target.staged_identity,
+                expected=target.token + "\n",
+                mode=0o600,
+            )
+        if finalize is not None:
+            finalize()
+    except BaseException as exc:
+        if isinstance(exc, _AtomicWriteCommittedError):
+            raise CliError(
+                f"{exc}；Bot token 私有凭据已保留。请检查磁盘/WSL 状态，"
+                "确认 .bashrc 已清理，并运行 `codex-tg doctor --offline` 检查凭据"
+            ) from None
+        if any(target.committed_identity is not None for target in targets):
+            try:
+                _restore_credentials(targets)
+            except Exception:
+                raise CliError("凭据更新失败且回滚未完整完成；请立即检查凭据文件") from None
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
+        if isinstance(exc, CliError):
+            raise
+        raise CliError("凭据文件更新失败；原有凭据已恢复") from None
+    finally:
+        for target in targets:
+            if target.staged_descriptor >= 0:
+                os.close(target.staged_descriptor)
+            if target.staged_name:
+                with contextlib.suppress(OSError):
+                    os.unlink(target.staged_name, dir_fd=target.parent_descriptor)
+        for descriptor in reversed(lock_descriptors):
+            with contextlib.suppress(OSError):
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+        for descriptor in parent_descriptors.values():
+            os.close(descriptor)
+
+
+async def _validate_telegram_token(token: str) -> str:
+    try:
+        async with Bot(token=token) as bot:
+            identity = await bot.get_me()
+    except Exception:
+        # PTB exceptions can contain the request URL. Never interpolate them here because
+        # Bot API URLs contain the credential.
+        raise CliError("Telegram getMe 验证失败；凭据未迁移，.bashrc 保持不变") from None
+    return identity.username or str(identity.id)
+
+
+async def _validate_distinct_tokens(
+    control: str,
+    forum: str,
+    *,
+    validator: Callable[[str], Awaitable[str]],
+) -> dict[str, str]:
+    if not _TOKEN_SHAPE.fullmatch(control) or not _TOKEN_SHAPE.fullmatch(forum):
+        raise CliError("Bot token 格式无效；未写入任何凭据")
+    if hmac.compare_digest(control, forum):
+        raise CliError("两个 Bot 必须使用不同的 token；未写入任何凭据")
+    control_identity, forum_identity = await asyncio.gather(validator(control), validator(forum))
+    if hmac.compare_digest(control_identity.casefold(), forum_identity.casefold()):
+        raise CliError("两个 token 指向同一个 Bot；未写入任何凭据")
+    return {"control": control_identity, "forum": forum_identity}
+
+
+def _rotation_requires_owner_reset(config: Config) -> bool:
+    store = Store(config.database_path)
+    try:
+        if store.get_owner() is not None or store.get_telegram_binding() is not None:
+            return True
+        return any(space.get("lifecycle") != "closed" for space in store.list_spaces())
+    finally:
+        store.close()
+
+
+async def migrate_bashrc_token(
+    config: Config,
+    bashrc: Path,
+    *,
+    validator: Callable[[str], Awaitable[str]] = _validate_telegram_token,
+) -> str:
+    token, original, cleaned, bashrc_mode = _read_bashrc_token(bashrc)
+    identity = await validator(token)
+    snapshot = _credential_snapshot(config.bot_token_path)
+    changed = not snapshot.existed or not hmac.compare_digest(snapshot.content.strip(), token)
+    if changed and _rotation_requires_owner_reset(config):
+        raise CliError(
+            "检测到 Bot token 变更，但仍存在 Telegram 授权状态；"
+            "请先运行 `codex-tg owner-reset` 再迁移凭据"
+        )
+    _install_token_files(
+        {"control": (config.bot_token_path, token)},
+        force=True,
+        finalize=lambda: _atomic_write_text(bashrc, cleaned, bashrc_mode, expected=original),
+    )
+    return identity
+
+
+async def migrate_bashrc_tokens(
+    config: Config,
+    bashrc: Path,
+    *,
+    validator: Callable[[str], Awaitable[str]] = _validate_telegram_token,
+) -> dict[str, str]:
+    tokens, original, cleaned, bashrc_mode = _read_bashrc_tokens(bashrc, require_all=False)
+    try:
+        control = tokens.get(TOKEN_VARIABLE) or config.read_token("control")
+        forum = tokens.get(FORUM_TOKEN_VARIABLE) or config.read_token("forum")
+    except RuntimeError as exc:
+        raise CliError(
+            "两个 Bot token 必须分别存在于 .bashrc 直接赋值或私有凭据文件中"
+        ) from exc
+    identities = await _validate_distinct_tokens(control, forum, validator=validator)
+
+    destinations = {
+        "control": (config.bot_token_path, control),
+        "forum": (config.forum_bot_token_path, forum),
+    }
+    snapshots = [_credential_snapshot(path) for path, _token in destinations.values()]
+    changed = any(
+        not snapshot.existed
+        or not hmac.compare_digest(snapshot.content.strip(), token)
+        for snapshot, token in zip(snapshots, (control, forum), strict=True)
+    )
+    if changed and _rotation_requires_owner_reset(config):
+        raise CliError(
+            "检测到 Bot token 变更，但仍存在 Telegram 授权状态；"
+            "请先运行 `codex-tg owner-reset` 再迁移凭据"
+        )
+    _install_token_files(
+        destinations,
+        force=True,
+        finalize=lambda: _atomic_write_text(bashrc, cleaned, bashrc_mode, expected=original),
+    )
+    return identities
+
+
+async def configure_prompt_tokens(
+    config: Config,
+    *,
+    force: bool = False,
+    token_reader: Callable[[str], str] = getpass.getpass,
+    validator: Callable[[str], Awaitable[str]] = _validate_telegram_token,
+) -> dict[str, str]:
+    try:
+        ensure_private_directory(config.config_dir)
+        snapshots = [
+            _credential_snapshot(config.bot_token_path),
+            _credential_snapshot(config.forum_bot_token_path),
+        ]
+    except RuntimeError as exc:
+        raise CliError(f"无法安全准备 Telegram 凭据目录：{exc}") from None
+    if not force and any(snapshot.existed for snapshot in snapshots):
+        raise CliError("Bot token 凭据已存在；确认替换时请添加 --force")
+    try:
+        control = token_reader(
+            f"输入 {config.control_bot_label} token（输入内容不会显示）："
+        ).strip()
+        forum = token_reader(
+            f"输入 {config.discussion_bot_label} token（输入内容不会显示）："
+        ).strip()
+    except (EOFError, OSError):
+        raise CliError("无法从终端安全读取 Bot token") from None
+
+    identities = await _validate_distinct_tokens(control, forum, validator=validator)
+    entered = (control, forum)
+    changed = any(
+        not snapshot.existed
+        or not hmac.compare_digest(snapshot.content.strip(), token)
+        for snapshot, token in zip(snapshots, entered, strict=True)
+    )
+    if force and changed and _rotation_requires_owner_reset(config):
+        raise CliError(
+            "检测到 Bot token 变更，但仍存在 owner、频道绑定或未关闭 SessionSpace；"
+            "请先运行 `codex-tg owner-reset`，再重新执行 token 配置，随后运行 "
+            "`systemctl --user restart codex-telegram-bridge` 和 `codex-tg onboard`"
+        )
+    _install_token_files(
+        {
+            "control": (config.bot_token_path, control),
+            "forum": (config.forum_bot_token_path, forum),
+        },
+        force=force,
+    )
+    return identities
+
+
+def _config_from_args(args: argparse.Namespace) -> Config:
+    return Config.load(args.config.expanduser() if args.config else None)
+
+
+def _with_store(config: Config) -> Store:
+    return Store(config.database_path)
+
+
+def _enroll(
+    security: SecurityManager,
+    enrollment: Enrollment,
+    *,
+    output: TextIO,
+    code_reader: Callable[[str], str] = getpass.getpass,
+) -> None:
+    output.write("请用认证器扫描二维码（该二维码包含 TOTP 密钥）：\n")
+    segno.make(enrollment.provisioning_uri, error="M").terminal(out=output, compact=True)
+    output.write(f"\n无法扫码时可手动输入：{enrollment.secret}\n")
+    code = code_reader("输入认证器生成的 6 位验证码：").strip()
+    if not security.commit_enrollment(enrollment, code):
+        raise CliError("验证码无效；未保存新的 TOTP 密钥")
+    output.write("TOTP 已启用。以下恢复码仅显示一次，请离线保存：\n")
+    output.write("\n".join(enrollment.recovery_codes) + "\n")
+
+
+def _confirm(prompt: str, expected: str, *, reader: Callable[[str], str] = input) -> None:
+    if reader(prompt).strip() != expected:
+        raise CliError("操作已取消")
+
+
+def _mode_is_private(path: Path) -> bool:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return False
+    return (
+        stat.S_ISREG(metadata.st_mode)
+        and not stat.S_ISLNK(metadata.st_mode)
+        and not (stat.S_IMODE(metadata.st_mode) & 0o077)
+    )
+
+
+def _socket_is_private(path: Path) -> bool:
+    try:
+        metadata = path.stat()
+    except FileNotFoundError:
+        return False
+    return stat.S_ISSOCK(metadata.st_mode) and not (stat.S_IMODE(metadata.st_mode) & 0o077)
+
+
+def _bashrc_contains_token(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    return any(_ASSIGNMENT.match(line) for line in path.read_text(encoding="utf-8").splitlines())
+
+
+def _bashrc_token_variables(path: Path) -> set[str]:
+    if not path.is_file():
+        return set()
+    found: set[str] = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        for variable in (TOKEN_VARIABLE, FORUM_TOKEN_VARIABLE):
+            assignment = re.compile(
+                rf"^[ \t]*(?:export[ \t]+)?{re.escape(variable)}[ \t]*="
+            )
+            if assignment.match(line):
+                found.add(variable)
+    return found
+
+
+def _binding_issues(binding: dict[str, object] | None) -> list[str]:
+    if binding is None:
+        return ["尚未绑定频道与讨论组"]
+    issues: list[str] = []
+    for field in ("channel_chat_id", "discussion_chat_id"):
+        value = binding.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value == 0:
+            issues.append(f"{field} 缺失或无效")
+    control_id = binding.get("control_bot_id", binding.get("controller_bot_id"))
+    forum_id = binding.get("forum_bot_id", binding.get("discussion_bot_id"))
+    if isinstance(control_id, bool) or not isinstance(control_id, int) or control_id <= 0:
+        issues.append("control_bot_id 缺失或无效")
+    if isinstance(forum_id, bool) or not isinstance(forum_id, int) or forum_id <= 0:
+        issues.append("forum_bot_id 缺失或无效")
+    if binding.get("is_forum") is True:
+        issues.append("讨论组启用了 Forum Topics")
+    if binding.get("channel_chat_id") == binding.get("discussion_chat_id"):
+        issues.append("频道与讨论组不能是同一个 chat")
+    return issues
+
+
+async def _wait_for_store_state(
+    ready: Callable[[], bool],
+    *,
+    timeout: int,
+    stage: str,
+    clock: Callable[[], float],
+    sleeper: Callable[[float], Awaitable[None]],
+) -> None:
+    deadline = clock() + timeout
+    while not ready():
+        remaining = deadline - clock()
+        if remaining <= 0:
+            raise CliError(f"等待 {stage} 超时；请重新运行 `codex-tg onboard`")
+        await sleeper(min(1.0, remaining))
+
+
+def _clear_one_time_code(store: Store, prefix: str) -> None:
+    store.set_meta_many(
+        {
+            f"{prefix}_code_salt": "",
+            f"{prefix}_code_digest": "",
+            f"{prefix}_code_expires": 0,
+            f"{prefix}_code_failures": 0,
+        }
+    )
+
+
+async def _doctor(config: Config, *, offline: bool, output: TextIO) -> int:
+    failures = 0
+
+    def report(level: str, text: str) -> None:
+        nonlocal failures
+        if level == "FAIL":
+            failures += 1
+        output.write(f"[{level}] {text}\n")
+
+    report("OK", f"Python {sys.version_info.major}.{sys.version_info.minor}")
+
+    identities: dict[str, str] = {}
+    for role, path in (("control", config.bot_token_path), ("forum", config.forum_bot_token_path)):
+        if _mode_is_private(path):
+            report("OK", f"Telegram {role} token 文件存在且权限为私有")
+            if not offline:
+                try:
+                    identities[role] = await _validate_telegram_token(config.read_token(role))
+                except Exception:
+                    report("FAIL", f"Telegram {role} getMe 验证失败")
+                else:
+                    report("OK", f"Telegram {role} getMe 验证成功")
+        else:
+            report("FAIL", f"Telegram {role} token 缺失、不是普通文件或权限过宽：{path}")
+    if not offline and len(identities) == 2 and identities["control"] == identities["forum"]:
+        report("FAIL", "control 与 forum token 指向同一个 Bot")
+
+    bashrc_variables = _bashrc_token_variables(Path.home() / ".bashrc")
+    if bashrc_variables:
+        report("FAIL", f"~/.bashrc 仍包含 Bot token 明文赋值：{', '.join(sorted(bashrc_variables))}")
+    else:
+        report("OK", "~/.bashrc 中没有两个 Bot token 的明文赋值")
+
+    environment_tokens = [
+        variable for variable in (TOKEN_VARIABLE, FORUM_TOKEN_VARIABLE) if os.environ.get(variable)
+    ]
+    if environment_tokens:
+        report(
+            "WARN",
+            "当前进程环境仍含 Bot token；请新开 shell，并清理 systemd user manager 环境："
+            + ", ".join(environment_tokens),
+        )
+    residue_candidates = [
+        Path.home() / ".bashrc~",
+        Path.home() / ".bashrc.bak",
+        Path.home() / ".bashrc.backup",
+        Path.home() / ".bash_history",
+    ]
+    residue = [path.name for path in residue_candidates if _bashrc_token_variables(path)]
+    if residue:
+        report("WARN", f"以下 shell 历史/备份仍有 token 赋值：{', '.join(residue)}")
+
+    if _mode_is_private(config.totp_secret_path):
+        report("OK", "TOTP 密钥存在且权限为私有")
+    else:
+        report("WARN", "TOTP 尚未配置，或密钥权限过宽")
+
+    if _socket_is_private(config.codex_socket):
+        report("OK", "Codex app-server Unix socket 可用且权限为私有")
+    else:
+        report("FAIL", f"Codex app-server socket 不可用或权限过宽：{config.codex_socket}")
+
+    codex = config.codex_binary
+    if codex.is_file() and os.access(codex, os.X_OK):
+        report("OK", f"Codex CLI 可执行文件：{codex}")
+    else:
+        report("FAIL", f"Codex CLI 不可执行：{codex}")
+    tmux = shutil.which("tmux")
+    report("OK" if tmux else "FAIL", "tmux 可用" if tmux else "未找到 tmux")
+
+    try:
+        store = _with_store(config)
+    except Exception:
+        report("FAIL", "状态数据库无法打开")
+    else:
+        try:
+            owner = store.get_owner()
+            report("OK" if owner else "WARN", "Telegram owner 已配对" if owner else "尚未配对 owner")
+            binding_issues = _binding_issues(store.get_telegram_binding())
+            if binding_issues:
+                report("WARN", "Telegram 频道绑定未就绪：" + "；".join(binding_issues))
+            else:
+                report("OK", "Telegram 频道与讨论组绑定结构有效")
+            report("OK", f"状态数据库 schema v{store.schema_version}")
+        finally:
+            store.close()
+    return 1 if failures else 0
+
+
+async def onboard(
+    config: Config,
+    *,
+    timeout: int = 600,
+    output: TextIO,
+    code_reader: Callable[[str], str] = getpass.getpass,
+    clock: Callable[[], float] = time.monotonic,
+    sleeper: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    doctor: Callable[..., Awaitable[int]] = _doctor,
+    store_factory: Callable[[Config], Store] = _with_store,
+) -> int:
+    if timeout <= 0:
+        raise CliError("--timeout 必须是正整数秒数")
+
+    store = store_factory(config)
+    try:
+        security = SecurityManager(store, config.totp_secret_path, config.totp_unlock_seconds)
+        if security.configured:
+            output.write("TOTP 已配置，跳过注册。\n")
+        else:
+            output.write("开始注册 TOTP。\n")
+            _enroll(
+                security,
+                security.begin_enrollment(),
+                output=output,
+                code_reader=code_reader,
+            )
+
+        if store.get_owner() is not None:
+            output.write("Telegram owner 已配对，跳过配对。\n")
+        else:
+            code = security.create_pair_code(max(config.pair_code_seconds, timeout))
+            output.write(f"配对码：{code}\n")
+            output.write(
+                f"请在 {config.control_bot_label} 私聊发送 /pair <配对码>，正在等待配对完成。\n"
+            )
+            try:
+                await _wait_for_store_state(
+                    lambda: store.get_owner() is not None,
+                    timeout=timeout,
+                    stage="owner 配对",
+                    clock=clock,
+                    sleeper=sleeper,
+                )
+            finally:
+                _clear_one_time_code(store, "pair")
+            output.write("Telegram owner 配对完成。\n")
+
+        if not _binding_issues(store.get_telegram_binding()):
+            output.write("频道与讨论组绑定有效，跳过绑定。\n")
+        else:
+            code = security.create_bind_code(max(config.pair_code_seconds, timeout))
+            output.write(f"绑定码：{code}\n")
+            output.write(
+                f"请在已关联的讨论组向 {config.discussion_bot_label} 发送 /bind <绑定码>，"
+                "正在等待绑定完成。\n"
+            )
+            try:
+                await _wait_for_store_state(
+                    lambda: not _binding_issues(store.get_telegram_binding()),
+                    timeout=timeout,
+                    stage="频道绑定",
+                    clock=clock,
+                    sleeper=sleeper,
+                )
+            finally:
+                _clear_one_time_code(store, "bind")
+            output.write("频道与讨论组绑定完成。\n")
+    finally:
+        store.close()
+
+    output.write("引导阶段完成，开始运行最终检查。\n")
+    return await doctor(config, offline=False, output=output)
+
+
+def _status(config: Config, output: TextIO) -> int:
+    store = _with_store(config)
+    try:
+        owner = store.get_owner()
+        subscriptions = store.subscriptions()
+        binding = store.get_telegram_binding()
+        spaces = store.list_spaces()
+        schema_version = store.schema_version
+        auth_epoch = store.auth_epoch()
+        force_locked = bool(store.get_meta("totp_force_locked", True))
+        pending_disconnect = bool(store.get_meta("telegram_disconnect_pending", False))
+        runtime_active = bool(store.get_meta("telegram_runtime_active", False))
+    finally:
+        store.close()
+    control_token_status = (
+        "configured/private" if _mode_is_private(config.bot_token_path) else "missing/insecure"
+    )
+    forum_token_status = (
+        "configured/private" if _mode_is_private(config.forum_bot_token_path) else "missing/insecure"
+    )
+    totp_status = "configured" if _mode_is_private(config.totp_secret_path) else "missing/insecure"
+    socket_status = "ready" if _socket_is_private(config.codex_socket) else "unavailable/insecure"
+    output.write(f"control token: {control_token_status}\n")
+    output.write(f"forum token: {forum_token_status}\n")
+    output.write(f"owner: {'paired' if owner else 'unpaired'}\n")
+    output.write(f"channel binding: {'ready' if not _binding_issues(binding) else 'missing/invalid'}\n")
+    output.write(f"totp: {totp_status}\n")
+    output.write(
+        f"write access gate: {'globally locked' if force_locked else 'space leases are process-local'}\n"
+    )
+    output.write(f"watched sessions: {len(subscriptions)}\n")
+    lifecycles = {name: sum(space.get("lifecycle") == name for space in spaces) for name in (
+        "pending", "active", "closed", "repair_required"
+    )}
+    output.write(
+        "session spaces: "
+        + " · ".join(f"{name}={count}" for name, count in lifecycles.items())
+        + "\n"
+    )
+    output.write(f"auth epoch: {auth_epoch}\n")
+    output.write(f"database schema: v{schema_version}\n")
+    output.write(f"last runtime marker: {'active/unclean' if runtime_active else 'cleanly stopped'}\n")
+    output.write(f"deferred disconnect emoji: {'pending' if pending_disconnect else 'none'}\n")
+    output.write(f"codex socket: {socket_status}\n")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="codex-tg", description="Codex Telegram Bridge 本机管理工具")
+    parser.add_argument("--config", type=Path, help="config.toml 路径")
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    configure = commands.add_parser(
+        "configure-token",
+        aliases=["migrate-token"],
+        help="验证并从 .bashrc 安全迁移 Bot token",
+    )
+    configure.add_argument("--bashrc", type=Path, default=Path.home() / ".bashrc")
+
+    configure_all = commands.add_parser(
+        "configure-tokens",
+        help="交互录入或从 .bashrc 安全迁移两个 Bot token",
+    )
+    configure_all.add_argument("--bashrc", type=Path, default=Path.home() / ".bashrc")
+    configure_all.add_argument("--prompt", action="store_true", help="从隐藏终端提示录入两个 token")
+    configure_all.add_argument("--json", action="store_true", help="只输出验证后的 Bot 身份 JSON")
+    configure_all.add_argument("--force", action="store_true", help="允许 --prompt 替换已有凭据")
+
+    commands.add_parser("pair-code", help="生成一次性 owner 配对码")
+    commands.add_parser("bind-code", help="生成一次性频道/讨论组绑定码")
+    onboard_parser = commands.add_parser("onboard", help="完成 TOTP、owner 配对、频道绑定和检查")
+    onboard_parser.add_argument("--timeout", type=int, default=600, help="每个等待阶段的超时秒数")
+    commands.add_parser("totp-enroll", help="首次注册 TOTP")
+    reset_totp = commands.add_parser("totp-reset", help="更换 TOTP 密钥并废弃旧恢复码")
+    reset_totp.add_argument("--force", action="store_true", help="本机强制重置（需要再次确认）")
+    reset_totp.add_argument("--yes", action="store_true", help="与 --force 一起跳过交互确认")
+
+    reset_owner = commands.add_parser("owner-reset", help="删除已配对 owner")
+    reset_owner.add_argument("--yes", action="store_true", help="跳过 RESET 确认")
+    commands.add_parser("lock", help="立即撤销 Telegram 写操作解锁状态")
+
+    doctor = commands.add_parser("doctor", help="检查凭据、权限、Codex socket 与依赖")
+    doctor.add_argument("--offline", action="store_true", help="不调用 Telegram getMe")
+    commands.add_parser("status", help="显示本机桥接状态（不显示秘密）")
+    return parser
+
+
+def run(args: argparse.Namespace, *, output: TextIO = sys.stdout) -> int:
+    config = _config_from_args(args)
+    if args.command in {"configure-token", "migrate-token"}:
+        identity = asyncio.run(migrate_bashrc_token(config, args.bashrc.expanduser()))
+        output.write(f"Bot @{identity} 验证成功；token 已迁移到私有凭据文件并从 .bashrc 删除。\n")
+        return 0
+    if args.command == "configure-tokens":
+        if args.prompt:
+            identities = asyncio.run(configure_prompt_tokens(config, force=args.force))
+        else:
+            identities = asyncio.run(migrate_bashrc_tokens(config, args.bashrc.expanduser()))
+        if args.json:
+            output.write(json.dumps(identities, ensure_ascii=False, separators=(",", ":")) + "\n")
+        elif args.prompt:
+            output.write(
+                f"{config.control_bot_label} @{identities['control']} 与 "
+                f"{config.discussion_bot_label} @{identities['forum']} 验证成功；"
+                "两个 token 已保存到私有凭据文件。\n"
+            )
+            if args.force:
+                output.write(
+                    "如 Bridge 服务正在运行，请执行 `systemctl --user restart "
+                    "codex-telegram-bridge`，然后运行 `codex-tg onboard`。\n"
+                )
+        else:
+            output.write(
+                f"{config.control_bot_label} @{identities['control']} 与 "
+                f"{config.discussion_bot_label} @{identities['forum']} 验证成功；"
+                "两个 token 已迁移到私有凭据文件并从 .bashrc 删除。\n"
+            )
+        return 0
+    if args.command == "onboard":
+        return asyncio.run(onboard(config, timeout=args.timeout, output=output))
+    if args.command == "doctor":
+        return asyncio.run(_doctor(config, offline=args.offline, output=output))
+    if args.command == "status":
+        return _status(config, output)
+
+    store = _with_store(config)
+    try:
+        if args.command == "pair-code":
+            if store.get_owner() is not None:
+                raise CliError("owner 已配对；如需更换，请先运行 `codex-tg owner-reset`")
+            security = SecurityManager(store, config.totp_secret_path, config.totp_unlock_seconds)
+            code = security.create_pair_code(config.pair_code_seconds)
+            output.write(f"配对码：{code}\n")
+            minutes = config.pair_code_seconds // 60
+            output.write(f"有效期：{minutes} 分钟；请在 Bot 私聊发送 /pair <配对码>。\n")
+        elif args.command == "bind-code":
+            if store.get_owner() is None:
+                raise CliError(f"尚未配对 owner；请先完成 {config.control_bot_label} 私聊配对")
+            security = SecurityManager(store, config.totp_secret_path, config.totp_unlock_seconds)
+            code = security.create_bind_code(config.pair_code_seconds)
+            output.write(f"绑定码：{code}\n")
+            minutes = config.pair_code_seconds // 60
+            output.write(f"有效期：{minutes} 分钟；请在已关联的讨论组发送 /bind <绑定码>。\n")
+        elif args.command == "totp-enroll":
+            security = SecurityManager(store, config.totp_secret_path, config.totp_unlock_seconds)
+            if security.configured:
+                raise CliError("TOTP 已配置；请使用 `codex-tg totp-reset`")
+            _enroll(security, security.begin_enrollment(), output=output)
+        elif args.command == "totp-reset":
+            security = SecurityManager(store, config.totp_secret_path, config.totp_unlock_seconds)
+            if security.configured and not args.force:
+                current = getpass.getpass("输入当前 TOTP 或恢复码：").strip()
+                if not security.verify(current):
+                    raise CliError("当前 TOTP/恢复码验证失败")
+            elif args.force and not args.yes:
+                _confirm("这会废弃当前 TOTP 和全部恢复码。输入 RESET-TOTP 继续：", "RESET-TOTP")
+            _enroll(security, security.begin_enrollment(), output=output)
+        elif args.command == "owner-reset":
+            if not args.yes:
+                _confirm("这会删除唯一 owner。输入 RESET 继续：", "RESET")
+            store.reset_owner()
+            store.set_meta("totp_force_locked", True)
+            store.set_meta("totp_unlocked_until", 0)
+            output.write("owner 已删除；Telegram 写操作已锁定。\n")
+        elif args.command == "lock":
+            security = SecurityManager(store, config.totp_secret_path, config.totp_unlock_seconds)
+            security.lock_all()
+            output.write("Telegram 写操作已锁定。\n")
+        else:  # pragma: no cover - argparse owns command validation
+            raise CliError(f"未知命令：{args.command}")
+    finally:
+        store.close()
+    return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return run(args)
+    except (CliError, ValueError) as exc:
+        print(f"错误：{exc}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("操作已取消", file=sys.stderr)
+        return 130

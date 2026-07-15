@@ -1,0 +1,17 @@
+.venv/
+.gitnexus/
+.codegraph/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+*.sqlite3
+*.sqlite3-*
+*.part
+*.log
+.env
+.env.*
+coverage.xml
+.coverage

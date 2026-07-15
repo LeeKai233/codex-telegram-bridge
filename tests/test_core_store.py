@@ -1,0 +1,592 @@
+from __future__ import annotations
+
+import base64
+import hashlib
+import sqlite3
+import stat
+import time
+from pathlib import Path
+
+import pytest
+
+from codex_telegram_bridge.models import Owner, SessionSpace, ThreadState
+from codex_telegram_bridge.store import SCHEMA_VERSION, Store
+
+
+def test_atomic_totp_replay_and_update_claims_across_connections(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    first = Store(path)
+    second = Store(path)
+    try:
+        assert first.accept_totp_timecode(100)
+        assert not second.accept_totp_timecode(100)
+        assert second.accept_totp_timecode(101)
+        assert first.claim_telegram_update(10)
+        assert not second.claim_telegram_update(10)
+        assert second.claim_telegram_update(5)
+        assert first.telegram_update_seen(10)
+        assert first.telegram_update_seen(5)
+    finally:
+        first.close()
+        second.close()
+
+
+def test_owner_and_callback_claims_are_first_writer_wins(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    first = Store(path)
+    second = Store(path)
+    try:
+        owner = Owner(1, 11, "first")
+        assert first.set_owner(owner)
+        assert not second.set_owner(Owner(2, 22, "second"))
+        assert second.get_owner() == owner
+        first.put_callback("nonce", "run", {"value": 1}, 1, 4_000_000_000)
+        assert second.consume_callback("nonce", 1) == ("run", {"value": 1})
+        assert first.consume_callback("nonce", 1) is None
+    finally:
+        first.close()
+        second.close()
+
+
+def test_pair_code_is_consumed_atomically_and_locked_after_failures(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    salt = b"0123456789abcdef"
+    code = "ABCDEF0123"
+    store.set_meta_many(
+        {
+            "pair_code_salt": base64.b64encode(salt).decode("ascii"),
+            "pair_code_digest": hashlib.sha256(salt + code.encode("ascii")).hexdigest(),
+            "pair_code_expires": 200,
+            "pair_code_failures": 0,
+        }
+    )
+    assert store.consume_pair_code(code, now=100)
+    assert not store.consume_pair_code(code, now=100)
+
+    store.set_meta_many(
+        {
+            "pair_code_salt": base64.b64encode(salt).decode("ascii"),
+            "pair_code_digest": hashlib.sha256(salt + code.encode("ascii")).hexdigest(),
+            "pair_code_expires": 200,
+            "pair_code_failures": 0,
+        }
+    )
+    for _ in range(5):
+        assert not store.consume_pair_code("WRONG", now=100)
+    assert store.get_meta("pair_code_expires") == 0
+    assert not store.consume_pair_code(code, now=100)
+    store.close()
+
+
+def test_reset_owner_revokes_authority_and_queued_work(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    upload = tmp_path / "inbox" / "upload.txt"
+    upload.parent.mkdir()
+    upload.write_text("data", encoding="utf-8")
+    assert store.set_owner(Owner(1, 11, "owner"))
+    store.subscribe("thread", message_id=99)
+    store.put_callback("nonce", "run", {}, 1, 4_000_000_000)
+    store.put_pending_input("request", "1", 1, "thread", "turn", "item", [], None)
+    store.enqueue_prompt(
+        "thread",
+        "read",
+        [{"type": "mention", "name": upload.name, "path": str(upload)}],
+        "message-1",
+    )
+    store.set_meta_many({"totp_force_locked": False, "totp_unlocked_until": 4_000_000_000})
+    assert store.queued_file_paths() == {upload.resolve()}
+
+    store.reset_owner()
+
+    assert store.get_owner() is None
+    assert store.consume_callback("nonce", 1) is None
+    assert store.get_pending_input("request") is None
+    assert store.queue_count("thread") == 0
+    assert store.queued_file_paths() == set()
+    assert store.subscriptions() == {"thread": None}
+    assert store.get_meta("totp_force_locked") is True
+    assert store.get_meta("totp_unlocked_until") == 0
+    store.close()
+
+
+def test_store_database_and_directory_are_private(tmp_path: Path) -> None:
+    path = tmp_path / "private" / "state.sqlite3"
+    store = Store(path)
+    try:
+        assert path.stat().st_mode & 0o777 == 0o600
+        assert path.parent.stat().st_mode & 0o777 == 0o700
+        with store._lock:
+            row = store._connection.execute("PRAGMA journal_mode").fetchone()
+            assert str(row[0]).casefold() == "wal"
+            assert int(store._connection.execute("PRAGMA busy_timeout").fetchone()[0]) == 30_000
+    finally:
+        store.close()
+
+
+def test_update_cleanup_keeps_recent_ids_without_a_high_water_mark(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    try:
+        assert store.claim_telegram_update(100)
+        assert store.claim_telegram_update(5)
+        with store._lock, store._connection:
+            store._connection.execute("UPDATE telegram_updates SET received_at=1")
+        store.cleanup(update_days=1, keep_recent_updates=1)
+        assert not store.telegram_update_seen(100)
+        assert store.telegram_update_seen(5)
+        assert store.claim_telegram_update(100)
+    finally:
+        store.close()
+
+
+def test_update_claim_enforces_hard_limit_by_arrival_order(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    try:
+        assert store.claim_telegram_update(100, max_tracked=2)
+        assert store.claim_telegram_update(200, max_tracked=2)
+        assert store.claim_telegram_update(5, max_tracked=2)
+
+        count = store._connection.execute("SELECT COUNT(*) FROM telegram_updates").fetchone()[0]
+        assert count == 2
+        assert not store.telegram_update_seen(100)
+        assert store.telegram_update_seen(200)
+        assert store.telegram_update_seen(5)
+        assert not store.claim_telegram_update(5, max_tracked=2)
+    finally:
+        store.close()
+
+
+def test_pending_callback_file_paths_only_returns_live_unconsumed_paths(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    live = tmp_path / "live.txt"
+    consumed = tmp_path / "consumed.txt"
+    expired = tmp_path / "expired.txt"
+    now = int(time.time())
+    try:
+        store.put_callback("live", "upload", {"path": str(live)}, 7, now + 60)
+        store.put_callback("used", "upload", {"path": str(consumed)}, 7, now + 60)
+        store.put_callback("old", "upload", {"path": str(expired)}, 7, now - 1)
+        assert store.consume_callback("used", 7) is not None
+
+        assert store.pending_callback_file_paths() == {live.resolve(strict=False)}
+    finally:
+        store.close()
+
+
+def test_legacy_database_is_backed_up_and_migrated_idempotently(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE subscriptions(
+            thread_id TEXT PRIMARY KEY,
+            dashboard_message_id INTEGER,
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at INTEGER NOT NULL
+        );
+        INSERT INTO subscriptions VALUES('old-thread', NULL, 0, 1);
+        CREATE TABLE telegram_updates(
+            update_id INTEGER PRIMARY KEY,
+            received_at INTEGER NOT NULL,
+            sequence INTEGER
+        );
+        INSERT INTO telegram_updates VALUES(7, 10, 1);
+        """
+    )
+    connection.close()
+
+    store = Store(path)
+    backup = store.last_backup_path
+    assert store.schema_version == SCHEMA_VERSION
+    assert backup is not None and backup.is_file()
+    assert stat.S_IMODE(backup.stat().st_mode) == 0o600
+    assert store.telegram_update_seen(7, "control")
+    assert store.subscriptions() == {}
+    store.close()
+
+    reopened = Store(path)
+    assert reopened.last_backup_path is None
+    assert reopened.schema_version == SCHEMA_VERSION
+    reopened.close()
+
+
+def test_bot_update_ids_are_isolated_by_role(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    try:
+        assert store.claim_telegram_update(42, "control")
+        assert store.claim_telegram_update(42, "forum")
+        assert not store.claim_telegram_update(42, "control")
+        assert store.telegram_update_seen(42, "forum")
+    finally:
+        store.close()
+
+
+def test_session_space_reconciles_early_discussion_root_and_freezes_generation(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    try:
+        store.record_discussion_root(-1001, 9, -1002, 19)
+        created = store.create_space(
+            {
+                "space_id": "space-1",
+                "thread_id": "thread-1",
+                "channel_chat_id": -1001,
+                "channel_post_id": 9,
+            }
+        )
+        bound = store.bind_space_messages(
+            "space-1", channel_chat_id=-1001, channel_post_id=9, expected_generation=1
+        )
+        assert bound is not None
+        assert bound["discussion_chat_id"] == -1002
+        assert bound["discussion_root_id"] == 19
+        assert store.get_space_by_thread("thread-1") == bound
+
+        store.record_discussion_message(-1002, 25, 19, "space-1")
+        assert store.resolve_discussion_root(-1002, 25) == {
+            "root_message_id": 19,
+            "space_id": "space-1",
+        }
+
+        store.put_callback(
+            "space-action",
+            "run",
+            {},
+            7,
+            4_000_000_000,
+            bot_role="forum",
+            chat_id=-1002,
+            space_id="space-1",
+            generation=1,
+        )
+        assert store.peek_callback(
+            "space-action",
+            7,
+            bot_role="forum",
+            chat_id=-1002,
+            space_id="space-1",
+            generation=1,
+        ) == ("run", {})
+        assert store.peek_callback(
+            "space-action",
+            7,
+            bot_role="forum",
+            chat_id=-1002,
+            space_id="wrong-space",
+            generation=1,
+        ) is None
+        store.enqueue_prompt(
+            "thread-1", "queued", [], "space-client", space_id="space-1", generation=1
+        )
+        closed = store.close_space("space-1", expected_generation=1)
+        assert closed is not None and closed["generation"] == 2
+        assert store.consume_callback(
+            "space-action", 7, bot_role="forum", space_id="space-1", generation=1
+        ) is None
+        assert store.space_queue_entries("space-1", 1) == []
+
+        model = store.get_session_space("space-1")
+        assert isinstance(model, SessionSpace)
+        assert model.lifecycle == "closed"
+        assert created["generation"] == 1
+    finally:
+        store.close()
+
+
+def test_reset_space_transport_preserves_thread_and_invalidates_old_messages(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    try:
+        state = ThreadState(
+            thread_id="thread-1",
+            status="active",
+            goal={"objective": "Preserve me", "status": "active"},
+        )
+        store.save_thread(state)
+        store.subscribe("thread-1")
+        store.create_space(
+            {
+                "space_id": "space-reset",
+                "space_type": "existing",
+                "lifecycle": "active",
+                "thread_id": "thread-1",
+                "channel_chat_id": -1001,
+                "channel_post_id": 9,
+                "discussion_chat_id": -1002,
+                "discussion_root_id": 19,
+                "status_message_id": 20,
+            }
+        )
+        store.record_discussion_root(-1001, 9, -1002, 19)
+        store.record_discussion_message(-1002, 19, 19, "space-reset")
+        store.record_discussion_message(-1002, 20, 19, "space-reset")
+        store.record_question_message("request-1", "discussion", -1002, 20)
+        store.schedule_message_deletions("discussion", -1002, [20], 4_000_000_000)
+        store.schedule_message_deletions("control", -1001, [9], 4_000_000_000)
+        store.put_callback(
+            "old-space-action",
+            "run",
+            {},
+            7,
+            4_000_000_000,
+            bot_role="discussion",
+            chat_id=-1002,
+            space_id="space-reset",
+            generation=1,
+        )
+        store.record_discussion_root(-2001, 29, -2002, 39)
+        store.record_discussion_message(-2002, 40, 39, "space-other")
+        store.put_callback(
+            "other-space-action",
+            "run",
+            {},
+            7,
+            4_000_000_000,
+            bot_role="discussion",
+            chat_id=-2002,
+            space_id="space-other",
+            generation=1,
+        )
+
+        assert store.reset_space_transport("space-reset", expected_generation=2) is None
+        assert store.reset_space_transport("missing", expected_generation=1) is None
+
+        reset = store.reset_space_transport("space-reset", expected_generation=1)
+
+        assert reset is not None
+        assert reset["thread_id"] == "thread-1"
+        assert reset["lifecycle"] == "repair_required"
+        assert reset["generation"] == 2
+        assert reset["channel_chat_id"] == -1001
+        assert reset["discussion_chat_id"] == -1002
+        assert reset["channel_post_id"] is None
+        assert reset["discussion_root_id"] is None
+        assert reset["status_message_id"] is None
+        assert store.get_thread("thread-1") == state
+        assert store.subscriptions() == {"thread-1": None}
+        assert store.get_discussion_root(-1001, 9) is None
+        assert store.resolve_discussion_root(-1002, 19) is None
+        assert store.resolve_discussion_root(-1002, 20) is None
+        assert store.question_messages("request-1") == []
+        assert store.due_message_deletions(now=4_000_000_000) == []
+        assert store.peek_callback(
+            "old-space-action",
+            7,
+            bot_role="discussion",
+            chat_id=-1002,
+            space_id="space-reset",
+            generation=1,
+        ) is None
+        assert store.get_discussion_root(-2001, 29) == {
+            "discussion_chat_id": -2002,
+            "root_message_id": 39,
+        }
+        assert store.resolve_discussion_root(-2002, 40) == {
+            "root_message_id": 39,
+            "space_id": "space-other",
+        }
+        assert store.peek_callback(
+            "other-space-action",
+            7,
+            bot_role="discussion",
+            chat_id=-2002,
+            space_id="space-other",
+            generation=1,
+        ) == ("run", {})
+    finally:
+        store.close()
+
+
+def test_reset_space_transport_blocks_queued_prompts_and_pending_inputs(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    try:
+        store.create_space(
+            {
+                "space_id": "space-busy",
+                "space_type": "existing",
+                "lifecycle": "active",
+                "thread_id": "thread-busy",
+                "channel_chat_id": -1001,
+                "channel_post_id": 9,
+                "discussion_chat_id": -1002,
+                "discussion_root_id": 19,
+                "status_message_id": 20,
+            }
+        )
+        queue_id = store.enqueue_prompt(
+            "thread-busy",
+            "queued",
+            [],
+            "queued-client",
+        )
+
+        with pytest.raises(RuntimeError, match="排队 prompt"):
+            store.reset_space_transport("space-busy", expected_generation=1)
+        assert store.cancel_prompt(queue_id)
+
+        store.put_pending_input(
+            "request-busy",
+            "1",
+            1,
+            "thread-busy",
+            "turn-1",
+            "item-1",
+            [{"id": "answer", "question": "Continue?"}],
+            None,
+        )
+        with pytest.raises(RuntimeError, match="待回答问题"):
+            store.reset_space_transport("space-busy", expected_generation=1)
+
+        current = store.get_space("space-busy")
+        assert current is not None
+        assert (current["generation"], current["channel_post_id"]) == (1, 9)
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("flag", ["waitingOnApproval", "waitingOnUserInput"])
+def test_reset_space_transport_blocks_interactive_thread_flags(
+    tmp_path: Path, flag: str
+) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    try:
+        store.save_thread(ThreadState(thread_id="thread-interactive", active_flags=[flag]))
+        store.create_space(
+            {
+                "space_id": "space-interactive",
+                "space_type": "existing",
+                "lifecycle": "active",
+                "thread_id": "thread-interactive",
+                "channel_chat_id": -1001,
+                "channel_post_id": 9,
+                "discussion_chat_id": -1002,
+                "discussion_root_id": 19,
+                "status_message_id": 20,
+            }
+        )
+
+        with pytest.raises(RuntimeError, match="等待审批或回答"):
+            store.reset_space_transport("space-interactive", expected_generation=1)
+
+        current = store.get_space("space-interactive")
+        assert current is not None
+        assert (current["generation"], current["channel_post_id"]) == (1, 9)
+    finally:
+        store.close()
+
+
+def test_reset_space_transport_removes_root_only_mapping(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    try:
+        store.create_space(
+            {
+                "space_id": "space-root-only",
+                "space_type": "existing",
+                "lifecycle": "repair_required",
+                "thread_id": "thread-root-only",
+                "channel_chat_id": -1001,
+                "discussion_chat_id": -1002,
+                "discussion_root_id": 19,
+            }
+        )
+        store.record_discussion_root(-1001, 9, -1002, 19)
+
+        reset = store.reset_space_transport("space-root-only", expected_generation=1)
+
+        assert reset is not None and reset["generation"] == 2
+        assert store.get_discussion_root(-1001, 9) is None
+    finally:
+        store.close()
+
+
+def test_space_provision_attempt_claim_is_due_bounded_and_model_safe(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    now = time.time()
+    try:
+        store.create_space({"space_id": "space-retry", "thread_id": "thread-1"})
+
+        first = store.claim_space_provision_attempt(
+            "space-retry", "channel_post", max_attempts=2, now=now
+        )
+        assert first is not None and first["provision_attempts"] == 1
+        store.update_space(
+            "space-retry",
+            {"provision_retry_at": now + 30},
+            expected_generation=int(first["generation"]),
+        )
+
+        assert (
+            store.claim_space_provision_attempt(
+                "space-retry", "channel_post", max_attempts=2, now=now + 29
+            )
+            is None
+        )
+        second = store.claim_space_provision_attempt(
+            "space-retry", "channel_post", max_attempts=2, now=now + 30
+        )
+        assert second is not None and second["provision_attempts"] == 2
+        assert (
+            store.claim_space_provision_attempt(
+                "space-retry", "channel_post", max_attempts=2, now=now + 31
+            )
+            is None
+        )
+
+        model = store.get_session_space("space-retry")
+        assert model is not None
+        assert (model.provision_stage, model.provision_attempts) == ("channel_post", 2)
+    finally:
+        store.close()
+
+
+def test_persistent_deletions_and_question_messages(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    try:
+        identifiers = store.schedule_message_deletions(
+            "control", 11, [101, 102], 50, group_key="perf:1"
+        )
+        assert len(identifiers) == 2
+        assert [item["message_id"] for item in store.due_message_deletions(now=50)] == [101, 102]
+        assert store.complete_message_deletion(identifiers[0])
+        assert store.reschedule_message_deletion(identifiers[1], 70, "temporary")
+        assert store.due_message_deletions(now=69) == []
+
+        store.record_question_message("request-1", "forum", -1002, 201)
+        store.record_question_message("request-1", "forum", -1002, 202)
+        assert len(store.question_messages("request-1")) == 2
+        assert len(store.pop_question_messages("request-1")) == 2
+        assert store.question_messages("request-1") == []
+    finally:
+        store.close()
+
+
+def test_cleanup_durably_schedules_expired_and_orphan_question_messages(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    try:
+        store.put_pending_input(
+            "expired", "1", 4, "thread-1", "turn-1", "item-1", [], 50
+        )
+        store.record_question_message("expired", "forum", -1002, 301)
+        store.record_question_message("orphan", "control", 9527, 302)
+        store.put_pending_input(
+            "live", "2", 5, "thread-1", "turn-2", "item-2", [], int(time.time()) + 60
+        )
+        store.record_question_message("live", "forum", -1002, 303)
+
+        store.cleanup()
+
+        due = store.due_message_deletions()
+        assert [item["message_id"] for item in due] == [301, 302]
+        assert [item["group_key"] for item in due] == [
+            "question:expired",
+            "question:orphan",
+        ]
+        assert store.get_pending_input("expired") is None
+        assert store.question_messages("expired") == []
+        assert store.question_messages("orphan") == []
+        assert store.get_pending_input("live") is not None
+        assert [item["message_id"] for item in store.question_messages("live")] == [303]
+    finally:
+        store.close()
