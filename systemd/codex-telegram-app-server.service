@@ -1,0 +1,19 @@
+# X-CodexTelegramBridge-Installer: managed
+# X-CodexTelegramBridge-Installer-Version: v0.1.0
+[Unit]
+Description=Codex App Server for Telegram Bridge
+Documentation=https://github.com/LeeKai233/codex-telegram-bridge
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env CODEX_HOME=%h/.codex %h/.local/bin/codex app-server --listen unix://
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=45s
+EnvironmentFile=-%h/.config/codex-telegram-bridge/proxy.env
+UMask=0077
+
+[Install]
+WantedBy=default.target
