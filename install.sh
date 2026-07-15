@@ -232,9 +232,8 @@ recommend_swap_drive() {
 }
 
 check_default_swap_disk() {
-    local c_mount=${1:-/mnt/c}
     local win_home="" wslconfig="" swap_size="" swap_file="" drive_info=""
-    local swap_drive="" swap_mount="" available=""
+    local swap_drive="" available=""
     if win_home="$(windows_user_home)"; then
         wslconfig="$win_home/.wslconfig"
     fi
@@ -264,19 +263,15 @@ check_default_swap_disk() {
             recommend_swap_drive
             return
         fi
-        IFS=$'\t' read -r swap_mount available <<<"$drive_info"
+        IFS=$'\t' read -r _ available <<<"$drive_info"
     else
         swap_drive=C
-        swap_mount=$c_mount
-        if [[ ! -d "$swap_mount" ]]; then
-            preflight_error "cannot inspect $swap_mount for the default WSL swap location"
+        if ! drive_info="$(windows_drive_info "$swap_drive")"; then
+            preflight_error "default WSL swap drive C: is not a verifiably mounted local Windows drive"
+            recommend_swap_drive
             return
         fi
-        available="$(df -P -B1 "$swap_mount" 2>/dev/null | awk 'NR == 2 {print $4}')"
-        if [[ ! "$available" =~ ^[0-9]+$ ]]; then
-            preflight_error "cannot determine free space on $swap_mount"
-            return
-        fi
+        IFS=$'\t' read -r _ available <<<"$drive_info"
     fi
 
     if ((available < 10 * GIB)); then

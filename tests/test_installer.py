@@ -256,22 +256,19 @@ fi
 
 
 def test_low_default_swap_disk_sets_preflight_failure(tmp_path: Path) -> None:
-    mount = tmp_path / "mnt-c"
-    mount.mkdir()
     result = run_installer_shell(
         tmp_path,
         """
 windows_user_home() { return 1; }
 recommend_swap_drive() { :; }
-df() {
-    printf 'Filesystem 1B-blocks Used Available Capacity Mounted on\n'
-    printf 'fake 100 95 %s 95%% /mnt-c\n' "$((5 * GIB))"
+windows_drive_info() {
+    [[ "$1" == C ]] || return 1
+    printf '/mnt/c\t%s\n' "$((5 * GIB))"
 }
 PREFLIGHT_FAILED=0
-check_default_swap_disk "$TEST_MOUNT"
+check_default_swap_disk
 [[ "$PREFLIGHT_FAILED" == 1 ]]
 """,
-        extra_env={"TEST_MOUNT": str(mount)},
     )
 
     assert result.returncode == 0

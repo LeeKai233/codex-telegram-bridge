@@ -59,7 +59,7 @@ unnecessary administrator privileges.
 Run the version-pinned installer from a WSL terminal:
 
 ```bash
-bash -c 'set -Eeuo pipefail; url="https://github.com/LeeKai233/codex-telegram-bridge/releases/download/v0.1.0/install.sh"; sha256="1bb70fc5effb28a8ff76e7d3609996a0fa607603faef3601b6c621440fe1fb7e"; installer="$(mktemp)"; cleanup() { rm -f -- "$installer"; }; trap cleanup EXIT; curl --proto "=https" --tlsv1.2 -fsSL --retry 3 --retry-all-errors -o "$installer" "$url"; printf "%s  %s\n" "$sha256" "$installer" | sha256sum -c -; bash "$installer"'
+bash -c 'set -Eeuo pipefail; url="https://github.com/LeeKai233/codex-telegram-bridge/releases/download/v0.1.0/install.sh"; sha256="cb09e388f8d4d19537e0cc46cd0e82aace039908a29b64fa3f1ff49593afa648"; installer="$(mktemp)"; cleanup() { rm -f -- "$installer"; }; trap cleanup EXIT; curl --proto "=https" --tlsv1.2 -fsSL --retry 3 --retry-all-errors -o "$installer" "$url"; printf "%s  %s\n" "$sha256" "$installer" | sha256sum -c -; bash "$installer"'
 ```
 
 The installer:
