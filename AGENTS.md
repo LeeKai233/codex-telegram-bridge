@@ -43,3 +43,16 @@ This project is indexed by GitNexus as **codex-telegram-bridge** (10133 symbols,
 | Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md` |
 
 <!-- gitnexus:end -->
+
+# Multi-Agent Development
+
+- For tasks with independent lanes, use the project `bridge-parallel-development` skill and keep the root agent as the only coordinator.
+- The root may run at most three direct subagents. Subagents must not spawn descendants.
+- Freeze a baseline SHA, use one isolated worktree and `agent/<goal>/<lane>` branch per writer, and assign exclusive file ownership before edits.
+- The user communicates with the root agent. Subagents are inspected or redirected through the root instead of being managed independently.
+- The active permission mode is inherited by subagents. Under Full Access, treat every child as Full Access even when its role is described as read-only.
+- Read-only exploration and review are behavioral contracts verified by Git diff; they are not security boundaries.
+- Subagents must not control systemd, install packages, edit credentials, touch other worktrees, push, publish releases, or modify unrelated user files.
+- The root agent alone integrates commits, resolves cross-lane contracts, runs final review, performs deployment, and reports results.
+- Prefer Terra/high for bounded exploration, GPT-5.6/high for implementation, and Luna/max for final review when available; otherwise inherit the root model.
+- Keep the existing untracked `assets/` directory outside agent scope unless the user explicitly assigns it.
