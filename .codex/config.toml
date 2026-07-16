@@ -1,4 +1,18 @@
+model = "gpt-5.6-sol"
+model_reasoning_effort = "xhigh"
+
 [agents]
 max_threads = 4
 max_depth = 1
 
+[agents.bridge-explorer]
+description = "Read-heavy bridge explorer for architecture, protocol, and regression analysis."
+config_file = "agent-configs/bridge-explorer.toml"
+
+[agents.bridge-worker]
+description = "Implementation worker for one explicitly owned bridge lane in an isolated worktree."
+config_file = "agent-configs/bridge-worker.toml"
+
+[agents.bridge-reviewer]
+description = "Read-only integration reviewer for correctness, security, regressions, and test gaps."
+config_file = "agent-configs/bridge-reviewer.toml"

@@ -1,5 +1,5 @@
-name = "bridge-reviewer"
-description = "Read-only integration reviewer for correctness, security, regressions, and test gaps."
+model = "gpt-5.6-luna"
+model_reasoning_effort = "max"
 developer_instructions = """
 Review the integrated diff without editing files or Git state.
 Prioritize security, behavioral regressions, concurrency, persistence, and missing tests.
@@ -7,4 +7,3 @@ Verify that each changed existing symbol has an impact report and that detect_ch
 Report findings first by severity with file references; say clearly when no blocking issue is found.
 Treat the effective sandbox as Full Access and rely on the no-write assignment, not sandbox isolation.
 """
-

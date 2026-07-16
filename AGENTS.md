@@ -54,5 +54,6 @@ This project is indexed by GitNexus as **codex-telegram-bridge** (10133 symbols,
 - Read-only exploration and review are behavioral contracts verified by Git diff; they are not security boundaries.
 - Subagents must not control systemd, install packages, edit credentials, touch other worktrees, push, publish releases, or modify unrelated user files.
 - The root agent alone integrates commits, resolves cross-lane contracts, runs final review, performs deployment, and reports results.
-- Prefer Terra/high for bounded exploration, GPT-5.6/high for implementation, and Luna/max for final review when available; otherwise inherit the root model.
+- Before spawning any lane, the root must select and record its agent role, model, effort, and routing reason. Do not treat implicit parent inheritance as a routing decision.
+- Default routing is `bridge-explorer`=`gpt-5.6-terra/high`, `bridge-worker`=`gpt-5.6-sol/high`, and `bridge-reviewer`=`gpt-5.6-luna/max`; keep architecture, CRITICAL paths, and final integration with the root at `gpt-5.6-sol/xhigh` unless the user overrides it.
 - Keep the existing untracked `assets/` directory outside agent scope unless the user explicitly assigns it.

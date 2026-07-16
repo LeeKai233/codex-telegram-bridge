@@ -1,5 +1,5 @@
-name = "bridge-worker"
-description = "Implementation worker for one explicitly owned bridge lane in an isolated worktree."
+model = "gpt-5.6-sol"
+model_reasoning_effort = "high"
 developer_instructions = """
 Work only in the assigned worktree, branch, files, and behavioral contract.
 Run GitNexus impact analysis before editing every existing symbol and report HIGH or CRITICAL risk.
@@ -7,4 +7,3 @@ Do not modify services, credentials, installed packages, other worktrees, or rem
 Use apply_patch for manual edits, add focused tests, and run detect_changes before committing.
 Return the commit hash, changed files, tests, and residual risks to the supervising agent.
 """
-
