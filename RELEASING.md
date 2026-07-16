@@ -32,8 +32,8 @@ release tag before release immutability is enabled.
 
    ```bash
    release_dir="$(mktemp -d)"
-   cp install.sh dist/codex_telegram_bridge-0.1.0-py3-none-any.whl \
-      dist/codex_telegram_bridge-0.1.0.tar.gz "$release_dir/"
+   cp install.sh dist/codex_telegram_bridge-0.2.0-py3-none-any.whl \
+      dist/codex_telegram_bridge-0.2.0.tar.gz "$release_dir/"
    (cd "$release_dir" && sha256sum install.sh *.whl *.tar.gz >SHA256SUMS)
    ```
 
@@ -42,11 +42,11 @@ release tag before release immutability is enabled.
 
    ```bash
    release_sha="$(git rev-parse HEAD)"
-   gh release create v0.1.0 --repo LeeKai233/codex-telegram-bridge \
-      --draft --target "$release_sha" --title "v0.1.0" \
+   gh release create v0.2.0 --repo LeeKai233/codex-telegram-bridge \
+      --draft --target "$release_sha" --title "v0.2.0" \
       "$release_dir/install.sh" "$release_dir/SHA256SUMS" \
-      "$release_dir/codex_telegram_bridge-0.1.0-py3-none-any.whl" \
-      "$release_dir/codex_telegram_bridge-0.1.0.tar.gz"
+      "$release_dir/codex_telegram_bridge-0.2.0-py3-none-any.whl" \
+      "$release_dir/codex_telegram_bridge-0.2.0.tar.gz"
    ```
 
 4. Review the draft assets and notes, then publish once. Confirm the release is marked immutable,
@@ -59,11 +59,11 @@ From a temporary directory with no project checkout:
 
 ```bash
 curl -fL -o install.sh \
-  https://github.com/LeeKai233/codex-telegram-bridge/releases/download/v0.1.0/install.sh
+  https://github.com/LeeKai233/codex-telegram-bridge/releases/download/v0.2.0/install.sh
 sha256sum install.sh
 UV_TOOL_DIR="$PWD/tools" UV_TOOL_BIN_DIR="$PWD/bin" \
   uv tool install --python 3.14 \
-  git+https://github.com/LeeKai233/codex-telegram-bridge@v0.1.0
+  git+https://github.com/LeeKai233/codex-telegram-bridge@v0.2.0
 "$PWD/bin/codex-tg" --help
 "$PWD/bin/codex-telegram-bridge" --help
 ```

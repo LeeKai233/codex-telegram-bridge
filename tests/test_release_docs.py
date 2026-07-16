@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 README = ROOT / "README.md"
 INSTALLER = ROOT / "install.sh"
 PYPROJECT = ROOT / "pyproject.toml"
+SYSTEMD = ROOT / "systemd"
 
 EXPECTED_SDIST_INCLUDES = [
     "/src",
@@ -29,7 +30,7 @@ def bootstrap_command() -> str:
     return next(
         line
         for line in README.read_text(encoding="utf-8").splitlines()
-        if line.startswith("bash -c '") and "releases/download/v0.1.0/install.sh" in line
+        if line.startswith("bash -c '") and "releases/download/v0.2.0/install.sh" in line
     )
 
 
@@ -45,6 +46,22 @@ def test_readme_bootstrap_checksum_matches_release_installer() -> None:
     assert ' -o "$installer" "$url"' in command
     assert 'sha256sum -c -' in command
     assert command.endswith('bash "$installer"\'')
+
+
+def test_release_version_is_consistent_across_public_artifacts() -> None:
+    version = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["project"]["version"]
+    installer = INSTALLER.read_text(encoding="utf-8")
+    readme = README.read_text(encoding="utf-8")
+    installer_match = re.search(r'^readonly INSTALLER_VERSION="([^"]+)"$', installer, re.MULTILINE)
+
+    assert version == "0.2.0"
+    assert installer_match is not None and installer_match.group(1) == version
+    assert f"releases/download/v{version}/install.sh" in readme
+    assert f"Bridge v{version}" in readme
+    for unit in SYSTEMD.glob("*.service"):
+        assert f"# X-CodexTelegramBridge-Installer-Version: v{version}" in unit.read_text(
+            encoding="utf-8"
+        )
 
 
 def test_readme_bootstrap_propagates_download_failure_and_cleans_temp_file(

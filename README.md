@@ -27,7 +27,7 @@ not Telegram Forum Topics, are the stable session boundary.
 
 ## Supported host
 
-The v0.1.0 installer intentionally has a narrow host contract:
+The v0.2.0 installer intentionally has a narrow host contract:
 
 - Ubuntu or Debian under WSL2.
 - systemd enabled in WSL and available as PID 1.
@@ -59,7 +59,7 @@ unnecessary administrator privileges.
 Run the version-pinned installer from a WSL terminal:
 
 ```bash
-bash -c 'set -Eeuo pipefail; url="https://github.com/LeeKai233/codex-telegram-bridge/releases/download/v0.1.0/install.sh"; sha256="cb09e388f8d4d19537e0cc46cd0e82aace039908a29b64fa3f1ff49593afa648"; installer="$(mktemp)"; cleanup() { rm -f -- "$installer"; }; trap cleanup EXIT; curl --proto "=https" --tlsv1.2 -fsSL --retry 3 --retry-all-errors -o "$installer" "$url"; printf "%s  %s\n" "$sha256" "$installer" | sha256sum -c -; bash "$installer"'
+bash -c 'set -Eeuo pipefail; url="https://github.com/LeeKai233/codex-telegram-bridge/releases/download/v0.2.0/install.sh"; sha256="064eb387dce1849a21163bfcb642d5dfb579a7c1aba390e94ba2e9de49d3d2e3"; installer="$(mktemp)"; cleanup() { rm -f -- "$installer"; }; trap cleanup EXIT; curl --proto "=https" --tlsv1.2 -fsSL --retry 3 --retry-all-errors -o "$installer" "$url"; printf "%s  %s\n" "$sha256" "$installer" | sha256sum -c -; bash "$installer"'
 ```
 
 The installer:
@@ -68,7 +68,7 @@ The installer:
    space, and network access.
 2. Installs missing `ca-certificates`, `curl`, `git`, and `tmux` packages.
 3. Installs pinned uv 0.11.28 without editing shell profiles, then installs uv-managed Python 3.14.
-4. Installs Bridge v0.1.0 into `~/.local/bin` from the matching immutable Git tag.
+4. Installs Bridge v0.2.0 into `~/.local/bin` from the matching immutable Git tag.
 5. Installs the latest official standalone Codex release into `~/.local/bin` and verifies the
    required `app-server --listen unix://` and `--remote unix://` capabilities.
 6. Pauses while you configure and authenticate Codex in another WSL terminal.
@@ -81,7 +81,7 @@ The installer enables user lingering so both services return after WSL/systemd r
 not copy another machine's Codex configuration, authentication, skills, MCP servers, hooks, Bridge
 database, or Telegram credentials.
 
-The bootstrap downloads the immutable `v0.1.0` release asset to a temporary file, verifies the
+The bootstrap downloads the immutable `v0.2.0` release asset to a temporary file, verifies the
 SHA-256 shown above, and only then executes it with terminal input still attached. The installer
 also pins and verifies the official uv and Codex installer-script contents. Codex itself is
 intentionally selected as the latest official standalone release at installation time; its
@@ -112,7 +112,7 @@ review instead of overwriting the remaining credential. If both credentials exis
 `Discussion Bot` label defaults because it does not replace the credentials just to rediscover
 their usernames.
 
-The v0.1 installer owns the standard paths under `~/.config/codex-telegram-bridge`,
+The v0.2 installer owns the standard paths under `~/.config/codex-telegram-bridge`,
 `~/.local/state/codex-telegram-bridge`, `~/.local/bin`, and `~/.codex`. An existing `config.toml`
 may customize labels and behavior, but overrides for `config_dir`, `state_dir`, `codex_home`,
 `codex_socket`, or `codex_binary` must match those standard paths. Unsupported path overrides are
@@ -259,11 +259,15 @@ allowed_root = "/home/your-user"
 tmux_session = "CodexBot"
 control_bot_label = "@my_control_bot"
 discussion_bot_label = "@my_discussion_bot"
-dashboard_debounce_seconds = 2.0
+dashboard_debounce_seconds = 0.5
 heartbeat_seconds = 60
 totp_unlock_seconds = 1800
 disconnect_threshold_seconds = 30
 ```
+
+Dashboard Braille frames advance with each real status refresh. The bridge does not issue
+animation-only Telegram edits, so active work remains visually dynamic without consuming the
+channel/group flood-control budget while a session is idle.
 
 State and inbox files live under `~/.local/state/codex-telegram-bridge/`. Private directories use
 mode `0700`; tokens, TOTP, and SQLite files use mode `0600`. Database schema upgrades create an

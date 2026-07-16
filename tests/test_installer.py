@@ -13,7 +13,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "install.sh"
 UNIT_MARKER = "# X-CodexTelegramBridge-Installer: managed"
-UNIT_VERSION = "# X-CodexTelegramBridge-Installer-Version: v0.1.0"
+UNIT_VERSION = "# X-CodexTelegramBridge-Installer-Version: v0.2.0"
 
 
 def run_installer_shell(
@@ -210,7 +210,7 @@ def test_previous_installer_version_unit_is_owned_and_upgradable(tmp_path: Path)
     unit = unit_dir / "codex-telegram-app-server.service"
     unit.write_text(
         f"{UNIT_MARKER}\n"
-        "# X-CodexTelegramBridge-Installer-Version: v0.0.9\n"
+        "# X-CodexTelegramBridge-Installer-Version: v0.1.0\n"
         "[Unit]\nDescription=old\n",
         encoding="utf-8",
     )
@@ -229,7 +229,7 @@ grep -Fxq "$UNIT_VERSION" "$USER_UNIT_DIR/codex-telegram-app-server.service"
     assert result.returncode == 0, result.stderr
 
 
-@pytest.mark.parametrize("future_version", ["0.1.1", "1.0.0"])
+@pytest.mark.parametrize("future_version", ["0.2.1", "1.0.0"])
 def test_future_installer_version_unit_is_not_owned(
     tmp_path: Path, future_version: str
 ) -> None:

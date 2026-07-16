@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly INSTALLER_VERSION="0.1.0"
+readonly INSTALLER_VERSION="0.2.0"
 readonly UV_VERSION="0.11.28"
 readonly PROJECT="codex-telegram-bridge"
 readonly REPOSITORY="LeeKai233/codex-telegram-bridge"
@@ -56,10 +56,10 @@ preflight_error() {
 }
 
 usage() {
-    cat <<'EOF'
+    cat <<EOF
 Usage: install.sh [OPTIONS]
 
-Install Codex Telegram Bridge v0.1.0 for the current WSL2 user.
+Install Codex Telegram Bridge v${INSTALLER_VERSION} for the current WSL2 user.
 
 Options:
   --version                    Print the installer version and exit
