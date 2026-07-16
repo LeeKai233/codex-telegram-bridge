@@ -224,7 +224,8 @@ class MetricsSampler:
         )
 
     async def with_gpu(self) -> MetricsSnapshot:
-        snapshot = self.snapshot or await self.sample()
+        # Interactive metrics must not reuse the background sampler's older host sample.
+        snapshot = await self.sample()
         snapshot.gpus = await _gpu_status()
         return snapshot
 

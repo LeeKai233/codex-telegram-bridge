@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 import pytest
 
@@ -151,3 +152,28 @@ def test_render_metrics_uses_markdown_ascii_bars_and_all_gpus() -> None:
 
 def test_render_metrics_reports_gpu_na() -> None:
     assert "*🟩 NVIDIA*\nGPU  `N/A`" in render_metrics(snapshot())
+
+
+@pytest.mark.asyncio
+async def test_with_gpu_always_collects_a_fresh_host_snapshot(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    sampler = metrics.MetricsSampler(tmp_path)
+    cached = snapshot()
+    cached.cpu_percent = 1.0
+    fresh = snapshot()
+    fresh.cpu_percent = 77.0
+    sampler.snapshot = cached
+
+    async def sample_fresh() -> MetricsSnapshot:
+        return fresh
+
+    gpu = GpuSnapshot(0, "NVIDIA RTX", 100, 1000, 20, 50, 30)
+    monkeypatch.setattr(sampler, "sample", sample_fresh)
+    monkeypatch.setattr(metrics, "_gpu_status", lambda: asyncio.sleep(0, result=(gpu,)))
+
+    result = await sampler.with_gpu()
+
+    assert result is fresh
+    assert result.cpu_percent == 77.0
+    assert result.gpus == (gpu,)
