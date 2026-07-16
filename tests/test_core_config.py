@@ -122,6 +122,12 @@ def test_config_rejects_incoherent_limits(tmp_path: Path) -> None:
         make_config(tmp_path, tmux_session="bad:name")
 
 
+def test_dashboard_debounce_default_is_fast(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+
+    assert config.dashboard_debounce_seconds == 0.5
+
+
 def test_bot_labels_default_to_generic_names_and_load_trimmed(tmp_path: Path) -> None:
     default = make_config(tmp_path)
     assert default.control_bot_label == "Control Bot"
@@ -129,8 +135,7 @@ def test_bot_labels_default_to_generic_names_and_load_trimmed(tmp_path: Path) ->
 
     config_path = tmp_path / "bridge.toml"
     config_path.write_text(
-        '[bridge]\ncontrol_bot_label = "  控制_[Bot]  "\n'
-        'discussion_bot_label = "  Session 助手  "\n',
+        '[bridge]\ncontrol_bot_label = "  控制_[Bot]  "\ndiscussion_bot_label = "  Session 助手  "\n',
         encoding="utf-8",
     )
     config_path.chmod(0o600)
@@ -183,9 +188,7 @@ def test_ask_model_settings_default_to_inherited_and_load_trimmed(tmp_path: Path
         ("ask_reasoning_effort", 5),
     ],
 )
-def test_ask_model_settings_reject_invalid_values(
-    tmp_path: Path, field: str, value: object
-) -> None:
+def test_ask_model_settings_reject_invalid_values(tmp_path: Path, field: str, value: object) -> None:
     with pytest.raises(ValueError, match=field):
         make_config(tmp_path, **{field: value})
 

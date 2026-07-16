@@ -16,10 +16,7 @@ def _expand_path(value: str | Path) -> Path:
 
 
 _DIRECTORY_OPEN_FLAGS = (
-    os.O_RDONLY
-    | getattr(os, "O_CLOEXEC", 0)
-    | getattr(os, "O_DIRECTORY", 0)
-    | getattr(os, "O_NOFOLLOW", 0)
+    os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
 )
 
 
@@ -107,10 +104,7 @@ def _load_config_document(path: Path) -> dict[str, Any] | None:
 def _normalize_bot_label(name: str, value: object) -> str:
     if not isinstance(value, str):
         raise ValueError(f"{name} must be a string")
-    if any(
-        unicodedata.category(character) == "Cc" or character in "\u2028\u2029"
-        for character in value
-    ):
+    if any(unicodedata.category(character) == "Cc" or character in "\u2028\u2029" for character in value):
         raise ValueError(f"{name} must not contain control characters or newlines")
     normalized = value.strip()
     if not normalized:
@@ -125,10 +119,7 @@ def _normalize_optional_codex_setting(name: str, value: object) -> str | None:
         return None
     if not isinstance(value, str):
         raise ValueError(f"{name} must be a string or omitted")
-    if any(
-        unicodedata.category(character) == "Cc" or character in "\u2028\u2029"
-        for character in value
-    ):
+    if any(unicodedata.category(character) == "Cc" or character in "\u2028\u2029" for character in value):
         raise ValueError(f"{name} must not contain control characters or newlines")
     normalized = value.strip()
     if not normalized:
@@ -174,7 +165,7 @@ class Config:
     codex_binary: Path
     allowed_root: Path
     tmux_session: str = "CodexBot"
-    dashboard_debounce_seconds: float = 2.0
+    dashboard_debounce_seconds: float = 0.5
     heartbeat_seconds: int = 60
     totp_unlock_seconds: int = 1800
     pair_code_seconds: int = 600
@@ -324,8 +315,7 @@ class Config:
             token = _read_private_text(path).strip()
         except FileNotFoundError as exc:
             raise RuntimeError(
-                "Telegram bot token is not configured; run "
-                f"`codex-tg configure-tokens` ({path})"
+                f"Telegram bot token is not configured; run `codex-tg configure-tokens` ({path})"
             ) from exc
         if not token or ":" not in token:
             raise RuntimeError(f"Invalid Telegram bot token in {path}")

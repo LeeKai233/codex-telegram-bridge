@@ -28,9 +28,7 @@ class BridgeStub:
         self.subscriptions.append(thread_id)
         return self.state
 
-    async def activate_pending_session(
-        self, space_id: str, *, client_message_id: str
-    ) -> ThreadState:
+    async def activate_pending_session(self, space_id: str, *, client_message_id: str) -> ThreadState:
         self.activations.append((space_id, client_message_id))
         return self.state
 
@@ -115,9 +113,7 @@ async def test_repair_required_pending_space_retries_bridge_activation(tmp_path:
     state = await coordinator.activate_pending("space-repair")
 
     assert state.thread_id == "thread-1"
-    assert bridge.activations == [
-        ("space-repair", "telegram-new-space-repair-1")
-    ]
+    assert bridge.activations == [("space-repair", "telegram-new-space-repair-1")]
     assert store.get_space("space-repair")["lifecycle"] == "active"  # type: ignore[index]
     assert dashboards.scheduled == [("space-repair", True)]
     store.close()
@@ -127,7 +123,8 @@ async def test_repair_required_pending_space_retries_bridge_activation(tmp_path:
 async def test_follow_existing_thread_subscribes_before_creating_channel_post(
     tmp_path: Path,
 ) -> None:
-    coordinator, store, bridge, _dashboards = make_coordinator(tmp_path)
+    control = Endpoint(100)
+    coordinator, store, bridge, _dashboards = make_coordinator(tmp_path, control=control)
     bridge.state.model = "gpt-5.6-sol"
     bridge.state.reasoning_effort = "xhigh"
     store.set_telegram_binding({"channel_chat_id": -1001, "discussion_chat_id": -1002})
@@ -142,6 +139,8 @@ async def test_follow_existing_thread_subscribes_before_creating_channel_post(
         "gpt-5.6-sol",
         "xhigh",
     )
+    assert control.sent[0]["markdown"].startswith("⠋ *⚙️ Normal mode*")
+    assert "*🧠 Main*  `gpt-5.6-sol` · Effort `xhigh`" in control.sent[0]["markdown"]
     store.close()
 
 

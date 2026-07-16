@@ -175,9 +175,11 @@ class MemoryStore:
         generation: int,
         item_id: str,
         *,
+        revision_key: str = "",
         expected_status: str,
         status: str,
     ) -> bool:
+        del revision_key
         self.completed.append(
             (space_id, generation, item_id, expected_status, status)
         )
@@ -189,8 +191,10 @@ class MemoryStore:
         generation: int,
         item_id: str,
         *,
+        revision_key: str = "",
         expected_status: str = "executing",
     ) -> bool:
+        del revision_key
         self.released.append((space_id, generation, item_id, expected_status))
         return True
 
@@ -267,6 +271,7 @@ class FakeBridge:
         _space_id: str,
         _generation: int,
         _item_id: str,
+        _revision_key: str,
         _client_message_id: str,
     ) -> str:
         return self.reconcile_status

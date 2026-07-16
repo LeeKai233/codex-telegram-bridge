@@ -17,7 +17,7 @@ from typing import Any
 from .config import ensure_private_directory
 from .models import InteractionDraft, Owner, QueuedPrompt, SessionSpace, ThreadState
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 CONTROL_BOT_ROLE = "control"
 _PLAN_PUBLICATION_RESULTS = frozenset({"published", "failed"})
 _PLAN_ACTION_STATUSES = frozenset({"executing", "revising"})
@@ -213,13 +213,14 @@ CREATE TABLE IF NOT EXISTS plan_publications (
     space_id TEXT NOT NULL,
     generation INTEGER NOT NULL,
     item_id TEXT NOT NULL,
+    revision_key TEXT NOT NULL DEFAULT '',
     thread_id TEXT NOT NULL,
     turn_id TEXT NOT NULL,
     status TEXT NOT NULL,
     message_ids_json TEXT NOT NULL DEFAULT '[]',
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
-    UNIQUE(space_id, generation, item_id)
+    UNIQUE(space_id, generation, item_id, revision_key)
 );
 CREATE INDEX IF NOT EXISTS idx_plan_publications_latest
     ON plan_publications(space_id, generation, id DESC);
@@ -298,11 +299,23 @@ class Store:
 
         self._connection.execute("BEGIN IMMEDIATE")
         try:
+            plan_columns = _columns(self._connection, "plan_publications")
+            if plan_columns and "revision_key" not in plan_columns:
+                self._connection.execute("DROP INDEX IF EXISTS idx_plan_publications_latest")
+                self._connection.execute("ALTER TABLE plan_publications RENAME TO plan_publications_v6")
             update_columns = _columns(self._connection, "telegram_updates")
             if update_columns and "bot_role" not in update_columns:
                 self._connection.execute("ALTER TABLE telegram_updates RENAME TO telegram_updates_legacy")
             for statement in _schema_statements():
                 self._connection.execute(statement)
+            if _columns(self._connection, "plan_publications_v6"):
+                self._connection.execute(
+                    "INSERT INTO plan_publications(id, space_id, generation, item_id, revision_key, "
+                    "thread_id, turn_id, status, message_ids_json, created_at, updated_at) "
+                    "SELECT id, space_id, generation, item_id, '', thread_id, turn_id, status, "
+                    "message_ids_json, created_at, updated_at FROM plan_publications_v6"
+                )
+                self._connection.execute("DROP TABLE plan_publications_v6")
             if _columns(self._connection, "telegram_updates_legacy"):
                 legacy_columns = _columns(self._connection, "telegram_updates_legacy")
                 sequence = "COALESCE(sequence, rowid)" if "sequence" in legacy_columns else "rowid"
@@ -550,9 +563,7 @@ class Store:
             merged = dict(current)
             merged.update(updates)
             merged["space_id"] = space_id
-            value = self._canonical_space(
-                merged, now=int(time.time()), created_at=int(current["created_at"])
-            )
+            value = self._canonical_space(merged, now=int(time.time()), created_at=int(current["created_at"]))
             self._write_space(connection, value)
         return value
 
@@ -623,7 +634,8 @@ class Store:
         suffix = "" if include_closed else " AND lifecycle != 'closed'"
         with self._lock:
             row = self._connection.execute(
-                "SELECT state_json FROM session_spaces WHERE thread_id=?" + suffix
+                "SELECT state_json FROM session_spaces WHERE thread_id=?"
+                + suffix
                 + " ORDER BY updated_at DESC LIMIT 1",
                 (thread_id,),
             ).fetchone()
@@ -675,9 +687,7 @@ class Store:
             updates["status_message_id"] = status_message_id
         return self.update_space(space_id, updates, expected_generation=expected_generation)
 
-    def reset_space_transport(
-        self, space_id: str, *, expected_generation: int
-    ) -> dict[str, Any] | None:
+    def reset_space_transport(self, space_id: str, *, expected_generation: int) -> dict[str, Any] | None:
         """Invalidate one space's Telegram messages while preserving its Codex thread."""
         with self._immediate_transaction() as connection:
             row = connection.execute(
@@ -704,14 +714,16 @@ class Store:
                 queue_filter = "(space_id=? OR thread_id=?)"
                 queue_parameters.append(str(thread_id))
             if connection.execute(
-                f"SELECT 1 FROM prompt_queue WHERE {queue_filter} "
-                "AND status='queued' LIMIT 1",
+                f"SELECT 1 FROM prompt_queue WHERE {queue_filter} AND status='queued' LIMIT 1",
                 queue_parameters,
             ).fetchone():
                 raise RuntimeError("当前 SessionSpace 仍有排队 prompt，不能重建 Telegram 帖子")
-            if thread_id and connection.execute(
-                "SELECT 1 FROM pending_inputs WHERE thread_id=? LIMIT 1", (thread_id,)
-            ).fetchone():
+            if (
+                thread_id
+                and connection.execute(
+                    "SELECT 1 FROM pending_inputs WHERE thread_id=? LIMIT 1", (thread_id,)
+                ).fetchone()
+            ):
                 raise RuntimeError("当前 Session 仍有待回答问题，不能重建 Telegram 帖子")
             if thread_id:
                 thread_row = connection.execute(
@@ -740,9 +752,7 @@ class Store:
                 f"SELECT message_id FROM discussion_messages WHERE {message_filter})",
                 [int(discussion_chat_id), *parameters],
             )
-            connection.execute(
-                f"DELETE FROM discussion_messages WHERE {message_filter}", parameters
-            )
+            connection.execute(f"DELETE FROM discussion_messages WHERE {message_filter}", parameters)
 
             channel_post_id = current.get("channel_post_id")
             root_filters: list[str] = []
@@ -787,9 +797,7 @@ class Store:
             self._write_space(connection, value)
         return value
 
-    def close_space(
-        self, space_id: str, *, expected_generation: int | None = None
-    ) -> dict[str, Any] | None:
+    def close_space(self, space_id: str, *, expected_generation: int | None = None) -> dict[str, Any] | None:
         with self._immediate_transaction() as connection:
             row = connection.execute(
                 "SELECT state_json FROM session_spaces WHERE space_id=?", (space_id,)
@@ -807,8 +815,7 @@ class Store:
             )
             self._write_space(connection, value)
             connection.execute(
-                "UPDATE callbacks SET used_at=? "
-                "WHERE space_id=? AND generation=? AND used_at IS NULL",
+                "UPDATE callbacks SET used_at=? WHERE space_id=? AND generation=? AND used_at IS NULL",
                 (int(time.time()), space_id, generation),
             )
             connection.execute(
@@ -1113,10 +1120,7 @@ class Store:
         turn_id: str,
         client_message_id: str,
     ) -> bool:
-        if not all(
-            value.strip()
-            for value in (run_id, space_id, thread_id, turn_id, client_message_id)
-        ):
+        if not all(value.strip() for value in (run_id, space_id, thread_id, turn_id, client_message_id)):
             raise ValueError("Prompt run identifiers must not be empty")
         if generation < 0:
             raise ValueError("generation must not be negative")
@@ -1186,6 +1190,7 @@ class Store:
         space_id: str,
         generation: int,
         item_id: str,
+        revision_key: str = "",
         thread_id: str,
         turn_id: str,
         stale_after: int = 300,
@@ -1200,17 +1205,26 @@ class Store:
         with self._immediate_transaction() as connection:
             cursor = connection.execute(
                 "INSERT OR IGNORE INTO plan_publications(space_id, generation, item_id, "
-                "thread_id, turn_id, status, created_at, updated_at) "
-                "VALUES(?, ?, ?, ?, ?, 'publishing', ?, ?)",
-                (space_id, int(generation), item_id, thread_id, turn_id, now, now),
+                "revision_key, thread_id, turn_id, status, created_at, updated_at) "
+                "VALUES(?, ?, ?, ?, ?, ?, 'publishing', ?, ?)",
+                (
+                    space_id,
+                    int(generation),
+                    item_id,
+                    revision_key,
+                    thread_id,
+                    turn_id,
+                    now,
+                    now,
+                ),
             )
             if cursor.rowcount == 1:
                 publication_id = int(cursor.lastrowid)
             else:
                 row = connection.execute(
                     "SELECT id, status, updated_at FROM plan_publications "
-                    "WHERE space_id=? AND generation=? AND item_id=?",
-                    (space_id, int(generation), item_id),
+                    "WHERE space_id=? AND generation=? AND item_id=? AND revision_key=?",
+                    (space_id, int(generation), item_id, revision_key),
                 ).fetchone()
                 if row is None:
                     return False
@@ -1222,8 +1236,7 @@ class Store:
                 if latest is None or publication_id != int(latest[0]):
                     return False
                 retryable = str(row[1]) == "failed" or (
-                    str(row[1]) == "publishing"
-                    and int(row[2]) <= now - stale_after
+                    str(row[1]) == "publishing" and int(row[2]) <= now - stale_after
                 )
                 if not retryable:
                     return False
@@ -1248,6 +1261,7 @@ class Store:
         space_id: str,
         generation: int,
         item_id: str,
+        revision_key: str = "",
         status: str,
         message_ids: list[int],
     ) -> bool:
@@ -1256,7 +1270,8 @@ class Store:
         with self._lock, self._connection:
             cursor = self._connection.execute(
                 "UPDATE plan_publications SET status=?, message_ids_json=?, updated_at=? "
-                "WHERE space_id=? AND generation=? AND item_id=? AND status='publishing'",
+                "WHERE space_id=? AND generation=? AND item_id=? AND revision_key=? "
+                "AND status='publishing'",
                 (
                     status,
                     json.dumps([int(value) for value in message_ids]),
@@ -1264,16 +1279,15 @@ class Store:
                     space_id,
                     int(generation),
                     item_id,
+                    revision_key,
                 ),
             )
         return cursor.rowcount == 1
 
-    def latest_plan_publication(
-        self, space_id: str, generation: int
-    ) -> dict[str, Any] | None:
+    def latest_plan_publication(self, space_id: str, generation: int) -> dict[str, Any] | None:
         with self._lock:
             row = self._connection.execute(
-                "SELECT item_id, thread_id, turn_id, status, message_ids_json, created_at, "
+                "SELECT item_id, revision_key, thread_id, turn_id, status, message_ids_json, created_at, "
                 "updated_at FROM plan_publications WHERE space_id=? AND generation=? "
                 "ORDER BY id DESC LIMIT 1",
                 (space_id, int(generation)),
@@ -1284,12 +1298,13 @@ class Store:
             "space_id": space_id,
             "generation": int(generation),
             "item_id": str(row[0]),
-            "thread_id": str(row[1]),
-            "turn_id": str(row[2]),
-            "status": str(row[3]),
-            "message_ids": json.loads(str(row[4])),
-            "created_at": int(row[5]),
-            "updated_at": int(row[6]),
+            "revision_key": str(row[1]),
+            "thread_id": str(row[2]),
+            "turn_id": str(row[3]),
+            "status": str(row[4]),
+            "message_ids": json.loads(str(row[5])),
+            "created_at": int(row[6]),
+            "updated_at": int(row[7]),
         }
 
     def mark_plan_action(
@@ -1298,6 +1313,7 @@ class Store:
         generation: int,
         item_id: str,
         *,
+        revision_key: str = "",
         status: str,
     ) -> bool:
         if status not in _PLAN_ACTION_STATUSES:
@@ -1305,7 +1321,8 @@ class Store:
         with self._lock, self._connection:
             cursor = self._connection.execute(
                 "UPDATE plan_publications SET status=?, updated_at=? "
-                "WHERE space_id=? AND generation=? AND item_id=? AND status='published' "
+                "WHERE space_id=? AND generation=? AND item_id=? AND revision_key=? "
+                "AND status='published' "
                 "AND id=(SELECT MAX(id) FROM plan_publications "
                 "WHERE space_id=? AND generation=?)",
                 (
@@ -1314,6 +1331,7 @@ class Store:
                     space_id,
                     int(generation),
                     item_id,
+                    revision_key,
                     space_id,
                     int(generation),
                 ),
@@ -1326,6 +1344,7 @@ class Store:
         generation: int,
         item_id: str,
         *,
+        revision_key: str = "",
         expected_status: str = "executing",
     ) -> bool:
         if expected_status not in _PLAN_ACTION_STATUSES:
@@ -1333,7 +1352,7 @@ class Store:
         with self._lock, self._connection:
             cursor = self._connection.execute(
                 "UPDATE plan_publications SET status='published', updated_at=? "
-                "WHERE space_id=? AND generation=? AND item_id=? AND status=? "
+                "WHERE space_id=? AND generation=? AND item_id=? AND revision_key=? AND status=? "
                 "AND id=(SELECT MAX(id) FROM plan_publications "
                 "WHERE space_id=? AND generation=?)",
                 (
@@ -1341,6 +1360,7 @@ class Store:
                     space_id,
                     int(generation),
                     item_id,
+                    revision_key,
                     expected_status,
                     space_id,
                     int(generation),
@@ -1354,6 +1374,7 @@ class Store:
         generation: int,
         item_id: str,
         *,
+        revision_key: str = "",
         expected_status: str,
         status: str,
     ) -> bool:
@@ -1364,7 +1385,7 @@ class Store:
         with self._lock, self._connection:
             cursor = self._connection.execute(
                 "UPDATE plan_publications SET status=?, updated_at=? "
-                "WHERE space_id=? AND generation=? AND item_id=? AND status=? "
+                "WHERE space_id=? AND generation=? AND item_id=? AND revision_key=? AND status=? "
                 "AND id=(SELECT MAX(id) FROM plan_publications "
                 "WHERE space_id=? AND generation=?)",
                 (
@@ -1373,6 +1394,7 @@ class Store:
                     space_id,
                     int(generation),
                     item_id,
+                    revision_key,
                     expected_status,
                     space_id,
                     int(generation),
@@ -1392,7 +1414,7 @@ class Store:
         placeholders = ",".join("?" for _ in selected)
         with self._lock:
             rows = self._connection.execute(
-                "SELECT space_id, generation, item_id, thread_id, turn_id, status, "
+                "SELECT space_id, generation, item_id, revision_key, thread_id, turn_id, status, "
                 "message_ids_json, created_at, updated_at FROM plan_publications "
                 f"WHERE status IN ({placeholders}) ORDER BY updated_at, id",
                 tuple(sorted(selected)),
@@ -1402,12 +1424,13 @@ class Store:
                 "space_id": str(row[0]),
                 "generation": int(row[1]),
                 "item_id": str(row[2]),
-                "thread_id": str(row[3]),
-                "turn_id": str(row[4]),
-                "status": str(row[5]),
-                "message_ids": json.loads(str(row[6])),
-                "created_at": int(row[7]),
-                "updated_at": int(row[8]),
+                "revision_key": str(row[3]),
+                "thread_id": str(row[4]),
+                "turn_id": str(row[5]),
+                "status": str(row[6]),
+                "message_ids": json.loads(str(row[7])),
+                "created_at": int(row[8]),
+                "updated_at": int(row[9]),
             }
             for row in rows
         ]
@@ -1527,24 +1550,16 @@ class Store:
             )
         return self.get_interaction(scope_key) if cursor.rowcount == 1 else None
 
-    def claim_interaction(
-        self, scope_key: str, flow_id: str, revision: int
-    ) -> InteractionDraft | None:
+    def claim_interaction(self, scope_key: str, flow_id: str, revision: int) -> InteractionDraft | None:
         return self._claim_interaction(scope_key, flow_id, revision)
 
-    def claim_live_interaction(
-        self, scope_key: str, flow_id: str, revision: int
-    ) -> InteractionDraft | None:
-        return self._claim_interaction(
-            scope_key, flow_id, revision, expiry="live"
-        )
+    def claim_live_interaction(self, scope_key: str, flow_id: str, revision: int) -> InteractionDraft | None:
+        return self._claim_interaction(scope_key, flow_id, revision, expiry="live")
 
     def claim_expired_interaction(
         self, scope_key: str, flow_id: str, revision: int
     ) -> InteractionDraft | None:
-        return self._claim_interaction(
-            scope_key, flow_id, revision, expiry="expired"
-        )
+        return self._claim_interaction(scope_key, flow_id, revision, expiry="expired")
 
     def _claim_interaction(
         self,
@@ -1558,11 +1573,7 @@ class Store:
             raise ValueError("Interaction expiry condition is invalid")
         now = int(time.time())
         expiry_sql = (
-            " AND expires_at>?"
-            if expiry == "live"
-            else " AND expires_at<=?"
-            if expiry == "expired"
-            else ""
+            " AND expires_at>?" if expiry == "live" else " AND expires_at<=?" if expiry == "expired" else ""
         )
         params: tuple[object, ...] = (scope_key, flow_id, int(revision))
         if expiry is not None:
@@ -1701,6 +1712,39 @@ class Store:
         if generation is not None and int(row[8]) != generation:
             return None
         return str(row[0]), json.loads(row[1])
+
+    def live_question_reply_callbacks(
+        self,
+        user_id: int,
+        *,
+        bot_role: str,
+        chat_id: int,
+        space_id: str,
+        generation: int,
+    ) -> list[dict[str, Any]]:
+        now = int(time.time())
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT nonce, action, payload_json FROM callbacks "
+                "WHERE user_id=? AND bot_role=? AND chat_id=? AND space_id=? AND generation=? "
+                "AND used_at IS NULL AND expires_at>=? "
+                "AND action IN ('reply_question_custom', 'reply_question_clarify') "
+                "ORDER BY rowid",
+                (user_id, bot_role, int(chat_id), space_id, int(generation), now),
+            ).fetchall()
+        callbacks: list[dict[str, Any]] = []
+        for row in rows:
+            payload = json.loads(str(row[2]))
+            if not isinstance(payload, dict):
+                continue
+            callbacks.append(
+                {
+                    "nonce": str(row[0]),
+                    "action": str(row[1]),
+                    "payload": payload,
+                }
+            )
+        return callbacks
 
     def replace_recovery_codes(self, entries: list[tuple[str, str]]) -> None:
         with self._immediate_transaction() as connection:
@@ -1857,9 +1901,7 @@ class Store:
 
     def increment_auth_epoch(self) -> int:
         with self._immediate_transaction() as connection:
-            row = connection.execute(
-                "SELECT value FROM metadata WHERE key='totp_auth_epoch'"
-            ).fetchone()
+            row = connection.execute("SELECT value FROM metadata WHERE key='totp_auth_epoch'").fetchone()
             epoch = int(json.loads(row[0])) + 1 if row else 1
             connection.executemany(
                 "INSERT INTO metadata(key, value) VALUES(?, ?) "
@@ -1982,9 +2024,7 @@ class Store:
             for row in rows
         ]
 
-    def space_queue_entries(
-        self, space_id: str, generation: int | None = None
-    ) -> list[dict[str, Any]]:
+    def space_queue_entries(self, space_id: str, generation: int | None = None) -> list[dict[str, Any]]:
         parameters: list[Any] = [space_id]
         generation_filter = ""
         if generation is not None:
@@ -1993,9 +2033,7 @@ class Store:
         with self._lock:
             rows = self._connection.execute(
                 "SELECT id, thread_id, prompt, inputs_json, client_message_id, created_at, generation "
-                "FROM prompt_queue WHERE space_id=? AND status='queued'"
-                + generation_filter
-                + " ORDER BY id",
+                "FROM prompt_queue WHERE space_id=? AND status='queued'" + generation_filter + " ORDER BY id",
                 parameters,
             ).fetchall()
         return [
@@ -2016,9 +2054,7 @@ class Store:
         entries = self.space_queue_entries(space_id, generation)
         return entries[0] if entries else None
 
-    def cancel_space_prompt(
-        self, space_id: str, queue_id: int, generation: int | None = None
-    ) -> bool:
+    def cancel_space_prompt(self, space_id: str, queue_id: int, generation: int | None = None) -> bool:
         parameters: list[Any] = [int(queue_id), space_id]
         generation_filter = ""
         if generation is not None:
@@ -2114,16 +2150,13 @@ class Store:
                     (bot_role, int(chat_id), message_id, int(delete_at), group_key, now),
                 )
                 row = connection.execute(
-                    "SELECT id FROM scheduled_deletions "
-                    "WHERE bot_role=? AND chat_id=? AND message_id=?",
+                    "SELECT id FROM scheduled_deletions WHERE bot_role=? AND chat_id=? AND message_id=?",
                     (bot_role, int(chat_id), message_id),
                 ).fetchone()
                 identifiers.append(int(row[0]))
         return identifiers
 
-    def due_message_deletions(
-        self, *, now: int | None = None, limit: int = 100
-    ) -> list[dict[str, Any]]:
+    def due_message_deletions(self, *, now: int | None = None, limit: int = 100) -> list[dict[str, Any]]:
         if limit <= 0:
             raise ValueError("limit must be positive")
         timestamp = int(time.time()) if now is None else int(now)
@@ -2156,13 +2189,10 @@ class Store:
     def delete_scheduled_message(self, deletion_id: int) -> bool:
         return self.complete_message_deletion(deletion_id)
 
-    def reschedule_message_deletion(
-        self, deletion_id: int, delete_at: int, error: str = ""
-    ) -> bool:
+    def reschedule_message_deletion(self, deletion_id: int, delete_at: int, error: str = "") -> bool:
         with self._lock, self._connection:
             cursor = self._connection.execute(
-                "UPDATE scheduled_deletions SET delete_at=?, attempts=attempts+1, last_error=? "
-                "WHERE id=?",
+                "UPDATE scheduled_deletions SET delete_at=?, attempts=attempts+1, last_error=? WHERE id=?",
                 (int(delete_at), error[:500] or None, int(deletion_id)),
             )
         return cursor.rowcount == 1
@@ -2276,13 +2306,10 @@ class Store:
     def pop_question_resolution(self, request_key: str) -> dict[str, Any] | None:
         with self._immediate_transaction() as connection:
             row = connection.execute(
-                "SELECT answers_json, source, resolved_at FROM question_resolutions "
-                "WHERE request_key=?",
+                "SELECT answers_json, source, resolved_at FROM question_resolutions WHERE request_key=?",
                 (request_key,),
             ).fetchone()
-            connection.execute(
-                "DELETE FROM question_resolutions WHERE request_key=?", (request_key,)
-            )
+            connection.execute("DELETE FROM question_resolutions WHERE request_key=?", (request_key,))
         if row is None:
             return None
         answers = json.loads(str(row[0]))
@@ -2338,15 +2365,9 @@ class Store:
                             timestamp,
                         ),
                     )
-                connection.execute(
-                    "DELETE FROM question_messages WHERE request_key=?", (request_key,)
-                )
-                connection.execute(
-                    "DELETE FROM pending_inputs WHERE request_key=?", (request_key,)
-                )
-                connection.execute(
-                    "DELETE FROM question_resolutions WHERE request_key=?", (request_key,)
-                )
+                connection.execute("DELETE FROM question_messages WHERE request_key=?", (request_key,))
+                connection.execute("DELETE FROM pending_inputs WHERE request_key=?", (request_key,))
+                connection.execute("DELETE FROM question_resolutions WHERE request_key=?", (request_key,))
         return request_keys
 
     def get_pending_input(self, request_key: str) -> dict[str, Any] | None:

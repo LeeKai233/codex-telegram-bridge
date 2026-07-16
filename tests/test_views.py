@@ -128,12 +128,9 @@ def test_full_status_comment_has_plan_tasks_auth_update_and_plain_fallback() -> 
         total_duration_seconds=1122,
         auth_expires_at=1_700_001_900,
     )
-    assert "~1\\. Inspect architecture~ ✅" in rendered.markdown
+    assert "✅ ~1\\. Inspect architecture~" in rendered.markdown
     assert "▶ *2\\. Implement routing*" in rendered.markdown
-    assert (
-        "*🧩 Agent Tasks*  `2/3` · Running `1` · Failed `0` · Interrupted `0`"
-        in rendered.markdown
-    )
+    assert "*🧩 Agent Tasks*  `2/3` · Running `1` · Failed `0` · Interrupted `0`" in rendered.markdown
     assert "*📥 Queue*  `2`" in rendered.markdown
     assert "🔓 TOTP 已认证 · 剩余 `30 min`" in rendered.markdown
     expires = time.strftime("%H:%M:%S", time.localtime(1_700_001_900))
@@ -233,10 +230,19 @@ def test_status_comment_shows_animated_mode_and_main_and_subagent_profiles() -> 
 
     rendered = render_status_comment(state, space=space, animation_frame=1)
 
-    assert rendered.markdown.startswith("*🧭 Plan mode · 🕒*")
+    assert rendered.markdown.startswith("⠙ *🧭 Plan mode*")
     assert "*🧠 Main*  `gpt-5.6-sol` · Effort `xhigh`" in rendered.markdown
     assert "`gpt-5.6-luna/max`" in rendered.markdown
-    assert rendered.plain.startswith("🧭 Plan mode · 🕒")
+    assert rendered.plain.startswith("⠙ 🧭 Plan mode")
+
+    channel = render_channel_post(state, space=space, animation_frame=1)
+    assert channel.markdown.startswith("⠙ *🧭 Plan mode*")
+    assert "*🧠 Main*  `gpt-5.6-sol` · Effort `xhigh`" in channel.markdown
+
+    space.current_mode = "default"
+    normal = render_channel_post(state, space=space, animation_frame=2)
+    assert normal.markdown.startswith("⠹ *⚙️ Normal mode*")
+    assert "*🧠 Main*  `gpt-5.6-luna` · Effort `max`" in normal.markdown
 
 
 def test_status_comment_separates_interrupted_tasks_and_warns_on_goal_plan_mismatch() -> None:
@@ -260,10 +266,7 @@ def test_status_comment_separates_interrupted_tasks_and_warns_on_goal_plan_misma
     rendered = render_status_comment(state, now=1_700_000_120)
 
     assert "Goal 已完成，但 Plan 仍有 1 项未完成" in rendered.markdown
-    assert (
-        "*🧩 Agent Tasks*  `1/1` · Running `0` · Failed `0` · Interrupted `1`"
-        in rendered.markdown
-    )
+    assert "*🧩 Agent Tasks*  `1/1` · Running `0` · Failed `0` · Interrupted `1`" in rendered.markdown
     assert "WARNING: Goal 已完成，但 Plan 仍有 1 项未完成" in rendered.plain
 
 

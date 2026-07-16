@@ -1104,6 +1104,21 @@ async def test_plan_completion_hook_uses_authoritative_item_once(
     assert received == [
         ("thread-plan", "turn-plan", "plan-1", "1. Inspect\n2. Implement")
     ]
+
+    updated = {"id": "plan-1", "type": "plan", "text": "1. Inspect\n2. Verify"}
+    await bridge._on_notification(
+        "item/completed",
+        {"threadId": "thread-plan", "turnId": "turn-plan", "item": updated},
+    )
+    await bridge._on_notification(
+        "item/completed",
+        {"threadId": "thread-plan", "turnId": "turn-next", "item": updated},
+    )
+
+    assert received[-2:] == [
+        ("thread-plan", "turn-plan", "plan-1", "1. Inspect\n2. Verify"),
+        ("thread-plan", "turn-next", "plan-1", "1. Inspect\n2. Verify"),
+    ]
     store.close()
 
 

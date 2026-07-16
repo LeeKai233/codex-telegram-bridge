@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import hashlib
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
+
+
+def plan_revision_key(turn_id: str, text: str) -> str:
+    payload = f"{turn_id.strip()}\0{text.strip()}".encode()
+    return hashlib.sha256(payload).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,9 +86,7 @@ class TaskState:
             agent_nickname=str(value.get("agent_nickname") or value.get("agentNickname") or ""),
             agent_role=str(value.get("agent_role") or value.get("agentRole") or ""),
             model=str(value.get("model") or ""),
-            reasoning_effort=str(
-                value.get("reasoning_effort") or value.get("reasoningEffort") or ""
-            ),
+            reasoning_effort=str(value.get("reasoning_effort") or value.get("reasoningEffort") or ""),
             message=str(value.get("message") or ""),
             started_at=int(value.get("started_at") or value.get("startedAt") or 0),
             finished_at=int(value.get("finished_at") or value.get("finishedAt") or 0),

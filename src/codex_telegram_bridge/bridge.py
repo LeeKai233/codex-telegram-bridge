@@ -17,7 +17,7 @@ from .config import Config
 from .dashboard import DashboardManager
 from .files import FileCandidate, PathPolicy, cleanup_inbox
 from .metrics import MetricsSampler
-from .models import ModelOption, ModelProfile, SessionSpace, ThreadState
+from .models import ModelOption, ModelProfile, SessionSpace, ThreadState, plan_revision_key
 from .outbound import OutboundMessenger
 from .projector import EventProjector
 from .resolver import CodexResolver, DirectoryIndex
@@ -73,9 +73,7 @@ async def _noop_question_resolved(request_key: str) -> None:
     del request_key
 
 
-async def _noop_plan_completed(
-    thread_id: str, turn_id: str, item_id: str, text: str
-) -> None:
+async def _noop_plan_completed(thread_id: str, turn_id: str, item_id: str, text: str) -> None:
     del thread_id, turn_id, item_id, text
 
 
@@ -121,7 +119,7 @@ class Bridge:
         self._space_locks: dict[str, asyncio.Lock] = {}
         self._pending_requests: dict[str, tuple[int | str, int]] = {}
         self._resolved_request_ids: dict[tuple[int, str], None] = {}
-        self._notified_plan_items: dict[tuple[str, str], None] = {}
+        self._notified_plan_items: dict[tuple[str, str, str], None] = {}
         self._terminal_turns: dict[tuple[str, str], tuple[str, str]] = {}
         self._maintenance_task: asyncio.Task[None] | None = None
         self._started = False
@@ -318,9 +316,7 @@ class Bridge:
         await self.directory_index.refresh()
         return created
 
-    async def list_sessions(
-        self, *, search_term: str | None = None, limit: int = 200
-    ) -> list[ThreadState]:
+    async def list_sessions(self, *, search_term: str | None = None, limit: int = 200) -> list[ThreadState]:
         states: list[ThreadState] = []
         for payload in await self.client.list_threads(limit=limit, search_term=search_term):
             if isinstance(payload, dict) and payload.get("id"):
@@ -357,8 +353,7 @@ class Bridge:
 
     async def _unsubscribe_thread_if_unused(self, thread_id: str) -> None:
         required = thread_id in self.store.subscriptions() or any(
-            str(space.get("thread_id") or "") == thread_id
-            and space.get("lifecycle") != "closed"
+            str(space.get("thread_id") or "") == thread_id and space.get("lifecycle") != "closed"
             for space in self.store.list_spaces()
         )
         state = self.store.get_thread(thread_id)
@@ -419,9 +414,7 @@ class Bridge:
             if not space.pending_cwd or not space.pending_prompt.strip():
                 raise ValueError("Pending session requires a directory and initial prompt")
             collaboration_mode: Json | None = None
-            profile_model, profile_effort = self._space_profile_values(
-                space, space.current_mode
-            )
+            profile_model, profile_effort = self._space_profile_values(space, space.current_mode)
             if profile_model or profile_effort:
                 profile = await self.resolve_model_profile(profile_model, profile_effort)
                 collaboration_mode = await self.client.resolve_collaboration_mode(
@@ -447,8 +440,10 @@ class Bridge:
                 created_now = True
 
             await self.tmux.ensure_window(state.thread_id, state.title, cwd)
-            delivered = False if created_now else await self._client_message_exists(
-                state.thread_id, client_message_id
+            delivered = (
+                False
+                if created_now
+                else await self._client_message_exists(state.thread_id, client_message_id)
             )
             if delivered is None:
                 space.last_error = "initial prompt delivery could not be reconciled"
@@ -635,9 +630,7 @@ class Bridge:
                     effective_model = str(payload.get("model") or "")
                     effective_effort = str(payload.get("reasoningEffort") or "")
                     if effective_model and effective_effort:
-                        profile = await self.resolve_model_profile(
-                            effective_model, effective_effort
-                        )
+                        profile = await self.resolve_model_profile(effective_model, effective_effort)
             else:
                 profile = await self.resolve_model_profile(profile.model, profile.effort)
             if profile is None:
@@ -689,13 +682,18 @@ class Bridge:
         space_id: str,
         generation: int,
         item_id: str,
+        revision_key: str,
         client_message_id: str,
     ) -> str:
         space = self._require_active_space(space_id)
         if space.generation != generation:
             raise RuntimeError("Session space generation is stale")
         latest = self.store.latest_plan_publication(space_id, generation)
-        if latest is None or str(latest.get("item_id") or "") != item_id:
+        if (
+            latest is None
+            or str(latest.get("item_id") or "") != item_id
+            or str(latest.get("revision_key") or "") != revision_key
+        ):
             raise RuntimeError("Plan publication is stale")
         delivered = await self._client_message_exists(space.thread_id or "", client_message_id)
         if delivered is None:
@@ -716,7 +714,7 @@ class Bridge:
         async with lock:
             try:
                 space = self._require_active_space(space_id)
-            except (RuntimeError, ValueError):
+            except RuntimeError, ValueError:
                 return
             if generation is not None and space.generation != generation:
                 return
@@ -860,7 +858,7 @@ class Bridge:
             if space_id is not None:
                 try:
                     space = self._require_active_space(space_id)
-                except (RuntimeError, ValueError):
+                except RuntimeError, ValueError:
                     return
                 if space.generation != generation or space.thread_id != thread_id:
                     return
@@ -908,9 +906,7 @@ class Bridge:
                 self._request_queue_retry(thread_id, space_id=space_id, generation=generation)
                 return
             if delivered:
-                await self._mark_prompt_dispatched(
-                    state, queue_id, space_id=space_id, generation=generation
-                )
+                await self._mark_prompt_dispatched(state, queue_id, space_id=space_id, generation=generation)
                 return
             try:
                 turn = await self.client.start_turn(
@@ -954,9 +950,7 @@ class Bridge:
                     LOGGER.exception("Failed to dispatch queued prompt %s", queue_id)
                 self._request_queue_retry(thread_id, space_id=space_id, generation=generation)
                 return
-            await self._mark_prompt_dispatched(
-                state, queue_id, space_id=space_id, generation=generation
-            )
+            await self._mark_prompt_dispatched(state, queue_id, space_id=space_id, generation=generation)
 
     async def _track_prompt_run(
         self,
@@ -969,8 +963,7 @@ class Bridge:
     ) -> None:
         if not turn_id:
             LOGGER.warning(
-                "event=prompt_run_tracking_skipped space_id=%s thread_id=%s "
-                "reason=missing_turn_id",
+                "event=prompt_run_tracking_skipped space_id=%s thread_id=%s reason=missing_turn_id",
                 space_id[:12],
                 thread_id[:8],
             )
@@ -1288,19 +1281,17 @@ class Bridge:
         )
         self._subagent_profile_tasks[child_id] = task
         task.add_done_callback(
-            lambda completed, thread_id=child_id: self._subagent_profile_tasks.pop(
-                thread_id, None
+            lambda completed, thread_id=child_id: (
+                self._subagent_profile_tasks.pop(thread_id, None)
+                if self._subagent_profile_tasks.get(thread_id) is completed
+                else None
             )
-            if self._subagent_profile_tasks.get(thread_id) is completed
-            else None
         )
 
-    async def _refresh_subagent_profile(
-        self, child_id: str, parent_id: str, agent_path: str
-    ) -> None:
+    async def _refresh_subagent_profile(self, child_id: str, parent_id: str, agent_path: str) -> None:
         try:
             payload = await self.client.resume_thread(child_id)
-        except (CodexRpcError, RuntimeError, TimeoutError):
+        except CodexRpcError, RuntimeError, TimeoutError:
             LOGGER.exception("Failed to load subagent profile for %s", child_id[:8])
             return
         payload.setdefault("parentThreadId", parent_id)
@@ -1320,9 +1311,7 @@ class Bridge:
             if spaces:
                 for space in spaces:
                     asyncio.create_task(
-                        self.dispatch_space_queue(
-                            str(space["space_id"]), generation=int(space["generation"])
-                        )
+                        self.dispatch_space_queue(str(space["space_id"]), generation=int(space["generation"]))
                     )
             else:
                 asyncio.create_task(self.dispatch_queue(state.thread_id))
@@ -1339,12 +1328,11 @@ class Bridge:
         except Exception:
             LOGGER.exception("Failed to remove resolved Telegram question %s", request_key)
 
-    async def _notify_plan_completed(
-        self, thread_id: str, turn_id: str, item_id: str, text: str
-    ) -> None:
+    async def _notify_plan_completed(self, thread_id: str, turn_id: str, item_id: str, text: str) -> None:
         if not thread_id or not item_id or not text.strip():
             return
-        marker = (thread_id, item_id)
+        revision_key = plan_revision_key(turn_id, text)
+        marker = (thread_id, item_id, revision_key)
         if marker in self._notified_plan_items:
             return
         try:

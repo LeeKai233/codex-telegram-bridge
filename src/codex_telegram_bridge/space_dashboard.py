@@ -18,6 +18,7 @@ from .security import SecurityManager
 from .store import Store
 from .telegram_common import CONTROL_ROLE, DISCUSSION_ROLE, TelegramEndpoint
 from .views import (
+    ANIMATION_FRAMES,
     RenderedMessage,
     render_channel_post,
     render_closed_space,
@@ -36,8 +37,6 @@ _IMMEDIATE_REASONS = {
     "thread/settings/updated",
     "turn/plan/updated",
 }
-
-_ANIMATION_FRAME_COUNT = 4
 
 _BOT_URL_TOKEN = re.compile(r"(https://api\.telegram\.org/bot)[^/\s]+", re.IGNORECASE)
 _BOT_TOKEN = re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{16,}\b")
@@ -115,9 +114,7 @@ class SpaceDashboardManager:
                 continue
             if space.get("lifecycle") not in {"active", "repair_required"}:
                 continue
-            await self.schedule_space(
-                str(space["space_id"]), immediate=reason in _IMMEDIATE_REASONS
-            )
+            await self.schedule_space(str(space["space_id"]), immediate=reason in _IMMEDIATE_REASONS)
 
     async def schedule_space(self, space_id: str, *, immediate: bool = False) -> None:
         self._dirty.add(space_id)
@@ -141,8 +138,7 @@ class SpaceDashboardManager:
                     await self._flush(space_id)
                 except TelegramError as exc:
                     LOGGER.warning(
-                        "event=space_dashboard_update_failed space_id=%s "
-                        "error_type=%s error=%s",
+                        "event=space_dashboard_update_failed space_id=%s error_type=%s error=%s",
                         space_id,
                         type(exc).__name__,
                         _safe_error_text(exc),
@@ -151,8 +147,7 @@ class SpaceDashboardManager:
                     await asyncio.sleep(5)
                 except Exception as exc:
                     LOGGER.error(
-                        "event=space_dashboard_unexpected_error space_id=%s "
-                        "error_type=%s error=%s",
+                        "event=space_dashboard_unexpected_error space_id=%s error_type=%s error=%s",
                         space_id,
                         type(exc).__name__,
                         _safe_error_text(exc),
@@ -176,28 +171,35 @@ class SpaceDashboardManager:
         )
         status_keyboard = self._status_keyboard(space)
 
+        edits: list[Any] = []
         if space.get("channel_chat_id") and space.get("channel_post_id"):
-            await self._edit_dashboard_target(
-                self.control,
-                channel_rendered.markdown,
-                bot_role=CONTROL_ROLE,
-                space_id=space_id,
-                chat_id=int(space["channel_chat_id"]),
-                message_id=int(space["channel_post_id"]),
-                plain=channel_rendered.plain,
+            edits.append(
+                self._edit_dashboard_target(
+                    self.control,
+                    channel_rendered.markdown,
+                    bot_role=CONTROL_ROLE,
+                    space_id=space_id,
+                    chat_id=int(space["channel_chat_id"]),
+                    message_id=int(space["channel_post_id"]),
+                    plain=channel_rendered.plain,
+                )
             )
         if space.get("discussion_chat_id") and space.get("status_message_id"):
-            await self._edit_dashboard_target(
-                self.discussion,
-                status_rendered.markdown,
-                bot_role=DISCUSSION_ROLE,
-                space_id=space_id,
-                chat_id=int(space["discussion_chat_id"]),
-                message_id=int(space["status_message_id"]),
-                plain=status_rendered.plain,
-                reply_markup=status_keyboard,
+            edits.append(
+                self._edit_dashboard_target(
+                    self.discussion,
+                    status_rendered.markdown,
+                    bot_role=DISCUSSION_ROLE,
+                    space_id=space_id,
+                    chat_id=int(space["discussion_chat_id"]),
+                    message_id=int(space["status_message_id"]),
+                    plain=status_rendered.plain,
+                    reply_markup=status_keyboard,
+                )
             )
-            self._animation_indices[space_id] = (animation_index + 1) % _ANIMATION_FRAME_COUNT
+        if edits:
+            await asyncio.gather(*edits)
+            self._animation_indices[space_id] = (animation_index + 1) % len(ANIMATION_FRAMES)
 
     @staticmethod
     async def _edit_dashboard_target(
@@ -266,8 +268,10 @@ class SpaceDashboardManager:
         auth_expires_at = int(time.time()) + remaining if remaining > 0 else None
         channel = render_channel_post(
             state,
+            space=space,
             lifecycle=lifecycle,
             heartbeat_seconds=self.config.heartbeat_seconds,
+            animation_frame=animation_frame,
         )
         status_options: dict[str, Any] = {
             "space": space,
@@ -314,11 +318,7 @@ class SpaceDashboardManager:
             )
         if post_id and channel_id:
             rows.append(
-                [
-                    InlineKeyboardButton(
-                        "返回帖子", url=private_message_link(int(channel_id), int(post_id))
-                    )
-                ]
+                [InlineKeyboardButton("返回帖子", url=private_message_link(int(channel_id), int(post_id)))]
             )
         return InlineKeyboardMarkup(rows) if rows else None
 

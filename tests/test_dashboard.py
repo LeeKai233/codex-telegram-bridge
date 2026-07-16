@@ -95,6 +95,27 @@ class RecordingEndpoint:
             raise self.error
 
 
+class ConcurrentEndpoint(RecordingEndpoint):
+    def __init__(self, started: list[str], ready: asyncio.Event, label: str) -> None:
+        super().__init__()
+        self.started = started
+        self.ready = ready
+        self.label = label
+
+    async def edit_text(
+        self,
+        chat_id: int,
+        message_id: int,
+        _markdown: str,
+        **_kwargs: Any,
+    ) -> None:
+        self.edit_calls.append((chat_id, message_id))
+        self.started.append(self.label)
+        if len(self.started) == 2:
+            self.ready.set()
+        await asyncio.wait_for(self.ready.wait(), timeout=0.2)
+
+
 def subscribed_state(store: Store, *, activity: str = "first") -> ThreadState:
     state = ThreadState(
         thread_id="thread-12345678",
@@ -233,8 +254,7 @@ async def test_space_dashboard_failure_logs_safe_target_context(
     control = RecordingEndpoint()
     discussion = RecordingEndpoint(
         BadRequest(
-            "invalid dashboard target at "
-            "https://api.telegram.org/bot123456789:SUPER-SECRET/editMessageText"
+            "invalid dashboard target at https://api.telegram.org/bot123456789:SUPER-SECRET/editMessageText"
         )
     )
     manager = SpaceDashboardManager(
@@ -283,6 +303,8 @@ async def test_space_dashboard_passes_mode_profiles_tasks_and_advancing_animatio
             "space_id": "space-animation",
             "lifecycle": "active",
             "thread_id": "thread-animation",
+            "channel_chat_id": -100122,
+            "channel_post_id": 39,
             "discussion_chat_id": -100123,
             "discussion_root_id": 40,
             "status_message_id": 41,
@@ -310,6 +332,19 @@ async def test_space_dashboard_passes_mode_profiles_tasks_and_advancing_animatio
     )
     store.save_thread(state)
     received: list[tuple[dict[str, Any], ThreadState, int | None]] = []
+    channel_received: list[tuple[dict[str, Any], ThreadState, int | None]] = []
+
+    def render_channel(
+        rendered_state: ThreadState,
+        *,
+        space: dict[str, Any],
+        lifecycle: str,
+        heartbeat_seconds: int,
+        animation_frame: int | None = None,
+    ) -> RenderedMessage:
+        del lifecycle, heartbeat_seconds
+        channel_received.append((space, rendered_state, animation_frame))
+        return RenderedMessage("channel", "channel")
 
     def render_status(
         rendered_state: ThreadState,
@@ -324,13 +359,15 @@ async def test_space_dashboard_passes_mode_profiles_tasks_and_advancing_animatio
         received.append((space, rendered_state, animation_frame))
         return RenderedMessage("status", "status")
 
+    monkeypatch.setattr(space_dashboard_module, "render_channel_post", render_channel)
     monkeypatch.setattr(space_dashboard_module, "render_status_comment", render_status)
+    control = RecordingEndpoint()
     discussion = RecordingEndpoint()
     manager = SpaceDashboardManager(
         config,
         store,
         StaticSecurity(),  # type: ignore[arg-type]
-        RecordingEndpoint(),  # type: ignore[arg-type]
+        control,  # type: ignore[arg-type]
         discussion,  # type: ignore[arg-type]
     )
 
@@ -338,10 +375,84 @@ async def test_space_dashboard_passes_mode_profiles_tasks_and_advancing_animatio
     await manager._flush("space-animation")
 
     assert [frame for _space, _state, frame in received] == [0, 1]
+    assert [frame for _space, _state, frame in channel_received] == [0, 1]
     assert received[0][0]["current_mode"] == "plan"
     assert received[0][0]["normal_model"] == "gpt-5.6-sol"
     assert received[0][0]["plan_effort"] == "max"
     assert received[0][1].tasks[0].model == "gpt-5.6-luna"
     assert received[0][1].tasks[0].reasoning_effort == "max"
     assert discussion.edit_calls == [(-100123, 41), (-100123, 41)]
+    assert control.edit_calls == [(-100122, 39), (-100122, 39)]
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_space_dashboard_edits_channel_and_discussion_concurrently(tmp_path: Path) -> None:
+    config = replace(
+        Config.default(),
+        config_dir=tmp_path / "config",
+        state_dir=tmp_path / "state",
+        allowed_root=tmp_path,
+    )
+    store = Store(config.database_path)
+    store.create_space(
+        {
+            "space_id": "space-concurrent",
+            "lifecycle": "active",
+            "thread_id": "thread-concurrent",
+            "channel_chat_id": -100122,
+            "channel_post_id": 39,
+            "discussion_chat_id": -100123,
+            "discussion_root_id": 40,
+            "status_message_id": 41,
+        }
+    )
+    store.save_thread(ThreadState(thread_id="thread-concurrent", status="active"))
+    started: list[str] = []
+    ready = asyncio.Event()
+    manager = SpaceDashboardManager(
+        config,
+        store,
+        StaticSecurity(),  # type: ignore[arg-type]
+        ConcurrentEndpoint(started, ready, "channel"),  # type: ignore[arg-type]
+        ConcurrentEndpoint(started, ready, "discussion"),  # type: ignore[arg-type]
+    )
+
+    await manager._flush("space-concurrent")
+
+    assert set(started) == {"channel", "discussion"}
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_space_dashboard_start_has_no_periodic_animation_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = replace(
+        Config.default(),
+        config_dir=tmp_path / "config",
+        state_dir=tmp_path / "state",
+        allowed_root=tmp_path,
+    )
+    store = Store(config.database_path)
+    store.create_space({"space_id": "active-space", "lifecycle": "active"})
+    store.create_space({"space_id": "pending-space", "lifecycle": "pending"})
+    manager = SpaceDashboardManager(
+        config,
+        store,
+        StaticSecurity(),  # type: ignore[arg-type]
+        RecordingEndpoint(),  # type: ignore[arg-type]
+        RecordingEndpoint(),  # type: ignore[arg-type]
+    )
+    scheduled: list[tuple[str, bool]] = []
+
+    async def schedule(space_id: str, *, immediate: bool = False) -> None:
+        scheduled.append((space_id, immediate))
+
+    monkeypatch.setattr(manager, "schedule_space", schedule)
+    await manager.start()
+    await asyncio.sleep(0.03)
+    await manager.stop()
+
+    assert scheduled == [("active-space", True), ("pending-space", True)]
     store.close()

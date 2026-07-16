@@ -290,6 +290,7 @@ class FakeBridge:
         _space_id: str,
         _generation: int,
         _item_id: str,
+        _revision_key: str,
         _client_message_id: str,
     ) -> str:
         return self.reconcile_status
@@ -1350,10 +1351,13 @@ async def test_plan_revision_force_reply_starts_plan_turn(rig: Rig) -> None:
         "item-plan",
         "Review the implementation plan.",
     )
+    publication = rig.store.latest_plan_publication("space-revise", 1)
+    assert publication is not None
     await rig.discussion._dispatch_callback(
         "plan_continue",
         {
             "item_id": "item-plan",
+            "revision_key": publication["revision_key"],
             "thread_id": "thread-revise",
             "turn_id": "turn-plan",
         },
@@ -1406,10 +1410,13 @@ async def test_ambiguous_plan_revision_reconciles_without_duplicate(rig: Rig) ->
         "item-plan",
         "Review this plan once.",
     )
+    publication = rig.store.latest_plan_publication("space-revise-delivered", 1)
+    assert publication is not None
     await rig.discussion._dispatch_callback(
         "plan_continue",
         {
             "item_id": "item-plan",
+            "revision_key": publication["revision_key"],
             "thread_id": "thread-revise-delivered",
             "turn_id": "turn-plan",
         },
@@ -1458,6 +1465,8 @@ async def test_plan_revision_prompt_failure_releases_fresh_action_buttons(
         "item-plan",
         "Plan can be revised.",
     )
+    publication = rig.store.latest_plan_publication("space-revise-send-fail", 1)
+    assert publication is not None
     original_send = rig.discussion._send_space
     attempts = 0
 
@@ -1473,6 +1482,7 @@ async def test_plan_revision_prompt_failure_releases_fresh_action_buttons(
         space,
         {
             "item_id": "item-plan",
+            "revision_key": publication["revision_key"],
             "thread_id": "thread-revise-send-fail",
             "turn_id": "turn-plan",
         },
@@ -1499,8 +1509,11 @@ async def test_failed_plan_execute_is_not_dispatched_twice(rig: Rig) -> None:
         "item-plan",
         "Execute safely.",
     )
+    publication = rig.store.latest_plan_publication("space-plan-fail", 1)
+    assert publication is not None
     payload = {
         "item_id": "item-plan",
+        "revision_key": publication["revision_key"],
         "thread_id": "thread-plan-fail",
         "turn_id": "turn-plan",
     }
@@ -1529,6 +1542,8 @@ async def test_ambiguous_plan_execute_marks_delivered_action_terminal(rig: Rig) 
         "item-plan",
         "Execute once.",
     )
+    publication = rig.store.latest_plan_publication("space-plan-delivered", 1)
+    assert publication is not None
     rig.bridge.collaboration_error = RuntimeError("response lost")
     rig.bridge.reconcile_status = "delivered"
 
@@ -1536,6 +1551,7 @@ async def test_ambiguous_plan_execute_marks_delivered_action_terminal(rig: Rig) 
         space,
         {
             "item_id": "item-plan",
+            "revision_key": publication["revision_key"],
             "thread_id": "thread-plan-delivered",
             "turn_id": "turn-plan",
         },
@@ -1545,6 +1561,204 @@ async def test_ambiguous_plan_execute_marks_delivered_action_terminal(rig: Rig) 
     assert publication is not None and publication["status"] == "executed"
     assert rig.store.recoverable_plan_publications() == []
     assert len(rig.bridge.collaboration_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_republished_plan_with_reused_item_rejects_old_button_without_consuming_it(
+    rig: Rig,
+) -> None:
+    add_active_space(
+        rig,
+        space_id="space-plan-republished",
+        thread_id="thread-plan-republished",
+        root_message_id=528,
+        channel_post_id=128,
+    )
+    rig.security.unlocked.add("space-plan-republished")
+
+    await rig.discussion.plan_completed(
+        "thread-plan-republished",
+        "turn-plan",
+        "item-plan",
+        "First version of the plan.",
+    )
+    first_article = rig.discussion_endpoint.sent[-1]
+    old_button = first_article["reply_markup"].inline_keyboard[0][0]
+    old_nonce = str(old_button.callback_data)[3:]
+    first = rig.store.latest_plan_publication("space-plan-republished", 1)
+    assert first is not None
+
+    await rig.discussion.plan_completed(
+        "thread-plan-republished",
+        "turn-plan",
+        "item-plan",
+        "Second version after BTW feedback.",
+    )
+    second_article = rig.discussion_endpoint.sent[-1]
+    new_button = second_article["reply_markup"].inline_keyboard[0][0]
+    second = rig.store.latest_plan_publication("space-plan-republished", 1)
+    assert second is not None
+    assert second["revision_key"] != first["revision_key"]
+    assert second["status"] == "published"
+
+    old_query = SimpleNamespace(data=old_button.callback_data)
+    old_update = SimpleNamespace(
+        callback_query=old_query,
+        effective_user=SimpleNamespace(id=OWNER_ID),
+        effective_chat=SimpleNamespace(id=DISCUSSION_CHAT_ID),
+    )
+    await rig.discussion.callback(old_update, SimpleNamespace())
+
+    assert rig.bridge.collaboration_calls == []
+    assert "已过期" in rig.discussion_endpoint.callback_answers[-1]["text"]
+    assert rig.store.peek_callback(
+        old_nonce,
+        OWNER_ID,
+        bot_role=DISCUSSION_ROLE,
+        chat_id=DISCUSSION_CHAT_ID,
+    ) is not None
+
+    new_update = SimpleNamespace(
+        callback_query=SimpleNamespace(data=new_button.callback_data),
+        effective_user=SimpleNamespace(id=OWNER_ID),
+        effective_chat=SimpleNamespace(id=DISCUSSION_CHAT_ID),
+    )
+    await rig.discussion.callback(new_update, SimpleNamespace())
+
+    assert len(rig.bridge.collaboration_calls) == 1
+    assert second["revision_key"] in rig.bridge.collaboration_calls[0]["client_message_id"]
+    latest = rig.store.latest_plan_publication("space-plan-republished", 1)
+    assert latest is not None and latest["status"] == "executed"
+
+
+@pytest.mark.asyncio
+async def test_plan_button_rechecks_revision_after_readiness_await(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    add_active_space(
+        rig,
+        space_id="space-plan-race",
+        thread_id="thread-plan-race",
+        root_message_id=532,
+        channel_post_id=132,
+    )
+    rig.security.unlocked.add("space-plan-race")
+    await rig.discussion.plan_completed(
+        "thread-plan-race",
+        "turn-plan",
+        "item-plan",
+        "First plan revision.",
+    )
+    old_button = rig.discussion_endpoint.sent[-1]["reply_markup"].inline_keyboard[0][0]
+    old_nonce = str(old_button.callback_data)[3:]
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def pause_readiness(_space: dict[str, Any]) -> None:
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(rig.discussion, "_ensure_plan_ready", pause_readiness)
+    update = SimpleNamespace(
+        callback_query=SimpleNamespace(data=old_button.callback_data),
+        effective_user=SimpleNamespace(id=OWNER_ID),
+        effective_chat=SimpleNamespace(id=DISCUSSION_CHAT_ID),
+    )
+    callback_task = asyncio.create_task(rig.discussion.callback(update, SimpleNamespace()))
+    await entered.wait()
+    await rig.discussion.plan_completed(
+        "thread-plan-race",
+        "turn-plan",
+        "item-plan",
+        "Second plan revision published during readiness.",
+    )
+    release.set()
+    await callback_task
+
+    assert rig.bridge.collaboration_calls == []
+    assert "已过期" in rig.discussion_endpoint.callback_answers[-1]["text"]
+    assert rig.store.peek_callback(
+        old_nonce,
+        OWNER_ID,
+        bot_role=DISCUSSION_ROLE,
+        chat_id=DISCUSSION_CHAT_ID,
+    ) is not None
+
+
+@pytest.mark.asyncio
+async def test_plan_revision_reply_rechecks_revision_after_readiness_await(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    space = add_active_space(
+        rig,
+        space_id="space-plan-reply-race",
+        thread_id="thread-plan-reply-race",
+        root_message_id=533,
+        channel_post_id=133,
+    )
+    rig.security.unlocked.add("space-plan-reply-race")
+    await rig.discussion.plan_completed(
+        "thread-plan-reply-race",
+        "turn-plan",
+        "item-plan",
+        "First plan revision.",
+    )
+    first = rig.store.latest_plan_publication("space-plan-reply-race", 1)
+    assert first is not None
+    await rig.discussion._begin_plan_revision(
+        space,
+        {
+            "item_id": "item-plan",
+            "revision_key": first["revision_key"],
+            "thread_id": "thread-plan-reply-race",
+            "turn_id": "turn-plan",
+        },
+    )
+    prompt_message_id = rig.discussion_endpoint.next_message_id - 1
+    reply_nonce = rig.discussion._reply_nonce(DISCUSSION_CHAT_ID, prompt_message_id)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def pause_readiness(_space: dict[str, Any]) -> None:
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(rig.discussion, "_ensure_plan_ready", pause_readiness)
+    reply = update_for_message(
+        "Add rollback checks.",
+        update_id=155,
+        message_id=75,
+        chat_id=DISCUSSION_CHAT_ID,
+        chat_type=ChatType.SUPERGROUP,
+        message_thread_id=533,
+        reply_to_message=SimpleNamespace(
+            message_id=prompt_message_id,
+            message_thread_id=533,
+            is_automatic_forward=False,
+        ),
+    )
+    reply_task = asyncio.create_task(rig.discussion.reply_to_intent(reply, SimpleNamespace()))
+    await entered.wait()
+    await rig.discussion.plan_completed(
+        "thread-plan-reply-race",
+        "turn-plan",
+        "item-plan",
+        "Second revision published while the reply was waiting.",
+    )
+    release.set()
+    with pytest.raises(ApplicationHandlerStop):
+        await reply_task
+
+    assert rig.bridge.collaboration_calls == []
+    assert "已过期" in rig.discussion_endpoint.sent[-1]["markdown"]
+    assert rig.store.peek_callback(
+        reply_nonce,
+        OWNER_ID,
+        bot_role=DISCUSSION_ROLE,
+        chat_id=DISCUSSION_CHAT_ID,
+        space_id="space-plan-reply-race",
+        generation=1,
+    ) is not None
 
 
 @pytest.mark.asyncio
@@ -1668,6 +1882,193 @@ async def test_question_offers_force_reply_custom_answer_scoped_to_exact_root(ri
         await rig.discussion.reply_to_intent(correct_root, SimpleNamespace())
     assert rig.bridge.answers == [
         ("request-custom", {"delivery": ["/not-an-option | exact answer"]})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_question_custom_answer_can_be_sent_directly_in_topic(rig: Rig) -> None:
+    space = add_active_space(
+        rig,
+        space_id="space-custom-direct",
+        thread_id="thread-custom-direct",
+        root_message_id=529,
+        channel_post_id=129,
+    )
+    questions = [
+        {
+            "id": "delivery",
+            "question": "How should this be delivered?",
+            "options": [{"label": "Queue"}],
+        }
+    ]
+    rig.store.put_pending_input(
+        "request-custom-direct",
+        "7",
+        1,
+        "thread-custom-direct",
+        "turn-1",
+        "item-1",
+        questions,
+        None,
+    )
+    rig.security.unlocked.add("space-custom-direct")
+    await rig.discussion._begin_question_reply(
+        space,
+        {"request_key": "request-custom-direct", "question_id": "delivery"},
+        clarification=False,
+    )
+
+    direct = update_for_message(
+        "Ship it through the queue.",
+        update_id=150,
+        message_id=70,
+        chat_id=DISCUSSION_CHAT_ID,
+        chat_type=ChatType.SUPERGROUP,
+        message_thread_id=529,
+    )
+    with pytest.raises(ApplicationHandlerStop):
+        await rig.discussion.reply_to_intent(direct, SimpleNamespace())
+
+    assert rig.bridge.answers == [
+        ("request-custom-direct", {"delivery": ["Ship it through the queue."]})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_multiple_direct_question_targets_require_exact_force_reply(rig: Rig) -> None:
+    space = add_active_space(
+        rig,
+        space_id="space-custom-ambiguous",
+        thread_id="thread-custom-ambiguous",
+        root_message_id=530,
+        channel_post_id=130,
+    )
+    rig.security.unlocked.add("space-custom-ambiguous")
+    prompt_ids: list[int] = []
+    for index in (1, 2):
+        request_key = f"request-custom-{index}"
+        questions = [
+            {
+                "id": "choice",
+                "question": f"Choose delivery {index}",
+                "options": [{"label": "Queue"}],
+            }
+        ]
+        rig.store.put_pending_input(
+            request_key,
+            str(7 + index),
+            1,
+            "thread-custom-ambiguous",
+            f"turn-{index}",
+            f"item-{index}",
+            questions,
+            None,
+        )
+        await rig.discussion._begin_question_reply(
+            space,
+            {"request_key": request_key, "question_id": "choice"},
+            clarification=False,
+        )
+        prompt_ids.append(rig.discussion_endpoint.next_message_id - 1)
+
+    ambiguous = update_for_message(
+        "Queue this one.",
+        update_id=151,
+        message_id=71,
+        chat_id=DISCUSSION_CHAT_ID,
+        chat_type=ChatType.SUPERGROUP,
+        message_thread_id=530,
+    )
+    with pytest.raises(ApplicationHandlerStop):
+        await rig.discussion.reply_to_intent(ambiguous, SimpleNamespace())
+    assert rig.bridge.answers == []
+    assert "多个问题" in rig.discussion_endpoint.sent[-1]["markdown"]
+
+    exact = update_for_message(
+        "Queue the first request.",
+        update_id=152,
+        message_id=72,
+        chat_id=DISCUSSION_CHAT_ID,
+        chat_type=ChatType.SUPERGROUP,
+        message_thread_id=530,
+        reply_to_message=SimpleNamespace(
+            message_id=prompt_ids[0],
+            message_thread_id=530,
+            is_automatic_forward=False,
+        ),
+    )
+    with pytest.raises(ApplicationHandlerStop):
+        await rig.discussion.reply_to_intent(exact, SimpleNamespace())
+    assert rig.bridge.answers == [
+        ("request-custom-1", {"choice": ["Queue the first request."]})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_known_commands_keep_precedence_but_unknown_slash_can_answer(rig: Rig) -> None:
+    space = add_active_space(
+        rig,
+        space_id="space-custom-command",
+        thread_id="thread-custom-command",
+        root_message_id=531,
+        channel_post_id=131,
+    )
+    questions = [
+        {
+            "id": "choice",
+            "question": "Choose a value",
+            "options": [{"label": "Queue"}],
+        }
+    ]
+    rig.store.put_pending_input(
+        "request-custom-command",
+        "10",
+        1,
+        "thread-custom-command",
+        "turn-1",
+        "item-1",
+        questions,
+        None,
+    )
+    rig.security.unlocked.add("space-custom-command")
+    await rig.discussion._begin_question_reply(
+        space,
+        {"request_key": "request-custom-command", "question_id": "choice"},
+        clarification=False,
+    )
+
+    known = update_for_message(
+        "/status",
+        update_id=153,
+        message_id=73,
+        chat_id=DISCUSSION_CHAT_ID,
+        chat_type=ChatType.SUPERGROUP,
+        message_thread_id=531,
+    )
+    await rig.discussion.reply_to_intent(known, SimpleNamespace())
+    assert rig.bridge.answers == []
+    assert len(
+        rig.store.live_question_reply_callbacks(
+            OWNER_ID,
+            bot_role=DISCUSSION_ROLE,
+            chat_id=DISCUSSION_CHAT_ID,
+            space_id="space-custom-command",
+            generation=1,
+        )
+    ) == 1
+
+    unknown = update_for_message(
+        "/use-queue",
+        update_id=154,
+        message_id=74,
+        chat_id=DISCUSSION_CHAT_ID,
+        chat_type=ChatType.SUPERGROUP,
+        message_thread_id=531,
+    )
+    with pytest.raises(ApplicationHandlerStop):
+        await rig.discussion.reply_to_intent(unknown, SimpleNamespace())
+    assert rig.bridge.answers == [
+        ("request-custom-command", {"choice": ["/use-queue"]})
     ]
 
 

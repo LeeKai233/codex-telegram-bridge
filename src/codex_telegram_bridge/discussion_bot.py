@@ -43,6 +43,7 @@ from .config import Config
 from .deletions import MessageDeletionManager
 from .files import FileCandidate, PathPolicyError, prepare_inbox_path
 from .markdown import clip, compact_path, escape, inline_code
+from .models import plan_revision_key
 from .rich_text import TelegramHtmlChunk, render_commonmark_chunks
 from .security import SecurityManager
 from .space_coordinator import SessionSpaceCoordinator
@@ -105,6 +106,10 @@ _SESSION_COMMANDS = (
     ("unwatch", "取消关注"),
     ("help", "显示帮助"),
 )
+_KNOWN_COMMANDS = {f"/{command}" for command, _description in _SESSION_COMMANDS} | {
+    "/answer",
+    "/bind",
+}
 
 
 class DiscussionBotController:
@@ -165,15 +170,12 @@ class DiscussionBotController:
             application.add_handler(CommandHandler(command, callback))
         application.add_handler(
             MessageHandler(
-                filters.TEXT
-                & filters.Regex(r"(?i)^/bind(?:@[a-z0-9_]+)?(?:\s|$)"),
+                filters.TEXT & filters.Regex(r"(?i)^/bind(?:@[a-z0-9_]+)?(?:\s|$)"),
                 self._bind_text_fallback,
             )
         )
         application.add_handler(CallbackQueryHandler(self.callback, pattern=r"^cb:"))
-        application.add_handler(
-            MessageHandler(filters.Document.ALL | filters.PHOTO, self.upload), group=1
-        )
+        application.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, self.upload), group=1)
         application.add_error_handler(self.error)
         self.bridge.on_question = self.forward_question
         self.bridge.on_notice = self.forward_notice
@@ -422,15 +424,10 @@ class DiscussionBotController:
                 f"\n安全提示：{escape(self.config.discussion_bot_label)}"
                 f" 仍有额外管理员权限：{extra_rights_text}"
             )
-            plain += (
-                f"\n安全提示：{self.config.discussion_bot_label}"
-                f" 仍有额外管理员权限：{extra_rights_text}"
-            )
+            plain += f"\n安全提示：{self.config.discussion_bot_label} 仍有额外管理员权限：{extra_rights_text}"
         await self._send_unscoped(chat.id, text, plain=plain)
 
-    async def _bind_text_fallback(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE
-    ) -> None:
+    async def _bind_text_fallback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._command_targets_this_bot(update):
             return
         await self.bind(update, context)
@@ -591,11 +588,9 @@ class DiscussionBotController:
             rendered = render_ask_error(ask_id, "等待 Codex 回答超时（180 秒）。")
         except asyncio.CancelledError:
             try:
-                self._schedule_ask_deletion(
-                    int(space["discussion_chat_id"]), waiting_message_id, ask_id
-                )
+                self._schedule_ask_deletion(int(space["discussion_chat_id"]), waiting_message_id, ask_id)
                 await asyncio.shield(self.deletions.flush())
-            except (asyncio.CancelledError, Exception):
+            except asyncio.CancelledError, Exception:
                 LOGGER.warning("Unable to flush cancelled ask message %s", ask_id)
             raise
         except Exception as exc:
@@ -661,9 +656,7 @@ class DiscussionBotController:
                 priority=5,
             )
         except TelegramError:
-            await self.discussion.delete_message(
-                int(space["discussion_chat_id"]), message_id
-            )
+            await self.discussion.delete_message(int(space["discussion_chat_id"]), message_id)
             await self._send_space_html(
                 space,
                 header_html + first.html,
@@ -713,9 +706,7 @@ class DiscussionBotController:
         if prompt:
             await self._send_prompt(space, prompt, "queue")
             return
-        entries = self.store.space_queue_entries(
-            str(space["space_id"]), int(space["generation"])
-        )
+        entries = self.store.space_queue_entries(str(space["space_id"]), int(space["generation"]))
         lines = ["*📥 Queue*"]
         rows: list[list[InlineKeyboardButton]] = []
         if not entries:
@@ -788,8 +779,7 @@ class DiscussionBotController:
         if len(parts) not in {2, 3} or not parts[0] or not parts[1]:
             await self._send_space(
                 space,
-                "用法：`/planmode <model> | <effort> [ | <prompt> ]`；"
-                "全不带参数可进入交互模式。",
+                "用法：`/planmode <model> | <effort> [ | <prompt> ]`；全不带参数可进入交互模式。",
             )
             return
         profile = await self._resolve_profile_or_suggest(
@@ -826,9 +816,7 @@ class DiscussionBotController:
                 "用法：`/changemodel <model> | <effort>`；全不带参数可进入交互模式。",
             )
             return
-        profile = await self._resolve_profile_or_suggest(
-            space, "changemodel", parts[0], parts[1]
-        )
+        profile = await self._resolve_profile_or_suggest(space, "changemodel", parts[0], parts[1])
         if profile is None:
             return
         updated = await self.bridge.change_space_model(
@@ -838,9 +826,7 @@ class DiscussionBotController:
         )
         await self._announce_model_change(updated, profile)
 
-    async def _begin_profile_interaction(
-        self, space: dict[str, Any], kind: str
-    ) -> None:
+    async def _begin_profile_interaction(self, space: dict[str, Any], kind: str) -> None:
         options = await self.bridge.list_model_options()
         if not options:
             raise RuntimeError("Codex 当前没有返回可用模型")
@@ -873,9 +859,7 @@ class DiscussionBotController:
             reply_markup=InlineKeyboardMarkup(rows),
         )
 
-    async def _profile_model_selected(
-        self, space: dict[str, Any], payload: dict[str, Any]
-    ) -> None:
+    async def _profile_model_selected(self, space: dict[str, Any], payload: dict[str, Any]) -> None:
         draft = self._current_draft(payload, phase="select_model")
         model = str(payload.get("model") or "")
         option = next(
@@ -920,9 +904,7 @@ class DiscussionBotController:
             reply_markup=InlineKeyboardMarkup(rows),
         )
 
-    async def _profile_effort_selected(
-        self, space: dict[str, Any], payload: dict[str, Any]
-    ) -> None:
+    async def _profile_effort_selected(self, space: dict[str, Any], payload: dict[str, Any]) -> None:
         draft = self._current_draft(payload, phase="select_effort")
         stored_payload = dict(_value(draft, "payload", {}) or {})
         model = str(payload.get("model") or "")
@@ -951,9 +933,7 @@ class DiscussionBotController:
             return
         await self._advance_to_prompt_wait(draft, profile, space)
 
-    async def _wait_for_plan_prompt(
-        self, space: dict[str, Any], profile: object
-    ) -> None:
+    async def _wait_for_plan_prompt(self, space: dict[str, Any], profile: object) -> None:
         draft = self._replace_interaction(
             space,
             kind="planmode",
@@ -966,9 +946,7 @@ class DiscussionBotController:
         )
         await self._send_plan_prompt_request(space, draft)
 
-    async def _advance_to_prompt_wait(
-        self, draft: object, profile: object, space: dict[str, Any]
-    ) -> None:
+    async def _advance_to_prompt_wait(self, draft: object, profile: object, space: dict[str, Any]) -> None:
         advanced = self.store.advance_interaction(
             str(_value(draft, "scope_key")),
             str(_value(draft, "flow_id")),
@@ -1000,19 +978,14 @@ class DiscussionBotController:
         self._schedule_interaction_timeout(advanced)
         await self._send_plan_prompt_request(space, advanced)
 
-    async def _send_plan_prompt_request(
-        self, space: dict[str, Any], draft: object
-    ) -> None:
+    async def _send_plan_prompt_request(self, space: dict[str, Any], draft: object) -> None:
         del draft
         await self._send_space(
             space,
-            "请在 30 秒内发送进入 Plan Mode 后的第一条 prompt。"
-            "超时将取消本次模式切换。",
+            "请在 30 秒内发送进入 Plan Mode 后的第一条 prompt。超时将取消本次模式切换。",
         )
 
-    async def _consume_plan_prompt(
-        self, space: dict[str, Any], draft: object, prompt: str
-    ) -> bool:
+    async def _consume_plan_prompt(self, space: dict[str, Any], draft: object, prompt: str) -> bool:
         now = int(time.time())
         if int(_value(draft, "expires_at", 0)) <= now:
             return False
@@ -1032,9 +1005,7 @@ class DiscussionBotController:
         await self._start_plan_mode(space, prompt, profile)
         return True
 
-    async def _start_plan_mode(
-        self, space: dict[str, Any], prompt: str, profile: object
-    ) -> None:
+    async def _start_plan_mode(self, space: dict[str, Any], prompt: str, profile: object) -> None:
         await self._ensure_plan_ready(space)
         turn = await self.bridge.start_space_collaboration_turn(
             str(space["space_id"]),
@@ -1076,9 +1047,7 @@ class DiscussionBotController:
         try:
             return await self.bridge.resolve_model_profile(model, effort)
         except ValueError:
-            suggestion = await self._profile_suggestion(
-                command, model, effort, prompt=prompt
-            )
+            suggestion = await self._profile_suggestion(command, model, effort, prompt=prompt)
             await self._send_space(
                 space,
                 f"模型或 effort 无效。你可能想发送：{inline_code(suggestion)}",
@@ -1112,9 +1081,7 @@ class DiscussionBotController:
         if not selected_effort and efforts:
             effort_match = difflib.get_close_matches(effort, efforts, n=1, cutoff=0.25)
             selected_effort = (
-                effort_match[0]
-                if effort_match
-                else str(_value(option, "default_effort") or efforts[0])
+                effort_match[0] if effort_match else str(_value(option, "default_effort") or efforts[0])
             )
         suggestion = f"/{command} {selected_model} | {selected_effort or '<effort>'}"
         if command == "planmode" and prompt:
@@ -1233,15 +1200,11 @@ class DiscussionBotController:
         if task is not None and task is not asyncio.current_task():
             task.cancel()
 
-    def _interaction_timeout_done(
-        self, scope_key: str, task: asyncio.Task[Any]
-    ) -> None:
+    def _interaction_timeout_done(self, scope_key: str, task: asyncio.Task[Any]) -> None:
         if self._interaction_tasks.get(scope_key) is task:
             self._interaction_tasks.pop(scope_key, None)
 
-    async def _expire_interaction(
-        self, scope_key: str, flow_id: str, revision: int, expires_at: int
-    ) -> None:
+    async def _expire_interaction(self, scope_key: str, flow_id: str, revision: int, expires_at: int) -> None:
         await asyncio.sleep(max(0, expires_at - int(time.time())))
         draft = self.store.get_interaction(scope_key)
         if (
@@ -1264,9 +1227,7 @@ class DiscussionBotController:
             or space.get("lifecycle") == "closed"
         ):
             return
-        if str(_value(claimed, "kind")) == "planmode" and str(
-            _value(claimed, "phase")
-        ) == "await_prompt":
+        if str(_value(claimed, "kind")) == "planmode" and str(_value(claimed, "phase")) == "await_prompt":
             message = "30 秒内未收到 prompt，本次 Plan Mode 切换已取消。"
         else:
             message = "模型选择交互已过期，请重新执行命令。"
@@ -1444,9 +1405,11 @@ class DiscussionBotController:
         if not query or not user or not chat:
             return
         data = str(query.data or "")
-        pending = self.store.peek_callback(
-            data[3:], user.id, bot_role=DISCUSSION_ROLE, chat_id=chat.id
-        ) if data.startswith("cb:") else None
+        pending = (
+            self.store.peek_callback(data[3:], user.id, bot_role=DISCUSSION_ROLE, chat_id=chat.id)
+            if data.startswith("cb:")
+            else None
+        )
         if not pending:
             await self.discussion.answer_callback(
                 query, "按钮已使用或过期，请重新执行命令。", show_alert=True
@@ -1474,6 +1437,7 @@ class DiscussionBotController:
             try:
                 self._ensure_latest_plan(space, payload)
                 await self._ensure_plan_ready(space)
+                self._ensure_latest_plan(space, payload)
             except RuntimeError as exc:
                 await self.discussion.answer_callback(query, str(exc), show_alert=True)
                 return
@@ -1495,9 +1459,7 @@ class DiscussionBotController:
         try:
             await self._dispatch_callback(action, payload, space)
         except (KeyError, ValueError, RuntimeError, OSError, TelegramError, PathPolicyError) as exc:
-            latest = self.store.latest_plan_publication(
-                str(space["space_id"]), int(space["generation"])
-            )
+            latest = self.store.latest_plan_publication(str(space["space_id"]), int(space["generation"]))
             if (
                 action in {"plan_execute", "plan_continue"}
                 and latest is not None
@@ -1507,9 +1469,7 @@ class DiscussionBotController:
             else:
                 await self._send_space(space, escape(str(exc)))
 
-    async def _dispatch_callback(
-        self, action: str, payload: dict[str, Any], space: dict[str, Any]
-    ) -> None:
+    async def _dispatch_callback(self, action: str, payload: dict[str, Any], space: dict[str, Any]) -> None:
         if action == "space_refresh":
             if space.get("thread_id"):
                 await self.bridge.refresh(str(space["thread_id"]))
@@ -1629,11 +1589,7 @@ class DiscussionBotController:
         text: str,
     ) -> None:
         space = self.store.get_space_by_thread(thread_id)
-        if (
-            not space
-            or space.get("lifecycle") != "active"
-            or str(space.get("thread_id") or "") != thread_id
-        ):
+        if not space or space.get("lifecycle") != "active" or str(space.get("thread_id") or "") != thread_id:
             LOGGER.info(
                 "event=plan_publish_skipped reason=no_active_space thread_id=%s item_id=%s",
                 thread_id[:8],
@@ -1642,10 +1598,12 @@ class DiscussionBotController:
             return
         space_id = str(space["space_id"])
         generation = int(space["generation"])
+        revision_key = plan_revision_key(turn_id, text)
         if not self.store.claim_plan_publication(
             space_id=space_id,
             generation=generation,
             item_id=item_id,
+            revision_key=revision_key,
             thread_id=thread_id,
             turn_id=turn_id,
         ):
@@ -1659,7 +1617,13 @@ class DiscussionBotController:
         chunks = render_commonmark_chunks(text, limit=3500)
         if not chunks:
             chunks = [TelegramHtmlChunk(html="<i>Plan 内容为空。</i>", plain="Plan 内容为空。")]
-        rows = self._plan_action_markup(space, item_id, thread_id, turn_id)
+        rows = self._plan_action_markup(
+            space,
+            item_id,
+            revision_key,
+            thread_id,
+            turn_id,
+        )
         message_ids: list[int] = []
         try:
             for index, chunk in enumerate(chunks):
@@ -1678,6 +1642,7 @@ class DiscussionBotController:
                 space_id=space_id,
                 generation=generation,
                 item_id=item_id,
+                revision_key=revision_key,
                 status="failed",
                 message_ids=message_ids,
             )
@@ -1686,6 +1651,7 @@ class DiscussionBotController:
             space_id=space_id,
             generation=generation,
             item_id=item_id,
+            revision_key=revision_key,
             status="published",
             message_ids=message_ids,
         )
@@ -1700,10 +1666,16 @@ class DiscussionBotController:
         self,
         space: dict[str, Any],
         item_id: str,
+        revision_key: str,
         thread_id: str,
         turn_id: str,
     ) -> InlineKeyboardMarkup:
-        payload = {"item_id": item_id, "thread_id": thread_id, "turn_id": turn_id}
+        payload = {
+            "item_id": item_id,
+            "revision_key": revision_key,
+            "thread_id": thread_id,
+            "turn_id": turn_id,
+        }
         return InlineKeyboardMarkup(
             [
                 [
@@ -1766,12 +1738,11 @@ class DiscussionBotController:
         *,
         allowed_statuses: set[str] | None = None,
     ) -> dict[str, Any]:
-        latest = self.store.latest_plan_publication(
-            str(space["space_id"]), int(space["generation"])
-        )
+        latest = self.store.latest_plan_publication(str(space["space_id"]), int(space["generation"]))
         if (
             latest is None
             or str(latest["item_id"]) != str(payload.get("item_id") or "")
+            or str(latest.get("revision_key") or "") != str(payload.get("revision_key") or "")
             or str(latest["thread_id"]) != str(space.get("thread_id") or "")
             or str(payload.get("thread_id") or "") != str(space.get("thread_id") or "")
         ):
@@ -1781,9 +1752,7 @@ class DiscussionBotController:
             raise RuntimeError("该 Plan 操作已处理或已过期")
         return latest
 
-    async def _execute_plan(
-        self, space: dict[str, Any], payload: dict[str, Any]
-    ) -> None:
+    async def _execute_plan(self, space: dict[str, Any], payload: dict[str, Any]) -> None:
         latest = self._ensure_latest_plan(space, payload)
         await self._ensure_plan_ready(space)
         profile = await self._profile_for_mode(space, "default")
@@ -1792,6 +1761,7 @@ class DiscussionBotController:
             str(space["space_id"]),
             int(space["generation"]),
             str(latest["item_id"]),
+            revision_key=str(latest.get("revision_key") or ""),
             status="executing",
         ):
             raise RuntimeError("该 Plan 操作已处理或已过期")
@@ -1811,6 +1781,7 @@ class DiscussionBotController:
                 str(space["space_id"]),
                 int(space["generation"]),
                 str(latest["item_id"]),
+                str(latest.get("revision_key") or ""),
                 client_message_id,
             )
             if status == "delivered":
@@ -1818,6 +1789,7 @@ class DiscussionBotController:
                     str(space["space_id"]),
                     int(space["generation"]),
                     str(latest["item_id"]),
+                    revision_key=str(latest.get("revision_key") or ""),
                     expected_status="executing",
                     status="executed",
                 )
@@ -1832,6 +1804,7 @@ class DiscussionBotController:
                     str(space["space_id"]),
                     int(space["generation"]),
                     str(latest["item_id"]),
+                    revision_key=str(latest.get("revision_key") or ""),
                     expected_status="executing",
                 )
                 await self._send_plan_action_retry(
@@ -1850,6 +1823,7 @@ class DiscussionBotController:
             str(space["space_id"]),
             int(space["generation"]),
             str(latest["item_id"]),
+            revision_key=str(latest.get("revision_key") or ""),
             expected_status="executing",
             status="executed",
         ):
@@ -1861,26 +1835,20 @@ class DiscussionBotController:
         )
 
     @staticmethod
-    def _plan_client_message_id(
-        space: dict[str, Any], publication: Mapping[str, Any]
-    ) -> str:
+    def _plan_client_message_id(space: dict[str, Any], publication: Mapping[str, Any]) -> str:
         return (
             f"telegram-plan-execute-{space['space_id']}-{space['generation']}-"
-            f"{publication['item_id']}"
+            f"{publication['item_id']}-{publication.get('revision_key') or 'legacy'}"
         )
 
     @staticmethod
-    def _plan_revision_client_message_id(
-        space: Mapping[str, Any], publication: Mapping[str, Any]
-    ) -> str:
+    def _plan_revision_client_message_id(space: Mapping[str, Any], publication: Mapping[str, Any]) -> str:
         return (
             f"telegram-plan-revise-{space['space_id']}-{space['generation']}-"
-            f"{publication['item_id']}"
+            f"{publication['item_id']}-{publication.get('revision_key') or 'legacy'}"
         )
 
-    async def _profile_for_mode(
-        self, space: Mapping[str, Any], mode: str
-    ) -> object | None:
+    async def _profile_for_mode(self, space: Mapping[str, Any], mode: str) -> object | None:
         prefix = "plan" if mode == "plan" else "normal"
         model = str(space.get(f"{prefix}_model") or "")
         effort = str(space.get(f"{prefix}_effort") or "")
@@ -1922,6 +1890,7 @@ class DiscussionBotController:
             reply_markup=self._plan_action_markup(
                 space,
                 str(publication["item_id"]),
+                str(publication.get("revision_key") or ""),
                 str(publication["thread_id"]),
                 str(publication["turn_id"]),
             ),
@@ -1946,15 +1915,14 @@ class DiscussionBotController:
                 client_message_id = self._plan_client_message_id(space, publication)
                 terminal_status = "executed"
             else:
-                client_message_id = self._plan_revision_client_message_id(
-                    space, publication
-                )
+                client_message_id = self._plan_revision_client_message_id(space, publication)
                 terminal_status = "revision_started"
             try:
                 status = await reconcile(
                     str(space["space_id"]),
                     int(space["generation"]),
                     str(publication["item_id"]),
+                    str(publication.get("revision_key") or ""),
                     client_message_id,
                 )
             except Exception:
@@ -1969,6 +1937,7 @@ class DiscussionBotController:
                     str(space["space_id"]),
                     int(space["generation"]),
                     str(publication["item_id"]),
+                    revision_key=str(publication.get("revision_key") or ""),
                     expected_status=action_status,
                     status=terminal_status,
                 )
@@ -1978,6 +1947,7 @@ class DiscussionBotController:
                     str(space["space_id"]),
                     int(space["generation"]),
                     str(publication["item_id"]),
+                    revision_key=str(publication.get("revision_key") or ""),
                     expected_status=action_status,
                 )
                 if released:
@@ -1993,9 +1963,7 @@ class DiscussionBotController:
                 priority=5,
             )
 
-    async def _begin_plan_revision(
-        self, space: dict[str, Any], payload: dict[str, Any]
-    ) -> None:
+    async def _begin_plan_revision(self, space: dict[str, Any], payload: dict[str, Any]) -> None:
         latest = self._ensure_latest_plan(space, payload)
         await self._profile_for_mode(space, "plan")
         owner = self.store.get_owner()
@@ -2005,6 +1973,7 @@ class DiscussionBotController:
             str(space["space_id"]),
             int(space["generation"]),
             str(latest["item_id"]),
+            revision_key=str(latest.get("revision_key") or ""),
             status="revising",
         ):
             raise RuntimeError("该 Plan 操作已处理或已过期")
@@ -2018,14 +1987,13 @@ class DiscussionBotController:
                 ),
                 priority=5,
             )
-            nonce = self._reply_nonce(
-                int(space["discussion_chat_id"]), int(prompt.message_id)
-            )
+            nonce = self._reply_nonce(int(space["discussion_chat_id"]), int(prompt.message_id))
             self.store.put_callback(
                 nonce,
                 "reply_plan_revision",
                 {
                     "item_id": str(latest["item_id"]),
+                    "revision_key": str(latest.get("revision_key") or ""),
                     "thread_id": str(latest["thread_id"]),
                     "turn_id": str(latest["turn_id"]),
                 },
@@ -2041,6 +2009,7 @@ class DiscussionBotController:
                 str(space["space_id"]),
                 int(space["generation"]),
                 str(latest["item_id"]),
+                revision_key=str(latest.get("revision_key") or ""),
                 expected_status="revising",
             )
             await self._send_plan_action_retry(
@@ -2079,9 +2048,7 @@ class DiscussionBotController:
             return
         await self._present_question(space, request_key, 0)
 
-    async def _present_question(
-        self, space: dict[str, Any], request_key: str, index: int
-    ) -> None:
+    async def _present_question(self, space: dict[str, Any], request_key: str, index: int) -> None:
         stored = self.store.get_pending_input(request_key)
         if not stored:
             return
@@ -2181,17 +2148,13 @@ class DiscussionBotController:
         question_text = clip(question.get("question") or "当前问题", 320)
         if clarification:
             markdown = (
-                f"{mention} 请回复这条消息，输入你要向 Codex 反问的内容。\n"
-                f"原问题：{escape(question_text)}"
+                f"{mention} 请回复这条消息，输入你要向 Codex 反问的内容。\n原问题：{escape(question_text)}"
             )
             plain = f"{label} 请回复这条消息，输入你要向 Codex 反问的内容。\n原问题：{question_text}"
             placeholder = "输入要向 Codex 反问的问题"
             action = "reply_question_clarify"
         else:
-            markdown = (
-                f"{mention} 请回复这条消息，输入你的自定义回答。\n"
-                f"问题：{escape(question_text)}"
-            )
+            markdown = f"{mention} 请回复这条消息，输入你的自定义回答。\n问题：{escape(question_text)}"
             plain = f"{label} 请回复这条消息，输入你的自定义回答。\n问题：{question_text}"
             placeholder = "输入自定义回答"
             action = "reply_question_custom"
@@ -2222,8 +2185,7 @@ class DiscussionBotController:
                         "question_id": question_id,
                     },
                     owner.user_id,
-                    int(time.time())
-                    + max(self.config.callback_seconds, self.config.totp_unlock_seconds),
+                    int(time.time()) + max(self.config.callback_seconds, self.config.totp_unlock_seconds),
                     bot_role=DISCUSSION_ROLE,
                     chat_id=int(space["discussion_chat_id"]),
                     space_id=str(space["space_id"]),
@@ -2240,6 +2202,85 @@ class DiscussionBotController:
         if resolved:
             await self._delete_question_message(space, request_key, prompt_message_id)
 
+    async def _consume_direct_question_reply(
+        self,
+        update: Update,
+        space: dict[str, Any],
+        user_id: int,
+        answer: str,
+    ) -> bool:
+        message = update.effective_message
+        if message is None or not answer:
+            return False
+        callbacks = self.store.live_question_reply_callbacks(
+            user_id,
+            bot_role=DISCUSSION_ROLE,
+            chat_id=int(message.chat_id),
+            space_id=str(space["space_id"]),
+            generation=int(space["generation"]),
+        )
+        candidates: list[dict[str, Any]] = []
+        for callback in callbacks:
+            payload = callback["payload"]
+            try:
+                self._pending_question(
+                    space,
+                    str(payload["request_key"]),
+                    str(payload["question_id"]),
+                )
+            except KeyError, RuntimeError:
+                continue
+            candidates.append(callback)
+        if not candidates:
+            return False
+        if len(candidates) > 1:
+            await self._send_space(
+                space,
+                "当前有多个问题等待文字输入，请回复对应的 Bot 提示消息以明确目标。",
+            )
+            return True
+        if space.get("lifecycle") != "active" or not space.get("thread_id"):
+            await self._send_space(space, "当前 Session 尚未激活。")
+            return True
+        try:
+            self._ensure_unlocked(space)
+        except RuntimeError as exc:
+            await self._send_space(space, escape(str(exc)))
+            return True
+        constraints = {
+            "bot_role": DISCUSSION_ROLE,
+            "chat_id": int(message.chat_id),
+            "space_id": str(space["space_id"]),
+            "generation": int(space["generation"]),
+        }
+        selected = candidates[0]
+        consumed = self.store.consume_callback(str(selected["nonce"]), user_id, **constraints)
+        if consumed is None:
+            await self._send_space(space, "这条回复请求已使用或过期。")
+            return True
+        action, payload = consumed
+        try:
+            if action == "reply_question_custom":
+                await self._record_question_answer(
+                    space,
+                    {**payload, "answer": answer},
+                )
+            else:
+                self._pending_question(
+                    space,
+                    str(payload["request_key"]),
+                    str(payload["question_id"]),
+                )
+                await self._launch_ask(
+                    space,
+                    answer,
+                    clarification=True,
+                    update=update,
+                )
+        except RuntimeError as exc:
+            await self._send_space(space, escape(str(exc)))
+        return True
+
     async def reply_to_intent(
         self,
         update: Update,
@@ -2254,7 +2295,10 @@ class DiscussionBotController:
         if not space:
             return
         text = (message.text or "").strip()
-        if text and not text.startswith("/"):
+        if command_name(update) in _KNOWN_COMMANDS:
+            return
+        reply = message.reply_to_message
+        if text and not text.startswith("/") and reply is None:
             scope_key = self._interaction_scope(space, user.id)
             get_interaction = getattr(self.store, "get_interaction", None)
             draft = get_interaction(scope_key) if get_interaction is not None else None
@@ -2275,8 +2319,9 @@ class DiscussionBotController:
                     raise ApplicationHandlerStop from None
                 if consumed:
                     raise ApplicationHandlerStop
-        reply = message.reply_to_message
         if not reply:
+            if await self._consume_direct_question_reply(update, space, user.id, text):
+                raise ApplicationHandlerStop
             return
         nonce = self._reply_nonce(int(message.chat_id), int(reply.message_id))
         constraints = {
@@ -2312,6 +2357,11 @@ class DiscussionBotController:
                     allowed_statuses={"revising"},
                 )
                 await self._ensure_plan_ready(space)
+                self._ensure_latest_plan(
+                    space,
+                    pending[1],
+                    allowed_statuses={"revising"},
+                )
             except RuntimeError as exc:
                 await self._send_space(space, escape(str(exc)))
                 raise ApplicationHandlerStop from None
@@ -2345,9 +2395,7 @@ class DiscussionBotController:
                     allowed_statuses={"revising"},
                 )
                 await self._ensure_plan_ready(space)
-                client_message_id = self._plan_revision_client_message_id(
-                    space, publication
-                )
+                client_message_id = self._plan_revision_client_message_id(space, publication)
                 try:
                     turn = await self._start_profiled_turn(
                         space,
@@ -2366,6 +2414,7 @@ class DiscussionBotController:
                             str(space["space_id"]),
                             int(space["generation"]),
                             str(publication["item_id"]),
+                            str(publication.get("revision_key") or ""),
                             client_message_id,
                         )
                         if reconcile is not None
@@ -2376,6 +2425,7 @@ class DiscussionBotController:
                             str(space["space_id"]),
                             int(space["generation"]),
                             str(publication["item_id"]),
+                            revision_key=str(publication.get("revision_key") or ""),
                             expected_status="revising",
                             status="revision_started",
                         )
@@ -2390,6 +2440,7 @@ class DiscussionBotController:
                             str(space["space_id"]),
                             int(space["generation"]),
                             str(publication["item_id"]),
+                            revision_key=str(publication.get("revision_key") or ""),
                             expected_status="revising",
                         )
                         await self._send_plan_action_retry(
@@ -2408,6 +2459,7 @@ class DiscussionBotController:
                     str(space["space_id"]),
                     int(space["generation"]),
                     str(publication["item_id"]),
+                    revision_key=str(publication.get("revision_key") or ""),
                     expected_status="revising",
                     status="revision_started",
                 ):
@@ -2419,14 +2471,13 @@ class DiscussionBotController:
                 )
         except RuntimeError as exc:
             if action == "reply_plan_revision":
-                latest = self.store.latest_plan_publication(
-                    str(space["space_id"]), int(space["generation"])
-                )
+                latest = self.store.latest_plan_publication(str(space["space_id"]), int(space["generation"]))
                 if latest is not None and str(latest.get("status") or "") == "revising":
                     self.store.release_plan_action(
                         str(space["space_id"]),
                         int(space["generation"]),
                         str(latest["item_id"]),
+                        revision_key=str(latest.get("revision_key") or ""),
                         expected_status="revising",
                     )
                     await self._send_plan_action_retry(space, latest, str(exc))
@@ -2471,9 +2522,7 @@ class DiscussionBotController:
             },
         )
 
-    async def _record_question_answer(
-        self, space: dict[str, Any], payload: dict[str, Any]
-    ) -> None:
+    async def _record_question_answer(self, space: dict[str, Any], payload: dict[str, Any]) -> None:
         request_key = str(payload["request_key"])
         question_id = str(payload["question_id"])
         answer = str(payload["answer"])
@@ -2481,10 +2530,7 @@ class DiscussionBotController:
         if not stored or str(stored["thread_id"]) != str(space["thread_id"]):
             raise RuntimeError("该问题已过期或不属于当前 Session")
         questions = stored["questions"]
-        known = [
-            str(value.get("id") or f"question-{index + 1}")
-            for index, value in enumerate(questions)
-        ]
+        known = [str(value.get("id") or f"question-{index + 1}") for index, value in enumerate(questions)]
         if question_id not in known:
             raise RuntimeError("问题 ID 不匹配")
         values = self._question_answers.setdefault(request_key, {})
@@ -2522,8 +2568,7 @@ class DiscussionBotController:
                 (
                     message
                     for message in messages
-                    if message["bot_role"] == DISCUSSION_ROLE
-                    and message["message_kind"] == "summary_anchor"
+                    if message["bot_role"] == DISCUSSION_ROLE and message["message_kind"] == "summary_anchor"
                 ),
                 None,
             )
@@ -2756,8 +2801,7 @@ class DiscussionBotController:
             action,
             context,
             owner.user_id if owner else 0,
-            int(time.time())
-            + (self.config.callback_seconds if ttl_seconds is None else max(1, ttl_seconds)),
+            int(time.time()) + (self.config.callback_seconds if ttl_seconds is None else max(1, ttl_seconds)),
             bot_role=DISCUSSION_ROLE,
             chat_id=int(space["discussion_chat_id"]),
             space_id=str(space["space_id"]),

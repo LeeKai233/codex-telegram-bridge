@@ -9,7 +9,12 @@ from pathlib import Path
 
 import pytest
 
-from codex_telegram_bridge.models import Owner, SessionSpace, ThreadState
+from codex_telegram_bridge.models import (
+    Owner,
+    SessionSpace,
+    ThreadState,
+    plan_revision_key,
+)
 from codex_telegram_bridge.store import SCHEMA_VERSION, Store
 
 
@@ -273,6 +278,114 @@ def test_v4_migration_adds_interaction_state_tables_and_preserves_messages(
             "prompt_runs",
             "plan_publications",
         } <= tables
+    finally:
+        store.close()
+
+
+def test_v6_plan_publications_migrate_and_accept_same_item_new_revision(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE plan_publications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            space_id TEXT NOT NULL,
+            generation INTEGER NOT NULL,
+            item_id TEXT NOT NULL,
+            thread_id TEXT NOT NULL,
+            turn_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            message_ids_json TEXT NOT NULL DEFAULT '[]',
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            UNIQUE(space_id, generation, item_id)
+        );
+        CREATE INDEX idx_plan_publications_latest
+            ON plan_publications(space_id, generation, id DESC);
+        INSERT INTO plan_publications(
+            space_id, generation, item_id, thread_id, turn_id, status,
+            message_ids_json, created_at, updated_at
+        ) VALUES('space-1', 2, 'item-1', 'thread-1', 'turn-1', 'published', '[41]', 1, 1);
+        PRAGMA user_version=6;
+        """
+    )
+    connection.close()
+
+    store = Store(path)
+    try:
+        assert store.schema_version == SCHEMA_VERSION
+        assert store.last_backup_path is not None
+        migrated = store.latest_plan_publication("space-1", 2)
+        assert migrated is not None
+        assert migrated["revision_key"] == ""
+        revision = plan_revision_key("turn-1", "Updated plan")
+        assert store.claim_plan_publication(
+            space_id="space-1",
+            generation=2,
+            item_id="item-1",
+            revision_key=revision,
+            thread_id="thread-1",
+            turn_id="turn-1",
+        )
+        latest = store.latest_plan_publication("space-1", 2)
+        assert latest is not None and latest["revision_key"] == revision
+        old_status = store._connection.execute(
+            "SELECT status FROM plan_publications WHERE revision_key=''"
+        ).fetchone()
+        assert old_status is not None and old_status[0] == "superseded"
+    finally:
+        store.close()
+
+
+def test_plan_publication_revision_key_deduplicates_events_but_allows_updates(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    try:
+        common = {
+            "space_id": "space-1",
+            "generation": 1,
+            "item_id": "item-plan",
+            "thread_id": "thread-1",
+            "turn_id": "turn-1",
+        }
+        first = plan_revision_key("turn-1", "First plan")
+        second = plan_revision_key("turn-1", "Second plan")
+        assert store.claim_plan_publication(**common, revision_key=first)
+        assert store.finish_plan_publication(
+            space_id="space-1",
+            generation=1,
+            item_id="item-plan",
+            revision_key=first,
+            status="published",
+            message_ids=[41],
+        )
+        assert not store.claim_plan_publication(**common, revision_key=first)
+        assert store.claim_plan_publication(**common, revision_key=second)
+        assert store.finish_plan_publication(
+            space_id="space-1",
+            generation=1,
+            item_id="item-plan",
+            revision_key=second,
+            status="published",
+            message_ids=[42],
+        )
+        assert not store.mark_plan_action(
+            "space-1",
+            1,
+            "item-plan",
+            revision_key=first,
+            status="executing",
+        )
+        assert store.mark_plan_action(
+            "space-1",
+            1,
+            "item-plan",
+            revision_key=second,
+            status="executing",
+        )
     finally:
         store.close()
 

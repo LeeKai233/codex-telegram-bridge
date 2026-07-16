@@ -69,25 +69,21 @@ class SessionSpaceCoordinator:
             self._reconcile_wakeup.clear()
             await self.reconcile()
             with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(
-                    self._reconcile_wakeup.wait(), timeout=self._reconcile_seconds
-                )
+                await asyncio.wait_for(self._reconcile_wakeup.wait(), timeout=self._reconcile_seconds)
 
     async def reconcile(self) -> None:
         for space in self.store.list_spaces():
             if space.get("lifecycle") == "closed":
                 continue
             try:
-                missing_channel_post = (
-                    space.get("lifecycle") == "repair_required"
-                    and not space.get("channel_post_id")
+                missing_channel_post = space.get("lifecycle") == "repair_required" and not space.get(
+                    "channel_post_id"
                 )
                 missing_status_with_root = (
                     not space.get("status_message_id") and self._discussion_root(space) is not None
                 )
-                bound_status_needs_repair = (
-                    space.get("lifecycle") == "repair_required"
-                    and bool(space.get("status_message_id"))
+                bound_status_needs_repair = space.get("lifecycle") == "repair_required" and bool(
+                    space.get("status_message_id")
                 )
                 if missing_channel_post:
                     await self._provision_channel_post(str(space["space_id"]))
@@ -100,15 +96,18 @@ class SessionSpaceCoordinator:
 
     async def _repair_bound_status(self, space: dict[str, Any]) -> dict[str, Any]:
         lifecycle = "pending" if space.get("space_type") == "pending_new" else "active"
-        space = self.store.update_space(
-            str(space["space_id"]),
-            {
-                "lifecycle": lifecycle,
-                "last_error": "",
-                **self._clear_provisioning(),
-            },
-            expected_generation=int(space["generation"]),
-        ) or space
+        space = (
+            self.store.update_space(
+                str(space["space_id"]),
+                {
+                    "lifecycle": lifecycle,
+                    "last_error": "",
+                    **self._clear_provisioning(),
+                },
+                expected_generation=int(space["generation"]),
+            )
+            or space
+        )
         await self.dashboards.schedule_space(str(space["space_id"]), immediate=True)
         return space
 
@@ -136,27 +135,31 @@ class SessionSpaceCoordinator:
         existing = self.store.get_space_by_thread(thread_id)
         if existing and existing.get("lifecycle") in {"pending", "active", "repair_required"}:
             await self.bridge.subscribe_space_thread(thread_id)
-            if existing.get("lifecycle") == "repair_required" and not existing.get(
-                "channel_post_id"
-            ):
+            if existing.get("lifecycle") == "repair_required" and not existing.get("channel_post_id"):
                 self.request_reconcile()
             return existing
         state = await self.bridge.subscribe_space_thread(thread_id)
+        value = {
+            "space_id": uuid.uuid4().hex,
+            "space_type": "existing",
+            "lifecycle": "pending",
+            "thread_id": thread_id,
+            "title": state.title,
+            "pending_cwd": state.cwd,
+            "normal_model": state.model,
+            "normal_effort": state.reasoning_effort,
+            "plan_model": state.model,
+            "plan_effort": state.reasoning_effort,
+            "current_mode": "default",
+        }
         return await self._create_space(
-            {
-                "space_id": uuid.uuid4().hex,
-                "space_type": "existing",
-                "lifecycle": "pending",
-                "thread_id": thread_id,
-                "title": state.title,
-                "pending_cwd": state.cwd,
-                "normal_model": state.model,
-                "normal_effort": state.reasoning_effort,
-                "plan_model": state.model,
-                "plan_effort": state.reasoning_effort,
-                "current_mode": "default",
-            },
-            render_channel_post(state, lifecycle="active"),
+            value,
+            render_channel_post(
+                state,
+                space=value,
+                lifecycle="active",
+                animation_frame=0,
+            ),
         )
 
     async def create_pending(
@@ -267,7 +270,12 @@ class SessionSpaceCoordinator:
                         rendered = render_pending_space(space)
                     else:
                         state = await self.bridge.subscribe_space_thread(str(space["thread_id"]))
-                        rendered = render_channel_post(state, lifecycle="active")
+                        rendered = render_channel_post(
+                            state,
+                            space=space,
+                            lifecycle="active",
+                            animation_frame=0,
+                        )
                 message = await self.control.send_text(
                     int(space["channel_chat_id"]),
                     rendered.markdown,
@@ -290,18 +298,22 @@ class SessionSpaceCoordinator:
                 # manufacture a replacement message ID during reconciliation.
                 LOGGER.error("Channel post was accepted but SessionSpace %s could not be bound", space_id)
                 return self.store.get_space(space_id) or space
-            space = self.store.update_space(
-                space_id,
-                {
-                    "lifecycle": "pending",
-                    "last_error": "",
-                    **self._clear_provisioning(),
-                },
-                expected_generation=int(bound["generation"]),
-            ) or bound
-            root_exists = self.store.get_discussion_root(
-                int(space["channel_chat_id"]), int(space["channel_post_id"])
-            ) is not None
+            space = (
+                self.store.update_space(
+                    space_id,
+                    {
+                        "lifecycle": "pending",
+                        "last_error": "",
+                        **self._clear_provisioning(),
+                    },
+                    expected_generation=int(bound["generation"]),
+                )
+                or bound
+            )
+            root_exists = (
+                self.store.get_discussion_root(int(space["channel_chat_id"]), int(space["channel_post_id"]))
+                is not None
+            )
 
         if root_exists:
             await self.provision_status(space_id)
@@ -356,9 +368,7 @@ class SessionSpaceCoordinator:
                     rendered = render_pending_space(space)
                 else:
                     state = await self.bridge.subscribe_space_thread(str(space["thread_id"]))
-                    rendered = render_status_comment(
-                        state, space={**space, "lifecycle": "active"}
-                    )
+                    rendered = render_status_comment(state, space={**space, "lifecycle": "active"})
                 message = await self.discussion.send_text(
                     int(root["discussion_chat_id"]),
                     rendered.markdown,
@@ -368,26 +378,32 @@ class SessionSpaceCoordinator:
             except Exception as exc:
                 self._record_provision_failure(space, "status_comment", exc)
                 raise
-            space = self.store.bind_space_messages(
-                space_id,
-                channel_chat_id=int(space["channel_chat_id"]),
-                channel_post_id=int(space["channel_post_id"]),
-                discussion_chat_id=int(root["discussion_chat_id"]),
-                discussion_root_id=int(root["root_message_id"]),
-                status_message_id=int(message.message_id),
-                expected_generation=int(space["generation"]),
-            ) or space
+            space = (
+                self.store.bind_space_messages(
+                    space_id,
+                    channel_chat_id=int(space["channel_chat_id"]),
+                    channel_post_id=int(space["channel_post_id"]),
+                    discussion_chat_id=int(root["discussion_chat_id"]),
+                    discussion_root_id=int(root["root_message_id"]),
+                    status_message_id=int(message.message_id),
+                    expected_generation=int(space["generation"]),
+                )
+                or space
+            )
             # The same sendMessage crash gap applies here: Telegram cannot deduplicate a
             # status comment accepted before status_message_id reaches SQLite.
-            space = self.store.update_space(
-                space_id,
-                {
-                    "lifecycle": lifecycle,
-                    "last_error": "",
-                    **self._clear_provisioning(),
-                },
-                expected_generation=int(space["generation"]),
-            ) or space
+            space = (
+                self.store.update_space(
+                    space_id,
+                    {
+                        "lifecycle": lifecycle,
+                        "last_error": "",
+                        **self._clear_provisioning(),
+                    },
+                    expected_generation=int(space["generation"]),
+                )
+                or space
+            )
             self.store.record_discussion_message(
                 int(root["discussion_chat_id"]),
                 int(root["root_message_id"]),

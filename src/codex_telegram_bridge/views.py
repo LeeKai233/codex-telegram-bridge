@@ -16,6 +16,7 @@ CHANNEL_POST_BUDGET = 1000
 STATUS_COMMENT_BUDGET = 3900
 SHORT_MESSAGE_BUDGET = 2000
 SESSION_PAGE_SIZE = 5
+ANIMATION_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 
 _DETAIL_LABELS = ("①", "②", "③", "④", "⑤")
 
@@ -360,11 +361,13 @@ def render_sessions_page(
 def render_channel_post(
     state: object,
     *,
+    space: object | None = None,
     now: int | None = None,
     lifecycle: str | None = None,
     total_duration_seconds: int | float | None = None,
     queue_count: int | None = None,
     heartbeat_seconds: int = 60,
+    animation_frame: int | None = None,
 ) -> RenderedMessage:
     now = int(time.time()) if now is None else now
     icon, status = _status(state, lifecycle)
@@ -376,30 +379,56 @@ def render_channel_post(
     title = clip(_title(state), 80)
     thread_id = _thread_id(state) or "Pending"
     cwd = _cwd(state)
+    current_mode, main_model, main_effort = _main_profile(space, state)
+    frame = ANIMATION_FRAMES[animation_frame % len(ANIMATION_FRAMES)] if animation_frame is not None else ""
+    mode_icon, mode_label = ("🧭", "Plan mode") if current_mode == "plan" else ("⚙️", "Normal mode")
+    frame_prefix = f"{frame} " if frame else ""
     progress = 100.0 * completed / plan_total if plan_total else 0.0
-    markdown_lines = [
-        f"*🤖 Codex · {escape(title)}*",
-        f"{inline_code(thread_id, 80)} · {icon} {escape(status)} · 总执行 {inline_code(duration)}",
-        f"🎯 Goal {goal_icon} {inline_code(goal_status)}",
-        f"🧭 Plan {inline_code(f'{completed}/{plan_total}')} {inline_code(ascii_bar(progress))}",
-        f"🧩 Tasks {inline_code(f'{tasks_completed}/{tasks_total}')} · Active "
-        f"{inline_code(tasks_active)} · Queue {inline_code(queue)}",
-        f"🕒 更新 {inline_code(time.strftime('%H:%M', time.localtime(now)))} · "
-        f"心跳 {inline_code(f'≤{heartbeat_seconds}s')}",
-        f"📁 {inline_code(cwd, 140)}",
-    ]
-    plain_lines = [
-        f"🤖 Codex · {title}",
-        f"{thread_id} · {icon} {status} · 总执行 {duration}",
-        f"🎯 Goal {goal_icon} {goal_status}",
-        f"🧭 Plan {completed}/{plan_total} {ascii_bar(progress)}",
-        f"🧩 Tasks {tasks_completed}/{tasks_total} · Active {tasks_active} · Queue {queue}",
-        f"🕒 更新 {time.strftime('%H:%M', time.localtime(now))} · 心跳 ≤{heartbeat_seconds}s",
-        f"📁 {cwd}",
-    ]
+    markdown_lines: list[str] = []
+    plain_lines: list[str] = []
+    if current_mode:
+        markdown_lines.append(f"{frame_prefix}*{mode_icon} {mode_label}*")
+        plain_lines.append(f"{frame_prefix}{mode_icon} {mode_label}")
+        frame_prefix = ""
+    markdown_lines.extend(
+        [
+            f"{frame_prefix}*🤖 Codex · {escape(title)}*",
+            f"{inline_code(thread_id, 80)} · {icon} {escape(status)} · 总执行 {inline_code(duration)}",
+            *(
+                [
+                    f"*🧠 Main*  {inline_code(main_model or 'N/A', 80)} · "
+                    f"Effort {inline_code(main_effort or 'N/A', 32)}"
+                ]
+                if current_mode or main_model or main_effort
+                else []
+            ),
+            f"🎯 Goal {goal_icon} {inline_code(goal_status)}",
+            f"🧭 Plan {inline_code(f'{completed}/{plan_total}')} {inline_code(ascii_bar(progress))}",
+            f"🧩 Tasks {inline_code(f'{tasks_completed}/{tasks_total}')} · Active "
+            f"{inline_code(tasks_active)} · Queue {inline_code(queue)}",
+            f"🕒 更新 {inline_code(time.strftime('%H:%M', time.localtime(now)))} · "
+            f"心跳 {inline_code(f'≤{heartbeat_seconds}s')}",
+            f"📁 {inline_code(cwd, 140)}",
+        ]
+    )
+    plain_lines.extend(
+        [
+            f"{frame_prefix}🤖 Codex · {title}",
+            f"{thread_id} · {icon} {status} · 总执行 {duration}",
+            *(
+                [f"🧠 Main · {main_model or 'N/A'} · Effort {main_effort or 'N/A'}"]
+                if current_mode or main_model or main_effort
+                else []
+            ),
+            f"🎯 Goal {goal_icon} {goal_status}",
+            f"🧭 Plan {completed}/{plan_total} {ascii_bar(progress)}",
+            f"🧩 Tasks {tasks_completed}/{tasks_total} · Active {tasks_active} · Queue {queue}",
+            f"🕒 更新 {time.strftime('%H:%M', time.localtime(now))} · 心跳 ≤{heartbeat_seconds}s",
+            f"📁 {cwd}",
+        ]
+    )
     fallback_plain = (
-        f"Codex · {title}\n{thread_id} · {status}\n"
-        f"更新 {time.strftime('%H:%M', time.localtime(now))}"
+        f"Codex · {title}\n{thread_id} · {status}\n更新 {time.strftime('%H:%M', time.localtime(now))}"
     )
     return _bounded_message(
         "\n".join(markdown_lines),
@@ -418,9 +447,7 @@ def _visible_steps(steps: Sequence[object]) -> tuple[list[tuple[int, object]], i
         return list(enumerate(steps, 1)), 0
     statuses = [_step_value(step)[1] for step in steps]
     priority = [
-        index
-        for index, status in enumerate(statuses)
-        if status in {"inProgress", "failed", "blocked"}
+        index for index, status in enumerate(statuses) if status in {"inProgress", "failed", "blocked"}
     ][:14]
     selected = set(priority)
     completed = [index for index, status in enumerate(statuses) if status == "completed"][-5:]
@@ -441,7 +468,7 @@ def _step_lines(index: int, step: object) -> tuple[str, str]:
     text, status = _step_value(step)
     text = clip(text, 180)
     if status == "completed":
-        return f"~{index}\\. {escape(text)}~ ✅", f"[x] {index}. {text}"
+        return f"✅ ~{index}\\. {escape(text)}~", f"[x] {index}. {text}"
     if status == "inProgress":
         return f"▶ *{index}\\. {escape(text)}*", f"> {index}. {text}"
     if status == "blocked":
@@ -465,8 +492,7 @@ def _auth_line(source: object, auth_expires_at: object | None, now: int) -> tupl
     minutes = max(1, math.ceil(remaining / 60))
     expires_at = time.strftime("%H:%M:%S", time.localtime(expires))
     return (
-        f"🔓 TOTP 已认证 · 剩余 {inline_code(f'{minutes} min')} · "
-        f"到期 {inline_code(expires_at)}",
+        f"🔓 TOTP 已认证 · 剩余 {inline_code(f'{minutes} min')} · 到期 {inline_code(expires_at)}",
         f"TOTP 已认证 · 剩余 {minutes} min · 到期 {expires_at}",
     )
 
@@ -498,13 +524,9 @@ def _visible_agents(state: object) -> tuple[list[object], int]:
     for task in tasks:
         _, _, is_active = _agent_status(task)
         (active if is_active else terminal).append(task)
-    active.sort(
-        key=lambda task: int(_value(task, "started_at", "updated_at", default=0) or 0)
-    )
+    active.sort(key=lambda task: int(_value(task, "started_at", "updated_at", default=0) or 0))
     terminal.sort(
-        key=lambda task: int(
-            _value(task, "finished_at", "updated_at", default=0) or 0
-        ),
+        key=lambda task: int(_value(task, "finished_at", "updated_at", default=0) or 0),
         reverse=True,
     )
     visible = active + terminal[:3]
@@ -552,9 +574,7 @@ def _main_profile(space: object | None, state: object) -> tuple[str, str, str]:
         model = str(_value(space, "normal_model", default="") or "")
         effort = str(_value(space, "normal_effort", default="") or "")
     model = model or str(_value(state, "model", default="") or "")
-    effort = effort or str(
-        _value(state, "reasoning_effort", "reasoningEffort", default="") or ""
-    )
+    effort = effort or str(_value(state, "reasoning_effort", "reasoningEffort", default="") or "")
     return mode, model, effort
 
 
@@ -576,9 +596,7 @@ def render_status_comment(
     goal_icon, goal_status, objective = _goal(state)
     steps = _steps(state)
     completed, plan_total = _plan_counts(state)
-    tasks_finished, tasks_total, tasks_active, tasks_failed, tasks_interrupted = (
-        _agent_task_counts(state)
-    )
+    tasks_finished, tasks_total, tasks_active, tasks_failed, tasks_interrupted = _agent_task_counts(state)
     queue = _queue_count(state, queue_count)
     duration = _duration(_total_duration(state, now, total_duration_seconds))
     title = clip(_title(state), 80)
@@ -591,43 +609,44 @@ def render_status_comment(
         mode_icon, mode_label = ("🧭", "Plan mode") if current_mode == "plan" else ("⚙️", "Normal mode")
         frame = ""
         if animation_frame is not None:
-            frame = ("🕛", "🕒", "🕕", "🕘")[animation_frame % 4]
-        mode_header = f"{mode_icon} {mode_label}" + (f" · {frame}" if frame else "")
-        markdown_lines.extend([f"*{mode_header}*", ""])
-        plain_lines.extend([mode_header, ""])
+            frame = ANIMATION_FRAMES[animation_frame % len(ANIMATION_FRAMES)]
+        frame_prefix = f"{frame} " if frame else ""
+        mode_header = f"{mode_icon} {mode_label}"
+        markdown_lines.extend([f"{frame_prefix}*{mode_header}*", ""])
+        plain_lines.extend([f"{frame_prefix}{mode_header}", ""])
     markdown_lines.extend(
         [
-        f"*🤖 Codex · {escape(title)}*",
-        f"{inline_code(thread_id, 80)} · {icon} {escape(status)} · 总执行 {inline_code(duration)}",
-        *(
-            [
-                f"*🧠 Main*  {inline_code(main_model or 'N/A', 80)} · "
-                f"Effort {inline_code(main_effort or 'N/A', 32)}"
-            ]
-            if current_mode or main_model or main_effort
-            else []
-        ),
-        "",
-        f"*🎯 Goal*  {goal_icon} {inline_code(goal_status)}",
-        escape(clip(objective, 320)),
-        "",
-        f"*🧭 Plan*  {inline_code(f'{completed}/{plan_total}')}  {inline_code(ascii_bar(progress))}",
+            f"*🤖 Codex · {escape(title)}*",
+            f"{inline_code(thread_id, 80)} · {icon} {escape(status)} · 总执行 {inline_code(duration)}",
+            *(
+                [
+                    f"*🧠 Main*  {inline_code(main_model or 'N/A', 80)} · "
+                    f"Effort {inline_code(main_effort or 'N/A', 32)}"
+                ]
+                if current_mode or main_model or main_effort
+                else []
+            ),
+            "",
+            f"*🎯 Goal*  {goal_icon} {inline_code(goal_status)}",
+            escape(clip(objective, 320)),
+            "",
+            f"*🧭 Plan*  {inline_code(f'{completed}/{plan_total}')}  {inline_code(ascii_bar(progress))}",
         ]
     )
     plain_lines.extend(
         [
-        f"🤖 Codex · {title}",
-        f"{thread_id} · {icon} {status} · 总执行 {duration}",
-        *(
-            [f"🧠 Main · {main_model or 'N/A'} · Effort {main_effort or 'N/A'}"]
-            if current_mode or main_model or main_effort
-            else []
-        ),
-        "",
-        f"🎯 Goal · {goal_icon} {goal_status}",
-        clip(objective, 320),
-        "",
-        f"🧭 Plan · {completed}/{plan_total} {ascii_bar(progress)}",
+            f"🤖 Codex · {title}",
+            f"{thread_id} · {icon} {status} · 总执行 {duration}",
+            *(
+                [f"🧠 Main · {main_model or 'N/A'} · Effort {main_effort or 'N/A'}"]
+                if current_mode or main_model or main_effort
+                else []
+            ),
+            "",
+            f"🎯 Goal · {goal_icon} {goal_status}",
+            clip(objective, 320),
+            "",
+            f"🧭 Plan · {completed}/{plan_total} {ascii_bar(progress)}",
         ]
     )
     visible_steps, hidden = _visible_steps(steps)
@@ -701,9 +720,7 @@ def render_status_comment(
             timestamp = _epoch(_value(activity, "timestamp", "created_at", "createdAt"))
             clock = time.strftime("%H:%M", time.localtime(timestamp)) if timestamp else "--:--"
             suffix = f" · {activity_status}" if activity_status else ""
-            markdown_lines.append(
-                f"{inline_code(clock)} {escape(activity_text)}{escape(suffix)}"
-            )
+            markdown_lines.append(f"{inline_code(clock)} {escape(activity_text)}{escape(suffix)}")
             plain_lines.append(f"{clock} {activity_text}{suffix}")
     auth_markdown, auth_plain = _auth_line(space or state, auth_expires_at, now)
     updated = _epoch(_value(state, "updated_at", "updatedAt")) or now
