@@ -93,6 +93,22 @@ def test_reset_owner_revokes_authority_and_queued_work(tmp_path: Path) -> None:
         [{"type": "mention", "name": upload.name, "path": str(upload)}],
         "message-1",
     )
+    assert store.save_question_resolution("request", {"question": ["answer"]}, source="telegram")
+    assert store.put_prompt_run(
+        "run-1",
+        space_id="space-1",
+        generation=1,
+        thread_id="thread",
+        turn_id="turn",
+        client_message_id="prompt-1",
+    )
+    assert store.claim_plan_publication(
+        space_id="space-1",
+        generation=1,
+        item_id="plan-1",
+        thread_id="thread",
+        turn_id="turn",
+    )
     store.set_meta_many({"totp_force_locked": False, "totp_unlocked_until": 4_000_000_000})
     assert store.queued_file_paths() == {upload.resolve()}
 
@@ -106,6 +122,9 @@ def test_reset_owner_revokes_authority_and_queued_work(tmp_path: Path) -> None:
     assert store.subscriptions() == {"thread": None}
     assert store.get_meta("totp_force_locked") is True
     assert store.get_meta("totp_unlocked_until") == 0
+    with store._lock:
+        for table in ("question_resolutions", "prompt_runs", "plan_publications"):
+            assert store._connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
     store.close()
 
 
@@ -208,6 +227,282 @@ def test_legacy_database_is_backed_up_and_migrated_idempotently(tmp_path: Path) 
     assert reopened.last_backup_path is None
     assert reopened.schema_version == SCHEMA_VERSION
     reopened.close()
+
+
+def test_v4_migration_adds_interaction_state_tables_and_preserves_messages(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE question_messages (
+            request_key TEXT NOT NULL,
+            bot_role TEXT NOT NULL,
+            chat_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY(request_key, bot_role, chat_id, message_id)
+        );
+        INSERT INTO question_messages VALUES('request-1', 'forum', -1002, 42, 1);
+        PRAGMA user_version=4;
+        """
+    )
+    connection.close()
+
+    store = Store(path)
+    try:
+        assert store.schema_version == 5
+        assert store.question_messages("request-1") == [
+            {
+                "bot_role": "forum",
+                "chat_id": -1002,
+                "message_id": 42,
+                "message_kind": "interaction",
+            }
+        ]
+        tables = {
+            str(row[0])
+            for row in store._connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        assert {"question_resolutions", "prompt_runs", "plan_publications"} <= tables
+    finally:
+        store.close()
+
+
+def test_question_resolution_is_first_writer_wins_and_popped_once(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    first = Store(path)
+    second = Store(path)
+    try:
+        assert first.save_question_resolution(
+            "request-1", {"question": ["Telegram answer"]}, source="telegram"
+        )
+        assert not second.save_question_resolution(
+            "request-1", {"question": ["Terminal answer"]}, source="terminal"
+        )
+
+        resolution = second.pop_question_resolution("request-1")
+        assert resolution is not None
+        assert resolution["answers"] == {"question": ["Telegram answer"]}
+        assert resolution["source"] == "telegram"
+        assert first.pop_question_resolution("request-1") is None
+    finally:
+        first.close()
+        second.close()
+
+
+def test_prompt_run_claim_and_completion_are_idempotent_across_connections(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    first = Store(path)
+    second = Store(path)
+    try:
+        assert first.put_prompt_run(
+            "run-1",
+            space_id="space-1",
+            generation=2,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            client_message_id="client-1",
+        )
+        assert not second.put_prompt_run(
+            "run-2",
+            space_id="space-1",
+            generation=2,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            client_message_id="client-1",
+        )
+
+        completed = second.finish_prompt_runs(
+            "thread-1", "turn-1", status="completed"
+        )
+        assert len(completed) == 1
+        assert completed[0] == {
+            "run_id": "run-1",
+            "space_id": "space-1",
+            "generation": 2,
+            "thread_id": "thread-1",
+            "turn_id": "turn-1",
+            "client_message_id": "client-1",
+            "status": "completed",
+            "error_kind": "",
+            "created_at": completed[0]["created_at"],
+            "updated_at": completed[0]["updated_at"],
+        }
+        assert first.finish_prompt_runs("thread-1", "turn-1", status="completed") == []
+        with pytest.raises(ValueError, match="terminal status"):
+            first.finish_prompt_runs("thread-1", "turn-1", status="running")
+    finally:
+        first.close()
+        second.close()
+
+
+def test_plan_publication_state_machine_rejects_stale_and_duplicate_actions(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    try:
+        common = {"space_id": "space-1", "generation": 3, "thread_id": "thread-1"}
+        assert store.claim_plan_publication(
+            **common, item_id="plan-1", turn_id="turn-1"
+        )
+        assert not store.claim_plan_publication(
+            **common, item_id="plan-1", turn_id="turn-1"
+        )
+        assert store.finish_plan_publication(
+            space_id="space-1",
+            generation=3,
+            item_id="plan-1",
+            status="published",
+            message_ids=[101, 102],
+        )
+        assert not store.finish_plan_publication(
+            space_id="space-1",
+            generation=3,
+            item_id="plan-1",
+            status="failed",
+            message_ids=[],
+        )
+
+        assert store.claim_plan_publication(
+            **common, item_id="plan-2", turn_id="turn-2"
+        )
+        assert not store.claim_plan_publication(
+            **common, item_id="plan-1", turn_id="turn-1"
+        )
+        latest = store.latest_plan_publication("space-1", 3)
+        assert latest is not None
+        assert (latest["item_id"], latest["status"]) == ("plan-2", "publishing")
+        assert store.finish_plan_publication(
+            space_id="space-1",
+            generation=3,
+            item_id="plan-2",
+            status="published",
+            message_ids=[103],
+        )
+        assert not store.mark_plan_action("space-1", 3, "plan-1", status="executing")
+        assert store.mark_plan_action("space-1", 3, "plan-2", status="revising")
+        assert not store.mark_plan_action("space-1", 3, "plan-2", status="executing")
+        with pytest.raises(ValueError, match="action status"):
+            store.mark_plan_action("space-1", 3, "plan-2", status="published")
+
+        assert store.claim_plan_publication(
+            **common, item_id="plan-3", turn_id="turn-3"
+        )
+        assert store.finish_plan_publication(
+            space_id="space-1",
+            generation=3,
+            item_id="plan-3",
+            status="failed",
+            message_ids=[104],
+        )
+        assert store.claim_plan_publication(
+            **common, item_id="plan-3", turn_id="turn-3-retry"
+        )
+        assert not store.claim_plan_publication(
+            **common, item_id="plan-3", turn_id="turn-3-retry"
+        )
+        assert store.claim_plan_publication(
+            **common,
+            item_id="plan-3",
+            turn_id="turn-3-stale-retry",
+            stale_after=0,
+        )
+    finally:
+        store.close()
+
+
+def test_cleanup_removes_expired_interaction_state_but_keeps_live_plan(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    try:
+        store.create_space({"space_id": "active-space"})
+        assert store.save_question_resolution("old-resolution", {}, source="terminal")
+        assert store.save_question_resolution("new-resolution", {}, source="telegram")
+        assert store.put_prompt_run(
+            "old-run",
+            space_id="missing-space",
+            generation=1,
+            thread_id="thread-old",
+            turn_id="turn-old",
+            client_message_id="client-old",
+        )
+        assert store.claim_plan_publication(
+            space_id="missing-space",
+            generation=1,
+            item_id="old-plan",
+            thread_id="thread-old",
+            turn_id="turn-old",
+        )
+        assert store.finish_plan_publication(
+            space_id="missing-space",
+            generation=1,
+            item_id="old-plan",
+            status="published",
+            message_ids=[1],
+        )
+        assert store.claim_plan_publication(
+            space_id="active-space",
+            generation=1,
+            item_id="old-active-plan",
+            thread_id="thread-live",
+            turn_id="turn-old-active",
+        )
+        assert store.finish_plan_publication(
+            space_id="active-space",
+            generation=1,
+            item_id="old-active-plan",
+            status="published",
+            message_ids=[2],
+        )
+        assert store.mark_plan_action(
+            "active-space", 1, "old-active-plan", status="executing"
+        )
+        assert store.claim_plan_publication(
+            space_id="active-space",
+            generation=1,
+            item_id="live-plan",
+            thread_id="thread-live",
+            turn_id="turn-live",
+        )
+        assert store.finish_plan_publication(
+            space_id="active-space",
+            generation=1,
+            item_id="live-plan",
+            status="published",
+            message_ids=[3],
+        )
+        with store._lock, store._connection:
+            store._connection.execute(
+                "UPDATE question_resolutions SET resolved_at=1 WHERE request_key='old-resolution'"
+            )
+            store._connection.execute(
+                "UPDATE prompt_runs SET updated_at=1 WHERE run_id='old-run'"
+            )
+            store._connection.execute("UPDATE plan_publications SET updated_at=1")
+
+        store.cleanup(event_days=1)
+
+        assert store.pop_question_resolution("old-resolution") is None
+        assert store.pop_question_resolution("new-resolution") is not None
+        assert store.latest_plan_publication("missing-space", 1) is None
+        live = store.latest_plan_publication("active-space", 1)
+        assert live is not None and live["status"] == "published"
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM plan_publications WHERE item_id='old-active-plan'"
+            ).fetchone()[0]
+            == 0
+        )
+        assert store.finish_prompt_runs("thread-old", "turn-old", status="completed") == []
+    finally:
+        store.close()
 
 
 def test_bot_update_ids_are_isolated_by_role(tmp_path: Path) -> None:

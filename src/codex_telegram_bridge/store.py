@@ -17,8 +17,10 @@ from typing import Any
 from .config import ensure_private_directory
 from .models import Owner, QueuedPrompt, SessionSpace, ThreadState
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 CONTROL_BOT_ROLE = "control"
+_PLAN_PUBLICATION_RESULTS = frozenset({"published", "failed"})
+_PLAN_ACTION_STATUSES = frozenset({"executing", "revising"})
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS metadata (
@@ -162,10 +164,45 @@ CREATE TABLE IF NOT EXISTS question_messages (
     bot_role TEXT NOT NULL,
     chat_id INTEGER NOT NULL,
     message_id INTEGER NOT NULL,
+    message_kind TEXT NOT NULL DEFAULT 'interaction',
     created_at INTEGER NOT NULL,
     PRIMARY KEY(request_key, bot_role, chat_id, message_id)
 );
 CREATE INDEX IF NOT EXISTS idx_question_messages_request ON question_messages(request_key);
+CREATE TABLE IF NOT EXISTS question_resolutions (
+    request_key TEXT PRIMARY KEY,
+    answers_json TEXT NOT NULL,
+    source TEXT NOT NULL,
+    resolved_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS prompt_runs (
+    run_id TEXT PRIMARY KEY,
+    space_id TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    thread_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL,
+    client_message_id TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL,
+    error_kind TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_prompt_runs_turn ON prompt_runs(thread_id, turn_id, status);
+CREATE TABLE IF NOT EXISTS plan_publications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    space_id TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    item_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    message_ids_json TEXT NOT NULL DEFAULT '[]',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE(space_id, generation, item_id)
+);
+CREATE INDEX IF NOT EXISTS idx_plan_publications_latest
+    ON plan_publications(space_id, generation, id DESC);
 """
 
 
@@ -280,6 +317,12 @@ class Store:
             for name, declaration in additions.items():
                 if name not in callback_columns:
                     self._connection.execute(f"ALTER TABLE callbacks ADD COLUMN {name} {declaration}")
+            question_message_columns = _columns(self._connection, "question_messages")
+            if "message_kind" not in question_message_columns:
+                self._connection.execute(
+                    "ALTER TABLE question_messages ADD COLUMN "
+                    "message_kind TEXT NOT NULL DEFAULT 'interaction'"
+                )
             self._connection.execute(
                 "INSERT INTO metadata(key, value) VALUES('schema_version', ?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -1029,6 +1072,223 @@ class Store:
             ).fetchone()
         return int(row[0])
 
+    def put_prompt_run(
+        self,
+        run_id: str,
+        *,
+        space_id: str,
+        generation: int,
+        thread_id: str,
+        turn_id: str,
+        client_message_id: str,
+    ) -> bool:
+        if not all(
+            value.strip()
+            for value in (run_id, space_id, thread_id, turn_id, client_message_id)
+        ):
+            raise ValueError("Prompt run identifiers must not be empty")
+        if generation < 0:
+            raise ValueError("generation must not be negative")
+        now = int(time.time())
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                "INSERT OR IGNORE INTO prompt_runs(run_id, space_id, generation, thread_id, turn_id, "
+                "client_message_id, status, created_at, updated_at) "
+                "VALUES(?, ?, ?, ?, ?, ?, 'running', ?, ?)",
+                (
+                    run_id,
+                    space_id,
+                    int(generation),
+                    thread_id,
+                    turn_id,
+                    client_message_id,
+                    now,
+                    now,
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def finish_prompt_runs(
+        self,
+        thread_id: str,
+        turn_id: str,
+        *,
+        status: str,
+        error_kind: str = "",
+    ) -> list[dict[str, Any]]:
+        if not thread_id.strip() or not turn_id.strip():
+            raise ValueError("Prompt run thread and turn IDs must not be empty")
+        if not status.strip() or status == "running":
+            raise ValueError("Prompt run terminal status is invalid")
+        now = int(time.time())
+        with self._immediate_transaction() as connection:
+            rows = connection.execute(
+                "SELECT run_id, space_id, generation, client_message_id, created_at "
+                "FROM prompt_runs WHERE thread_id=? AND turn_id=? AND status='running' "
+                "ORDER BY created_at, run_id",
+                (thread_id, turn_id),
+            ).fetchall()
+            connection.execute(
+                "UPDATE prompt_runs SET status=?, error_kind=?, updated_at=? "
+                "WHERE thread_id=? AND turn_id=? AND status='running'",
+                (status, error_kind or None, now, thread_id, turn_id),
+            )
+        return [
+            {
+                "run_id": str(row[0]),
+                "space_id": str(row[1]),
+                "generation": int(row[2]),
+                "thread_id": thread_id,
+                "turn_id": turn_id,
+                "client_message_id": str(row[3]),
+                "status": status,
+                "error_kind": error_kind,
+                "created_at": int(row[4]),
+                "updated_at": now,
+            }
+            for row in rows
+        ]
+
+    def claim_plan_publication(
+        self,
+        *,
+        space_id: str,
+        generation: int,
+        item_id: str,
+        thread_id: str,
+        turn_id: str,
+        stale_after: int = 300,
+    ) -> bool:
+        if not all(value.strip() for value in (space_id, item_id, thread_id, turn_id)):
+            raise ValueError("Plan publication identifiers must not be empty")
+        if generation < 0:
+            raise ValueError("generation must not be negative")
+        if stale_after < 0:
+            raise ValueError("stale_after must not be negative")
+        now = int(time.time())
+        with self._immediate_transaction() as connection:
+            cursor = connection.execute(
+                "INSERT OR IGNORE INTO plan_publications(space_id, generation, item_id, "
+                "thread_id, turn_id, status, created_at, updated_at) "
+                "VALUES(?, ?, ?, ?, ?, 'publishing', ?, ?)",
+                (space_id, int(generation), item_id, thread_id, turn_id, now, now),
+            )
+            if cursor.rowcount == 1:
+                publication_id = int(cursor.lastrowid)
+            else:
+                row = connection.execute(
+                    "SELECT id, status, updated_at FROM plan_publications "
+                    "WHERE space_id=? AND generation=? AND item_id=?",
+                    (space_id, int(generation), item_id),
+                ).fetchone()
+                if row is None:
+                    return False
+                publication_id = int(row[0])
+                latest = connection.execute(
+                    "SELECT MAX(id) FROM plan_publications WHERE space_id=? AND generation=?",
+                    (space_id, int(generation)),
+                ).fetchone()
+                if latest is None or publication_id != int(latest[0]):
+                    return False
+                retryable = str(row[1]) == "failed" or (
+                    str(row[1]) == "publishing"
+                    and int(row[2]) <= now - stale_after
+                )
+                if not retryable:
+                    return False
+                retry = connection.execute(
+                    "UPDATE plan_publications SET status='publishing', message_ids_json='[]', "
+                    "thread_id=?, turn_id=?, updated_at=? WHERE id=? AND status=? AND updated_at=?",
+                    (thread_id, turn_id, now, publication_id, str(row[1]), int(row[2])),
+                )
+                if retry.rowcount != 1:
+                    return False
+            connection.execute(
+                "UPDATE plan_publications SET status='superseded', updated_at=? "
+                "WHERE space_id=? AND generation=? AND id<? "
+                "AND status IN ('publishing', 'published', 'failed', 'revising')",
+                (now, space_id, int(generation), publication_id),
+            )
+            return True
+
+    def finish_plan_publication(
+        self,
+        *,
+        space_id: str,
+        generation: int,
+        item_id: str,
+        status: str,
+        message_ids: list[int],
+    ) -> bool:
+        if status not in _PLAN_PUBLICATION_RESULTS:
+            raise ValueError("Plan publication result is invalid")
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                "UPDATE plan_publications SET status=?, message_ids_json=?, updated_at=? "
+                "WHERE space_id=? AND generation=? AND item_id=? AND status='publishing'",
+                (
+                    status,
+                    json.dumps([int(value) for value in message_ids]),
+                    int(time.time()),
+                    space_id,
+                    int(generation),
+                    item_id,
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def latest_plan_publication(
+        self, space_id: str, generation: int
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT item_id, thread_id, turn_id, status, message_ids_json, created_at, "
+                "updated_at FROM plan_publications WHERE space_id=? AND generation=? "
+                "ORDER BY id DESC LIMIT 1",
+                (space_id, int(generation)),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "space_id": space_id,
+            "generation": int(generation),
+            "item_id": str(row[0]),
+            "thread_id": str(row[1]),
+            "turn_id": str(row[2]),
+            "status": str(row[3]),
+            "message_ids": json.loads(str(row[4])),
+            "created_at": int(row[5]),
+            "updated_at": int(row[6]),
+        }
+
+    def mark_plan_action(
+        self,
+        space_id: str,
+        generation: int,
+        item_id: str,
+        *,
+        status: str,
+    ) -> bool:
+        if status not in _PLAN_ACTION_STATUSES:
+            raise ValueError("Plan action status is invalid")
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                "UPDATE plan_publications SET status=?, updated_at=? "
+                "WHERE space_id=? AND generation=? AND item_id=? AND status='published' "
+                "AND id=(SELECT MAX(id) FROM plan_publications "
+                "WHERE space_id=? AND generation=?)",
+                (
+                    status,
+                    int(time.time()),
+                    space_id,
+                    int(generation),
+                    item_id,
+                    space_id,
+                    int(generation),
+                ),
+            )
+        return cursor.rowcount == 1
+
     def put_callback(
         self,
         nonce: str,
@@ -1320,6 +1580,28 @@ class Store:
                 "DELETE FROM scheduled_deletions WHERE delete_at < ? AND attempts >= 20",
                 (now - 7 * 86400,),
             )
+            retention_cutoff = now - event_days * 86400
+            self._connection.execute(
+                "DELETE FROM question_resolutions WHERE resolved_at < ?",
+                (retention_cutoff,),
+            )
+            self._connection.execute(
+                "DELETE FROM prompt_runs WHERE updated_at < ?",
+                (retention_cutoff,),
+            )
+            self._connection.execute(
+                "DELETE FROM plan_publications WHERE updated_at < ? AND ("
+                "status IN ('superseded', 'failed') OR EXISTS ("
+                "SELECT 1 FROM plan_publications AS newer "
+                "WHERE newer.space_id=plan_publications.space_id "
+                "AND newer.generation=plan_publications.generation "
+                "AND newer.id>plan_publications.id) OR NOT EXISTS ("
+                "SELECT 1 FROM session_spaces AS spaces "
+                "WHERE spaces.space_id=plan_publications.space_id "
+                "AND spaces.generation=plan_publications.generation "
+                "AND spaces.lifecycle!='closed'))",
+                (retention_cutoff,),
+            )
 
     def telegram_update_seen(self, update_id: int, bot_role: str = CONTROL_BOT_ROLE) -> bool:
         with self._lock:
@@ -1592,39 +1874,100 @@ class Store:
             )
 
     def record_question_message(
-        self, request_key: str, bot_role: str, chat_id: int, message_id: int
+        self,
+        request_key: str,
+        bot_role: str,
+        chat_id: int,
+        message_id: int,
+        *,
+        message_kind: str = "interaction",
     ) -> None:
         with self._lock, self._connection:
             self._connection.execute(
                 "INSERT OR IGNORE INTO question_messages(request_key, bot_role, chat_id, message_id, "
-                "created_at) VALUES(?, ?, ?, ?, ?)",
-                (request_key, bot_role, int(chat_id), int(message_id), int(time.time())),
+                "message_kind, created_at) VALUES(?, ?, ?, ?, ?, ?)",
+                (
+                    request_key,
+                    bot_role,
+                    int(chat_id),
+                    int(message_id),
+                    message_kind,
+                    int(time.time()),
+                ),
             )
 
     def question_messages(self, request_key: str) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._connection.execute(
-                "SELECT bot_role, chat_id, message_id FROM question_messages "
+                "SELECT bot_role, chat_id, message_id, message_kind FROM question_messages "
                 "WHERE request_key=? ORDER BY created_at, message_id",
                 (request_key,),
             ).fetchall()
         return [
-            {"bot_role": str(row[0]), "chat_id": int(row[1]), "message_id": int(row[2])}
+            {
+                "bot_role": str(row[0]),
+                "chat_id": int(row[1]),
+                "message_id": int(row[2]),
+                "message_kind": str(row[3]),
+            }
             for row in rows
         ]
 
     def pop_question_messages(self, request_key: str) -> list[dict[str, Any]]:
         with self._immediate_transaction() as connection:
             rows = connection.execute(
-                "SELECT bot_role, chat_id, message_id FROM question_messages "
+                "SELECT bot_role, chat_id, message_id, message_kind FROM question_messages "
                 "WHERE request_key=? ORDER BY created_at, message_id",
                 (request_key,),
             ).fetchall()
             connection.execute("DELETE FROM question_messages WHERE request_key=?", (request_key,))
         return [
-            {"bot_role": str(row[0]), "chat_id": int(row[1]), "message_id": int(row[2])}
+            {
+                "bot_role": str(row[0]),
+                "chat_id": int(row[1]),
+                "message_id": int(row[2]),
+                "message_kind": str(row[3]),
+            }
             for row in rows
         ]
+
+    def save_question_resolution(
+        self,
+        request_key: str,
+        answers: Mapping[str, list[str]],
+        *,
+        source: str,
+    ) -> bool:
+        if not request_key.strip() or not source.strip():
+            raise ValueError("Question resolution identifiers must not be empty")
+        now = int(time.time())
+        encoded = json.dumps(dict(answers), ensure_ascii=False, separators=(",", ":"))
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                "INSERT OR IGNORE INTO question_resolutions("
+                "request_key, answers_json, source, resolved_at) VALUES(?, ?, ?, ?)",
+                (request_key, encoded, source, now),
+            )
+        return cursor.rowcount == 1
+
+    def pop_question_resolution(self, request_key: str) -> dict[str, Any] | None:
+        with self._immediate_transaction() as connection:
+            row = connection.execute(
+                "SELECT answers_json, source, resolved_at FROM question_resolutions "
+                "WHERE request_key=?",
+                (request_key,),
+            ).fetchone()
+            connection.execute(
+                "DELETE FROM question_resolutions WHERE request_key=?", (request_key,)
+            )
+        if row is None:
+            return None
+        answers = json.loads(str(row[0]))
+        return {
+            "answers": answers if isinstance(answers, dict) else {},
+            "source": str(row[1]),
+            "resolved_at": int(row[2]),
+        }
 
     def retire_question_requests(
         self,
@@ -1678,6 +2021,9 @@ class Store:
                 connection.execute(
                     "DELETE FROM pending_inputs WHERE request_key=?", (request_key,)
                 )
+                connection.execute(
+                    "DELETE FROM question_resolutions WHERE request_key=?", (request_key,)
+                )
         return request_keys
 
     def get_pending_input(self, request_key: str) -> dict[str, Any] | None:
@@ -1726,6 +2072,9 @@ class Store:
             connection.execute("DELETE FROM telegram_binding")
             connection.execute("DELETE FROM callbacks")
             connection.execute("DELETE FROM pending_inputs")
+            connection.execute("DELETE FROM question_resolutions")
+            connection.execute("DELETE FROM prompt_runs")
+            connection.execute("DELETE FROM plan_publications")
             connection.execute("UPDATE subscriptions SET dashboard_message_id=NULL")
             connection.execute("UPDATE prompt_queue SET status='cancelled' WHERE status='queued'")
             rows = connection.execute(
