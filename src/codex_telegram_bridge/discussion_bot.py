@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import difflib
 import html
 import logging
 import re
 import secrets
 import time
 import uuid
+from collections.abc import Mapping
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -65,6 +67,8 @@ LOGGER = logging.getLogger(__name__)
 _MAX_RESOLVED_QUESTION_TOMBSTONES = 512
 _LOCKED_COMMAND_ALLOWLIST = {"/totp", "/help", "/lock"}
 _PLAN_ACTION_SECONDS = 24 * 60 * 60
+_INTERACTION_SECONDS = 5 * 60
+_PROMPT_WAIT_SECONDS = 30
 _BOT_URL_TOKEN = re.compile(r"(https://api\.telegram\.org/bot)[^/\s]+", re.IGNORECASE)
 _BOT_TOKEN = re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{16,}\b")
 
@@ -74,6 +78,17 @@ def _redacted_error(error: object) -> str:
     detail = _BOT_URL_TOKEN.sub(r"\1<redacted>", detail)
     return _BOT_TOKEN.sub("<redacted>", detail)[:240]
 
+
+def _value(source: object, name: str, default: Any = None) -> Any:
+    if isinstance(source, Mapping):
+        return source.get(name, default)
+    return getattr(source, name, default)
+
+
+def _pipe_arguments(raw: str, *, limit: int) -> list[str]:
+    return [part.strip() for part in raw.split("|", max(0, limit - 1))]
+
+
 _SESSION_COMMANDS = (
     ("status", "刷新当前 Session 状态"),
     ("totp", "认证当前 Session"),
@@ -81,6 +96,8 @@ _SESSION_COMMANDS = (
     ("prompt", "发送 prompt"),
     ("ask", "独立询问 Codex"),
     ("queue", "查看队列或加入 prompt"),
+    ("planmode", "进入 Plan Mode"),
+    ("changemodel", "切换当前模式的模型"),
     ("plan", "查看完整计划"),
     ("timeline", "查看近期事件"),
     ("attach", "接入 tmux"),
@@ -118,6 +135,8 @@ class DiscussionBotController:
         self._application: Application | None = None
         self._ask_tasks: set[asyncio.Task[Any]] = set()
         self._ask_waiting_messages: dict[asyncio.Task[Any], tuple[int, int, str]] = {}
+        self._interaction_tasks: dict[str, asyncio.Task[None]] = {}
+        self._plan_recovery_done = False
 
     def install(self, application: Application) -> None:
         self._application = application
@@ -133,6 +152,8 @@ class DiscussionBotController:
             ("prompt", self.prompt),
             ("ask", self.ask),
             ("queue", self.queue),
+            ("planmode", self.planmode),
+            ("changemodel", self.changemodel),
             ("plan", self.plan),
             ("timeline", self.timeline),
             ("attach", self.attach),
@@ -160,6 +181,12 @@ class DiscussionBotController:
         self.bridge.on_prompt_completed = self.prompt_completed
 
     async def stop(self) -> None:
+        interaction_tasks = list(self._interaction_tasks.values())
+        self._interaction_tasks.clear()
+        for task in interaction_tasks:
+            task.cancel()
+        if interaction_tasks:
+            await asyncio.gather(*interaction_tasks, return_exceptions=True)
         tasks = list(self._ask_tasks)
         self._ask_tasks.clear()
         scheduled = False
@@ -193,6 +220,10 @@ class DiscussionBotController:
                     chat_id=int(binding["discussion_chat_id"]), user_id=owner.user_id
                 ),
             )
+        await self._recover_interactions()
+        if not self._plan_recovery_done:
+            self._plan_recovery_done = True
+            await self._recover_plan_executions()
 
     async def _guard(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         del context
@@ -714,6 +745,492 @@ class DiscussionBotController:
         }
         await self._send_space(space, labels.get(result, escape(result)))
 
+    async def planmode(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        del context
+        space = self._require_active_unlocked(update)
+        await self._ensure_plan_ready(space)
+        raw = raw_arguments(update).strip()
+        if not raw:
+            await self._begin_profile_interaction(space, "planmode")
+            return
+        parts = _pipe_arguments(raw, limit=3)
+        if len(parts) not in {2, 3} or not parts[0] or not parts[1]:
+            await self._send_space(
+                space,
+                "用法：`/planmode <model> | <effort> [ | <prompt> ]`；"
+                "全不带参数可进入交互模式。",
+            )
+            return
+        profile = await self._resolve_profile_or_suggest(
+            space, "planmode", parts[0], parts[1]
+        )
+        if profile is None:
+            return
+        await self.bridge.set_space_profile(
+            str(space["space_id"]),
+            "plan",
+            str(_value(profile, "model")),
+            str(_value(profile, "effort")),
+        )
+        if len(parts) == 3 and parts[2]:
+            await self._start_plan_mode(space, parts[2], profile)
+            return
+        await self._wait_for_plan_prompt(space, profile)
+
+    async def changemodel(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        del context
+        space = self._require_active_unlocked(update)
+        raw = raw_arguments(update).strip()
+        if not raw:
+            await self._begin_profile_interaction(space, "changemodel")
+            return
+        parts = _pipe_arguments(raw, limit=2)
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            await self._send_space(
+                space,
+                "用法：`/changemodel <model> | <effort>`；全不带参数可进入交互模式。",
+            )
+            return
+        profile = await self._resolve_profile_or_suggest(
+            space, "changemodel", parts[0], parts[1]
+        )
+        if profile is None:
+            return
+        updated = await self.bridge.change_space_model(
+            str(space["space_id"]),
+            str(_value(profile, "model")),
+            str(_value(profile, "effort")),
+        )
+        await self._announce_model_change(updated, profile)
+
+    async def _begin_profile_interaction(
+        self, space: dict[str, Any], kind: str
+    ) -> None:
+        options = await self.bridge.list_model_options()
+        if not options:
+            raise RuntimeError("Codex 当前没有返回可用模型")
+        draft = self._replace_interaction(
+            space,
+            kind=kind,
+            phase="select_model",
+            payload={},
+            expires_at=int(time.time()) + _INTERACTION_SECONDS,
+        )
+        rows = [
+            [
+                self._interaction_button(
+                    clip(
+                        str(_value(option, "display_name") or _value(option, "model")),
+                        60,
+                    ),
+                    "profile_model",
+                    draft,
+                    {"model": str(_value(option, "model"))},
+                    space,
+                )
+            ]
+            for option in options
+        ]
+        label = "Plan Mode" if kind == "planmode" else "当前模式"
+        await self._send_space(
+            space,
+            f"请选择 {label} 使用的模型：",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+
+    async def _profile_model_selected(
+        self, space: dict[str, Any], payload: dict[str, Any]
+    ) -> None:
+        draft = self._current_draft(payload, phase="select_model")
+        model = str(payload.get("model") or "")
+        option = next(
+            (
+                candidate
+                for candidate in await self.bridge.list_model_options()
+                if str(_value(candidate, "model")) == model
+            ),
+            None,
+        )
+        if option is None:
+            raise RuntimeError("模型目录已更新，请重新执行命令")
+        efforts = tuple(str(value) for value in (_value(option, "supported_efforts", ()) or ()))
+        if not efforts:
+            raise RuntimeError("该模型没有可用的 effort")
+        advanced = self.store.advance_interaction(
+            str(_value(draft, "scope_key")),
+            str(_value(draft, "flow_id")),
+            int(_value(draft, "revision")),
+            phase="select_effort",
+            payload={"model": model},
+            expires_at=int(time.time()) + _INTERACTION_SECONDS,
+        )
+        if advanced is None:
+            raise RuntimeError("这次交互已被新命令替换")
+        self._schedule_interaction_timeout(advanced)
+        rows = [
+            [
+                self._interaction_button(
+                    effort,
+                    "profile_effort",
+                    advanced,
+                    {"model": model, "effort": effort},
+                    space,
+                )
+            ]
+            for effort in efforts
+        ]
+        await self._send_space(
+            space,
+            f"模型 {inline_code(model)} 支持以下 effort：",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+
+    async def _profile_effort_selected(
+        self, space: dict[str, Any], payload: dict[str, Any]
+    ) -> None:
+        draft = self._current_draft(payload, phase="select_effort")
+        stored_payload = dict(_value(draft, "payload", {}) or {})
+        model = str(payload.get("model") or "")
+        effort = str(payload.get("effort") or "")
+        if model != str(stored_payload.get("model") or ""):
+            raise RuntimeError("模型选择已过期")
+        kind = str(_value(draft, "kind"))
+        profile = await self._resolve_profile_or_suggest(space, kind, model, effort)
+        if profile is None:
+            return
+        if kind == "changemodel":
+            updated = await self.bridge.change_space_model(
+                str(space["space_id"]),
+                str(_value(profile, "model")),
+                str(_value(profile, "effort")),
+            )
+            claimed = self.store.claim_interaction(
+                str(_value(draft, "scope_key")),
+                str(_value(draft, "flow_id")),
+                int(_value(draft, "revision")),
+            )
+            if claimed is None:
+                raise RuntimeError("这次交互已被新命令替换")
+            self._cancel_interaction_timeout(str(_value(draft, "scope_key")))
+            await self._announce_model_change(updated, profile)
+            return
+        await self.bridge.set_space_profile(
+            str(space["space_id"]),
+            "plan",
+            str(_value(profile, "model")),
+            str(_value(profile, "effort")),
+        )
+        await self._advance_to_prompt_wait(draft, profile, space)
+
+    async def _wait_for_plan_prompt(
+        self, space: dict[str, Any], profile: object
+    ) -> None:
+        draft = self._replace_interaction(
+            space,
+            kind="planmode",
+            phase="await_prompt",
+            payload={
+                "model": str(_value(profile, "model")),
+                "effort": str(_value(profile, "effort")),
+            },
+            expires_at=int(time.time()) + _PROMPT_WAIT_SECONDS,
+        )
+        await self._send_plan_prompt_request(space, draft)
+
+    async def _advance_to_prompt_wait(
+        self, draft: object, profile: object, space: dict[str, Any]
+    ) -> None:
+        advanced = self.store.advance_interaction(
+            str(_value(draft, "scope_key")),
+            str(_value(draft, "flow_id")),
+            int(_value(draft, "revision")),
+            phase="await_prompt",
+            payload={
+                "model": str(_value(profile, "model")),
+                "effort": str(_value(profile, "effort")),
+            },
+            expires_at=int(time.time()) + _PROMPT_WAIT_SECONDS,
+        )
+        if advanced is None:
+            raise RuntimeError("这次交互已被新命令替换")
+        self._schedule_interaction_timeout(advanced)
+        await self._send_plan_prompt_request(space, advanced)
+
+    async def _send_plan_prompt_request(
+        self, space: dict[str, Any], draft: object
+    ) -> None:
+        del draft
+        await self._send_space(
+            space,
+            "请在 30 秒内发送进入 Plan Mode 后的第一条 prompt。"
+            "超时将取消本次模式切换。",
+        )
+
+    async def _consume_plan_prompt(
+        self, space: dict[str, Any], draft: object, prompt: str
+    ) -> bool:
+        now = int(time.time())
+        if int(_value(draft, "expires_at", 0)) <= now:
+            return False
+        claimed = self.store.claim_interaction(
+            str(_value(draft, "scope_key")),
+            str(_value(draft, "flow_id")),
+            int(_value(draft, "revision")),
+        )
+        if claimed is None:
+            return False
+        self._cancel_interaction_timeout(str(_value(draft, "scope_key")))
+        payload = dict(_value(claimed, "payload", {}) or {})
+        profile = await self.bridge.resolve_model_profile(
+            str(payload.get("model") or ""),
+            str(payload.get("effort") or ""),
+        )
+        await self._start_plan_mode(space, prompt, profile)
+        return True
+
+    async def _start_plan_mode(
+        self, space: dict[str, Any], prompt: str, profile: object
+    ) -> None:
+        await self._ensure_plan_ready(space)
+        turn = await self.bridge.start_space_collaboration_turn(
+            str(space["space_id"]),
+            prompt,
+            mode="plan",
+            client_message_id=f"telegram-planmode-{space['space_id']}-{uuid.uuid4()}",
+            profile=profile,
+        )
+        await self.dashboards.schedule_space(str(space["space_id"]), immediate=True)
+        await self._send_space(
+            space,
+            "已进入 Plan Mode。\n"
+            f"{inline_code(str(_value(profile, 'model')))} · "
+            f"{inline_code(str(_value(profile, 'effort')))}\n"
+            f"Turn {inline_code(str(turn.get('id') or '')[:8])}",
+            priority=5,
+        )
+
+    async def _ensure_plan_ready(self, space: dict[str, Any]) -> Any:
+        state = await self._state(space)
+        if state.status == "active" or state.turn_status == "inProgress":
+            raise RuntimeError("当前 turn 正在运行，请稍后重试")
+        blockers = set(state.active_flags) & {"waitingOnApproval", "waitingOnUserInput"}
+        if blockers:
+            raise RuntimeError("当前 Session 正在等待审批或用户输入，不能进入 Plan Mode")
+        if self.store.space_queue_entries(str(space["space_id"]), int(space["generation"])):
+            raise RuntimeError("当前 Session 的 prompt 队列非空，不能进入 Plan Mode")
+        return state
+
+    async def _resolve_profile_or_suggest(
+        self,
+        space: dict[str, Any],
+        command: str,
+        model: str,
+        effort: str,
+    ) -> object | None:
+        try:
+            return await self.bridge.resolve_model_profile(model, effort)
+        except ValueError:
+            suggestion = await self._profile_suggestion(command, model, effort)
+            await self._send_space(
+                space,
+                f"模型或 effort 无效。你可能想发送：{inline_code(suggestion)}",
+            )
+            return None
+
+    async def _profile_suggestion(self, command: str, model: str, effort: str) -> str:
+        options = await self.bridge.list_model_options()
+        if not options:
+            return f"/{command} <model> | <effort>"
+        by_model = {str(_value(option, "model")): option for option in options}
+        aliases: dict[str, str] = {}
+        for candidate in by_model:
+            aliases[candidate.casefold()] = candidate
+            aliases[candidate.rsplit("-", 1)[-1].casefold()] = candidate
+        requested = model.casefold()
+        selected_model = aliases.get(requested)
+        if selected_model is None:
+            match = difflib.get_close_matches(requested, list(aliases), n=1, cutoff=0.25)
+            selected_model = aliases[match[0]] if match else next(iter(by_model))
+        option = by_model[selected_model]
+        efforts = [str(value) for value in (_value(option, "supported_efforts", ()) or ())]
+        selected_effort = effort if effort in efforts else ""
+        if not selected_effort and efforts:
+            effort_match = difflib.get_close_matches(effort, efforts, n=1, cutoff=0.25)
+            selected_effort = (
+                effort_match[0]
+                if effort_match
+                else str(_value(option, "default_effort") or efforts[0])
+            )
+        return f"/{command} {selected_model} | {selected_effort or '<effort>'}"
+
+    async def _announce_model_change(self, space: object, profile: object) -> None:
+        current_mode = str(_value(space, "current_mode", "normal"))
+        label = "Plan Mode" if current_mode == "plan" else "Normal Mode"
+        space_id = str(_value(space, "space_id"))
+        current = self.store.get_space(space_id)
+        if current is None:
+            raise RuntimeError("Session 状态已变化")
+        await self.dashboards.schedule_space(space_id, immediate=True)
+        await self._send_space(
+            current,
+            f"{label} 的模型已更新为 {inline_code(str(_value(profile, 'model')))} · "
+            f"{inline_code(str(_value(profile, 'effort')))}。\n"
+            "当前 turn 不变，后续 turn 使用新配置。",
+        )
+
+    def _replace_interaction(
+        self,
+        space: dict[str, Any],
+        *,
+        kind: str,
+        phase: str,
+        payload: dict[str, Any],
+        expires_at: int,
+    ) -> object:
+        owner = self.store.get_owner()
+        if owner is None:
+            raise RuntimeError("owner 配对已失效")
+        scope_key = self._interaction_scope(space, owner.user_id)
+        draft = self.store.replace_interaction(
+            scope_key,
+            kind=kind,
+            phase=phase,
+            payload=payload,
+            user_id=owner.user_id,
+            bot_role=DISCUSSION_ROLE,
+            chat_id=int(space["discussion_chat_id"]),
+            expires_at=expires_at,
+            space_id=str(space["space_id"]),
+            generation=int(space["generation"]),
+        )
+        self._schedule_interaction_timeout(draft)
+        return draft
+
+    @staticmethod
+    def _interaction_scope(space: dict[str, Any], user_id: int) -> str:
+        return (
+            f"discussion:{int(space['discussion_chat_id'])}:{space['space_id']}:"
+            f"{int(space['generation'])}:{user_id}"
+        )
+
+    def _interaction_button(
+        self,
+        label: str,
+        action: str,
+        draft: object,
+        payload: dict[str, Any],
+        space: dict[str, Any],
+    ) -> InlineKeyboardButton:
+        return self._button(
+            label,
+            action,
+            {
+                **payload,
+                "scope_key": str(_value(draft, "scope_key")),
+                "flow_id": str(_value(draft, "flow_id")),
+                "revision": int(_value(draft, "revision")),
+            },
+            space,
+        )
+
+    def _current_draft(self, payload: dict[str, Any], *, phase: str) -> object:
+        scope_key = str(payload.get("scope_key") or "")
+        draft = self.store.get_interaction(scope_key)
+        if (
+            draft is None
+            or str(_value(draft, "flow_id")) != str(payload.get("flow_id") or "")
+            or int(_value(draft, "revision")) != int(payload.get("revision") or 0)
+            or str(_value(draft, "phase")) != phase
+            or int(_value(draft, "expires_at", 0)) <= int(time.time())
+        ):
+            raise RuntimeError("这次交互已被新命令替换或已经过期")
+        return draft
+
+    def _schedule_interaction_timeout(self, draft: object) -> None:
+        scope_key = str(_value(draft, "scope_key"))
+        self._cancel_interaction_timeout(scope_key)
+        coroutine = self._expire_interaction(
+            scope_key,
+            str(_value(draft, "flow_id")),
+            int(_value(draft, "revision")),
+            int(_value(draft, "expires_at")),
+        )
+        if self._application is not None:
+            task = self._application.create_task(
+                coroutine,
+                name=f"codex-tg-interaction-{str(_value(draft, 'flow_id'))[:8]}",
+            )
+        else:
+            task = asyncio.create_task(
+                coroutine,
+                name=f"codex-tg-interaction-{str(_value(draft, 'flow_id'))[:8]}",
+            )
+        self._interaction_tasks[scope_key] = task
+        task.add_done_callback(
+            lambda completed, key=scope_key: self._interaction_timeout_done(key, completed)
+        )
+
+    def _cancel_interaction_timeout(self, scope_key: str) -> None:
+        task = self._interaction_tasks.pop(scope_key, None)
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+
+    def _interaction_timeout_done(
+        self, scope_key: str, task: asyncio.Task[Any]
+    ) -> None:
+        if self._interaction_tasks.get(scope_key) is task:
+            self._interaction_tasks.pop(scope_key, None)
+
+    async def _expire_interaction(
+        self, scope_key: str, flow_id: str, revision: int, expires_at: int
+    ) -> None:
+        await asyncio.sleep(max(0, expires_at - int(time.time())))
+        draft = self.store.get_interaction(scope_key)
+        if (
+            draft is None
+            or str(_value(draft, "flow_id")) != flow_id
+            or int(_value(draft, "revision")) != revision
+        ):
+            return
+        now = int(time.time())
+        if int(_value(draft, "expires_at")) > now:
+            self._schedule_interaction_timeout(draft)
+            return
+        claimed = self.store.claim_interaction(scope_key, flow_id, revision)
+        if claimed is None:
+            return
+        space = self.store.get_space(str(_value(claimed, "space_id") or ""))
+        if (
+            space is None
+            or int(space.get("generation") or 0) != int(_value(claimed, "generation", 0))
+            or space.get("lifecycle") == "closed"
+        ):
+            return
+        if str(_value(claimed, "kind")) == "planmode" and str(
+            _value(claimed, "phase")
+        ) == "await_prompt":
+            message = "30 秒内未收到 prompt，本次 Plan Mode 切换已取消。"
+        else:
+            message = "模型选择交互已过期，请重新执行命令。"
+        await self._send_space(space, message)
+
+    async def _recover_interactions(self) -> None:
+        list_interactions = getattr(self.store, "list_interactions", None)
+        if list_interactions is None:
+            return
+        for draft in list_interactions():
+            if str(_value(draft, "bot_role")) != DISCUSSION_ROLE:
+                continue
+            space = self.store.get_space(str(_value(draft, "space_id") or ""))
+            if (
+                space is None
+                or int(space.get("generation") or 0) != int(_value(draft, "generation", 0))
+                or space.get("lifecycle") == "closed"
+            ):
+                self.store.delete_interaction(str(_value(draft, "scope_key")))
+                continue
+            self._schedule_interaction_timeout(draft)
+
     async def plan(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         del context
         space = self._require_space(update)
@@ -946,6 +1463,12 @@ class DiscussionBotController:
                 str(space["space_id"]), int(payload["queue_id"]), int(space["generation"])
             )
             await self._send_space(space, "已取消队列项。" if cancelled else "队列项已变化。")
+        elif action == "profile_model":
+            self._ensure_unlocked(space)
+            await self._profile_model_selected(space, payload)
+        elif action == "profile_effort":
+            self._ensure_unlocked(space)
+            await self._profile_effort_selected(space, payload)
         elif action == "send_file":
             self._ensure_unlocked(space)
             await self._send_file(space, payload)
@@ -1070,26 +1593,7 @@ class DiscussionBotController:
         chunks = render_commonmark_chunks(text, limit=3500)
         if not chunks:
             chunks = [TelegramHtmlChunk(html="<i>Plan 内容为空。</i>", plain="Plan 内容为空。")]
-        rows = InlineKeyboardMarkup(
-            [
-                [
-                    self._button(
-                        "批准并执行",
-                        "plan_execute",
-                        {"item_id": item_id, "thread_id": thread_id, "turn_id": turn_id},
-                        space,
-                        ttl_seconds=_PLAN_ACTION_SECONDS,
-                    ),
-                    self._button(
-                        "继续完善计划",
-                        "plan_continue",
-                        {"item_id": item_id, "thread_id": thread_id, "turn_id": turn_id},
-                        space,
-                        ttl_seconds=_PLAN_ACTION_SECONDS,
-                    ),
-                ]
-            ]
-        )
+        rows = self._plan_action_markup(space, item_id, thread_id, turn_id)
         message_ids: list[int] = []
         try:
             for index, chunk in enumerate(chunks):
@@ -1124,6 +1628,35 @@ class DiscussionBotController:
             space_id[:12],
             item_id[:8],
             len(message_ids),
+        )
+
+    def _plan_action_markup(
+        self,
+        space: dict[str, Any],
+        item_id: str,
+        thread_id: str,
+        turn_id: str,
+    ) -> InlineKeyboardMarkup:
+        payload = {"item_id": item_id, "thread_id": thread_id, "turn_id": turn_id}
+        return InlineKeyboardMarkup(
+            [
+                [
+                    self._button(
+                        "批准并执行",
+                        "plan_execute",
+                        payload,
+                        space,
+                        ttl_seconds=_PLAN_ACTION_SECONDS,
+                    ),
+                    self._button(
+                        "继续完善计划",
+                        "plan_continue",
+                        payload,
+                        space,
+                        ttl_seconds=_PLAN_ACTION_SECONDS,
+                    ),
+                ]
+            ]
         )
 
     async def prompt_completed(self, run: dict[str, Any]) -> None:
@@ -1186,6 +1719,9 @@ class DiscussionBotController:
         self, space: dict[str, Any], payload: dict[str, Any]
     ) -> None:
         latest = self._ensure_latest_plan(space, payload)
+        await self._ensure_plan_ready(space)
+        profile = await self._profile_for_mode(space, "default")
+        client_message_id = self._plan_client_message_id(space, latest)
         if not self.store.mark_plan_action(
             str(space["space_id"]),
             int(space["generation"]),
@@ -1193,25 +1729,170 @@ class DiscussionBotController:
             status="executing",
         ):
             raise RuntimeError("该 Plan 操作已处理或已过期")
-        turn = await self.bridge.start_space_collaboration_turn(
-            str(space["space_id"]),
-            "Implement the approved plan. Use goal to track and execute it end to end.",
-            mode="default",
-            client_message_id=(
-                f"telegram-plan-execute-{space['space_id']}-{space['generation']}-"
-                f"{latest['item_id']}"
-            ),
-        )
+        try:
+            turn = await self._start_profiled_turn(
+                space,
+                "Implement the approved plan. Use goal to track and execute it end to end.",
+                mode="default",
+                client_message_id=client_message_id,
+                profile=profile,
+            )
+        except Exception:
+            reconcile = getattr(self.bridge, "reconcile_plan_execution", None)
+            if reconcile is None:
+                raise
+            status = await reconcile(
+                str(space["space_id"]),
+                int(space["generation"]),
+                str(latest["item_id"]),
+                client_message_id,
+            )
+            if status == "delivered":
+                await self._send_space(
+                    space,
+                    "已确认批准请求送达 Codex；当前 turn 不会重复创建。",
+                    priority=5,
+                )
+                return
+            if status == "absent":
+                self.store.release_plan_action(
+                    str(space["space_id"]),
+                    int(space["generation"]),
+                    str(latest["item_id"]),
+                    expected_status="executing",
+                )
+                await self._send_plan_action_retry(
+                    space,
+                    latest,
+                    "批准请求未送达 Codex，请使用新按钮重试。",
+                )
+                return
+            await self._send_space(
+                space,
+                "批准请求的送达状态暂时无法确认。为避免重复执行，已暂停自动重试。",
+                priority=5,
+            )
+            return
         await self._send_space(
             space,
             f"已批准 Plan 并开始执行。\nTurn {inline_code(str(turn.get('id') or '')[:8])}",
             priority=5,
         )
 
+    @staticmethod
+    def _plan_client_message_id(
+        space: dict[str, Any], publication: Mapping[str, Any]
+    ) -> str:
+        return (
+            f"telegram-plan-execute-{space['space_id']}-{space['generation']}-"
+            f"{publication['item_id']}"
+        )
+
+    async def _profile_for_mode(
+        self, space: Mapping[str, Any], mode: str
+    ) -> object | None:
+        prefix = "plan" if mode == "plan" else "normal"
+        model = str(space.get(f"{prefix}_model") or "")
+        effort = str(space.get(f"{prefix}_effort") or "")
+        if not model or not effort:
+            return None
+        return await self.bridge.resolve_model_profile(model, effort)
+
+    async def _start_profiled_turn(
+        self,
+        space: dict[str, Any],
+        prompt: str,
+        *,
+        mode: str,
+        client_message_id: str,
+        profile: object | None = None,
+    ) -> dict[str, Any]:
+        selected = profile if profile is not None else await self._profile_for_mode(space, mode)
+        kwargs: dict[str, Any] = {
+            "mode": mode,
+            "client_message_id": client_message_id,
+        }
+        if selected is not None:
+            kwargs["profile"] = selected
+        return await self.bridge.start_space_collaboration_turn(
+            str(space["space_id"]),
+            prompt,
+            **kwargs,
+        )
+
+    async def _send_plan_action_retry(
+        self,
+        space: dict[str, Any],
+        publication: Mapping[str, Any],
+        message: str,
+    ) -> None:
+        await self._send_space(
+            space,
+            message,
+            reply_markup=self._plan_action_markup(
+                space,
+                str(publication["item_id"]),
+                str(publication["thread_id"]),
+                str(publication["turn_id"]),
+            ),
+            priority=5,
+        )
+
+    async def _recover_plan_executions(self) -> None:
+        publications = getattr(self.store, "executing_plan_publications", None)
+        reconcile = getattr(self.bridge, "reconcile_plan_execution", None)
+        if publications is None or reconcile is None:
+            return
+        for publication in publications():
+            space = self.store.get_space(str(publication.get("space_id") or ""))
+            if (
+                space is None
+                or space.get("lifecycle") != "active"
+                or int(space.get("generation") or 0) != int(publication.get("generation") or 0)
+            ):
+                continue
+            client_message_id = self._plan_client_message_id(space, publication)
+            try:
+                status = await reconcile(
+                    str(space["space_id"]),
+                    int(space["generation"]),
+                    str(publication["item_id"]),
+                    client_message_id,
+                )
+            except Exception:
+                LOGGER.exception(
+                    "event=plan_execution_reconcile_failed space_id=%s item_id=%s",
+                    str(space["space_id"])[:12],
+                    str(publication["item_id"])[:8],
+                )
+                continue
+            if status == "delivered":
+                continue
+            if status == "absent":
+                released = self.store.release_plan_action(
+                    str(space["space_id"]),
+                    int(space["generation"]),
+                    str(publication["item_id"]),
+                    expected_status="executing",
+                )
+                if released:
+                    await self._send_plan_action_retry(
+                        space,
+                        publication,
+                        "服务重启前的批准请求没有送达 Codex，请使用新按钮重试。",
+                    )
+                continue
+            await self._send_space(
+                space,
+                "服务重启前的批准请求状态暂时无法确认。为避免重复执行，已暂停自动重试。",
+                priority=5,
+            )
+
     async def _begin_plan_revision(
         self, space: dict[str, Any], payload: dict[str, Any]
     ) -> None:
         latest = self._ensure_latest_plan(space, payload)
+        await self._profile_for_mode(space, "plan")
         if not self.store.mark_plan_action(
             str(space["space_id"]),
             int(space["generation"]),
@@ -1449,11 +2130,35 @@ class DiscussionBotController:
         del context
         message = update.effective_message
         user = update.effective_user
-        reply = message.reply_to_message if message else None
-        if not message or not user or not reply:
+        if not message or not user:
             return
         space = self._space_for_message(message)
         if not space:
+            return
+        text = (message.text or "").strip()
+        if text and not text.startswith("/"):
+            scope_key = self._interaction_scope(space, user.id)
+            get_interaction = getattr(self.store, "get_interaction", None)
+            draft = get_interaction(scope_key) if get_interaction is not None else None
+            if (
+                draft is not None
+                and int(_value(draft, "user_id", 0)) == user.id
+                and int(_value(draft, "chat_id", 0)) == int(message.chat_id)
+                and str(_value(draft, "space_id") or "") == str(space["space_id"])
+                and int(_value(draft, "generation", 0)) == int(space["generation"])
+                and str(_value(draft, "kind")) == "planmode"
+                and str(_value(draft, "phase")) == "await_prompt"
+            ):
+                try:
+                    self._ensure_unlocked(space)
+                    consumed = await self._consume_plan_prompt(space, draft, text)
+                except RuntimeError as exc:
+                    await self._send_space(space, escape(str(exc)))
+                    raise ApplicationHandlerStop from None
+                if consumed:
+                    raise ApplicationHandlerStop
+        reply = message.reply_to_message
+        if not reply:
             return
         nonce = self._reply_nonce(int(message.chat_id), int(reply.message_id))
         constraints = {
@@ -1510,8 +2215,8 @@ class DiscussionBotController:
                     payload,
                     allowed_statuses={"revising"},
                 )
-                turn = await self.bridge.start_space_collaboration_turn(
-                    str(space["space_id"]),
+                turn = await self._start_profiled_turn(
+                    space,
                     (
                         "Continue refining the current plan based on this feedback. "
                         "Do not implement it yet.\n\n"

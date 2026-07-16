@@ -12,9 +12,10 @@ from telegram.error import BadRequest, NetworkError
 import codex_telegram_bridge.space_dashboard as space_dashboard_module
 from codex_telegram_bridge.config import Config
 from codex_telegram_bridge.dashboard import DashboardManager
-from codex_telegram_bridge.models import ThreadState
+from codex_telegram_bridge.models import TaskState, ThreadState
 from codex_telegram_bridge.space_dashboard import _IMMEDIATE_REASONS, SpaceDashboardManager
 from codex_telegram_bridge.store import Store
+from codex_telegram_bridge.views import RenderedMessage
 
 
 class DirectMessenger:
@@ -263,4 +264,84 @@ async def test_space_dashboard_failure_logs_safe_target_context(
     assert "error_type=BadRequest" in caplog.text
     assert "invalid dashboard target" in caplog.text
     assert "SUPER-SECRET" not in caplog.text
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_space_dashboard_passes_mode_profiles_tasks_and_advancing_animation_frame(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = replace(
+        Config.default(),
+        config_dir=tmp_path / "config",
+        state_dir=tmp_path / "state",
+        allowed_root=tmp_path,
+    )
+    store = Store(config.database_path)
+    store.create_space(
+        {
+            "space_id": "space-animation",
+            "lifecycle": "active",
+            "thread_id": "thread-animation",
+            "discussion_chat_id": -100123,
+            "discussion_root_id": 40,
+            "status_message_id": 41,
+            "current_mode": "plan",
+            "normal_model": "gpt-5.6-sol",
+            "normal_effort": "xhigh",
+            "plan_model": "gpt-5.6-luna",
+            "plan_effort": "max",
+        }
+    )
+    state = ThreadState(
+        thread_id="thread-animation",
+        title="Animation test",
+        cwd=str(tmp_path),
+        status="active",
+        tasks=[
+            TaskState(
+                task_id="subagent-1",
+                title="Review",
+                status="inProgress",
+                model="gpt-5.6-luna",
+                reasoning_effort="max",
+            )
+        ],
+    )
+    store.save_thread(state)
+    received: list[tuple[dict[str, Any], ThreadState, int | None]] = []
+
+    def render_status(
+        rendered_state: ThreadState,
+        *,
+        space: dict[str, Any],
+        lifecycle: str,
+        auth_expires_at: int | None,
+        heartbeat_seconds: int,
+        animation_frame: int | None = None,
+    ) -> RenderedMessage:
+        del lifecycle, auth_expires_at, heartbeat_seconds
+        received.append((space, rendered_state, animation_frame))
+        return RenderedMessage("status", "status")
+
+    monkeypatch.setattr(space_dashboard_module, "render_status_comment", render_status)
+    discussion = RecordingEndpoint()
+    manager = SpaceDashboardManager(
+        config,
+        store,
+        StaticSecurity(),  # type: ignore[arg-type]
+        RecordingEndpoint(),  # type: ignore[arg-type]
+        discussion,  # type: ignore[arg-type]
+    )
+
+    await manager._flush("space-animation")
+    await manager._flush("space-animation")
+
+    assert [frame for _space, _state, frame in received] == [0, 1]
+    assert received[0][0]["current_mode"] == "plan"
+    assert received[0][0]["normal_model"] == "gpt-5.6-sol"
+    assert received[0][0]["plan_effort"] == "max"
+    assert received[0][1].tasks[0].model == "gpt-5.6-luna"
+    assert received[0][1].tasks[0].reasoning_effort == "max"
+    assert discussion.edit_calls == [(-100123, 41), (-100123, 41)]
     store.close()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import logging
 import re
 import secrets
@@ -32,8 +33,11 @@ _IMMEDIATE_REASONS = {
     "thread/goal/updated",
     "thread/goal/cleared",
     "thread/status/changed",
+    "thread/settings/updated",
     "turn/plan/updated",
 }
+
+_ANIMATION_FRAME_COUNT = 4
 
 _BOT_URL_TOKEN = re.compile(r"(https://api\.telegram\.org/bot)[^/\s]+", re.IGNORECASE)
 _BOT_TOKEN = re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{16,}\b")
@@ -77,6 +81,7 @@ class SpaceDashboardManager:
         self._dirty: set[str] = set()
         self._immediate: set[str] = set()
         self._tasks: dict[str, asyncio.Task[None]] = {}
+        self._animation_indices: dict[str, int] = {}
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._stopping = False
 
@@ -163,7 +168,12 @@ class SpaceDashboardManager:
         if not space:
             return
         state = self._state_for_space(space)
-        channel_rendered, status_rendered = self._render(space, state)
+        animation_index = self._animation_indices.get(space_id, 0)
+        channel_rendered, status_rendered = self._render(
+            space,
+            state,
+            animation_frame=animation_index,
+        )
         status_keyboard = self._status_keyboard(space)
 
         if space.get("channel_chat_id") and space.get("channel_post_id"):
@@ -187,6 +197,7 @@ class SpaceDashboardManager:
                 plain=status_rendered.plain,
                 reply_markup=status_keyboard,
             )
+            self._animation_indices[space_id] = (animation_index + 1) % _ANIMATION_FRAME_COUNT
 
     @staticmethod
     async def _edit_dashboard_target(
@@ -238,7 +249,11 @@ class SpaceDashboardManager:
         }
 
     def _render(
-        self, space: dict[str, Any], state: ThreadState | dict[str, Any]
+        self,
+        space: dict[str, Any],
+        state: ThreadState | dict[str, Any],
+        *,
+        animation_frame: int | None = None,
     ) -> tuple[RenderedMessage, RenderedMessage]:
         lifecycle = str(space.get("lifecycle") or "pending")
         if lifecycle == "pending":
@@ -254,13 +269,15 @@ class SpaceDashboardManager:
             lifecycle=lifecycle,
             heartbeat_seconds=self.config.heartbeat_seconds,
         )
-        status = render_status_comment(
-            state,
-            space=space,
-            lifecycle=lifecycle,
-            auth_expires_at=auth_expires_at,
-            heartbeat_seconds=self.config.heartbeat_seconds,
-        )
+        status_options: dict[str, Any] = {
+            "space": space,
+            "lifecycle": lifecycle,
+            "auth_expires_at": auth_expires_at,
+            "heartbeat_seconds": self.config.heartbeat_seconds,
+        }
+        if "animation_frame" in inspect.signature(render_status_comment).parameters:
+            status_options["animation_frame"] = animation_frame
+        status = render_status_comment(state, **status_options)
         return channel, status
 
     def _callback_button(
