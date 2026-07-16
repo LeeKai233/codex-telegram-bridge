@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 from telegram import Chat, ForceReply, MessageOriginChannel
-from telegram.constants import ChatType
+from telegram.constants import ChatType, ParseMode
 from telegram.ext import ApplicationHandlerStop
 
 from codex_telegram_bridge.config import Config
@@ -47,6 +47,7 @@ class RecordingEndpoint:
         markdown: str,
         *,
         plain: str | None = None,
+        parse_mode: str | None = ParseMode.MARKDOWN_V2,
         reply_markup: Any = None,
         reply_parameters: Any = None,
         priority: int = 10,
@@ -55,6 +56,7 @@ class RecordingEndpoint:
             "chat_id": chat_id,
             "markdown": markdown,
             "plain": plain,
+            "parse_mode": parse_mode,
             "reply_markup": reply_markup,
             "reply_parameters": reply_parameters,
             "priority": priority,
@@ -134,9 +136,13 @@ class FakeBridge:
         self.answers: list[tuple[str, dict[str, list[str]]]] = []
         self.ask_calls: list[dict[str, Any]] = []
         self.ask_waiters: dict[str, asyncio.Future[str]] = {}
+        self.collaboration_calls: list[dict[str, Any]] = []
+        self.collaboration_error: RuntimeError | None = None
         self.on_question: Any = None
         self.on_notice: Any = None
         self.on_question_resolved: Any = None
+        self.on_plan_completed: Any = None
+        self.on_prompt_completed: Any = None
 
     async def resolve_directory(self, description: str) -> list[Path]:
         assert description
@@ -236,6 +242,25 @@ class FakeBridge:
         )
         self.ask_waiters[client_message_id] = future
         return await future
+
+    async def start_space_collaboration_turn(
+        self,
+        space_id: str,
+        prompt: str,
+        *,
+        mode: str,
+        client_message_id: str,
+    ) -> dict[str, str]:
+        call = {
+            "space_id": space_id,
+            "prompt": prompt,
+            "mode": mode,
+            "client_message_id": client_message_id,
+        }
+        self.collaboration_calls.append(call)
+        if self.collaboration_error is not None:
+            raise self.collaboration_error
+        return {"id": f"turn-{len(self.collaboration_calls)}"}
 
 
 class FakeSecurity:
@@ -481,6 +506,7 @@ async def test_update_deduplication_is_role_scoped_and_guards_enforce_owner(rig:
     )
 
     await rig.control._guard(private, SimpleNamespace())
+    rig.security.unlocked.add("space-a")
     await rig.discussion._guard(discussion, SimpleNamespace())
     assert rig.store.telegram_update_seen(77, CONTROL_ROLE)
     assert rig.store.telegram_update_seen(77, DISCUSSION_ROLE)
@@ -502,6 +528,39 @@ async def test_update_deduplication_is_role_scoped_and_guards_enforce_owner(rig:
     with pytest.raises(ApplicationHandlerStop):
         await rig.discussion._guard(outsider, SimpleNamespace())
     assert rig.bridge.prompt_calls == []
+
+
+@pytest.mark.asyncio
+async def test_locked_space_allows_only_totp_help_and_lock(rig: Rig) -> None:
+    space = add_active_space(
+        rig,
+        space_id="space-locked",
+        thread_id="thread-locked",
+        root_message_id=525,
+        channel_post_id=125,
+    )
+    blocked = update_for_message(
+        "/status",
+        update_id=140,
+        message_id=60,
+        chat_id=DISCUSSION_CHAT_ID,
+        chat_type=ChatType.SUPERGROUP,
+        message_thread_id=int(space["discussion_root_id"]),
+    )
+    with pytest.raises(ApplicationHandlerStop):
+        await rig.discussion._guard(blocked, SimpleNamespace())
+    assert "写操作已锁定" in rig.discussion_endpoint.sent[-1]["markdown"]
+
+    for update_id, command in enumerate(("/totp 123456", "/help", "/lock"), 141):
+        allowed = update_for_message(
+            command,
+            update_id=update_id,
+            message_id=update_id,
+            chat_id=DISCUSSION_CHAT_ID,
+            chat_type=ChatType.SUPERGROUP,
+            message_thread_id=int(space["discussion_root_id"]),
+        )
+        await rig.discussion._guard(allowed, SimpleNamespace())
 
 
 @pytest.mark.asyncio
@@ -954,13 +1013,402 @@ async def test_tmux_question_resolution_deletes_all_forwarded_question_messages(
 
     await rig.discussion.question_resolved("request-1")
 
-    assert rig.discussion_endpoint.deleted == [
-        (DISCUSSION_CHAT_ID, 2000),
-        (DISCUSSION_CHAT_ID, 2001),
-    ]
+    assert rig.discussion_endpoint.deleted == [(DISCUSSION_CHAT_ID, 2001)]
+    [summary] = rig.discussion_endpoint.edited
+    assert summary["message_id"] == 2000
+    assert summary["parse_mode"] == ParseMode.HTML
+    assert "已在终端处理；具体答案不可用" in summary["markdown"]
+    assert "Later" in summary["markdown"]
     assert rig.store.question_messages("request-1") == []
     assert rig.store.due_message_deletions() == []
     assert "request-1" not in rig.discussion._question_answers
+
+
+@pytest.mark.asyncio
+async def test_telegram_question_answer_is_persisted_before_rpc_and_archived(rig: Rig) -> None:
+    space = add_active_space(
+        rig,
+        space_id="space-answer",
+        thread_id="thread-answer",
+        root_message_id=520,
+        channel_post_id=120,
+    )
+    questions = [
+        {
+            "id": "delivery",
+            "header": "Delivery",
+            "question": "How should this run?",
+            "options": [
+                {"label": "Queue", "description": "Run after the active turn"},
+                {"label": "Steer", "description": "Inject into the active turn"},
+            ],
+        }
+    ]
+    rig.store.put_pending_input(
+        "request-answer",
+        "4",
+        1,
+        "thread-answer",
+        "turn-1",
+        "item-1",
+        questions,
+        None,
+    )
+    observed: list[dict[str, Any]] = []
+
+    async def answer_question(
+        request_key: str, answers: dict[str, list[str]]
+    ) -> None:
+        persisted = rig.store.pop_question_resolution(request_key)
+        assert persisted is not None
+        observed.append(persisted)
+        rig.store.save_question_resolution(
+            request_key,
+            answers,
+            source=str(persisted["source"]),
+        )
+        await rig.discussion.question_resolved(request_key)
+
+    rig.bridge.answer_question = answer_question  # type: ignore[method-assign]
+    await rig.discussion.forward_question(
+        "request-answer",
+        {"threadId": "thread-answer", "questions": questions},
+    )
+    assert "Run after the active turn" in rig.discussion_endpoint.sent[1]["markdown"]
+
+    await rig.discussion._record_question_answer(
+        space,
+        {
+            "request_key": "request-answer",
+            "question_id": "delivery",
+            "answer": "Queue",
+        },
+    )
+
+    assert observed == [
+        {
+            "answers": {"delivery": ["Queue"]},
+            "source": "telegram",
+            "resolved_at": observed[0]["resolved_at"],
+        }
+    ]
+    [summary] = rig.discussion_endpoint.edited
+    assert summary["message_id"] == 2000
+    assert "<b>选择：</b>Queue" in summary["markdown"]
+    assert "来源：Telegram" in summary["markdown"]
+    assert rig.discussion_endpoint.deleted == [(DISCUSSION_CHAT_ID, 2001)]
+
+
+@pytest.mark.asyncio
+async def test_locked_question_button_survives_totp_authentication_window(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    add_active_space(
+        rig,
+        space_id="space-locked-question",
+        thread_id="thread-locked-question",
+        root_message_id=525,
+        channel_post_id=125,
+    )
+    questions = [
+        {
+            "id": "delivery",
+            "question": "How should this run?",
+            "options": [{"label": "Queue", "description": "Run later"}],
+        }
+    ]
+    rig.store.put_pending_input(
+        "request-locked",
+        "5",
+        1,
+        "thread-locked-question",
+        "turn-1",
+        "item-1",
+        questions,
+        None,
+    )
+    clock = [10_000]
+    monkeypatch.setattr("codex_telegram_bridge.discussion_bot.time.time", lambda: clock[0])
+    monkeypatch.setattr("codex_telegram_bridge.store.time.time", lambda: clock[0])
+
+    await rig.discussion.forward_question(
+        "request-locked",
+        {"threadId": "thread-locked-question", "questions": questions},
+    )
+    button = rig.discussion_endpoint.sent[1]["reply_markup"].inline_keyboard[0][0]
+    nonce = str(button.callback_data)[3:]
+    expiry = rig.store._connection.execute(  # noqa: SLF001
+        "SELECT expires_at FROM callbacks WHERE nonce=?", (nonce,)
+    ).fetchone()
+    assert expiry is not None and int(expiry[0]) == 10_000 + rig.config.totp_unlock_seconds
+
+    clock[0] += 10 * 60
+    update = SimpleNamespace(
+        callback_query=SimpleNamespace(data=button.callback_data),
+        effective_user=SimpleNamespace(id=OWNER_ID),
+        effective_chat=SimpleNamespace(id=DISCUSSION_CHAT_ID),
+    )
+    await rig.discussion.callback(update, SimpleNamespace())
+    assert rig.store.peek_callback(
+        nonce,
+        OWNER_ID,
+        bot_role=DISCUSSION_ROLE,
+        chat_id=DISCUSSION_CHAT_ID,
+    ) is not None
+
+    rig.security.unlocked.add("space-locked-question")
+    await rig.discussion.callback(update, SimpleNamespace())
+    assert rig.bridge.answers == [
+        ("request-locked", {"delivery": ["Queue"]})
+    ]
+    assert rig.store.peek_callback(
+        nonce,
+        OWNER_ID,
+        bot_role=DISCUSSION_ROLE,
+        chat_id=DISCUSSION_CHAT_ID,
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_question_rejects_second_answer_after_first_rpc_failure(rig: Rig) -> None:
+    space = add_active_space(
+        rig,
+        space_id="space-answer-race",
+        thread_id="thread-answer-race",
+        root_message_id=526,
+        channel_post_id=126,
+    )
+    questions = [
+        {
+            "id": "delivery",
+            "question": "How should this run?",
+            "options": [{"label": "Queue"}, {"label": "Steer"}],
+        }
+    ]
+    rig.store.put_pending_input(
+        "request-answer-race",
+        "6",
+        1,
+        "thread-answer-race",
+        "turn-1",
+        "item-1",
+        questions,
+        None,
+    )
+    calls: list[dict[str, list[str]]] = []
+
+    async def fail_answer(_request_key: str, answers: dict[str, list[str]]) -> None:
+        calls.append(answers)
+        raise RuntimeError("transport failed")
+
+    rig.bridge.answer_question = fail_answer  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="transport failed"):
+        await rig.discussion._record_question_answer(
+            space,
+            {
+                "request_key": "request-answer-race",
+                "question_id": "delivery",
+                "answer": "Queue",
+            },
+        )
+    with pytest.raises(RuntimeError, match="不能更改答案"):
+        await rig.discussion._record_question_answer(
+            space,
+            {
+                "request_key": "request-answer-race",
+                "question_id": "delivery",
+                "answer": "Steer",
+            },
+        )
+
+    assert calls == [{"delivery": ["Queue"]}]
+    assert rig.discussion._question_answers["request-answer-race"] == {
+        "delivery": ["Queue"]
+    }
+    resolution = rig.store.pop_question_resolution("request-answer-race")
+    assert resolution is not None
+    assert resolution["answers"] == {"delivery": ["Queue"]}
+
+
+@pytest.mark.asyncio
+async def test_plan_article_buttons_preserve_nonce_while_locked_then_execute_once(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    add_active_space(
+        rig,
+        space_id="space-plan",
+        thread_id="thread-plan",
+        root_message_id=521,
+        channel_post_id=121,
+    )
+    monkeypatch.setattr("codex_telegram_bridge.discussion_bot.time.time", lambda: 10_000)
+    await rig.discussion.plan_completed(
+        "thread-plan",
+        "turn-plan",
+        "item-plan",
+        "# Build plan\n\n- Keep `<unsafe>` escaped\n- Run tests",
+    )
+
+    article = rig.discussion_endpoint.sent[-1]
+    assert article["parse_mode"] == ParseMode.HTML
+    assert "<b>Build plan</b>" in article["markdown"]
+    assert "<unsafe>" not in article["markdown"]
+    execute, revise = article["reply_markup"].inline_keyboard[0]
+    assert [execute.text, revise.text] == ["批准并执行", "继续完善计划"]
+    execute_nonce = str(execute.callback_data)[3:]
+    expiry = rig.store._connection.execute(  # noqa: SLF001
+        "SELECT expires_at FROM callbacks WHERE nonce=?", (execute_nonce,)
+    ).fetchone()
+    assert expiry is not None and int(expiry[0]) == 10_000 + 24 * 60 * 60
+
+    query = SimpleNamespace(data=execute.callback_data)
+    update = SimpleNamespace(
+        callback_query=query,
+        effective_user=SimpleNamespace(id=OWNER_ID),
+        effective_chat=SimpleNamespace(id=DISCUSSION_CHAT_ID),
+    )
+    await rig.discussion.callback(update, SimpleNamespace())
+    assert rig.bridge.collaboration_calls == []
+    assert rig.store.peek_callback(
+        execute_nonce,
+        OWNER_ID,
+        bot_role=DISCUSSION_ROLE,
+        chat_id=DISCUSSION_CHAT_ID,
+    ) is not None
+    assert "认证后可再次点击原按钮" in rig.discussion_endpoint.callback_answers[-1]["text"]
+
+    rig.security.unlocked.add("space-plan")
+    await rig.discussion.callback(update, SimpleNamespace())
+    assert len(rig.bridge.collaboration_calls) == 1
+    assert rig.bridge.collaboration_calls[0]["mode"] == "default"
+    assert "Use goal" in rig.bridge.collaboration_calls[0]["prompt"]
+    assert rig.store.peek_callback(
+        execute_nonce,
+        OWNER_ID,
+        bot_role=DISCUSSION_ROLE,
+        chat_id=DISCUSSION_CHAT_ID,
+    ) is None
+    assert rig.store.latest_plan_publication("space-plan", 1)["status"] == "executing"
+
+    await rig.discussion.callback(update, SimpleNamespace())
+    assert len(rig.bridge.collaboration_calls) == 1
+    assert "已使用或过期" in rig.discussion_endpoint.callback_answers[-1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_plan_revision_force_reply_starts_plan_turn(rig: Rig) -> None:
+    space = add_active_space(
+        rig,
+        space_id="space-revise",
+        thread_id="thread-revise",
+        root_message_id=522,
+        channel_post_id=122,
+    )
+    rig.security.unlocked.add("space-revise")
+    await rig.discussion.plan_completed(
+        "thread-revise",
+        "turn-plan",
+        "item-plan",
+        "Review the implementation plan.",
+    )
+    await rig.discussion._dispatch_callback(
+        "plan_continue",
+        {
+            "item_id": "item-plan",
+            "thread_id": "thread-revise",
+            "turn_id": "turn-plan",
+        },
+        space,
+    )
+    force_prompt = rig.discussion_endpoint.sent[-1]
+    assert isinstance(force_prompt["reply_markup"], ForceReply)
+    assert force_prompt["reply_markup"].input_field_placeholder == "输入 Plan 修改意见"
+    prompt_message_id = rig.discussion_endpoint.next_message_id - 1
+    reply = update_for_message(
+        "Add a rollback verification step.",
+        update_id=130,
+        message_id=50,
+        chat_id=DISCUSSION_CHAT_ID,
+        chat_type=ChatType.SUPERGROUP,
+        message_thread_id=522,
+        reply_to_message=SimpleNamespace(
+            message_id=prompt_message_id,
+            message_thread_id=522,
+            is_automatic_forward=False,
+        ),
+    )
+
+    with pytest.raises(ApplicationHandlerStop):
+        await rig.discussion.reply_to_intent(reply, SimpleNamespace())
+
+    [call] = rig.bridge.collaboration_calls
+    assert call["mode"] == "plan"
+    assert "Do not implement it yet" in call["prompt"]
+    assert "rollback verification" in call["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_failed_plan_execute_is_not_dispatched_twice(rig: Rig) -> None:
+    space = add_active_space(
+        rig,
+        space_id="space-plan-fail",
+        thread_id="thread-plan-fail",
+        root_message_id=523,
+        channel_post_id=123,
+    )
+    rig.security.unlocked.add("space-plan-fail")
+    await rig.discussion.plan_completed(
+        "thread-plan-fail",
+        "turn-plan",
+        "item-plan",
+        "Execute safely.",
+    )
+    payload = {
+        "item_id": "item-plan",
+        "thread_id": "thread-plan-fail",
+        "turn_id": "turn-plan",
+    }
+    rig.bridge.collaboration_error = RuntimeError("start failed")
+
+    with pytest.raises(RuntimeError, match="start failed"):
+        await rig.discussion._execute_plan(space, payload)
+    with pytest.raises(RuntimeError, match="已处理"):
+        await rig.discussion._execute_plan(space, payload)
+
+    assert len(rig.bridge.collaboration_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_prompt_completion_receipt_is_scoped_to_active_generation(rig: Rig) -> None:
+    add_active_space(
+        rig,
+        space_id="space-receipt",
+        thread_id="thread-receipt",
+        root_message_id=524,
+        channel_post_id=124,
+    )
+    await rig.discussion.prompt_completed(
+        {
+            "space_id": "space-receipt",
+            "generation": 1,
+            "thread_id": "thread-receipt",
+            "turn_id": "turn-receipt",
+            "status": "completed",
+        }
+    )
+    assert "任务已完成" in rig.discussion_endpoint.sent[-1]["markdown"]
+    count = len(rig.discussion_endpoint.sent)
+
+    await rig.discussion.prompt_completed(
+        {
+            "space_id": "space-receipt",
+            "generation": 2,
+            "thread_id": "thread-receipt",
+            "turn_id": "stale-turn",
+            "status": "failed",
+        }
+    )
+    assert len(rig.discussion_endpoint.sent) == count
 
 
 @pytest.mark.asyncio
@@ -1130,8 +1578,9 @@ async def test_question_clarification_is_isolated_and_keeps_original_question(ri
 
     [edited] = rig.discussion_endpoint.edited
     assert edited["message_id"] == 2003
-    assert f"`{ask_id}`" in edited["markdown"]
-    assert r"Use \*Queue\* for isolation\." in edited["markdown"]
+    assert f"<code>{ask_id}</code>" in edited["markdown"]
+    assert "Use <i>Queue</i> for isolation." in edited["markdown"]
+    assert edited["parse_mode"] == ParseMode.HTML
     assert rig.store.get_pending_input("request-clarify") is not None
 
 
@@ -1177,13 +1626,13 @@ async def test_two_ask_commands_run_concurrently_and_correlate_out_of_order(rig:
     rig.bridge.ask_waiters[second_call["client_message_id"]].set_result("second answer")
     await asyncio.sleep(0)
     assert rig.discussion_endpoint.edited[0]["message_id"] == 2001
-    assert f"`{waiting_ids[1]}`" in rig.discussion_endpoint.edited[0]["markdown"]
+    assert f"<code>{waiting_ids[1]}</code>" in rig.discussion_endpoint.edited[0]["markdown"]
     first_call = rig.bridge.ask_calls[0]
     rig.bridge.ask_waiters[first_call["client_message_id"]].set_result("first answer")
     await asyncio.gather(*tasks)
 
     by_message = {item["message_id"]: item["markdown"] for item in rig.discussion_endpoint.edited}
-    assert f"`{waiting_ids[0]}`" in by_message[2000]
+    assert f"<code>{waiting_ids[0]}</code>" in by_message[2000]
     assert "first answer" in by_message[2000]
     assert "second answer" in by_message[2001]
     assert rig.bridge.prompt_calls == []

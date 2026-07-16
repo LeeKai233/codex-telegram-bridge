@@ -80,6 +80,7 @@ class TelegramEndpoint:
         markdown: str,
         *,
         plain: str | None = None,
+        parse_mode: str | None = ParseMode.MARKDOWN_V2,
         reply_markup: InlineKeyboardMarkup | ForceReply | None = None,
         reply_parameters: ReplyParameters | None = None,
         priority: int = 10,
@@ -96,12 +97,16 @@ class TelegramEndpoint:
             return await self.messenger.call(
                 lambda: self.bot.send_message(
                     text=markdown,
-                    parse_mode=ParseMode.MARKDOWN_V2,
+                    parse_mode=parse_mode,
                     **kwargs,
                 ),
                 priority=priority,
             )
         except BadRequest:
+            LOGGER.warning(
+                "event=telegram_format_fallback bot_role=%s operation=send_text",
+                self.role,
+            )
             return await self.messenger.call(
                 lambda: self.bot.send_message(text=fallback, **kwargs),
                 priority=priority,
@@ -114,6 +119,7 @@ class TelegramEndpoint:
         markdown: str,
         *,
         plain: str | None = None,
+        parse_mode: str | None = ParseMode.MARKDOWN_V2,
         reply_markup: InlineKeyboardMarkup | None = None,
         priority: int = 10,
     ) -> Any:
@@ -129,7 +135,7 @@ class TelegramEndpoint:
             return await self.messenger.call(
                 lambda: self.bot.edit_message_text(
                     text=markdown,
-                    parse_mode=ParseMode.MARKDOWN_V2,
+                    parse_mode=parse_mode,
                     **kwargs,
                 ),
                 priority=priority,
@@ -137,6 +143,10 @@ class TelegramEndpoint:
         except BadRequest as exc:
             if "message is not modified" in str(exc).casefold():
                 return True
+            LOGGER.warning(
+                "event=telegram_format_fallback bot_role=%s operation=edit_text",
+                self.role,
+            )
             return await self.messenger.call(
                 lambda: self.bot.edit_message_text(text=fallback, **kwargs),
                 priority=priority,

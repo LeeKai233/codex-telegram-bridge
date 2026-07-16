@@ -160,6 +160,27 @@ async def test_subagent_protocol_metadata_is_linked_without_exposing_activity_pa
     assert child.agent_path == "/root/reviewer"
     assert child.agent_nickname == "Ada"
 
+    camel_child = projector.apply_thread(
+        {
+            "id": "child-camel",
+            "source": {
+                "subagent": {
+                    "threadSpawn": {
+                        "parentThreadId": "parent",
+                        "agentPath": "/root/camel",
+                        "agentNickname": "Grace",
+                        "agentRole": "implementer",
+                    }
+                }
+            },
+            "status": {"type": "idle"},
+        }
+    )
+    assert camel_child.parent_thread_id == "parent"
+    assert camel_child.agent_path == "/root/camel"
+    assert camel_child.agent_nickname == "Grace"
+    assert camel_child.agent_role == "implementer"
+
     await projector.ingest(
         "item/started",
         {

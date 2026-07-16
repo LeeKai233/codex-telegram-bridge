@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -10,7 +11,8 @@ from typing import Any
 
 import pytest
 from telegram import Chat, Message, Update, User
-from telegram.constants import ChatMemberStatus, ChatType
+from telegram.constants import ChatMemberStatus, ChatType, ParseMode
+from telegram.error import BadRequest
 from telegram.ext import CommandHandler, MessageHandler
 
 import codex_telegram_bridge.discussion_bot as discussion_bot_module
@@ -23,6 +25,7 @@ from codex_telegram_bridge.store import Store
 from codex_telegram_bridge.telegram_common import (
     CONTROL_ROLE,
     DISCUSSION_ROLE,
+    TelegramEndpoint,
     build_application,
 )
 
@@ -33,6 +36,12 @@ class Messenger:
 
     async def stop(self) -> None:
         pass
+
+
+class DirectMessenger:
+    async def call(self, operation: Any, *, priority: int = 10) -> Any:
+        del priority
+        return await operation()
 
 
 class DeletingEndpoint:
@@ -90,6 +99,55 @@ def put_pending(store: Store, request_key: str, request_id: str = "42") -> None:
         [{"id": "answer", "question": "Continue?"}],
         None,
     )
+
+
+@pytest.mark.asyncio
+async def test_telegram_endpoint_honors_html_parse_mode_and_plain_fallback() -> None:
+    sent: list[dict[str, Any]] = []
+    edited: list[dict[str, Any]] = []
+
+    async def send_message(**kwargs: Any) -> SimpleNamespace:
+        sent.append(kwargs)
+        if len(sent) == 1:
+            raise BadRequest("can't parse entities")
+        return SimpleNamespace(message_id=1)
+
+    async def edit_message_text(**kwargs: Any) -> bool:
+        edited.append(kwargs)
+        if len(edited) == 1:
+            raise BadRequest("can't parse entities")
+        return True
+
+    endpoint = TelegramEndpoint(
+        DISCUSSION_ROLE,
+        SimpleNamespace(
+            send_message=send_message,
+            edit_message_text=edit_message_text,
+        ),
+        DirectMessenger(),  # type: ignore[arg-type]
+    )
+
+    await endpoint.send_text(
+        -1001,
+        "<b>broken</b>",
+        plain="plain send",
+        parse_mode=ParseMode.HTML,
+    )
+    await endpoint.edit_text(
+        -1001,
+        4,
+        "<b>broken</b>",
+        plain="plain edit",
+        parse_mode=ParseMode.HTML,
+    )
+
+    assert sent[0]["parse_mode"] == ParseMode.HTML
+    assert sent[0]["text"] == "<b>broken</b>"
+    assert sent[1]["text"] == "plain send"
+    assert "parse_mode" not in sent[1]
+    assert edited[0]["parse_mode"] == ParseMode.HTML
+    assert edited[1]["text"] == "plain edit"
+    assert "parse_mode" not in edited[1]
 
 
 @pytest.mark.asyncio
@@ -190,6 +248,70 @@ async def test_unbound_bind_runtime_error_is_reported_to_owner(
     assert sent == [
         (-1001, "绑定失败：426 Bot 缺少删除消息权限", "绑定失败：426 Bot 缺少删除消息权限")
     ]
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_discussion_error_log_is_structured_scoped_and_redacted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _bridge, store, controller, _control, _discussion = make_runtime(tmp_path)
+    store.create_space(
+        {
+            "space_id": "space-log-safe",
+            "space_type": "existing",
+            "lifecycle": "active",
+            "thread_id": "thread-log",
+            "channel_chat_id": -1002,
+            "channel_post_id": 5,
+            "discussion_chat_id": -1001,
+            "discussion_root_id": 10,
+        }
+    )
+    monkeypatch.setattr(discussion_bot_module, "Update", SimpleNamespace)
+
+    async def send_space(*_args: Any, **_kwargs: Any) -> SimpleNamespace:
+        return SimpleNamespace(message_id=1)
+
+    monkeypatch.setattr(controller, "_send_space", send_space)
+    update = SimpleNamespace(
+        update_id=99,
+        effective_chat=SimpleNamespace(id=-1001),
+        effective_user=SimpleNamespace(id=7),
+        effective_message=SimpleNamespace(
+            text="/prompt private user instructions",
+            caption=None,
+            message_thread_id=10,
+            reply_to_message=None,
+            chat_id=-1001,
+            message_id=8,
+        ),
+    )
+
+    with caplog.at_level(logging.ERROR, logger=discussion_bot_module.__name__):
+        await controller.error(
+            update,
+            SimpleNamespace(
+                error=RuntimeError(
+                    "request https://api.telegram.org/"
+                    "bot123456:ABCDEFGHIJKLMNOPQRSTUVWXYZ1234/sendMessage failed"
+                )
+            ),
+        )
+
+    [record] = caplog.records
+    rendered = record.getMessage()
+    assert "event=discussion_handler_failed" in rendered
+    assert "error_type=RuntimeError" in rendered
+    assert "update_id=99" in rendered
+    assert "chat_id=-1001" in rendered
+    assert "command=/prompt" in rendered
+    assert "space_id=space-log-sa" in rendered
+    assert "bot<redacted>/sendMessage" in rendered
+    assert "ABCDEFGHIJKLMNOPQRSTUVWXYZ1234" not in rendered
+    assert "private user instructions" not in rendered
     store.close()
 
 

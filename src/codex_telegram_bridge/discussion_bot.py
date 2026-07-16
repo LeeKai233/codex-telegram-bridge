@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import html
 import logging
+import re
 import secrets
 import time
 import uuid
@@ -21,7 +23,7 @@ from telegram import (
     ReplyParameters,
     Update,
 )
-from telegram.constants import ChatMemberStatus, ChatType
+from telegram.constants import ChatMemberStatus, ChatType, ParseMode
 from telegram.error import TelegramError
 from telegram.ext import (
     Application,
@@ -39,6 +41,7 @@ from .config import Config
 from .deletions import MessageDeletionManager
 from .files import FileCandidate, PathPolicyError, prepare_inbox_path
 from .markdown import clip, compact_path, escape, inline_code
+from .rich_text import TelegramHtmlChunk, render_commonmark_chunks
 from .security import SecurityManager
 from .space_coordinator import SessionSpaceCoordinator
 from .space_dashboard import SpaceDashboardManager
@@ -52,7 +55,6 @@ from .telegram_common import (
 )
 from .views import (
     RenderedMessage,
-    render_ask_answer,
     render_ask_error,
     render_ask_waiting,
     render_help,
@@ -61,6 +63,16 @@ from .views import (
 LOGGER = logging.getLogger(__name__)
 
 _MAX_RESOLVED_QUESTION_TOMBSTONES = 512
+_LOCKED_COMMAND_ALLOWLIST = {"/totp", "/help", "/lock"}
+_PLAN_ACTION_SECONDS = 24 * 60 * 60
+_BOT_URL_TOKEN = re.compile(r"(https://api\.telegram\.org/bot)[^/\s]+", re.IGNORECASE)
+_BOT_TOKEN = re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{16,}\b")
+
+
+def _redacted_error(error: object) -> str:
+    detail = " ".join(str(error).split()) or type(error).__name__
+    detail = _BOT_URL_TOKEN.sub(r"\1<redacted>", detail)
+    return _BOT_TOKEN.sub("<redacted>", detail)[:240]
 
 _SESSION_COMMANDS = (
     ("status", "刷新当前 Session 状态"),
@@ -144,6 +156,8 @@ class DiscussionBotController:
         self.bridge.on_question = self.forward_question
         self.bridge.on_notice = self.forward_notice
         self.bridge.on_question_resolved = self.question_resolved
+        self.bridge.on_plan_completed = self.plan_completed
+        self.bridge.on_prompt_completed = self.prompt_completed
 
     async def stop(self) -> None:
         tasks = list(self._ask_tasks)
@@ -229,6 +243,21 @@ class DiscussionBotController:
                 await self.discussion.delete_message(chat.id, message.message_id)
             raise ApplicationHandlerStop
         if space is None and command not in {"/help", "/bind"}:
+            raise ApplicationHandlerStop
+        if (
+            space is not None
+            and command not in _LOCKED_COMMAND_ALLOWLIST
+            and not self.security.is_space_unlocked(str(space["space_id"]))
+        ):
+            await self._send_space(
+                space,
+                "写操作已锁定，请先在当前评论串发送 `/totp <验证码>`。",
+            )
+            LOGGER.info(
+                "event=locked_update_rejected space_id=%s command=%s",
+                str(space["space_id"])[:12],
+                command or "message",
+            )
             raise ApplicationHandlerStop
 
     def _command_targets_this_bot(self, update: Update) -> bool:
@@ -416,7 +445,7 @@ class DiscussionBotController:
         if not prompt:
             await self._send_space(space, "用法：`/prompt <内容>`")
             return
-        await self._send_prompt(space, prompt, "auto")
+        await self._send_prompt(space, prompt, "steer")
 
     async def ask(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         del context
@@ -489,6 +518,7 @@ class DiscussionBotController:
         *,
         client_message_id: str,
     ) -> None:
+        rich_answer: str | None = None
         try:
             answer = await self.bridge.ask_space_question(
                 str(space["space_id"]),
@@ -507,11 +537,12 @@ class DiscussionBotController:
                 LOGGER.warning("Unable to flush cancelled ask message %s", ask_id)
             raise
         except Exception as exc:
-            LOGGER.exception("Isolated Telegram ask %s failed", ask_id)
+            LOGGER.exception("event=ask_failed ask_id=%s", ask_id)
             detail = clip(str(exc) or type(exc).__name__, 500)
             rendered = render_ask_error(ask_id, f"独立提问失败：{detail}")
         else:
-            rendered = render_ask_answer(question, answer, ask_id)
+            rich_answer = answer
+            rendered = None
         current = self.store.get_space(str(space["space_id"]))
         if (
             current is None
@@ -523,7 +554,73 @@ class DiscussionBotController:
                 waiting_message_id,
             )
             return
-        await self._edit_or_resend_ask(current, waiting_message_id, rendered)
+        if rich_answer is not None:
+            await self._edit_or_resend_rich_ask(
+                current,
+                waiting_message_id,
+                question,
+                rich_answer,
+                ask_id,
+            )
+            return
+        if rendered is not None:
+            await self._edit_or_resend_ask(current, waiting_message_id, rendered)
+
+    async def _edit_or_resend_rich_ask(
+        self,
+        space: dict[str, Any],
+        message_id: int,
+        question: str,
+        answer: str,
+        ask_id: str,
+    ) -> None:
+        chunks = render_commonmark_chunks(answer, limit=3400)
+        if not chunks:
+            chunks = [
+                TelegramHtmlChunk(
+                    html="<i>Codex 没有返回文本回答。</i>",
+                    plain="Codex 没有返回文本回答。",
+                )
+            ]
+        question_text = clip(" ".join(question.split()), 500)
+        header_html = (
+            f"<b>💬 Codex 回答 · <code>{html.escape(ask_id)}</code></b>\n"
+            f"<b>❓ {html.escape(question_text)}</b>\n\n"
+        )
+        header_plain = f"💬 Codex 回答 · {ask_id}\n❓ {question_text}\n\n"
+        first = chunks[0]
+        try:
+            await self.discussion.edit_text(
+                int(space["discussion_chat_id"]),
+                message_id,
+                header_html + first.html,
+                plain=header_plain + first.plain,
+                parse_mode=ParseMode.HTML,
+                priority=5,
+            )
+        except TelegramError:
+            await self.discussion.delete_message(
+                int(space["discussion_chat_id"]), message_id
+            )
+            await self._send_space_html(
+                space,
+                header_html + first.html,
+                plain=header_plain + first.plain,
+                priority=5,
+            )
+        for chunk in chunks[1:]:
+            await self._send_space_html(
+                space,
+                chunk.html,
+                plain=chunk.plain,
+                priority=5,
+            )
+        LOGGER.info(
+            "event=ask_completed space_id=%s ask_id=%s chunks=%d",
+            str(space["space_id"])[:12],
+            ask_id,
+            len(chunks),
+        )
 
     async def _edit_or_resend_ask(
         self,
@@ -610,7 +707,11 @@ class DiscussionBotController:
                 ),
             )
             return
-        labels = {"started": "已开始执行。", "steered": "已作为 BTW prompt 插入。", "queued": "已加入队列。"}
+        labels = {
+            "started": "已开始执行。",
+            "steered": "已注入当前 turn。",
+            "queued": "已加入队列。",
+        }
         await self._send_space(space, labels.get(result, escape(result)))
 
     async def plan(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -768,19 +869,55 @@ class DiscussionBotController:
         if not query or not user or not chat:
             return
         data = str(query.data or "")
-        consumed = self.store.consume_callback(
+        pending = self.store.peek_callback(
             data[3:], user.id, bot_role=DISCUSSION_ROLE, chat_id=chat.id
         ) if data.startswith("cb:") else None
-        if not consumed:
+        if not pending:
+            await self.discussion.answer_callback(
+                query, "按钮已使用或过期，请重新执行命令。", show_alert=True
+            )
+            return
+        action, payload = pending
+        space = self.store.get_space(str(payload.get("space_id") or ""))
+        if not space or int(payload.get("generation") or 0) != int(space["generation"]):
+            await self.discussion.answer_callback(query, "Session 状态已变化。", show_alert=True)
+            return
+        if not self.security.is_space_unlocked(str(space["space_id"])):
+            await self.discussion.answer_callback(
+                query,
+                "写操作已锁定，请先发送 /totp <验证码>。认证后可再次点击原按钮。",
+                show_alert=True,
+            )
+            await self.dashboards.schedule_space(str(space["space_id"]), immediate=True)
+            LOGGER.info(
+                "event=locked_callback_rejected space_id=%s action=%s",
+                str(space["space_id"])[:12],
+                action,
+            )
+            return
+        if action in {"plan_execute", "plan_continue"}:
+            try:
+                self._ensure_latest_plan(space, payload)
+                state = self.store.get_thread(str(space.get("thread_id") or ""))
+                if state and (state.status == "active" or state.turn_status == "inProgress"):
+                    raise RuntimeError("当前 turn 正在运行，请稍后重试")
+            except RuntimeError as exc:
+                await self.discussion.answer_callback(query, str(exc), show_alert=True)
+                return
+        consumed = self.store.consume_callback(
+            data[3:],
+            user.id,
+            bot_role=DISCUSSION_ROLE,
+            chat_id=chat.id,
+            space_id=str(space["space_id"]),
+            generation=int(space["generation"]),
+        )
+        if consumed is None:
             await self.discussion.answer_callback(
                 query, "按钮已使用或过期，请重新执行命令。", show_alert=True
             )
             return
         action, payload = consumed
-        space = self.store.get_space(str(payload.get("space_id") or ""))
-        if not space or int(payload.get("generation") or 0) != int(space["generation"]):
-            await self.discussion.answer_callback(query, "Session 状态已变化。", show_alert=True)
-            return
         await self.discussion.answer_callback(query)
         try:
             await self._dispatch_callback(action, payload, space)
@@ -825,6 +962,12 @@ class DiscussionBotController:
                 payload,
                 clarification=action == "question_clarify",
             )
+        elif action == "plan_execute":
+            self._ensure_unlocked(space)
+            await self._execute_plan(space, payload)
+        elif action == "plan_continue":
+            self._ensure_unlocked(space)
+            await self._begin_plan_revision(space, payload)
 
     async def _send_file(self, space: dict[str, Any], payload: dict[str, Any]) -> None:
         candidate = FileCandidate(
@@ -889,6 +1032,224 @@ class DiscussionBotController:
         if owner:
             await self.control.send_text(owner.chat_id, escape(message), priority=5)
 
+    async def plan_completed(
+        self,
+        thread_id: str,
+        turn_id: str,
+        item_id: str,
+        text: str,
+    ) -> None:
+        space = self.store.get_space_by_thread(thread_id)
+        if (
+            not space
+            or space.get("lifecycle") != "active"
+            or str(space.get("thread_id") or "") != thread_id
+        ):
+            LOGGER.info(
+                "event=plan_publish_skipped reason=no_active_space thread_id=%s item_id=%s",
+                thread_id[:8],
+                item_id[:8],
+            )
+            return
+        space_id = str(space["space_id"])
+        generation = int(space["generation"])
+        if not self.store.claim_plan_publication(
+            space_id=space_id,
+            generation=generation,
+            item_id=item_id,
+            thread_id=thread_id,
+            turn_id=turn_id,
+        ):
+            LOGGER.info(
+                "event=plan_publish_deduplicated space_id=%s item_id=%s",
+                space_id[:12],
+                item_id[:8],
+            )
+            return
+
+        chunks = render_commonmark_chunks(text, limit=3500)
+        if not chunks:
+            chunks = [TelegramHtmlChunk(html="<i>Plan 内容为空。</i>", plain="Plan 内容为空。")]
+        rows = InlineKeyboardMarkup(
+            [
+                [
+                    self._button(
+                        "批准并执行",
+                        "plan_execute",
+                        {"item_id": item_id, "thread_id": thread_id, "turn_id": turn_id},
+                        space,
+                        ttl_seconds=_PLAN_ACTION_SECONDS,
+                    ),
+                    self._button(
+                        "继续完善计划",
+                        "plan_continue",
+                        {"item_id": item_id, "thread_id": thread_id, "turn_id": turn_id},
+                        space,
+                        ttl_seconds=_PLAN_ACTION_SECONDS,
+                    ),
+                ]
+            ]
+        )
+        message_ids: list[int] = []
+        try:
+            for index, chunk in enumerate(chunks):
+                prefix_html = "<b>📋 Codex Plan</b>\n\n" if index == 0 else ""
+                prefix_plain = "📋 Codex Plan\n\n" if index == 0 else ""
+                message = await self._send_space_html(
+                    space,
+                    prefix_html + chunk.html,
+                    plain=prefix_plain + chunk.plain,
+                    reply_markup=rows if index == len(chunks) - 1 else None,
+                    priority=5,
+                )
+                message_ids.append(int(message.message_id))
+        except Exception:
+            self.store.finish_plan_publication(
+                space_id=space_id,
+                generation=generation,
+                item_id=item_id,
+                status="failed",
+                message_ids=message_ids,
+            )
+            raise
+        self.store.finish_plan_publication(
+            space_id=space_id,
+            generation=generation,
+            item_id=item_id,
+            status="published",
+            message_ids=message_ids,
+        )
+        LOGGER.info(
+            "event=plan_published space_id=%s item_id=%s chunks=%d",
+            space_id[:12],
+            item_id[:8],
+            len(message_ids),
+        )
+
+    async def prompt_completed(self, run: dict[str, Any]) -> None:
+        space_id = str(run.get("space_id") or "")
+        space = self.store.get_space(space_id)
+        if (
+            not space
+            or space.get("lifecycle") != "active"
+            or int(space.get("generation") or 0) != int(run.get("generation") or 0)
+            or str(space.get("thread_id") or "") != str(run.get("thread_id") or "")
+        ):
+            LOGGER.info(
+                "event=prompt_receipt_skipped reason=stale_space space_id=%s turn_id=%s",
+                space_id[:12],
+                str(run.get("turn_id") or "")[:8],
+            )
+            return
+        status = str(run.get("status") or "completed")
+        turn_id = str(run.get("turn_id") or "")
+        if status == "completed":
+            message = "✅ `/prompt` 任务已完成。Codex 将继续此前工作；若无待处理指令则进入空闲。"
+        elif status == "interrupted":
+            message = "⏹ `/prompt` 任务已中断。"
+        else:
+            detail = str(run.get("error_kind") or status)
+            message = f"❌ `/prompt` 任务失败：{inline_code(clip(detail, 160))}"
+        if turn_id:
+            message += f"\nTurn {inline_code(turn_id[:8])}"
+        await self._send_space(space, message, priority=5)
+        LOGGER.info(
+            "event=prompt_receipt_sent space_id=%s turn_id=%s status=%s",
+            space_id[:12],
+            turn_id[:8],
+            status,
+        )
+
+    def _ensure_latest_plan(
+        self,
+        space: dict[str, Any],
+        payload: dict[str, Any],
+        *,
+        allowed_statuses: set[str] | None = None,
+    ) -> dict[str, Any]:
+        latest = self.store.latest_plan_publication(
+            str(space["space_id"]), int(space["generation"])
+        )
+        if (
+            latest is None
+            or str(latest["item_id"]) != str(payload.get("item_id") or "")
+            or str(latest["thread_id"]) != str(space.get("thread_id") or "")
+            or str(payload.get("thread_id") or "") != str(space.get("thread_id") or "")
+        ):
+            raise RuntimeError("该 Plan 已过期，请使用最新 Plan 的按钮")
+        expected = allowed_statuses or {"published"}
+        if str(latest["status"]) not in expected:
+            raise RuntimeError("该 Plan 操作已处理或已过期")
+        return latest
+
+    async def _execute_plan(
+        self, space: dict[str, Any], payload: dict[str, Any]
+    ) -> None:
+        latest = self._ensure_latest_plan(space, payload)
+        if not self.store.mark_plan_action(
+            str(space["space_id"]),
+            int(space["generation"]),
+            str(latest["item_id"]),
+            status="executing",
+        ):
+            raise RuntimeError("该 Plan 操作已处理或已过期")
+        turn = await self.bridge.start_space_collaboration_turn(
+            str(space["space_id"]),
+            "Implement the approved plan. Use goal to track and execute it end to end.",
+            mode="default",
+            client_message_id=(
+                f"telegram-plan-execute-{space['space_id']}-{space['generation']}-"
+                f"{latest['item_id']}"
+            ),
+        )
+        await self._send_space(
+            space,
+            f"已批准 Plan 并开始执行。\nTurn {inline_code(str(turn.get('id') or '')[:8])}",
+            priority=5,
+        )
+
+    async def _begin_plan_revision(
+        self, space: dict[str, Any], payload: dict[str, Any]
+    ) -> None:
+        latest = self._ensure_latest_plan(space, payload)
+        if not self.store.mark_plan_action(
+            str(space["space_id"]),
+            int(space["generation"]),
+            str(latest["item_id"]),
+            status="revising",
+        ):
+            raise RuntimeError("该 Plan 操作已处理或已过期")
+        owner = self.store.get_owner()
+        if owner is None:
+            raise RuntimeError("owner 配对已失效")
+        prompt = await self._send_space(
+            space,
+            "请回复这条消息，说明需要如何继续完善 Plan。",
+            reply_markup=ForceReply(
+                selective=True,
+                input_field_placeholder="输入 Plan 修改意见",
+            ),
+            priority=5,
+        )
+        nonce = self._reply_nonce(
+            int(space["discussion_chat_id"]), int(prompt.message_id)
+        )
+        self.store.put_callback(
+            nonce,
+            "reply_plan_revision",
+            {
+                "item_id": str(latest["item_id"]),
+                "thread_id": str(latest["thread_id"]),
+                "turn_id": str(latest["turn_id"]),
+            },
+            owner.user_id,
+            int(time.time()) + _PLAN_ACTION_SECONDS,
+            bot_role=DISCUSSION_ROLE,
+            chat_id=int(space["discussion_chat_id"]),
+            space_id=str(space["space_id"]),
+            generation=int(space["generation"]),
+        )
+
     async def forward_question(self, request_key: str, params: dict[str, Any]) -> None:
         thread_id = str(params.get("threadId") or "")
         space = self.store.get_space_by_thread(thread_id)
@@ -910,6 +1271,7 @@ class DiscussionBotController:
                     DISCUSSION_ROLE,
                     int(space["discussion_chat_id"]),
                     int(header.message_id),
+                    message_kind="summary_anchor",
                 )
             else:
                 resolved = True
@@ -929,6 +1291,7 @@ class DiscussionBotController:
             return
         question = questions[index]
         question_id = str(question.get("id") or f"question-{index + 1}")
+        question_ttl = max(self.config.callback_seconds, self.config.totp_unlock_seconds)
         lines = [
             f"*{escape(question.get('header') or f'问题 {index + 1}')}*",
             escape(question.get("question") or "请选择"),
@@ -938,6 +1301,11 @@ class DiscussionBotController:
             if not isinstance(option, dict) or not option.get("label"):
                 continue
             label = str(option["label"])
+            description = str(option.get("description") or "").strip()
+            option_line = f"• {escape(label)}"
+            if description:
+                option_line += f" — {escape(description)}"
+            lines.append(option_line)
             rows.append(
                 [
                     self._button(
@@ -949,6 +1317,7 @@ class DiscussionBotController:
                             "answer": label,
                         },
                         space,
+                        ttl_seconds=question_ttl,
                     )
                 ]
             )
@@ -958,8 +1327,20 @@ class DiscussionBotController:
         }
         rows.append(
             [
-                self._button("✍️ 自定义回答", "question_custom", reply_payload, space),
-                self._button("❓ 反问 Codex", "question_clarify", reply_payload, space),
+                self._button(
+                    "✍️ 自定义回答",
+                    "question_custom",
+                    reply_payload,
+                    space,
+                    ttl_seconds=question_ttl,
+                ),
+                self._button(
+                    "❓ 反问 Codex",
+                    "question_clarify",
+                    reply_payload,
+                    space,
+                    ttl_seconds=question_ttl,
+                ),
             ]
         )
         message = await self._send_space(
@@ -1085,6 +1466,7 @@ class DiscussionBotController:
         if pending is None or pending[0] not in {
             "reply_question_custom",
             "reply_question_clarify",
+            "reply_plan_revision",
         }:
             return
         if space.get("lifecycle") != "active" or not space.get("thread_id"):
@@ -1110,7 +1492,7 @@ class DiscussionBotController:
                     space,
                     {**payload, "answer": answer},
                 )
-            else:
+            elif action == "reply_question_clarify":
                 self._pending_question(
                     space,
                     str(payload["request_key"]),
@@ -1121,6 +1503,30 @@ class DiscussionBotController:
                     answer,
                     clarification=True,
                     update=update,
+                )
+            else:
+                self._ensure_latest_plan(
+                    space,
+                    payload,
+                    allowed_statuses={"revising"},
+                )
+                turn = await self.bridge.start_space_collaboration_turn(
+                    str(space["space_id"]),
+                    (
+                        "Continue refining the current plan based on this feedback. "
+                        "Do not implement it yet.\n\n"
+                        f"{answer}"
+                    ),
+                    mode="plan",
+                    client_message_id=(
+                        f"telegram-plan-revise-{space['space_id']}-{space['generation']}-"
+                        f"{payload['item_id']}"
+                    ),
+                )
+                await self._send_space(
+                    space,
+                    f"已提交 Plan 修改意见。\nTurn {inline_code(str(turn.get('id') or '')[:8])}",
+                    priority=5,
                 )
         except RuntimeError as exc:
             await self._send_space(space, escape(str(exc)))
@@ -1180,12 +1586,24 @@ class DiscussionBotController:
         if question_id not in known:
             raise RuntimeError("问题 ID 不匹配")
         values = self._question_answers.setdefault(request_key, {})
+        previous = values.get(question_id)
         values[question_id] = [answer]
         missing = next((index for index, value in enumerate(known) if value not in values), None)
         if missing is not None:
             await self._present_question(space, request_key, missing)
             return
-        await self.bridge.answer_question(request_key, values)
+        persisted = {key: list(value) for key, value in values.items()}
+        if not self.store.save_question_resolution(
+            request_key,
+            persisted,
+            source="telegram",
+        ):
+            if previous is None:
+                values.pop(question_id, None)
+            else:
+                values[question_id] = previous
+            raise RuntimeError("该问题已提交，不能更改答案")
+        await self.bridge.answer_question(request_key, persisted)
         self._question_answers.pop(request_key, None)
 
     async def question_resolved(self, request_key: str) -> None:
@@ -1195,10 +1613,51 @@ class DiscussionBotController:
             self._resolved_questions[request_key] = None
             while len(self._resolved_questions) > _MAX_RESOLVED_QUESTION_TOMBSTONES:
                 self._resolved_questions.pop(next(iter(self._resolved_questions)))
-            messages = self.store.question_messages(request_key)
+            stored = self.store.get_pending_input(request_key)
+            resolution = self.store.pop_question_resolution(request_key)
+            messages = self.store.pop_question_messages(request_key)
+            anchor = next(
+                (
+                    message
+                    for message in messages
+                    if message["bot_role"] == DISCUSSION_ROLE
+                    and message["message_kind"] == "summary_anchor"
+                ),
+                None,
+            )
+            retained: tuple[str, int, int] | None = None
+            if stored and anchor:
+                space = self.store.get_space_by_thread(str(stored["thread_id"]))
+                if space and int(space["discussion_chat_id"]) == int(anchor["chat_id"]):
+                    summary_html, summary_plain = self._question_summary(
+                        stored,
+                        resolution,
+                    )
+                    try:
+                        await self.discussion.edit_text(
+                            int(anchor["chat_id"]),
+                            int(anchor["message_id"]),
+                            summary_html,
+                            plain=summary_plain,
+                            parse_mode=ParseMode.HTML,
+                            priority=5,
+                        )
+                    except TelegramError:
+                        LOGGER.warning(
+                            "event=question_summary_edit_failed request_key=%s",
+                            request_key[:16],
+                        )
+                    else:
+                        retained = (
+                            DISCUSSION_ROLE,
+                            int(anchor["chat_id"]),
+                            int(anchor["message_id"]),
+                        )
             grouped: dict[tuple[str, int], list[int]] = {}
             for message in messages:
                 key = (str(message["bot_role"]), int(message["chat_id"]))
+                if retained == (key[0], key[1], int(message["message_id"])):
+                    continue
                 grouped.setdefault(key, []).append(int(message["message_id"]))
             delete_at = int(time.time())
             for (bot_role, chat_id), message_ids in grouped.items():
@@ -1209,9 +1668,57 @@ class DiscussionBotController:
                     delete_at=delete_at,
                     group_key=f"question:{request_key}",
                 )
-            self.store.pop_question_messages(request_key)
             await self.deletions.flush()
             self._question_answers.pop(request_key, None)
+
+    @staticmethod
+    def _question_summary(
+        stored: dict[str, Any],
+        resolution: dict[str, Any] | None,
+    ) -> tuple[str, str]:
+        answers = resolution.get("answers") if resolution else {}
+        source = str(resolution.get("source") or "terminal") if resolution else "terminal"
+        html_lines = ["<b>Codex 请求输入 · 已处理</b>"]
+        plain_lines = ["Codex 请求输入 · 已处理"]
+        thread_id = str(stored.get("thread_id") or "")
+        if thread_id:
+            html_lines.append(f"Session <code>{html.escape(thread_id[:8])}</code>")
+            plain_lines.append(f"Session {thread_id[:8]}")
+        for index, question in enumerate(stored.get("questions") or []):
+            if not isinstance(question, dict):
+                continue
+            question_id = str(question.get("id") or f"question-{index + 1}")
+            header = clip(str(question.get("header") or f"问题 {index + 1}"), 120)
+            question_text = clip(str(question.get("question") or "请选择"), 360)
+            html_lines.extend(
+                [
+                    "",
+                    f"<b>{html.escape(header)}</b>",
+                    html.escape(question_text),
+                ]
+            )
+            plain_lines.extend(["", header, question_text])
+            for option in (question.get("options") or [])[:6]:
+                if not isinstance(option, dict) or not option.get("label"):
+                    continue
+                label = clip(str(option["label"]), 100)
+                description = clip(str(option.get("description") or "").strip(), 180)
+                suffix = f" — {description}" if description else ""
+                html_lines.append(f"• {html.escape(label + suffix)}")
+                plain_lines.append(f"• {label}{suffix}")
+            selected = answers.get(question_id) if isinstance(answers, dict) else None
+            if isinstance(selected, list) and selected:
+                selected_text = clip("; ".join(str(value) for value in selected), 360)
+                html_lines.append(f"<b>选择：</b>{html.escape(selected_text)}")
+                plain_lines.append(f"选择：{selected_text}")
+            else:
+                fallback = "已在终端处理；具体答案不可用"
+                html_lines.append(f"<b>选择：</b>{fallback}")
+                plain_lines.append(f"选择：{fallback}")
+        source_label = "Telegram" if source == "telegram" else "终端"
+        html_lines.extend(["", f"<i>来源：{source_label}</i>"])
+        plain_lines.extend(["", f"来源：{source_label}"])
+        return "\n".join(html_lines), "\n".join(plain_lines)
 
     async def _delete_question_message(
         self,
@@ -1239,6 +1746,32 @@ class DiscussionBotController:
             int(space["discussion_chat_id"]),
             markdown,
             plain=plain,
+            reply_markup=reply_markup,
+            reply_parameters=ReplyParameters(message_id=int(space["discussion_root_id"])),
+            priority=priority,
+        )
+        self.store.record_discussion_message(
+            int(space["discussion_chat_id"]),
+            int(message.message_id),
+            int(space["discussion_root_id"]),
+            str(space["space_id"]),
+        )
+        return message
+
+    async def _send_space_html(
+        self,
+        space: dict[str, Any],
+        html_text: str,
+        *,
+        plain: str,
+        reply_markup: InlineKeyboardMarkup | None = None,
+        priority: int = 10,
+    ) -> Any:
+        message = await self.discussion.send_text(
+            int(space["discussion_chat_id"]),
+            html_text,
+            plain=plain,
+            parse_mode=ParseMode.HTML,
             reply_markup=reply_markup,
             reply_parameters=ReplyParameters(message_id=int(space["discussion_root_id"])),
             priority=priority,
@@ -1305,6 +1838,8 @@ class DiscussionBotController:
         action: str,
         payload: dict[str, Any],
         space: dict[str, Any],
+        *,
+        ttl_seconds: int | None = None,
     ) -> InlineKeyboardButton:
         owner = self.store.get_owner()
         nonce = secrets.token_urlsafe(12)
@@ -1319,7 +1854,8 @@ class DiscussionBotController:
             action,
             context,
             owner.user_id if owner else 0,
-            int(time.time()) + self.config.callback_seconds,
+            int(time.time())
+            + (self.config.callback_seconds if ttl_seconds is None else max(1, ttl_seconds)),
             bot_role=DISCUSSION_ROLE,
             chat_id=int(space["discussion_chat_id"]),
             space_id=str(space["space_id"]),
@@ -1341,13 +1877,28 @@ class DiscussionBotController:
 
     async def error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         error = context.error
-        LOGGER.error("Discussion Bot handler failed (%s)", type(error).__name__)
+        message = getattr(update, "effective_message", None)
+        chat = getattr(update, "effective_chat", None)
+        space = None
+        command = ""
+        if message is not None:
+            with contextlib.suppress(Exception):
+                space = self._space_for_message(message)
+            with contextlib.suppress(Exception):
+                command = command_name(update)  # type: ignore[arg-type]
+        LOGGER.error(
+            "event=discussion_handler_failed error_type=%s error=%r "
+            "update_id=%s chat_id=%s command=%s space_id=%s",
+            type(error).__name__,
+            _redacted_error(error),
+            getattr(update, "update_id", None),
+            getattr(chat, "id", None),
+            command or "none",
+            str(space.get("space_id") or "")[:12] if space else "none",
+        )
         if not isinstance(update, Update):
             return
-        message = update.effective_message
-        space = self._space_for_message(message)
         if not space:
-            chat = update.effective_chat
             user = update.effective_user
             owner = self.store.get_owner()
             if (

@@ -30,6 +30,10 @@ QuestionHandler = Callable[[str, Json], Awaitable[None]]
 NoticeHandler = Callable[[str, str | None], Awaitable[None]]
 StateChangeHandler = Callable[[ThreadState, str], Awaitable[None]]
 QuestionResolvedHandler = Callable[[str], Awaitable[None]]
+PlanCompletedHandler = Callable[[str, str, str, str], Awaitable[None]]
+PromptCompletedHandler = Callable[[Json], Awaitable[None]]
+
+_FINAL_TURN_STATUSES = {"completed", "failed", "interrupted"}
 
 
 def _workspace_write_policy() -> Json:
@@ -40,6 +44,17 @@ def _workspace_write_policy() -> Json:
         "excludeSlashTmp": True,
         "excludeTmpdirEnvVar": True,
     }
+
+
+def _turn_error_kind(error: object) -> str:
+    if not isinstance(error, dict):
+        return ""
+    info = error.get("codexErrorInfo")
+    if isinstance(info, str):
+        return info
+    if isinstance(info, dict) and info:
+        return str(next(iter(info)))
+    return "turnFailed" if error else ""
 
 
 async def _noop_question(request_key: str, params: Json) -> None:
@@ -58,6 +73,16 @@ async def _noop_question_resolved(request_key: str) -> None:
     del request_key
 
 
+async def _noop_plan_completed(
+    thread_id: str, turn_id: str, item_id: str, text: str
+) -> None:
+    del thread_id, turn_id, item_id, text
+
+
+async def _noop_prompt_completed(run: Json) -> None:
+    del run
+
+
 class Bridge:
     def __init__(self, config: Config, store: Store, bot: Bot, messenger: OutboundMessenger) -> None:
         self.config = config
@@ -68,6 +93,8 @@ class Bridge:
         self.on_notice: NoticeHandler = _noop_notice
         self.on_state_change: StateChangeHandler = _noop_state_change
         self.on_question_resolved: QuestionResolvedHandler = _noop_question_resolved
+        self.on_plan_completed: PlanCompletedHandler = _noop_plan_completed
+        self.on_prompt_completed: PromptCompletedHandler = _noop_prompt_completed
         self.dashboard = DashboardManager(
             bot,
             store,
@@ -93,6 +120,8 @@ class Bridge:
         self._space_locks: dict[str, asyncio.Lock] = {}
         self._pending_requests: dict[str, tuple[int | str, int]] = {}
         self._resolved_request_ids: dict[tuple[int, str], None] = {}
+        self._notified_plan_items: dict[tuple[str, str], None] = {}
+        self._terminal_turns: dict[tuple[str, str], tuple[str, str]] = {}
         self._maintenance_task: asyncio.Task[None] | None = None
         self._started = False
 
@@ -213,7 +242,9 @@ class Bridge:
         states: list[ThreadState] = []
         for payload in await self.client.list_threads(limit=limit, search_term=search_term):
             if isinstance(payload, dict) and payload.get("id"):
-                states.append(self.projector.apply_thread(payload))
+                state = self.projector.apply_thread(payload)
+                if not state.is_subagent and not state.ephemeral:
+                    states.append(state)
         return states
 
     async def resolve_thread(self, selector: str) -> ThreadState:
@@ -406,6 +437,59 @@ class Bridge:
             effort=self.config.ask_reasoning_effort,
         )
 
+    async def start_space_collaboration_turn(
+        self,
+        space_id: str,
+        prompt: str,
+        *,
+        mode: str,
+        client_message_id: str,
+    ) -> Json:
+        prompt = prompt.strip()
+        if not prompt:
+            raise ValueError("Collaboration prompt cannot be empty")
+        if mode not in {"default", "plan"}:
+            raise ValueError(f"Unsupported collaboration mode: {mode!r}")
+        lock = self._space_locks.setdefault(space_id, asyncio.Lock())
+        async with lock:
+            space = self._require_active_space(space_id)
+            generation = space.generation
+            thread_id = space.thread_id or ""
+            payload = await self.client.resume_thread(space.thread_id or "")
+            state = self.projector.apply_thread(payload)
+            if state.thread_id != thread_id:
+                raise RuntimeError("Codex resumed a different session")
+            if state.is_subagent or state.ephemeral:
+                raise RuntimeError("Collaboration turns require a primary session")
+            if state.status == "active" or state.turn_status == "inProgress":
+                raise RuntimeError("当前 turn 正在运行，请稍后重试")
+            if not state.cwd:
+                raise ValueError("Session does not report a working directory")
+            cwd = self.path_policy.validate_directory(Path(state.cwd))
+            collaboration_mode = await self.client.resolve_collaboration_mode(mode)
+            current = self._require_active_space(space_id)
+            if current.generation != generation or current.thread_id != thread_id:
+                raise RuntimeError("Session space generation is stale")
+            turn = await self.client.start_turn(
+                state.thread_id,
+                [text_input(prompt)],
+                client_message_id=client_message_id,
+                cwd=cwd,
+                sandbox_policy=_workspace_write_policy(),
+                approval_policy="never",
+                collaboration_mode=collaboration_mode,
+            )
+            if not (turn or {}).get("id"):
+                raise RuntimeError("Codex did not return an ID for the collaboration turn")
+            LOGGER.info(
+                "event=collaboration_turn_started space_id=%s thread_id=%s turn_id=%s mode=%s",
+                space.space_id,
+                state.short_id,
+                str((turn or {})["id"])[:8],
+                mode,
+            )
+            return turn or {}
+
     async def dispatch_space_queue(
         self,
         space_id: str,
@@ -513,14 +597,35 @@ class Bridge:
             await self.client.steer_turn(
                 thread_id, state.turn_id, values, client_message_id=client_message_id
             )
+            LOGGER.info(
+                "event=prompt_injected space_id=%s thread_id=%s turn_id=%s",
+                space_id or "legacy",
+                thread_id[:8],
+                state.turn_id[:8],
+            )
             return "steered"
-        await self.client.start_turn(
+        turn = await self.client.start_turn(
             thread_id,
             values,
             client_message_id=client_message_id,
             cwd=cwd,
             sandbox_policy=_workspace_write_policy(),
             approval_policy="never",
+        )
+        turn_id = str((turn or {}).get("id") or "")
+        if space_id is not None and generation is not None:
+            await self._track_prompt_run(
+                space_id=space_id,
+                generation=generation,
+                thread_id=thread_id,
+                turn_id=turn_id,
+                client_message_id=client_message_id,
+            )
+        LOGGER.info(
+            "event=prompt_started space_id=%s thread_id=%s turn_id=%s",
+            space_id or "legacy",
+            thread_id[:8],
+            turn_id[:8] or "unknown",
         )
         return "started"
 
@@ -592,7 +697,7 @@ class Bridge:
                 )
                 return
             try:
-                await self.client.start_turn(
+                turn = await self.client.start_turn(
                     thread_id,
                     inputs,
                     client_message_id=client_message_id,
@@ -600,6 +705,15 @@ class Bridge:
                     sandbox_policy=_workspace_write_policy(),
                     approval_policy="never",
                 )
+                turn_id = str((turn or {}).get("id") or "")
+                if space_id is not None and generation is not None:
+                    await self._track_prompt_run(
+                        space_id=space_id,
+                        generation=generation,
+                        thread_id=thread_id,
+                        turn_id=turn_id,
+                        client_message_id=client_message_id,
+                    )
             except Exception as exc:
                 delivered = await self._client_message_exists(thread_id, client_message_id)
                 if delivered:
@@ -626,6 +740,51 @@ class Bridge:
                 return
             await self._mark_prompt_dispatched(
                 state, queue_id, space_id=space_id, generation=generation
+            )
+
+    async def _track_prompt_run(
+        self,
+        *,
+        space_id: str,
+        generation: int,
+        thread_id: str,
+        turn_id: str,
+        client_message_id: str,
+    ) -> None:
+        if not turn_id:
+            LOGGER.warning(
+                "event=prompt_run_tracking_skipped space_id=%s thread_id=%s "
+                "reason=missing_turn_id",
+                space_id[:12],
+                thread_id[:8],
+            )
+            return
+        try:
+            inserted = self.store.put_prompt_run(
+                uuid.uuid4().hex,
+                space_id=space_id,
+                generation=generation,
+                thread_id=thread_id,
+                turn_id=turn_id,
+                client_message_id=client_message_id,
+            )
+        except Exception:
+            LOGGER.exception(
+                "event=prompt_run_tracking_failed space_id=%s thread_id=%s turn_id=%s",
+                space_id[:12],
+                thread_id[:8],
+                turn_id[:8],
+            )
+            return
+        if not inserted:
+            return
+        terminal = self._terminal_turns.get((thread_id, turn_id))
+        if terminal is not None:
+            await self._finish_prompt_runs(
+                thread_id,
+                turn_id,
+                status=terminal[0],
+                error_kind=terminal[1],
             )
 
     async def _mark_prompt_dispatched(
@@ -842,6 +1001,49 @@ class Bridge:
                 self.store.delete_pending_input(key)
             return
         await self.projector.ingest(method, params)
+        if method == "item/completed":
+            item = params.get("item") or {}
+            if isinstance(item, dict) and item.get("type") == "plan":
+                await self._notify_plan_completed(
+                    str(params.get("threadId") or ""),
+                    str(params.get("turnId") or ""),
+                    str(item.get("id") or ""),
+                    str(item.get("text") or ""),
+                )
+        elif method == "turn/completed":
+            thread_id = str(params.get("threadId") or "")
+            turn = params.get("turn") or {}
+            if not isinstance(turn, dict):
+                return
+            turn_id = str(turn.get("id") or "")
+            for item in turn.get("items") or []:
+                if isinstance(item, dict) and item.get("type") == "plan":
+                    await self._notify_plan_completed(
+                        thread_id,
+                        turn_id,
+                        str(item.get("id") or ""),
+                        str(item.get("text") or ""),
+                    )
+            status = str(turn.get("status") or "")
+            if not thread_id or not turn_id or status not in _FINAL_TURN_STATUSES:
+                LOGGER.warning(
+                    "event=invalid_turn_completion thread_id=%s turn_id=%s status=%s",
+                    thread_id[:8] or "missing",
+                    turn_id[:8] or "missing",
+                    status or "missing",
+                )
+                return
+            error_kind = _turn_error_kind(turn.get("error"))
+            marker = (thread_id, turn_id)
+            self._terminal_turns[marker] = (status, error_kind)
+            while len(self._terminal_turns) > 512:
+                self._terminal_turns.pop(next(iter(self._terminal_turns)))
+            await self._finish_prompt_runs(
+                thread_id,
+                turn_id,
+                status=status,
+                error_kind=error_kind,
+            )
 
     async def _on_state_change(self, state: ThreadState, reason: str) -> None:
         immediate = reason in {"error", "turn/completed", "thread/goal/updated", "thread/status/changed"}
@@ -870,6 +1072,54 @@ class Bridge:
             await self.on_question_resolved(request_key)
         except Exception:
             LOGGER.exception("Failed to remove resolved Telegram question %s", request_key)
+
+    async def _notify_plan_completed(
+        self, thread_id: str, turn_id: str, item_id: str, text: str
+    ) -> None:
+        if not thread_id or not item_id or not text.strip():
+            return
+        marker = (thread_id, item_id)
+        if marker in self._notified_plan_items:
+            return
+        try:
+            await self.on_plan_completed(thread_id, turn_id, item_id, text)
+        except Exception:
+            LOGGER.exception(
+                "event=plan_publish_hook_failed thread_id=%s turn_id=%s item_id=%s",
+                thread_id[:8],
+                turn_id[:8],
+                item_id[:8],
+            )
+            return
+        self._notified_plan_items[marker] = None
+        while len(self._notified_plan_items) > 512:
+            self._notified_plan_items.pop(next(iter(self._notified_plan_items)))
+
+    async def _notify_prompt_completed(self, run: Json) -> None:
+        try:
+            await self.on_prompt_completed(run)
+        except Exception:
+            LOGGER.exception(
+                "event=prompt_receipt_hook_failed space_id=%s turn_id=%s",
+                str(run.get("space_id") or "")[:12],
+                str(run.get("turn_id") or "")[:8],
+            )
+
+    async def _finish_prompt_runs(
+        self,
+        thread_id: str,
+        turn_id: str,
+        *,
+        status: str,
+        error_kind: str,
+    ) -> None:
+        for run in self.store.finish_prompt_runs(
+            thread_id,
+            turn_id,
+            status=status,
+            error_kind=error_kind,
+        ):
+            await self._notify_prompt_completed(run)
 
     async def _on_server_request(
         self, request_id: int | str, method: str, params: Json, generation: int

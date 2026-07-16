@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 import secrets
 import time
 from typing import Any
@@ -14,7 +15,7 @@ from .config import Config
 from .models import ThreadState
 from .security import SecurityManager
 from .store import Store
-from .telegram_common import DISCUSSION_ROLE, TelegramEndpoint
+from .telegram_common import CONTROL_ROLE, DISCUSSION_ROLE, TelegramEndpoint
 from .views import (
     RenderedMessage,
     render_channel_post,
@@ -27,14 +28,21 @@ LOGGER = logging.getLogger(__name__)
 
 _IMMEDIATE_REASONS = {
     "error",
-    "item/completed",
-    "item/started",
     "turn/completed",
     "thread/goal/updated",
     "thread/goal/cleared",
     "thread/status/changed",
     "turn/plan/updated",
 }
+
+_BOT_URL_TOKEN = re.compile(r"(https://api\.telegram\.org/bot)[^/\s]+", re.IGNORECASE)
+_BOT_TOKEN = re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{16,}\b")
+
+
+def _safe_error_text(exc: BaseException) -> str:
+    detail = " ".join(str(exc).split()) or type(exc).__name__
+    detail = _BOT_URL_TOKEN.sub(r"\1<redacted>", detail)
+    return _BOT_TOKEN.sub("<redacted>", detail)[:500]
 
 
 def private_message_link(chat_id: int, message_id: int) -> str:
@@ -128,17 +136,21 @@ class SpaceDashboardManager:
                     await self._flush(space_id)
                 except TelegramError as exc:
                     LOGGER.warning(
-                        "Space dashboard update failed for %s (%s)",
-                        space_id[:8],
+                        "event=space_dashboard_update_failed space_id=%s "
+                        "error_type=%s error=%s",
+                        space_id,
                         type(exc).__name__,
+                        _safe_error_text(exc),
                     )
                     self._dirty.add(space_id)
                     await asyncio.sleep(5)
                 except Exception as exc:
                     LOGGER.error(
-                        "Unexpected space dashboard error for %s (%s)",
-                        space_id[:8],
+                        "event=space_dashboard_unexpected_error space_id=%s "
+                        "error_type=%s error=%s",
+                        space_id,
                         type(exc).__name__,
+                        _safe_error_text(exc),
                     )
                     self._dirty.add(space_id)
                     await asyncio.sleep(5)
@@ -155,20 +167,61 @@ class SpaceDashboardManager:
         status_keyboard = self._status_keyboard(space)
 
         if space.get("channel_chat_id") and space.get("channel_post_id"):
-            await self.control.edit_text(
-                int(space["channel_chat_id"]),
-                int(space["channel_post_id"]),
+            await self._edit_dashboard_target(
+                self.control,
                 channel_rendered.markdown,
+                bot_role=CONTROL_ROLE,
+                space_id=space_id,
+                chat_id=int(space["channel_chat_id"]),
+                message_id=int(space["channel_post_id"]),
                 plain=channel_rendered.plain,
             )
         if space.get("discussion_chat_id") and space.get("status_message_id"):
-            await self.discussion.edit_text(
-                int(space["discussion_chat_id"]),
-                int(space["status_message_id"]),
+            await self._edit_dashboard_target(
+                self.discussion,
                 status_rendered.markdown,
+                bot_role=DISCUSSION_ROLE,
+                space_id=space_id,
+                chat_id=int(space["discussion_chat_id"]),
+                message_id=int(space["status_message_id"]),
                 plain=status_rendered.plain,
                 reply_markup=status_keyboard,
             )
+
+    @staticmethod
+    async def _edit_dashboard_target(
+        endpoint: TelegramEndpoint,
+        markdown: str,
+        *,
+        bot_role: str,
+        space_id: str,
+        chat_id: int,
+        message_id: int,
+        plain: str,
+        reply_markup: InlineKeyboardMarkup | None = None,
+    ) -> None:
+        try:
+            options: dict[str, Any] = {"plain": plain}
+            if reply_markup is not None:
+                options["reply_markup"] = reply_markup
+            await endpoint.edit_text(
+                chat_id,
+                message_id,
+                markdown,
+                **options,
+            )
+        except Exception as exc:
+            LOGGER.warning(
+                "event=space_dashboard_target_failed space_id=%s bot_role=%s "
+                "chat_id=%s message_id=%s error_type=%s error=%s",
+                space_id,
+                bot_role,
+                chat_id,
+                message_id,
+                type(exc).__name__,
+                _safe_error_text(exc),
+            )
+            raise
 
     def _state_for_space(self, space: dict[str, Any]) -> ThreadState | dict[str, Any]:
         thread_id = str(space.get("thread_id") or "")

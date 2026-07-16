@@ -798,3 +798,253 @@ async def test_side_fork_events_and_input_requests_never_reach_bridge_hooks(
     assert rejected == [(99, -32600)]
     assert store.get_thread("side-fork") is None
     store.close()
+
+
+@pytest.mark.asyncio
+async def test_list_sessions_hides_subagents_and_ephemeral_forks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, store = make_bridge(tmp_path)
+
+    async def list_threads(**_kwargs: Any) -> list[dict[str, Any]]:
+        return [
+            {"id": "primary", "status": {"type": "idle"}},
+            {
+                "id": "child",
+                "source": {
+                    "subagent": {"threadSpawn": {"parentThreadId": "primary"}}
+                },
+                "status": {"type": "idle"},
+            },
+            {"id": "ask-fork", "ephemeral": True, "status": {"type": "idle"}},
+        ]
+
+    monkeypatch.setattr(bridge.client, "list_threads", list_threads)
+
+    sessions = await bridge.list_sessions()
+
+    assert [state.thread_id for state in sessions] == ["primary"]
+    assert store.get_thread("child").is_subagent  # type: ignore[union-attr]
+    assert store.get_thread("ask-fork").ephemeral  # type: ignore[union-attr]
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_collaboration_turn_validates_space_generation_before_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, store = make_bridge(tmp_path)
+    store.save_session_space(
+        SessionSpace(
+            space_id="space-plan",
+            generation=3,
+            lifecycle="active",
+            thread_id="thread-plan",
+        )
+    )
+    started: list[dict[str, Any]] = []
+
+    async def resume_thread(_thread_id: str) -> dict[str, Any]:
+        return {
+            "id": "thread-plan",
+            "cwd": str(tmp_path),
+            "status": {"type": "idle"},
+        }
+
+    async def resolve_mode(mode: str) -> dict[str, Any]:
+        assert mode == "default"
+        space = store.get_session_space("space-plan")
+        assert space is not None
+        space.generation = 4
+        store.save_session_space(space)
+        return {"mode": mode, "settings": {"model": "gpt-test"}}
+
+    async def start_turn(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+        started.append(kwargs)
+        return {"id": "turn-plan"}
+
+    monkeypatch.setattr(bridge.client, "resume_thread", resume_thread)
+    monkeypatch.setattr(bridge.client, "resolve_collaboration_mode", resolve_mode)
+    monkeypatch.setattr(bridge.client, "start_turn", start_turn)
+
+    with pytest.raises(ValueError, match="cannot be empty"):
+        await bridge.start_space_collaboration_turn(
+            "space-plan", " ", mode="default", client_message_id="tg-empty"
+        )
+    with pytest.raises(ValueError, match="Unsupported collaboration mode"):
+        await bridge.start_space_collaboration_turn(
+            "space-plan", "Refine", mode="review", client_message_id="tg-review"
+        )
+    with pytest.raises(RuntimeError, match="generation is stale"):
+        await bridge.start_space_collaboration_turn(
+            "space-plan", "Implement the plan", mode="default", client_message_id="tg-plan"
+        )
+
+    assert started == []
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_plan_completion_hook_uses_authoritative_item_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, store = make_bridge(tmp_path)
+    received: list[tuple[str, str, str, str]] = []
+
+    async def ingest(_method: str, _params: dict[str, Any]) -> None:
+        pass
+
+    async def plan_completed(
+        thread_id: str, turn_id: str, item_id: str, text: str
+    ) -> None:
+        received.append((thread_id, turn_id, item_id, text))
+
+    monkeypatch.setattr(bridge.projector, "ingest", ingest)
+    bridge.on_plan_completed = plan_completed
+    plan = {"id": "plan-1", "type": "plan", "text": "1. Inspect\n2. Implement"}
+
+    await bridge._on_notification(
+        "item/completed",
+        {"threadId": "thread-plan", "turnId": "turn-plan", "item": plan},
+    )
+    await bridge._on_notification(
+        "turn/completed",
+        {
+            "threadId": "thread-plan",
+            "turn": {"id": "turn-plan", "status": "completed", "items": [plan]},
+        },
+    )
+
+    assert received == [
+        ("thread-plan", "turn-plan", "plan-1", "1. Inspect\n2. Implement")
+    ]
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_space_prompt_completion_receipt_is_routed_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, store = make_bridge(tmp_path)
+    store.save_session_space(
+        SessionSpace(
+            space_id="space-prompt",
+            generation=7,
+            lifecycle="active",
+            thread_id="thread-prompt",
+        )
+    )
+    receipts: list[dict[str, Any]] = []
+    notification = {
+        "threadId": "thread-prompt",
+        "turn": {
+            "id": "turn-prompt",
+            "status": "failed",
+            "error": {
+                "message": "request failed",
+                "codexErrorInfo": "usageLimitExceeded",
+            },
+            "items": [],
+        },
+    }
+
+    async def resume_thread(_thread_id: str) -> dict[str, Any]:
+        return {
+            "id": "thread-prompt",
+            "cwd": str(tmp_path),
+            "status": {"type": "idle"},
+        }
+
+    async def start_turn(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        await bridge._on_notification("turn/completed", notification)
+        return {"id": "turn-prompt"}
+
+    async def ingest(_method: str, _params: dict[str, Any]) -> None:
+        pass
+
+    async def completed(run: dict[str, Any]) -> None:
+        receipts.append(run)
+
+    monkeypatch.setattr(bridge.client, "resume_thread", resume_thread)
+    monkeypatch.setattr(bridge.client, "start_turn", start_turn)
+    monkeypatch.setattr(bridge.projector, "ingest", ingest)
+    bridge.on_prompt_completed = completed
+
+    assert await bridge.send_space_prompt(
+        "space-prompt",
+        "Do the work",
+        client_message_id="tg-prompt",
+    ) == "started"
+    await bridge._on_notification("turn/completed", notification)
+    await bridge._on_notification("turn/completed", notification)
+
+    assert len(receipts) == 1
+    expected = {
+        "space_id": "space-prompt",
+        "generation": 7,
+        "thread_id": "thread-prompt",
+        "turn_id": "turn-prompt",
+        "client_message_id": "tg-prompt",
+        "status": "failed",
+        "error_kind": "usageLimitExceeded",
+    }
+    assert {key: receipts[0][key] for key in expected} == expected
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_queued_space_prompt_registers_completion_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, store = make_bridge(tmp_path)
+    store.save_session_space(
+        SessionSpace(
+            space_id="space-queued",
+            generation=2,
+            lifecycle="active",
+            thread_id="thread-queued",
+        )
+    )
+    store.save_thread(
+        ThreadState(thread_id="thread-queued", cwd=str(tmp_path), status="idle")
+    )
+    store.enqueue_prompt(
+        "thread-queued",
+        "Queued work",
+        [{"type": "text", "text": "Queued work"}],
+        "tg-queued",
+        space_id="space-queued",
+        generation=2,
+    )
+    receipts: list[dict[str, Any]] = []
+    notification = {
+        "threadId": "thread-queued",
+        "turn": {"id": "turn-queued", "status": "completed", "items": []},
+    }
+
+    async def not_delivered(_thread_id: str, _client_message_id: str) -> bool:
+        return False
+
+    async def start_turn(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        await bridge._on_notification("turn/completed", notification)
+        return {"id": "turn-queued"}
+
+    async def ingest(_method: str, _params: dict[str, Any]) -> None:
+        pass
+
+    async def completed(run: dict[str, Any]) -> None:
+        receipts.append(run)
+
+    monkeypatch.setattr(bridge, "_client_message_exists", not_delivered)
+    monkeypatch.setattr(bridge.client, "start_turn", start_turn)
+    monkeypatch.setattr(bridge.projector, "ingest", ingest)
+    bridge.on_prompt_completed = completed
+
+    await bridge.dispatch_space_queue("space-queued", generation=2)
+    await bridge._on_notification("turn/completed", notification)
+
+    assert len(receipts) == 1
+    assert (receipts[0]["space_id"], receipts[0]["generation"]) == ("space-queued", 2)
+    assert receipts[0]["status"] == "completed"
+    assert store.space_queue_entries("space-queued", 2) == []
+    store.close()

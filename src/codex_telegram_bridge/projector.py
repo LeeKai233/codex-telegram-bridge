@@ -83,18 +83,29 @@ class EventProjector:
     def _apply_subagent_source(state: ThreadState, source: object) -> None:
         if not isinstance(source, dict):
             return
-        subagent = source.get("subAgent")
+        subagent = source.get("subAgent") or source.get("subagent")
         if not isinstance(subagent, dict):
             return
-        spawned = subagent.get("thread_spawn")
+        spawned = subagent.get("threadSpawn") or subagent.get("thread_spawn")
         if not isinstance(spawned, dict):
             return
         state.parent_thread_id = str(
-            spawned.get("parent_thread_id") or state.parent_thread_id or ""
+            spawned.get("parentThreadId")
+            or spawned.get("parent_thread_id")
+            or state.parent_thread_id
+            or ""
         ) or None
-        state.agent_path = str(spawned.get("agent_path") or state.agent_path)
-        state.agent_nickname = str(spawned.get("agent_nickname") or state.agent_nickname)
-        state.agent_role = str(spawned.get("agent_role") or state.agent_role)
+        state.agent_path = str(
+            spawned.get("agentPath") or spawned.get("agent_path") or state.agent_path
+        )
+        state.agent_nickname = str(
+            spawned.get("agentNickname")
+            or spawned.get("agent_nickname")
+            or state.agent_nickname
+        )
+        state.agent_role = str(
+            spawned.get("agentRole") or spawned.get("agent_role") or state.agent_role
+        )
 
     def _sync_parent_agent_metadata(self, state: ThreadState) -> None:
         if not state.parent_thread_id:
@@ -254,6 +265,15 @@ class EventProjector:
                 state.last_agent_message = text[:2000]
                 state.latest_activity = text[:360]
                 self._record_activity(state, item_type, state.latest_activity, "completed")
+            return
+        if item_type == "plan":
+            state.latest_activity = "Plan 已完成" if completed else "Plan 正在生成"
+            self._record_activity(
+                state,
+                item_type,
+                state.latest_activity,
+                "completed" if completed else "inProgress",
+            )
             return
         if item_type == "commandExecution":
             status = str(item.get("status") or ("completed" if completed else "inProgress"))

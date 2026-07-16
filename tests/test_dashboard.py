@@ -7,11 +7,13 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from telegram.error import NetworkError
+from telegram.error import BadRequest, NetworkError
 
+import codex_telegram_bridge.space_dashboard as space_dashboard_module
+from codex_telegram_bridge.config import Config
 from codex_telegram_bridge.dashboard import DashboardManager
 from codex_telegram_bridge.models import ThreadState
-from codex_telegram_bridge.space_dashboard import _IMMEDIATE_REASONS
+from codex_telegram_bridge.space_dashboard import _IMMEDIATE_REASONS, SpaceDashboardManager
 from codex_telegram_bridge.store import Store
 
 
@@ -68,6 +70,28 @@ class RetryBot(RecordingBot):
             raise NetworkError("request failed at https://api.telegram.org/botSUPER-SECRET/sendMessage")
         self.delivered.set()
         return SimpleNamespace(message_id=42)
+
+
+class StaticSecurity:
+    def space_unlock_remaining(self, _space_id: str) -> int:
+        return 0
+
+
+class RecordingEndpoint:
+    def __init__(self, error: Exception | None = None) -> None:
+        self.error = error
+        self.edit_calls: list[tuple[int, int]] = []
+
+    async def edit_text(
+        self,
+        chat_id: int,
+        message_id: int,
+        _markdown: str,
+        **_kwargs: Any,
+    ) -> None:
+        self.edit_calls.append((chat_id, message_id))
+        if self.error:
+            raise self.error
 
 
 def subscribed_state(store: Store, *, activity: str = "first") -> ThreadState:
@@ -169,5 +193,74 @@ async def test_heartbeat_refreshes_idle_subscriptions(tmp_path: Path) -> None:
     store.close()
 
 
-def test_subagent_item_events_refresh_space_dashboard_immediately() -> None:
-    assert {"item/started", "item/completed"} <= _IMMEDIATE_REASONS
+def test_subagent_item_events_are_debounced_until_a_semantic_boundary() -> None:
+    assert {"item/started", "item/completed"}.isdisjoint(_IMMEDIATE_REASONS)
+    assert {"turn/completed", "turn/plan/updated"} <= _IMMEDIATE_REASONS
+
+
+@pytest.mark.asyncio
+async def test_space_dashboard_failure_logs_safe_target_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    config = replace(
+        Config.default(),
+        config_dir=tmp_path / "config",
+        state_dir=tmp_path / "state",
+        allowed_root=tmp_path,
+    )
+    store = Store(config.database_path)
+    store.create_space(
+        {
+            "space_id": "space-log-context",
+            "lifecycle": "active",
+            "thread_id": "thread-log-context",
+            "discussion_chat_id": -100123,
+            "discussion_root_id": 40,
+            "status_message_id": 41,
+        }
+    )
+    store.save_thread(
+        ThreadState(
+            thread_id="thread-log-context",
+            title="Logging test",
+            cwd=str(tmp_path),
+            status="idle",
+        )
+    )
+    control = RecordingEndpoint()
+    discussion = RecordingEndpoint(
+        BadRequest(
+            "invalid dashboard target at "
+            "https://api.telegram.org/bot123456789:SUPER-SECRET/editMessageText"
+        )
+    )
+    manager = SpaceDashboardManager(
+        config,
+        store,
+        StaticSecurity(),  # type: ignore[arg-type]
+        control,  # type: ignore[arg-type]
+        discussion,  # type: ignore[arg-type]
+    )
+
+    async def stop_after_retry(delay: float) -> None:
+        assert delay == 5
+        manager._stopping = True
+
+    monkeypatch.setattr(space_dashboard_module.asyncio, "sleep", stop_after_retry)
+    manager._dirty.add("space-log-context")
+    manager._immediate.add("space-log-context")
+    await manager._worker("space-log-context")
+
+    assert discussion.edit_calls == [(-100123, 41)]
+    assert "event=space_dashboard_target_failed" in caplog.text
+    assert "event=space_dashboard_update_failed" in caplog.text
+    assert "space_id=space-log-context" in caplog.text
+    assert "bot_role=discussion" in caplog.text
+    assert "chat_id=-100123" in caplog.text
+    assert "message_id=41" in caplog.text
+    assert "error_type=BadRequest" in caplog.text
+    assert "invalid dashboard target" in caplog.text
+    assert "SUPER-SECRET" not in caplog.text
+    store.close()
