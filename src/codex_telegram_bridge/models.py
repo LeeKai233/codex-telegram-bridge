@@ -21,7 +21,14 @@ class TaskState:
     title: str
     status: str = "pending"
     agent_thread_id: str | None = None
+    agent_path: str = ""
+    agent_nickname: str = ""
+    agent_role: str = ""
+    model: str = ""
+    reasoning_effort: str = ""
     message: str = ""
+    started_at: int = 0
+    finished_at: int = 0
     updated_at: int = 0
 
     @classmethod
@@ -30,9 +37,22 @@ class TaskState:
             task_id=str(value.get("task_id") or ""),
             title=str(value.get("title") or ""),
             status=str(value.get("status") or "pending"),
-            agent_thread_id=str(value["agent_thread_id"]) if value.get("agent_thread_id") else None,
+            agent_thread_id=(
+                str(value.get("agent_thread_id") or value.get("agentThreadId"))
+                if value.get("agent_thread_id") or value.get("agentThreadId")
+                else None
+            ),
+            agent_path=str(value.get("agent_path") or value.get("agentPath") or ""),
+            agent_nickname=str(value.get("agent_nickname") or value.get("agentNickname") or ""),
+            agent_role=str(value.get("agent_role") or value.get("agentRole") or ""),
+            model=str(value.get("model") or ""),
+            reasoning_effort=str(
+                value.get("reasoning_effort") or value.get("reasoningEffort") or ""
+            ),
             message=str(value.get("message") or ""),
-            updated_at=int(value.get("updated_at") or 0),
+            started_at=int(value.get("started_at") or value.get("startedAt") or 0),
+            finished_at=int(value.get("finished_at") or value.get("finishedAt") or 0),
+            updated_at=int(value.get("updated_at") or value.get("updatedAt") or 0),
         )
 
 
@@ -58,6 +78,12 @@ class ThreadState:
     thread_id: str
     title: str = "Codex session"
     cwd: str = ""
+    session_id: str = ""
+    parent_thread_id: str | None = None
+    agent_nickname: str = ""
+    agent_role: str = ""
+    agent_path: str = ""
+    ephemeral: bool = False
     status: str = "notLoaded"
     active_flags: list[str] = field(default_factory=list)
     turn_id: str | None = None
@@ -85,6 +111,10 @@ class ThreadState:
     @property
     def short_id(self) -> str:
         return self.thread_id[:8]
+
+    @property
+    def is_subagent(self) -> bool:
+        return self.parent_thread_id is not None
 
     @property
     def completed_steps(self) -> int:

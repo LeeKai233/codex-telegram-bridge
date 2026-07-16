@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from codex_telegram_bridge.models import LifecycleActivity, PlanStep, ThreadState
+from codex_telegram_bridge.models import LifecycleActivity, PlanStep, TaskState, ThreadState
 from codex_telegram_bridge.views import (
     CHANNEL_POST_BUDGET,
     SESSIONS_MESSAGE_BUDGET,
@@ -127,6 +127,8 @@ def test_full_status_comment_has_plan_tasks_auth_update_and_plain_fallback() -> 
     assert "*🧩 Tasks*  `2/3` · Active `1` · Failed `0`" in rendered.markdown
     assert "*📥 Queue*  `2`" in rendered.markdown
     assert "🔓 TOTP 已认证 · 剩余 `30 min`" in rendered.markdown
+    expires = time.strftime("%H:%M:%S", time.localtime(1_700_001_900))
+    assert f"到期 `{expires}`" in rendered.markdown
     assert "*🕘 近期事件*" in rendered.markdown
     assert "Plan created · completed" in rendered.markdown
     updated = time.strftime("%H:%M:%S", time.localtime(1_700_000_000))
@@ -134,6 +136,68 @@ def test_full_status_comment_has_plan_tasks_auth_update_and_plain_fallback() -> 
     assert "[x] 1. Inspect architecture" in rendered.plain
     assert len(rendered.markdown) <= STATUS_COMMENT_BUDGET
     assert len(rendered.plain) <= STATUS_COMMENT_BUDGET
+
+
+def test_status_comment_lists_active_agents_before_bounded_terminal_history() -> None:
+    state = ThreadState(thread_id="parent", title="Parallel task", status="active")
+    state.tasks = [
+        TaskState(
+            task_id="done-old",
+            title="Old completion",
+            status="completed",
+            finished_at=1_700_000_010,
+            updated_at=1_700_000_010,
+        ),
+        TaskState(
+            task_id="active-agent-id",
+            title="Implement status rendering",
+            status="inProgress",
+            agent_thread_id="active-agent-id",
+            agent_path="/root/security_status",
+            agent_nickname="Ada_*[]",
+            agent_role="reviewer",
+            model="gpt-5.6-luna",
+            reasoning_effort="max",
+            message="PRIVATE REASONING AND TOOL ARGUMENTS",
+            started_at=1_700_000_000,
+            updated_at=1_700_000_100,
+        ),
+        TaskState(
+            task_id="done-new",
+            title="Recent completion",
+            status="completed",
+            finished_at=1_700_000_090,
+            updated_at=1_700_000_090,
+        ),
+        TaskState(
+            task_id="failed-agent",
+            title="Failed review",
+            status="failed",
+            finished_at=1_700_000_080,
+            updated_at=1_700_000_080,
+        ),
+        TaskState(
+            task_id="closed-agent",
+            title="Closed worker",
+            status="shutdown",
+            finished_at=1_700_000_070,
+            updated_at=1_700_000_070,
+        ),
+    ]
+
+    rendered = render_status_comment(state, now=1_700_000_120)
+
+    assert "*🤝 Subagents*" in rendered.markdown
+    assert "Ada\\_\\*\\[\\]" in rendered.markdown
+    assert "`reviewer`" in rendered.markdown
+    assert "`gpt-5.6-luna/max`" in rendered.markdown
+    assert "`00:02:00`" in rendered.markdown
+    assert rendered.plain.index("active-a") < rendered.plain.index("done-new")
+    assert "Recent completion" in rendered.plain
+    assert "Old completion" not in rendered.plain
+    assert "另有 1 个已结束 Agent" in rendered.plain
+    assert "PRIVATE REASONING" not in rendered.markdown
+    assert "PRIVATE REASONING" not in rendered.plain
 
 
 def test_status_comment_expires_auth_and_stays_bounded_with_hostile_text() -> None:

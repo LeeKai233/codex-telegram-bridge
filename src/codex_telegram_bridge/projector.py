@@ -42,6 +42,14 @@ class EventProjector:
         state = self.store.get_thread(thread_id) or ThreadState(thread_id=thread_id)
         state.title = str(payload.get("name") or payload.get("preview") or state.title)
         state.cwd = str(payload.get("cwd") or state.cwd)
+        state.session_id = str(payload.get("sessionId") or state.session_id)
+        if "parentThreadId" in payload:
+            state.parent_thread_id = str(payload.get("parentThreadId") or "") or None
+        state.agent_nickname = str(payload.get("agentNickname") or state.agent_nickname)
+        state.agent_role = str(payload.get("agentRole") or state.agent_role)
+        if "ephemeral" in payload:
+            state.ephemeral = bool(payload.get("ephemeral"))
+        self._apply_subagent_source(state, payload.get("source"))
         state.created_at = int(payload.get("createdAt") or state.created_at)
         state.updated_at = int(payload.get("updatedAt") or state.updated_at)
         status = payload.get("status") or {}
@@ -68,7 +76,44 @@ class EventProjector:
             state.recent_activity = recent_activity
         state.queue_count = self.store.queue_count(thread_id)
         self.store.save_thread(state)
+        self._sync_parent_agent_metadata(state)
         return state
+
+    @staticmethod
+    def _apply_subagent_source(state: ThreadState, source: object) -> None:
+        if not isinstance(source, dict):
+            return
+        subagent = source.get("subAgent")
+        if not isinstance(subagent, dict):
+            return
+        spawned = subagent.get("thread_spawn")
+        if not isinstance(spawned, dict):
+            return
+        state.parent_thread_id = str(
+            spawned.get("parent_thread_id") or state.parent_thread_id or ""
+        ) or None
+        state.agent_path = str(spawned.get("agent_path") or state.agent_path)
+        state.agent_nickname = str(spawned.get("agent_nickname") or state.agent_nickname)
+        state.agent_role = str(spawned.get("agent_role") or state.agent_role)
+
+    def _sync_parent_agent_metadata(self, state: ThreadState) -> None:
+        if not state.parent_thread_id:
+            return
+        parent = self.store.get_thread(state.parent_thread_id)
+        if parent is None:
+            return
+        changed = False
+        for task in parent.tasks:
+            if task.agent_thread_id != state.thread_id and task.task_id != state.thread_id:
+                continue
+            before = (task.agent_path, task.agent_nickname, task.agent_role)
+            task.agent_path = state.agent_path or task.agent_path
+            task.agent_nickname = state.agent_nickname or task.agent_nickname
+            task.agent_role = state.agent_role or task.agent_role
+            changed = before != (task.agent_path, task.agent_nickname, task.agent_role)
+            break
+        if changed:
+            self.store.save_thread(parent)
 
     async def ingest(self, method: str, params: dict[str, Any]) -> None:
         thread_id = self._thread_id(params)
@@ -231,34 +276,108 @@ class EventProjector:
             states = item.get("agentsStates") or {}
             tasks = {task.task_id: task for task in state.tasks}
             now = int(time.time())
-            prompt = " ".join(str(item.get("prompt") or "").split())[:240]
+            prompt = " ".join(str(item.get("prompt") or "").split())[:160]
+            tool = str(item.get("tool") or "")
+            model = str(item.get("model") or "")
+            effort = str(item.get("reasoningEffort") or "")
             for agent_thread_id, value in states.items():
                 if not isinstance(value, dict):
                     continue
                 task_id = str(agent_thread_id)
                 current = tasks.get(task_id)
+                child_state = self.store.get_thread(task_id)
                 raw_status = str(value.get("status") or "pendingInit")
                 task_status = self._task_status(raw_status)
+                started_at = current.started_at if current else 0
+                if not started_at and task_status in {"pending", "inProgress"}:
+                    started_at = now
+                finished_at = current.finished_at if current else 0
+                if task_status in {"completed", "failed", "interrupted", "shutdown", "notFound"}:
+                    finished_at = finished_at or now
+                elif task_status in {"pending", "inProgress"}:
+                    finished_at = 0
+                use_prompt = prompt and (tool in {"spawnAgent", "spawn_agent"} or current is None)
                 tasks[task_id] = TaskState(
                     task_id=task_id,
-                    title=prompt or (current.title if current else f"Agent {task_id[:8]}"),
+                    title=prompt if use_prompt else (current.title if current else f"Agent {task_id[:8]}"),
                     status=task_status,
                     agent_thread_id=task_id,
+                    agent_path=(
+                        (child_state.agent_path if child_state else "")
+                        or (current.agent_path if current else "")
+                    ),
+                    agent_nickname=(
+                        (child_state.agent_nickname if child_state else "")
+                        or (current.agent_nickname if current else "")
+                    ),
+                    agent_role=(
+                        (child_state.agent_role if child_state else "")
+                        or (current.agent_role if current else "")
+                    ),
+                    model=model or (current.model if current else ""),
+                    reasoning_effort=effort or (current.reasoning_effort if current else ""),
                     message=str(value.get("message") or (current.message if current else "")),
+                    started_at=started_at,
+                    finished_at=finished_at,
                     updated_at=now,
                 )
             state.tasks = sorted(tasks.values(), key=lambda task: (task.updated_at, task.task_id))[-50:]
             state.agents_active = sum(task.status in {"pending", "inProgress"} for task in state.tasks)
-            state.agents_completed = sum(task.status == "completed" for task in state.tasks)
-            state.agents_failed = sum(task.status == "failed" for task in state.tasks)
+            state.agents_completed = sum(
+                task.status in {"completed", "shutdown"} for task in state.tasks
+            )
+            state.agents_failed = sum(
+                task.status in {"failed", "interrupted", "notFound"} for task in state.tasks
+            )
             state.latest_activity = f"Agent task {item.get('tool', '')}: {item.get('status', '')}".strip()
             self._record_activity(
                 state, item_type, state.latest_activity, str(item.get("status") or "inProgress")
             )
             return
         if item_type == "subAgentActivity":
-            state.latest_activity = f"Subagent {item.get('kind', '')}".strip()
-            self._record_activity(state, item_type, state.latest_activity, str(item.get("kind") or ""))
+            agent_thread_id = str(item.get("agentThreadId") or "")
+            agent_path = " ".join(str(item.get("agentPath") or "").split())[:120]
+            kind = str(item.get("kind") or "")
+            now = int(time.time())
+            tasks = {task.task_id: task for task in state.tasks}
+            current = tasks.get(agent_thread_id)
+            if agent_thread_id:
+                if kind == "interrupted":
+                    task_status = "interrupted"
+                elif kind in {"started", "interacted"}:
+                    task_status = "inProgress"
+                else:
+                    task_status = current.status if current else "pending"
+                tasks[agent_thread_id] = TaskState(
+                    task_id=agent_thread_id,
+                    title=current.title if current else f"Agent {agent_path or agent_thread_id[:8]}",
+                    status=task_status,
+                    agent_thread_id=agent_thread_id,
+                    agent_path=agent_path or (current.agent_path if current else ""),
+                    agent_nickname=current.agent_nickname if current else "",
+                    agent_role=current.agent_role if current else "",
+                    model=current.model if current else "",
+                    reasoning_effort=current.reasoning_effort if current else "",
+                    message=current.message if current else "",
+                    started_at=(current.started_at if current else 0) or now,
+                    finished_at=now if task_status == "interrupted" else 0,
+                    updated_at=now,
+                )
+                state.tasks = sorted(
+                    tasks.values(), key=lambda task: (task.updated_at, task.task_id)
+                )[-50:]
+                state.agents_active = sum(
+                    task.status in {"pending", "inProgress"} for task in state.tasks
+                )
+                state.agents_completed = sum(
+                    task.status in {"completed", "shutdown"} for task in state.tasks
+                )
+                state.agents_failed = sum(
+                    task.status in {"failed", "interrupted", "notFound"}
+                    for task in state.tasks
+                )
+            state.latest_activity = f"Subagent {kind}".strip()
+            self._record_activity(state, item_type, state.latest_activity, kind)
             return
         if item_type == "imageGeneration":
             state.latest_activity = f"图像生成: {item.get('status', '')}".strip()
@@ -275,9 +394,15 @@ class EventProjector:
 
     @staticmethod
     def _task_status(status: str) -> str:
-        if status in {"completed", "shutdown"}:
+        if status == "completed":
             return "completed"
-        if status in {"errored", "interrupted", "notFound"}:
+        if status == "shutdown":
+            return "shutdown"
+        if status == "interrupted":
+            return "interrupted"
+        if status == "notFound":
+            return "notFound"
+        if status == "errored":
             return "failed"
         if status == "running":
             return "inProgress"

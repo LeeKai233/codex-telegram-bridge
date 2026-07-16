@@ -11,6 +11,7 @@ from telegram.error import NetworkError
 
 from codex_telegram_bridge.dashboard import DashboardManager
 from codex_telegram_bridge.models import ThreadState
+from codex_telegram_bridge.space_dashboard import _IMMEDIATE_REASONS
 from codex_telegram_bridge.store import Store
 
 
@@ -166,3 +167,7 @@ async def test_heartbeat_refreshes_idle_subscriptions(tmp_path: Path) -> None:
 
     await manager.stop()
     store.close()
+
+
+def test_subagent_item_events_refresh_space_dashboard_immediately() -> None:
+    assert {"item/started", "item/completed"} <= _IMMEDIATE_REASONS

@@ -442,7 +442,82 @@ def _auth_line(source: object, auth_expires_at: object | None, now: int) -> tupl
     if remaining <= 0:
         return "🔒 TOTP 已过期", "TOTP 已过期"
     minutes = max(1, math.ceil(remaining / 60))
-    return f"🔓 TOTP 已认证 · 剩余 {inline_code(f'{minutes} min')}", f"TOTP 已认证 · 剩余 {minutes} min"
+    expires_at = time.strftime("%H:%M:%S", time.localtime(expires))
+    return (
+        f"🔓 TOTP 已认证 · 剩余 {inline_code(f'{minutes} min')} · "
+        f"到期 {inline_code(expires_at)}",
+        f"TOTP 已认证 · 剩余 {minutes} min · 到期 {expires_at}",
+    )
+
+
+def _agent_status(task: object) -> tuple[str, str, bool]:
+    status = str(_value(task, "status", default="pending") or "pending")
+    statuses = {
+        "pending": ("🟡", "初始化", True),
+        "pendingInit": ("🟡", "初始化", True),
+        "active": ("🟢", "运行中", True),
+        "running": ("🟢", "运行中", True),
+        "inProgress": ("🟢", "运行中", True),
+        "completed": ("✅", "已完成", False),
+        "shutdown": ("⚫", "已关闭", False),
+        "interrupted": ("⏸", "已中断", False),
+        "notFound": ("❓", "未找到", False),
+        "errored": ("❌", "失败", False),
+        "failed": ("❌", "失败", False),
+    }
+    return statuses.get(status, ("⚪", "未知", False))
+
+
+def _visible_agents(state: object) -> tuple[list[object], int]:
+    tasks = _value(state, "tasks", default=()) or ()
+    if not isinstance(tasks, Sequence) or isinstance(tasks, str | bytes):
+        return [], 0
+    active: list[object] = []
+    terminal: list[object] = []
+    for task in tasks:
+        _, _, is_active = _agent_status(task)
+        (active if is_active else terminal).append(task)
+    active.sort(
+        key=lambda task: int(_value(task, "started_at", "updated_at", default=0) or 0)
+    )
+    terminal.sort(
+        key=lambda task: int(
+            _value(task, "finished_at", "updated_at", default=0) or 0
+        ),
+        reverse=True,
+    )
+    visible = active + terminal[:3]
+    return visible, max(0, len(tasks) - len(visible))
+
+
+def _agent_lines(task: object, now: int) -> tuple[str, str]:
+    icon, status, _ = _agent_status(task)
+    thread_id = str(_value(task, "agent_thread_id") or _value(task, "task_id") or "")
+    path = str(_value(task, "agent_path", default="") or "")
+    nickname = str(_value(task, "agent_nickname", default="") or "")
+    role = str(_value(task, "agent_role", default="") or "")
+    label = clip(nickname or path or thread_id[:8] or "agent", 48)
+    short_id = thread_id[:8] or path or "unknown"
+    model = str(_value(task, "model", default="") or "")
+    effort = str(_value(task, "reasoning_effort", default="") or "")
+    model_effort = "/".join(value for value in (model, effort) if value)
+    started = _epoch(_value(task, "started_at", "updated_at")) or now
+    finished = _epoch(_value(task, "finished_at"))
+    elapsed = _duration(max(0, (finished or now) - started))
+    title = clip(str(_value(task, "title", default="Agent task") or "Agent task"), 100)
+    metadata = [status, short_id]
+    if role:
+        metadata.append(clip(role, 32))
+    if model_effort:
+        metadata.append(clip(model_effort, 64))
+    metadata.append(elapsed)
+    markdown = (
+        f"{icon} *{escape(label)}* · "
+        + " · ".join(inline_code(value) for value in metadata)
+        + f"\n└ {escape(title)}"
+    )
+    plain = f"{icon} {label} · " + " · ".join(metadata) + f"\n  {title}"
+    return markdown, plain
 
 
 def render_status_comment(
@@ -512,6 +587,17 @@ def render_status_comment(
             f"📥 Queue · {queue}",
         ]
     )
+    visible_agents, hidden_agents = _visible_agents(state)
+    if visible_agents:
+        markdown_lines.extend(["", "*🤝 Subagents*"])
+        plain_lines.extend(["", "🤝 Subagents"])
+        for task in visible_agents:
+            markdown, plain = _agent_lines(task, now)
+            markdown_lines.append(markdown)
+            plain_lines.append(plain)
+        if hidden_agents:
+            markdown_lines.append(escape(f"… 另有 {hidden_agents} 个已结束 Agent"))
+            plain_lines.append(f"... 另有 {hidden_agents} 个已结束 Agent")
     latest = str(_value(state, "latest_activity", "activity", default="") or "")
     if latest:
         markdown_lines.append(f"*⚡ 最新*  {escape(clip(latest, 360))}")

@@ -27,6 +27,8 @@ LOGGER = logging.getLogger(__name__)
 
 _IMMEDIATE_REASONS = {
     "error",
+    "item/completed",
+    "item/started",
     "turn/completed",
     "thread/goal/updated",
     "thread/goal/cleared",
