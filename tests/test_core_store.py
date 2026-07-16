@@ -252,7 +252,7 @@ def test_v4_migration_adds_interaction_state_tables_and_preserves_messages(
 
     store = Store(path)
     try:
-        assert store.schema_version == 5
+        assert store.schema_version == SCHEMA_VERSION
         assert store.question_messages("request-1") == [
             {
                 "bot_role": "forum",
@@ -267,7 +267,168 @@ def test_v4_migration_adds_interaction_state_tables_and_preserves_messages(
                 "SELECT name FROM sqlite_master WHERE type='table'"
             )
         }
-        assert {"question_resolutions", "prompt_runs", "plan_publications"} <= tables
+        assert {
+            "interaction_drafts",
+            "question_resolutions",
+            "prompt_runs",
+            "plan_publications",
+        } <= tables
+    finally:
+        store.close()
+
+
+def test_interaction_draft_progress_and_claim_are_atomic_across_connections(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    first = Store(path)
+    second = Store(path)
+    try:
+        draft = first.replace_interaction(
+            "control:11:7:new",
+            kind="new",
+            phase="model",
+            payload={"seed": "value"},
+            user_id=7,
+            bot_role="control",
+            chat_id=11,
+            expires_at=4_000_000_000,
+        )
+        assert draft.revision == 1
+        assert draft.claimed_at is None
+
+        advanced = second.advance_interaction(
+            draft.scope_key,
+            draft.flow_id,
+            draft.revision,
+            phase="effort",
+            payload={"model": "gpt-5.6-luna"},
+            expires_at=4_000_000_001,
+        )
+        assert advanced is not None
+        assert advanced.revision == 2
+        assert advanced.phase == "effort"
+        assert advanced.payload == {"model": "gpt-5.6-luna"}
+        assert (
+            first.advance_interaction(
+                draft.scope_key,
+                draft.flow_id,
+                draft.revision,
+                phase="stale",
+                payload={},
+                expires_at=4_000_000_002,
+            )
+            is None
+        )
+
+        claimed = first.claim_interaction(
+            advanced.scope_key,
+            advanced.flow_id,
+            advanced.revision,
+        )
+        assert claimed is not None
+        assert claimed.claimed_at is not None
+        assert (
+            second.claim_interaction(
+                advanced.scope_key,
+                advanced.flow_id,
+                advanced.revision,
+            )
+            is None
+        )
+        assert second.get_interaction(advanced.scope_key) is None
+    finally:
+        first.close()
+        second.close()
+
+
+def test_interaction_claims_enforce_expiry_inside_the_atomic_update(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    first = Store(path)
+    second = Store(path)
+    now = int(time.time())
+    try:
+        expired = first.replace_interaction(
+            "control:11:7:expired",
+            kind="new",
+            phase="prompt",
+            payload={"cwd": str(tmp_path)},
+            user_id=7,
+            bot_role="control",
+            chat_id=11,
+            expires_at=now - 1,
+        )
+        assert (
+            first.advance_interaction(
+                expired.scope_key,
+                expired.flow_id,
+                expired.revision,
+                phase="revived",
+                payload={},
+                expires_at=now + 60,
+            )
+            is None
+        )
+        assert (
+            first.claim_live_interaction(
+                expired.scope_key, expired.flow_id, expired.revision
+            )
+            is None
+        )
+        assert (
+            second.claim_expired_interaction(
+                expired.scope_key, expired.flow_id, expired.revision
+            )
+            is not None
+        )
+
+        live = first.replace_interaction(
+            "control:11:7:live",
+            kind="new",
+            phase="prompt",
+            payload={"cwd": str(tmp_path)},
+            user_id=7,
+            bot_role="control",
+            chat_id=11,
+            expires_at=now + 60,
+        )
+        assert (
+            second.claim_expired_interaction(
+                live.scope_key, live.flow_id, live.revision
+            )
+            is None
+        )
+        assert (
+            first.claim_live_interaction(live.scope_key, live.flow_id, live.revision)
+            is not None
+        )
+    finally:
+        first.close()
+        second.close()
+
+
+def test_reset_owner_deletes_interaction_drafts(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    try:
+        store.replace_interaction(
+            "discussion:22:8:planmode",
+            kind="planmode",
+            phase="prompt",
+            payload={"model": "gpt-5.6-luna", "effort": "max"},
+            user_id=8,
+            bot_role="discussion",
+            chat_id=22,
+            expires_at=4_000_000_000,
+            space_id="space-1",
+            generation=2,
+        )
+        assert len(store.list_interactions("planmode")) == 1
+
+        store.reset_owner()
+
+        assert store.list_interactions() == []
     finally:
         store.close()
 
@@ -388,6 +549,14 @@ def test_plan_publication_state_machine_rejects_stale_and_duplicate_actions(
         assert not store.mark_plan_action("space-1", 3, "plan-1", status="executing")
         assert store.mark_plan_action("space-1", 3, "plan-2", status="revising")
         assert not store.mark_plan_action("space-1", 3, "plan-2", status="executing")
+        assert store.complete_plan_action(
+            "space-1",
+            3,
+            "plan-2",
+            expected_status="revising",
+            status="revision_started",
+        )
+        assert store.recoverable_plan_publications() == []
         with pytest.raises(ValueError, match="action status"):
             store.mark_plan_action("space-1", 3, "plan-2", status="published")
 

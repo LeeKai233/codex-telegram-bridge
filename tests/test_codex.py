@@ -19,6 +19,9 @@ async def test_resume_thread_merges_latest_turn_metadata() -> None:
         calls.append((method, params, timeout))
         return {
             "thread": {"id": "thread-1", "turns": []},
+            "model": "gpt-5.6-luna",
+            "reasoningEffort": "max",
+            "cwd": "/tmp/project",
             "initialTurnsPage": {
                 "data": [{"id": "turn-2", "status": "inProgress", "items": [], "itemsView": "notLoaded"}]
             },
@@ -29,6 +32,9 @@ async def test_resume_thread_merges_latest_turn_metadata() -> None:
     thread = await client.resume_thread("thread-1")
 
     assert thread["turns"][0]["id"] == "turn-2"
+    assert thread["model"] == "gpt-5.6-luna"
+    assert thread["reasoningEffort"] == "max"
+    assert thread["cwd"] == "/tmp/project"
     assert calls == [
         (
             "thread/resume",
@@ -178,6 +184,21 @@ async def test_collaboration_modes_are_validated_and_resolved() -> None:
         },
     }
 
+    explicit = await client.resolve_collaboration_mode(
+        "default",
+        model=" gpt-5.6-luna ",
+        effort=" max ",
+    )
+    assert explicit == {
+        "mode": "default",
+        "settings": {
+            "model": "gpt-5.6-luna",
+            "reasoning_effort": "max",
+            "developer_instructions": None,
+        },
+    }
+    assert calls == [("collaborationMode/list", {})]
+
 
 @pytest.mark.asyncio
 async def test_collaboration_modes_fail_closed_on_missing_or_invalid_capability() -> None:
@@ -197,6 +218,92 @@ async def test_collaboration_modes_fail_closed_on_missing_or_invalid_capability(
         await client.resolve_collaboration_mode("plan")
     with pytest.raises(ValueError, match="Unsupported"):
         await client.resolve_collaboration_mode("review")
+    with pytest.raises(ValueError, match="provided together"):
+        await client.resolve_collaboration_mode("plan", model="gpt-5.6-luna")
+
+
+@pytest.mark.asyncio
+async def test_model_options_follow_pagination_and_validate_efforts() -> None:
+    client = CodexClient(Path("/tmp/not-used.sock"))
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def request(
+        method: str, params: dict[str, Any], timeout: float = 30.0
+    ) -> dict[str, Any]:
+        del timeout
+        calls.append((method, params))
+        if "cursor" not in params:
+            return {
+                "data": [
+                    {
+                        "model": "gpt-5.6-luna",
+                        "displayName": "GPT-5.6 Luna",
+                        "defaultReasoningEffort": "high",
+                        "isDefault": True,
+                        "supportedReasoningEfforts": [
+                            {"reasoningEffort": "high", "description": ""},
+                            {"reasoningEffort": "max", "description": ""},
+                        ],
+                    }
+                ],
+                "nextCursor": "page-2",
+            }
+        return {
+            "data": [
+                {
+                    "model": "gpt-5.6-sol",
+                    "displayName": "GPT-5.6 Sol",
+                    "defaultReasoningEffort": "xhigh",
+                    "isDefault": False,
+                    "supportedReasoningEfforts": [
+                        {"reasoningEffort": "xhigh", "description": ""}
+                    ],
+                }
+            ],
+            "nextCursor": None,
+        }
+
+    client.request = request  # type: ignore[method-assign]
+
+    options = await client.list_model_options(page_size=1)
+
+    assert [option.model for option in options] == ["gpt-5.6-luna", "gpt-5.6-sol"]
+    assert options[0].supported_efforts == ("high", "max")
+    assert options[0].is_default
+    assert calls == [
+        ("model/list", {"limit": 1}),
+        ("model/list", {"limit": 1, "cursor": "page-2"}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_update_thread_settings_sends_explicit_collaboration_profile() -> None:
+    client = CodexClient(Path("/tmp/not-used.sock"))
+    calls: list[tuple[str, dict[str, Any], float]] = []
+
+    async def request(method: str, params: dict[str, Any], timeout: float = 30.0) -> dict[str, Any]:
+        calls.append((method, params, timeout))
+        return {}
+
+    client.request = request  # type: ignore[method-assign]
+    collaboration_mode = await client.resolve_collaboration_mode(
+        "plan",
+        model="gpt-5.6-luna",
+        effort="low",
+    )
+
+    await client.update_thread_settings(
+        "thread-1",
+        collaboration_mode=collaboration_mode,
+    )
+
+    assert calls == [
+        (
+            "thread/settings/update",
+            {"threadId": "thread-1", "collaborationMode": collaboration_mode},
+            30,
+        )
+    ]
 
 
 @pytest.mark.asyncio

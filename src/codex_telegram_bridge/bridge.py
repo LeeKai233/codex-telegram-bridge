@@ -17,7 +17,7 @@ from .config import Config
 from .dashboard import DashboardManager
 from .files import FileCandidate, PathPolicy, cleanup_inbox
 from .metrics import MetricsSampler
-from .models import SessionSpace, ThreadState
+from .models import ModelOption, ModelProfile, SessionSpace, ThreadState
 from .outbound import OutboundMessenger
 from .projector import EventProjector
 from .resolver import CodexResolver, DirectoryIndex
@@ -117,6 +117,7 @@ class Bridge:
         self.resolver = CodexResolver(self.client, self.path_policy, self.directory_index)
         self._queue_locks: dict[str, asyncio.Lock] = {}
         self._queue_retry_tasks: dict[str, asyncio.Task[None]] = {}
+        self._subagent_profile_tasks: dict[str, asyncio.Task[None]] = {}
         self._space_locks: dict[str, asyncio.Lock] = {}
         self._pending_requests: dict[str, tuple[int | str, int]] = {}
         self._resolved_request_ids: dict[tuple[int, str], None] = {}
@@ -155,6 +156,12 @@ class Bridge:
             task.cancel()
         if retry_tasks:
             await asyncio.gather(*retry_tasks, return_exceptions=True)
+        profile_tasks = list(self._subagent_profile_tasks.values())
+        self._subagent_profile_tasks.clear()
+        for task in profile_tasks:
+            task.cancel()
+        if profile_tasks:
+            await asyncio.gather(*profile_tasks, return_exceptions=True)
         await self.dashboard.stop()
         await self.metrics.stop()
         await self.client.stop()
@@ -212,6 +219,24 @@ class Bridge:
                         asyncio.create_task(self.dispatch_queue(thread_id))
             except CodexRpcError, RuntimeError:
                 LOGGER.exception("Failed to resync thread %s", thread_id)
+        await self._hydrate_missing_subagent_profiles()
+
+    async def _hydrate_missing_subagent_profiles(self) -> None:
+        seen: set[str] = set()
+        for parent in self.store.list_threads():
+            for task in parent.tasks:
+                child_id = str(task.agent_thread_id or task.task_id or "")
+                if not child_id or child_id in seen:
+                    continue
+                seen.add(child_id)
+                child = self.store.get_thread(child_id)
+                if child is not None and child.model and child.reasoning_effort:
+                    continue
+                await self._refresh_subagent_profile(
+                    child_id,
+                    parent.thread_id,
+                    task.agent_path,
+                )
 
     def _space_subscription_thread_ids(self) -> set[str]:
         return {
@@ -230,11 +255,68 @@ class Bridge:
     async def subscribe_space_thread(self, thread_id: str) -> ThreadState:
         """Resume a thread for live events without creating a legacy private dashboard."""
         payload = await self.client.resume_thread(thread_id)
+        self._backfill_space_profiles(thread_id, payload)
         state = self.projector.apply_thread(payload)
-        state.goal = await self.client.get_goal(thread_id)
+        state = self.projector.apply_goal(state, await self.client.get_goal(thread_id))
         state.subscribed = True
         self.store.save_thread(state)
         return state
+
+    def _backfill_space_profiles(self, thread_id: str, payload: Json) -> None:
+        model = str(payload.get("model") or "").strip()
+        effort = str(payload.get("reasoningEffort") or "").strip()
+        if not model or not effort:
+            return
+        for raw in self.store.list_spaces():
+            if str(raw.get("thread_id") or "") != thread_id:
+                continue
+            space = self.store.get_session_space(str(raw["space_id"]))
+            if space is None or (space.normal_model and space.normal_effort):
+                continue
+            space.normal_model = space.normal_model or model
+            space.normal_effort = space.normal_effort or effort
+            space.plan_model = space.plan_model or model
+            space.plan_effort = space.plan_effort or effort
+            latest = self.store.latest_plan_publication(space.space_id, space.generation)
+            if latest and latest.get("status") in {"published", "executing", "revising"}:
+                space.current_mode = "plan"
+            self.store.save_session_space(space)
+
+    async def list_model_options(self) -> list[ModelOption]:
+        return await self.client.list_model_options()
+
+    async def resolve_model_profile(self, model: str, effort: str) -> ModelProfile:
+        requested_model = model.strip().casefold()
+        requested_effort = effort.strip().casefold()
+        if not requested_model or not requested_effort:
+            raise ValueError("Model and effort must not be empty")
+        options = await self.list_model_options()
+        matches: list[ModelOption] = []
+        for option in options:
+            aliases = {
+                option.model.casefold(),
+                option.display_name.casefold(),
+                option.model.rsplit("-", 1)[-1].casefold(),
+            }
+            if requested_model in aliases:
+                matches.append(option)
+        unique = {option.model: option for option in matches}
+        if len(unique) != 1:
+            detail = "ambiguous" if unique else "unavailable"
+            raise ValueError(f"Model {model!r} is {detail}")
+        selected = next(iter(unique.values()))
+        efforts = {value.casefold(): value for value in selected.supported_efforts}
+        if requested_effort not in efforts:
+            raise ValueError(f"Effort {effort!r} is unavailable for model {selected.model!r}")
+        return ModelProfile(selected.model, efforts[requested_effort])
+
+    async def prepare_directory_creation(self, value: str) -> Path | None:
+        return await asyncio.to_thread(self.path_policy.prepare_directory_creation, value)
+
+    async def create_project_directory(self, target: Path) -> Path:
+        created = await asyncio.to_thread(self.path_policy.create_directory, target)
+        await self.directory_index.refresh()
+        return created
 
     async def list_sessions(
         self, *, search_term: str | None = None, limit: int = 200
@@ -294,7 +376,7 @@ class Bridge:
     async def refresh(self, thread_id: str) -> ThreadState:
         payload = await self.client.read_thread(thread_id, include_turns=True)
         state = self.projector.apply_thread(payload)
-        state.goal = await self.client.get_goal(thread_id)
+        state = self.projector.apply_goal(state, await self.client.get_goal(thread_id))
         self.store.save_thread(state)
         await self.dashboard.schedule(state, immediate=True)
         return state
@@ -336,6 +418,17 @@ class Bridge:
                 raise RuntimeError("Session space is no longer activatable")
             if not space.pending_cwd or not space.pending_prompt.strip():
                 raise ValueError("Pending session requires a directory and initial prompt")
+            collaboration_mode: Json | None = None
+            profile_model, profile_effort = self._space_profile_values(
+                space, space.current_mode
+            )
+            if profile_model or profile_effort:
+                profile = await self.resolve_model_profile(profile_model, profile_effort)
+                collaboration_mode = await self.client.resolve_collaboration_mode(
+                    space.current_mode,
+                    model=profile.model,
+                    effort=profile.effort,
+                )
 
             created_now = False
             if space.thread_id:
@@ -370,6 +463,7 @@ class Bridge:
                         cwd=cwd,
                         sandbox_policy=_workspace_write_policy(),
                         approval_policy="never",
+                        collaboration_mode=collaboration_mode,
                     )
                 except Exception as exc:
                     delivered = await self._client_message_exists(state.thread_id, client_message_id)
@@ -385,6 +479,70 @@ class Bridge:
             self.store.save_session_space(space)
             await self._notify_state_change(state, "session/activated")
             return state
+
+    @staticmethod
+    def _space_profile_values(space: SessionSpace, mode: str) -> tuple[str, str]:
+        if mode == "plan":
+            return space.plan_model, space.plan_effort
+        if mode == "default":
+            return space.normal_model, space.normal_effort
+        raise ValueError(f"Unsupported collaboration mode: {mode!r}")
+
+    async def set_space_profile(
+        self,
+        space_id: str,
+        mode: str,
+        model: str,
+        effort: str,
+    ) -> SessionSpace:
+        profile = await self.resolve_model_profile(model, effort)
+        lock = self._space_locks.setdefault(space_id, asyncio.Lock())
+        async with lock:
+            space = self._require_active_space(space_id)
+            if mode == "plan":
+                space.plan_model = profile.model
+                space.plan_effort = profile.effort
+            elif mode == "default":
+                space.normal_model = profile.model
+                space.normal_effort = profile.effort
+            else:
+                raise ValueError(f"Unsupported collaboration mode: {mode!r}")
+            self.store.save_session_space(space)
+            return space
+
+    async def change_space_model(
+        self,
+        space_id: str,
+        model: str,
+        effort: str,
+    ) -> SessionSpace:
+        profile = await self.resolve_model_profile(model, effort)
+        lock = self._space_locks.setdefault(space_id, asyncio.Lock())
+        async with lock:
+            space = self._require_active_space(space_id)
+            mode = space.current_mode
+            collaboration_mode = await self.client.resolve_collaboration_mode(
+                mode,
+                model=profile.model,
+                effort=profile.effort,
+            )
+            await self.client.update_thread_settings(
+                space.thread_id or "",
+                collaboration_mode=collaboration_mode,
+            )
+            current = self._require_active_space(space_id)
+            if current.generation != space.generation or current.thread_id != space.thread_id:
+                raise RuntimeError("Session space generation is stale")
+            if mode == "plan":
+                current.plan_model = profile.model
+                current.plan_effort = profile.effort
+            else:
+                current.normal_model = profile.model
+                current.normal_effort = profile.effort
+            self.store.save_session_space(current)
+            if state := self.store.get_thread(current.thread_id or ""):
+                await self._notify_state_change(state, "thread/settings/updated")
+            return current
 
     async def send_space_prompt(
         self,
@@ -444,6 +602,7 @@ class Bridge:
         *,
         mode: str,
         client_message_id: str,
+        profile: ModelProfile | None = None,
     ) -> Json:
         prompt = prompt.strip()
         if not prompt:
@@ -463,10 +622,33 @@ class Bridge:
                 raise RuntimeError("Collaboration turns require a primary session")
             if state.status == "active" or state.turn_status == "inProgress":
                 raise RuntimeError("当前 turn 正在运行，请稍后重试")
+            if self.store.space_queue_entries(space.space_id, generation):
+                raise RuntimeError("当前 Session 仍有排队 prompt，请先处理队列")
             if not state.cwd:
                 raise ValueError("Session does not report a working directory")
             cwd = self.path_policy.validate_directory(Path(state.cwd))
-            collaboration_mode = await self.client.resolve_collaboration_mode(mode)
+            if profile is None:
+                stored_model, stored_effort = self._space_profile_values(space, mode)
+                if stored_model and stored_effort:
+                    profile = await self.resolve_model_profile(stored_model, stored_effort)
+                else:
+                    effective_model = str(payload.get("model") or "")
+                    effective_effort = str(payload.get("reasoningEffort") or "")
+                    if effective_model and effective_effort:
+                        profile = await self.resolve_model_profile(
+                            effective_model, effective_effort
+                        )
+            else:
+                profile = await self.resolve_model_profile(profile.model, profile.effort)
+            if profile is None:
+                raise RuntimeError(
+                    "Codex 没有返回当前 Session 的 model/effort，已阻止使用空 profile 启动 turn"
+                )
+            collaboration_mode = await self.client.resolve_collaboration_mode(
+                mode,
+                model=profile.model,
+                effort=profile.effort,
+            )
             current = self._require_active_space(space_id)
             if current.generation != generation or current.thread_id != thread_id:
                 raise RuntimeError("Session space generation is stale")
@@ -481,6 +663,18 @@ class Bridge:
             )
             if not (turn or {}).get("id"):
                 raise RuntimeError("Codex did not return an ID for the collaboration turn")
+            current = self._require_active_space(space_id)
+            if current.generation != generation or current.thread_id != thread_id:
+                raise RuntimeError("Session space generation is stale")
+            current.current_mode = mode
+            if profile is not None:
+                if mode == "plan":
+                    current.plan_model = profile.model
+                    current.plan_effort = profile.effort
+                else:
+                    current.normal_model = profile.model
+                    current.normal_effort = profile.effort
+            self.store.save_session_space(current)
             LOGGER.info(
                 "event=collaboration_turn_started space_id=%s thread_id=%s turn_id=%s mode=%s",
                 space.space_id,
@@ -489,6 +683,28 @@ class Bridge:
                 mode,
             )
             return turn or {}
+
+    async def reconcile_plan_execution(
+        self,
+        space_id: str,
+        generation: int,
+        item_id: str,
+        client_message_id: str,
+    ) -> str:
+        space = self._require_active_space(space_id)
+        if space.generation != generation:
+            raise RuntimeError("Session space generation is stale")
+        latest = self.store.latest_plan_publication(space_id, generation)
+        if latest is None or str(latest.get("item_id") or "") != item_id:
+            raise RuntimeError("Plan publication is stale")
+        delivered = await self._client_message_exists(space.thread_id or "", client_message_id)
+        if delivered is None:
+            return "unknown"
+        if delivered:
+            space.current_mode = "default"
+            self.store.save_session_space(space)
+            return "delivered"
+        return "absent"
 
     async def dispatch_space_queue(
         self,
@@ -1001,6 +1217,7 @@ class Bridge:
                 self.store.delete_pending_input(key)
             return
         await self.projector.ingest(method, params)
+        self._schedule_subagent_profile_refresh(method, params)
         if method == "item/completed":
             item = params.get("item") or {}
             if isinstance(item, dict) and item.get("type") == "plan":
@@ -1044,6 +1261,55 @@ class Bridge:
                 status=status,
                 error_kind=error_kind,
             )
+
+    def _schedule_subagent_profile_refresh(self, method: str, params: Json) -> None:
+        if method not in {"item/started", "item/completed"}:
+            return
+        item = params.get("item")
+        if not isinstance(item, dict) or item.get("type") != "subAgentActivity":
+            return
+        child_id = str(item.get("agentThreadId") or "")
+        parent_id = str(params.get("threadId") or "")
+        if not child_id or not parent_id:
+            return
+        child = self.store.get_thread(child_id)
+        if child is not None and child.model and child.reasoning_effort:
+            return
+        running = self._subagent_profile_tasks.get(child_id)
+        if running is not None and not running.done():
+            return
+        task = asyncio.create_task(
+            self._refresh_subagent_profile(
+                child_id,
+                parent_id,
+                str(item.get("agentPath") or ""),
+            ),
+            name=f"codex-subagent-profile-{child_id[:8]}",
+        )
+        self._subagent_profile_tasks[child_id] = task
+        task.add_done_callback(
+            lambda completed, thread_id=child_id: self._subagent_profile_tasks.pop(
+                thread_id, None
+            )
+            if self._subagent_profile_tasks.get(thread_id) is completed
+            else None
+        )
+
+    async def _refresh_subagent_profile(
+        self, child_id: str, parent_id: str, agent_path: str
+    ) -> None:
+        try:
+            payload = await self.client.resume_thread(child_id)
+        except (CodexRpcError, RuntimeError, TimeoutError):
+            LOGGER.exception("Failed to load subagent profile for %s", child_id[:8])
+            return
+        payload.setdefault("parentThreadId", parent_id)
+        if agent_path:
+            payload.setdefault("agentPath", agent_path)
+        self.projector.apply_thread(payload)
+        parent = self.store.get_thread(parent_id)
+        if parent is not None:
+            await self._notify_state_change(parent, "subagent/profile")
 
     async def _on_state_change(self, state: ThreadState, reason: str) -> None:
         immediate = reason in {"error", "turn/completed", "thread/goal/updated", "thread/status/changed"}

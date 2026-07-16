@@ -12,6 +12,8 @@ from typing import Any
 from websockets.asyncio.client import ClientConnection, unix_connect
 from websockets.exceptions import ConnectionClosed
 
+from .models import ModelOption
+
 LOGGER = logging.getLogger(__name__)
 Json = dict[str, Any]
 NotificationHandler = Callable[[str, Json], Awaitable[None]]
@@ -519,6 +521,16 @@ class CodexClient:
         if isinstance(turns, list) and turns:
             # thread/resume excludes history, but steering still needs the active turn ID.
             thread["turns"] = [turns[0]]
+        if isinstance(result, dict):
+            model = result.get("model")
+            effort = result.get("reasoningEffort")
+            cwd = result.get("cwd")
+            if isinstance(model, str) and model.strip():
+                thread["model"] = model.strip()
+            if isinstance(effort, str) and effort.strip():
+                thread["reasoningEffort"] = effort.strip()
+            if isinstance(cwd, str) and cwd.strip():
+                thread["cwd"] = cwd
         return thread
 
     async def get_goal(self, thread_id: str) -> Json | None:
@@ -556,10 +568,97 @@ class CodexClient:
             modes.append(dict(item))
         return modes
 
-    async def resolve_collaboration_mode(self, mode: str) -> Json:
+    async def list_model_options(self, *, page_size: int = 100) -> list[ModelOption]:
+        """Return the complete validated model picker advertised by app-server."""
+        if page_size <= 0:
+            raise ValueError("Model page size must be positive")
+        options: list[ModelOption] = []
+        seen_models: set[str] = set()
+        seen_cursors: set[str] = set()
+        cursor: str | None = None
+        while True:
+            params: Json = {"limit": page_size}
+            if cursor is not None:
+                params["cursor"] = cursor
+            result = await self.request("model/list", params)
+            if not isinstance(result, dict) or not isinstance(result.get("data"), list):
+                raise RuntimeError("Codex returned an invalid model-list response")
+            for item in result["data"]:
+                if not isinstance(item, dict):
+                    raise RuntimeError("Codex returned an invalid model-list entry")
+                model = item.get("model")
+                display_name = item.get("displayName")
+                default_effort = item.get("defaultReasoningEffort")
+                is_default = item.get("isDefault")
+                raw_efforts = item.get("supportedReasoningEfforts")
+                if not isinstance(model, str) or not model.strip():
+                    raise RuntimeError("Codex returned a model without an identifier")
+                if not isinstance(display_name, str) or not display_name.strip():
+                    raise RuntimeError(f"Codex model {model!r} has no display name")
+                if not isinstance(default_effort, str) or not default_effort.strip():
+                    raise RuntimeError(f"Codex model {model!r} has no default effort")
+                if not isinstance(is_default, bool) or not isinstance(raw_efforts, list):
+                    raise RuntimeError(f"Codex model {model!r} has invalid picker metadata")
+                efforts: list[str] = []
+                for value in raw_efforts:
+                    effort = value.get("reasoningEffort") if isinstance(value, dict) else None
+                    if not isinstance(effort, str) or not effort.strip():
+                        raise RuntimeError(f"Codex model {model!r} has an invalid effort")
+                    normalized = effort.strip()
+                    if normalized not in efforts:
+                        efforts.append(normalized)
+                normalized_model = model.strip()
+                normalized_default = default_effort.strip()
+                if not efforts or normalized_default not in efforts:
+                    raise RuntimeError(f"Codex model {model!r} has inconsistent effort metadata")
+                if normalized_model in seen_models:
+                    raise RuntimeError(f"Codex returned duplicate model {normalized_model!r}")
+                seen_models.add(normalized_model)
+                options.append(
+                    ModelOption(
+                        model=normalized_model,
+                        display_name=display_name.strip(),
+                        supported_efforts=tuple(efforts),
+                        default_effort=normalized_default,
+                        is_default=is_default,
+                    )
+                )
+            next_cursor = result.get("nextCursor")
+            if next_cursor is None:
+                break
+            if not isinstance(next_cursor, str) or not next_cursor.strip():
+                raise RuntimeError("Codex returned an invalid model-list cursor")
+            cursor = next_cursor.strip()
+            if cursor in seen_cursors:
+                raise RuntimeError("Codex returned a repeated model-list cursor")
+            seen_cursors.add(cursor)
+        return options
+
+    async def resolve_collaboration_mode(
+        self,
+        mode: str,
+        *,
+        model: str | None = None,
+        effort: str | None = None,
+    ) -> Json:
         """Build a turn/start collaborationMode payload or fail closed."""
         if mode not in {"default", "plan"}:
             raise ValueError(f"Unsupported collaboration mode: {mode!r}")
+        if (model is None) != (effort is None):
+            raise ValueError("Collaboration model and effort must be provided together")
+        if model is not None and effort is not None:
+            normalized_model = model.strip()
+            normalized_effort = effort.strip()
+            if not normalized_model or not normalized_effort:
+                raise ValueError("Collaboration model and effort must not be empty")
+            return {
+                "mode": mode,
+                "settings": {
+                    "model": normalized_model,
+                    "reasoning_effort": normalized_effort,
+                    "developer_instructions": None,
+                },
+            }
         for item in await self.list_collaboration_modes():
             if item.get("mode") != mode:
                 continue
@@ -578,6 +677,48 @@ class CodexClient:
                 },
             }
         raise RuntimeError(f"Codex collaboration mode {mode!r} is unavailable")
+
+    async def update_thread_settings(
+        self,
+        thread_id: str,
+        *,
+        model: str | None = None,
+        effort: str | None = None,
+        collaboration_mode: Json | None = None,
+    ) -> None:
+        """Update sticky settings used by subsequent turns in a thread."""
+        normalized_thread_id = thread_id.strip()
+        if not normalized_thread_id:
+            raise ValueError("Thread ID must not be empty")
+        if collaboration_mode is not None and (model is not None or effort is not None):
+            raise ValueError("collaboration_mode cannot be combined with model or effort")
+        params: Json = {"threadId": normalized_thread_id}
+        if collaboration_mode is not None:
+            mode = collaboration_mode.get("mode")
+            settings = collaboration_mode.get("settings")
+            profile_model = settings.get("model") if isinstance(settings, dict) else None
+            profile_effort = settings.get("reasoning_effort") if isinstance(settings, dict) else None
+            if mode not in {"default", "plan"}:
+                raise ValueError("Collaboration mode is invalid")
+            if not isinstance(profile_model, str) or not profile_model.strip():
+                raise ValueError("Collaboration mode model is invalid")
+            if profile_effort is not None and (
+                not isinstance(profile_effort, str) or not profile_effort.strip()
+            ):
+                raise ValueError("Collaboration mode effort is invalid")
+            params["collaborationMode"] = collaboration_mode
+        else:
+            if model is not None:
+                if not model.strip():
+                    raise ValueError("Model must not be empty")
+                params["model"] = model.strip()
+            if effort is not None:
+                if not effort.strip():
+                    raise ValueError("Effort must not be empty")
+                params["effort"] = effort.strip()
+            if len(params) == 1:
+                raise ValueError("At least one thread setting must be provided")
+        await self.request("thread/settings/update", params, timeout=30)
 
     async def start_thread(self, cwd: Path, *, ephemeral: bool = False, read_only: bool = False) -> Json:
         params: Json = {

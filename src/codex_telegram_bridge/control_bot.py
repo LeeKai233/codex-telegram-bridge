@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import difflib
 import logging
+import math
 import secrets
 import time
 from dataclasses import dataclass
@@ -308,11 +309,11 @@ class ControlBotController:
 
         parsed = self._parse_new_arguments(arguments)
         if parsed is None:
-            await self._send_new_usage(chat.id)
+            await self._send_new_parse_suggestion(chat.id, arguments)
             return
         normal_model, normal_effort, mode, plan_model, plan_effort, cwd, prompt = parsed
         if mode not in {None, "planmode", "noplan"}:
-            await self._send_new_suggestion(chat.id, parsed)
+            await self._send_new_parse_suggestion(chat.id, arguments)
             return
         try:
             normal = await self.bridge.resolve_model_profile(normal_model, normal_effort)
@@ -385,27 +386,20 @@ class ControlBotController:
         if not chat or not message:
             return
         await self._cancel_perf(chat.id, delete=True)
-        started = time.monotonic()
-        deadline = int(time.time() + _PERF_LIFETIME_SECONDS)
         group_key = f"perf:{update.update_id}"
-        self.deletions.schedule(
-            CONTROL_ROLE,
-            chat.id,
-            [message.message_id],
-            delete_at=deadline,
-            group_key=group_key,
-        )
         snapshot = await self.bridge.metrics.with_gpu()
         reply = await self.endpoint.send_text(
             chat.id,
             self._render_perf(snapshot, 0, plain=False),
             plain=self._render_perf(snapshot, 0, plain=True),
         )
+        started = time.monotonic()
+        deadline = math.ceil(time.time() + _PERF_LIFETIME_SECONDS)
         reply_id = int(reply.message_id)
         self.deletions.schedule(
             CONTROL_ROLE,
             chat.id,
-            [reply_id],
+            [message.message_id, reply_id],
             delete_at=deadline,
             group_key=group_key,
         )
@@ -468,6 +462,9 @@ class ControlBotController:
         scope_key = self._new_scope(chat.id, user.id)
         draft = self.store.get_interaction(scope_key)
         if draft is None or draft.claimed_at is not None:
+            return
+        if draft.expires_at <= int(time.time()):
+            await self._expire_new_draft(draft)
             return
         if draft.phase == "prompt":
             await self._finish_new_prompt(draft, text)
@@ -577,6 +574,10 @@ class ControlBotController:
         ):
             await self.endpoint.send_text(chat_id, "该选择已失效，请重新执行 `/new`。")
             return
+        if draft.expires_at <= int(time.time()):
+            await self._expire_new_draft(draft)
+            await self.endpoint.send_text(chat_id, "该选择已过期，请重新执行 `/new`。")
+            return
         event = str(callback["event"])
         value = str(callback.get("value") or "")
         payload = dict(draft.payload)
@@ -628,9 +629,22 @@ class ControlBotController:
             )
             return
         if event == "create_project" and draft.phase == "project_confirmation":
-            cwd = await self.bridge.create_project_directory(Path(value))
+            applying = self._advance_new(draft, "creating_project", payload)
+            if applying is None:
+                return
+            try:
+                cwd = await self.bridge.create_project_directory(Path(value))
+            except (ValueError, OSError) as exc:
+                self.store.claim_interaction(
+                    applying.scope_key,
+                    applying.flow_id,
+                    applying.revision,
+                )
+                self._cancel_new_timeout(applying.scope_key)
+                await self.endpoint.send_text(chat_id, escape(str(exc)))
+                return
             await self._accept_project(
-                draft,
+                applying,
                 cwd,
                 initial_prompt=self._optional_text(payload.get("initial_prompt")),
             )
@@ -741,10 +755,15 @@ class ControlBotController:
             reply_markup=InlineKeyboardMarkup([[hello]]),
         )
 
-    async def _finish_new_prompt(self, draft: Any, prompt: str) -> None:
-        claimed = self.store.claim_interaction(
-            draft.scope_key, draft.flow_id, draft.revision
+    async def _finish_new_prompt(
+        self, draft: Any, prompt: str, *, expired: bool = False
+    ) -> None:
+        claim = (
+            self.store.claim_expired_interaction
+            if expired
+            else self.store.claim_live_interaction
         )
+        claimed = claim(draft.scope_key, draft.flow_id, draft.revision)
         if claimed is None:
             return
         self._cancel_new_timeout(draft.scope_key)
@@ -814,10 +833,7 @@ class ControlBotController:
                 or current.revision != revision
             ):
                 return
-            if current.phase == "prompt":
-                await self._finish_new_prompt(current, "Hello")
-            else:
-                self.store.delete_interaction(scope_key)
+            await self._expire_new_draft(current)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -826,6 +842,12 @@ class ControlBotController:
             current_task = asyncio.current_task()
             if self._new_timeouts.get(scope_key) is current_task:
                 self._new_timeouts.pop(scope_key, None)
+
+    async def _expire_new_draft(self, draft: Any) -> None:
+        if draft.phase == "prompt":
+            await self._finish_new_prompt(draft, "Hello", expired=True)
+        else:
+            self.store.delete_interaction(draft.scope_key)
 
     def _restore_new_interactions(self) -> None:
         for draft in self.store.list_interactions(kind=_NEW_INTERACTION_KIND):
@@ -1025,6 +1047,28 @@ class ControlBotController:
             "`/new <model> | <effort> | noplan [ | <cwd> [ | <prompt> ] ]`\n"
             "`/new <model> | <effort> | planmode | <plan_model> | <plan_effort> "
             "[ | <cwd> [ | <prompt> ] ]`",
+        )
+
+    async def _send_new_parse_suggestion(self, chat_id: int, arguments: str) -> None:
+        parts = [part.strip() for part in arguments.split("|")]
+        model = parts[0] if parts else ""
+        effort = parts[1] if len(parts) > 1 else ""
+        mode = parts[2].casefold() if len(parts) > 2 and parts[2] else None
+        plan_model: str | None = None
+        plan_effort: str | None = None
+        cwd: str | None = None
+        prompt: str | None = None
+        if mode is not None and self._nearest_value(mode, ("planmode", "noplan")) == "planmode":
+            plan_model = parts[3] if len(parts) > 3 else ""
+            plan_effort = parts[4] if len(parts) > 4 else ""
+            cwd = parts[5] if len(parts) > 5 and parts[5] else None
+            prompt = " | ".join(parts[6:]).strip() or None
+        elif mode is not None:
+            cwd = parts[3] if len(parts) > 3 and parts[3] else None
+            prompt = " | ".join(parts[4:]).strip() or None
+        await self._send_new_suggestion(
+            chat_id,
+            (model, effort, mode, plan_model, plan_effort, cwd, prompt),
         )
 
     async def _send_new_suggestion(

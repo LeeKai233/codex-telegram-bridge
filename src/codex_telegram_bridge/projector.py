@@ -30,6 +30,22 @@ _REPEATABLE_NOTIFICATIONS = {
     "configWarning",
 }
 
+_ACTIVE_AGENT_TASK_STATUSES = {"pending", "pendingInit", "active", "running", "inProgress"}
+_TERMINAL_AGENT_TASK_STATUSES = {
+    "completed",
+    "shutdown",
+    "failed",
+    "errored",
+    "interrupted",
+    "notFound",
+}
+_CHILD_THREAD_TASK_STATUS = {
+    "active": "inProgress",
+    "idle": "completed",
+    "notLoaded": "shutdown",
+    "systemError": "failed",
+}
+
 
 class EventProjector:
     def __init__(self, store: Store, on_change: ChangeHandler = _noop_change) -> None:
@@ -39,10 +55,24 @@ class EventProjector:
 
     def apply_thread(self, payload: dict[str, Any]) -> ThreadState:
         thread_id = str(payload.get("id") or "")
-        state = self.store.get_thread(thread_id) or ThreadState(thread_id=thread_id)
+        persisted = self.store.get_thread(thread_id)
+        state = persisted or ThreadState(thread_id=thread_id)
+        incoming_updated_at = int(payload.get("updatedAt") or 0)
+        stale_payload = bool(
+            persisted is not None
+            and incoming_updated_at
+            and persisted.updated_at
+            and incoming_updated_at < persisted.updated_at
+        )
         state.title = str(payload.get("name") or payload.get("preview") or state.title)
         state.cwd = str(payload.get("cwd") or state.cwd)
         state.session_id = str(payload.get("sessionId") or state.session_id)
+        state.model = str(payload.get("model") or state.model)
+        state.reasoning_effort = str(
+            payload.get("reasoningEffort")
+            or payload.get("reasoning_effort")
+            or state.reasoning_effort
+        )
         if "parentThreadId" in payload:
             state.parent_thread_id = str(payload.get("parentThreadId") or "") or None
         state.agent_nickname = str(payload.get("agentNickname") or state.agent_nickname)
@@ -51,12 +81,17 @@ class EventProjector:
             state.ephemeral = bool(payload.get("ephemeral"))
         self._apply_subagent_source(state, payload.get("source"))
         state.created_at = int(payload.get("createdAt") or state.created_at)
-        state.updated_at = int(payload.get("updatedAt") or state.updated_at)
-        status = payload.get("status") or {}
-        if isinstance(status, dict):
-            state.status = str(status.get("type") or state.status)
-            state.active_flags = [str(value) for value in status.get("activeFlags") or []]
-        turns = [value for value in payload.get("turns") or [] if isinstance(value, dict)]
+        if not stale_payload:
+            state.updated_at = incoming_updated_at or state.updated_at
+            status = payload.get("status") or {}
+            if isinstance(status, dict):
+                state.status = str(status.get("type") or state.status)
+                state.active_flags = [str(value) for value in status.get("activeFlags") or []]
+        turns = (
+            []
+            if stale_payload
+            else [value for value in payload.get("turns") or [] if isinstance(value, dict)]
+        )
         recent_activity = state.recent_activity
         for turn in turns:
             turn_id = str(turn.get("id") or "")
@@ -72,11 +107,24 @@ class EventProjector:
             state.turn_duration_ms = max(0, duration_ms) if isinstance(duration_ms, int) else 0
             for item in turn.get("items") or []:
                 if isinstance(item, dict):
-                    self._apply_item(state, item, completed=state.turn_status != "inProgress")
+                    self._apply_item(
+                        state,
+                        item,
+                        completed=state.turn_status != "inProgress",
+                        historical=True,
+                    )
             state.recent_activity = recent_activity
+        self._reconcile_tasks_from_children(state)
         state.queue_count = self.store.queue_count(thread_id)
         self.store.save_thread(state)
         self._sync_parent_agent_metadata(state)
+        return state
+
+    def apply_goal(self, state: ThreadState, goal: object) -> ThreadState:
+        state.goal = dict(goal) if isinstance(goal, dict) else None
+        if state.goal and str(state.goal.get("status") or "") == "complete":
+            self._finalize_active_tasks(state)
+        self.store.save_thread(state)
         return state
 
     @staticmethod
@@ -117,14 +165,133 @@ class EventProjector:
         for task in parent.tasks:
             if task.agent_thread_id != state.thread_id and task.task_id != state.thread_id:
                 continue
-            before = (task.agent_path, task.agent_nickname, task.agent_role)
+            before = (
+                task.agent_path,
+                task.agent_nickname,
+                task.agent_role,
+                task.model,
+                task.reasoning_effort,
+                task.status,
+                task.started_at,
+                task.finished_at,
+                task.updated_at,
+            )
             task.agent_path = state.agent_path or task.agent_path
             task.agent_nickname = state.agent_nickname or task.agent_nickname
             task.agent_role = state.agent_role or task.agent_role
-            changed = before != (task.agent_path, task.agent_nickname, task.agent_role)
+            task.model = state.model or task.model
+            task.reasoning_effort = state.reasoning_effort or task.reasoning_effort
+            self._reconcile_task_from_child(task, state)
+            changed = before != (
+                task.agent_path,
+                task.agent_nickname,
+                task.agent_role,
+                task.model,
+                task.reasoning_effort,
+                task.status,
+                task.started_at,
+                task.finished_at,
+                task.updated_at,
+            )
             break
         if changed:
+            self._refresh_agent_counts(parent)
             self.store.save_thread(parent)
+
+    def _reconcile_tasks_from_children(self, state: ThreadState) -> bool:
+        changed = False
+        for task in state.tasks:
+            child = self.store.get_thread(task.agent_thread_id or task.task_id)
+            if child is not None:
+                changed = self._reconcile_task_from_child(task, child) or changed
+        if changed:
+            self._refresh_agent_counts(state)
+        return changed
+
+    @staticmethod
+    def _reconcile_task_from_child(task: TaskState, child: ThreadState) -> bool:
+        projected = _CHILD_THREAD_TASK_STATUS.get(child.status)
+        if projected is None:
+            return False
+        if (
+            projected in _ACTIVE_AGENT_TASK_STATUSES
+            and task.status in _TERMINAL_AGENT_TASK_STATUSES
+            and task.finished_at
+            and child.updated_at
+            and child.updated_at <= task.finished_at
+        ):
+            return False
+        if projected in {"completed", "shutdown"} and task.status in {
+            "completed",
+            "failed",
+            "interrupted",
+            "notFound",
+        }:
+            projected = task.status
+        now = int(time.time())
+        before = (
+            task.model,
+            task.reasoning_effort,
+            task.status,
+            task.started_at,
+            task.finished_at,
+            task.updated_at,
+        )
+        task.model = child.model or task.model
+        task.reasoning_effort = child.reasoning_effort or task.reasoning_effort
+        if child.created_at and (not task.started_at or child.created_at < task.started_at):
+            task.started_at = child.created_at
+        task.status = projected
+        if projected in _ACTIVE_AGENT_TASK_STATUSES:
+            task.finished_at = 0
+        else:
+            task.finished_at = task.finished_at or child.updated_at or now
+        after = (
+            task.model,
+            task.reasoning_effort,
+            task.status,
+            task.started_at,
+            task.finished_at,
+            task.updated_at,
+        )
+        if before != after:
+            task.updated_at = max(task.updated_at, child.updated_at or now)
+        return before != (
+            task.model,
+            task.reasoning_effort,
+            task.status,
+            task.started_at,
+            task.finished_at,
+            task.updated_at,
+        )
+
+    @staticmethod
+    def _refresh_agent_counts(state: ThreadState) -> None:
+        state.agents_active = sum(
+            task.status in _ACTIVE_AGENT_TASK_STATUSES for task in state.tasks
+        )
+        state.agents_completed = sum(
+            task.status in {"completed", "shutdown"} for task in state.tasks
+        )
+        state.agents_failed = sum(
+            task.status in {"failed", "errored", "interrupted", "notFound"}
+            for task in state.tasks
+        )
+
+    def _finalize_active_tasks(self, state: ThreadState) -> None:
+        now = int(time.time())
+        for task in state.tasks:
+            if task.status not in _ACTIVE_AGENT_TASK_STATUSES:
+                continue
+            child = self.store.get_thread(task.agent_thread_id or task.task_id)
+            if child is not None:
+                self._reconcile_task_from_child(task, child)
+                if child.status == "active" or task.status not in _ACTIVE_AGENT_TASK_STATUSES:
+                    continue
+            task.status = "shutdown"
+            task.finished_at = task.finished_at or now
+            task.updated_at = max(task.updated_at, now)
+        self._refresh_agent_counts(state)
 
     async def ingest(self, method: str, params: dict[str, Any]) -> None:
         thread_id = self._thread_id(params)
@@ -147,6 +314,8 @@ class EventProjector:
             state = self.apply_thread(dict(params.get("thread") or {}))
             await self.on_change(state, method)
             return
+        if method == "thread/settings/updated":
+            self._sync_space_settings(thread_id, params)
         state = self.store.get_thread(thread_id) or ThreadState(thread_id=thread_id)
         changed = self._apply(state, method, params)
         if not changed:
@@ -154,7 +323,42 @@ class EventProjector:
         state.queue_count = self.store.queue_count(thread_id)
         state.updated_at = int(time.time())
         self.store.save_thread(state)
+        self._sync_parent_agent_metadata(state)
         await self.on_change(state, method)
+
+    def _sync_space_settings(self, thread_id: str, params: dict[str, Any]) -> None:
+        thread_settings = params.get("threadSettings")
+        if not isinstance(thread_settings, dict):
+            return
+        collaboration = thread_settings.get("collaborationMode")
+        if not isinstance(collaboration, dict):
+            return
+        mode = str(collaboration.get("mode") or "")
+        settings = collaboration.get("settings")
+        if mode not in {"default", "plan"} or not isinstance(settings, dict):
+            return
+        model = str(settings.get("model") or "").strip()
+        effort = str(
+            settings.get("reasoning_effort") or thread_settings.get("effort") or ""
+        ).strip()
+        for raw in self.store.list_spaces():
+            if (
+                str(raw.get("thread_id") or "") != thread_id
+                or raw.get("lifecycle") == "closed"
+            ):
+                continue
+            space = self.store.get_session_space(str(raw["space_id"]))
+            if space is None:
+                continue
+            space.current_mode = mode
+            if model and effort:
+                if mode == "plan":
+                    space.plan_model = model
+                    space.plan_effort = effort
+                else:
+                    space.normal_model = model
+                    space.normal_effort = effort
+            self.store.save_session_space(space)
 
     @staticmethod
     def _thread_id(params: dict[str, Any]) -> str | None:
@@ -178,6 +382,10 @@ class EventProjector:
             state.latest_activity = f"Session {state.status}"
             self._record_activity(state, method, state.latest_activity, state.status)
             return True
+        if method == "thread/settings/updated":
+            state.latest_activity = "Session settings updated"
+            self._record_activity(state, method, state.latest_activity, "updated")
+            return True
         if method in {"thread/closed", "thread/deleted", "thread/archived"}:
             state.status = "notLoaded"
             state.latest_activity = method.split("/")[-1]
@@ -185,6 +393,8 @@ class EventProjector:
             return True
         if method == "thread/goal/updated":
             state.goal = dict(params.get("goal") or {})
+            if str(state.goal.get("status") or "") == "complete":
+                self._finalize_active_tasks(state)
             state.latest_activity = f"Goal: {state.goal.get('status', 'updated')}"
             self._record_activity(
                 state, method, state.latest_activity, str(state.goal.get("status") or "updated")
@@ -221,7 +431,8 @@ class EventProjector:
             state.latest_activity = turn_activity
             for item in turn.get("items") or []:
                 if isinstance(item, dict):
-                    self._apply_item(state, item, completed=True)
+                    self._apply_item(state, item, completed=True, historical=True)
+            self._reconcile_tasks_from_children(state)
             self._record_activity(state, method, turn_activity, state.turn_status)
             return True
         if method == "turn/plan/updated":
@@ -257,7 +468,14 @@ class EventProjector:
             return True
         return False
 
-    def _apply_item(self, state: ThreadState, item: dict[str, Any], *, completed: bool) -> None:
+    def _apply_item(
+        self,
+        state: ThreadState,
+        item: dict[str, Any],
+        *,
+        completed: bool,
+        historical: bool = False,
+    ) -> None:
         item_type = str(item.get("type") or "item")
         if item_type == "agentMessage":
             text = " ".join(str(item.get("text") or "").split())
@@ -298,8 +516,11 @@ class EventProjector:
             now = int(time.time())
             prompt = " ".join(str(item.get("prompt") or "").split())[:160]
             tool = str(item.get("tool") or "")
-            model = str(item.get("model") or "")
-            effort = str(item.get("reasoningEffort") or "")
+            receivers = {
+                str(value) for value in (item.get("receiverThreadIds") or []) if value
+            }
+            spawned_model = str(item.get("model") or "")
+            spawned_effort = str(item.get("reasoningEffort") or "")
             for agent_thread_id, value in states.items():
                 if not isinstance(value, dict):
                     continue
@@ -308,6 +529,13 @@ class EventProjector:
                 child_state = self.store.get_thread(task_id)
                 raw_status = str(value.get("status") or "pendingInit")
                 task_status = self._task_status(raw_status)
+                if (
+                    historical
+                    and current is not None
+                    and current.status in _TERMINAL_AGENT_TASK_STATUSES
+                    and task_status in _ACTIVE_AGENT_TASK_STATUSES
+                ):
+                    task_status = current.status
                 started_at = current.started_at if current else 0
                 if not started_at and task_status in {"pending", "inProgress"}:
                     started_at = now
@@ -317,6 +545,9 @@ class EventProjector:
                 elif task_status in {"pending", "inProgress"}:
                     finished_at = 0
                 use_prompt = prompt and (tool in {"spawnAgent", "spawn_agent"} or current is None)
+                is_spawn_receiver = (
+                    tool in {"spawnAgent", "spawn_agent"} and task_id in receivers
+                )
                 tasks[task_id] = TaskState(
                     task_id=task_id,
                     title=prompt if use_prompt else (current.title if current else f"Agent {task_id[:8]}"),
@@ -334,21 +565,23 @@ class EventProjector:
                         (child_state.agent_role if child_state else "")
                         or (current.agent_role if current else "")
                     ),
-                    model=model or (current.model if current else ""),
-                    reasoning_effort=effort or (current.reasoning_effort if current else ""),
+                    model=(
+                        (child_state.model if child_state else "")
+                        or (spawned_model if is_spawn_receiver else "")
+                        or (current.model if current else "")
+                    ),
+                    reasoning_effort=(
+                        (child_state.reasoning_effort if child_state else "")
+                        or (spawned_effort if is_spawn_receiver else "")
+                        or (current.reasoning_effort if current else "")
+                    ),
                     message=str(value.get("message") or (current.message if current else "")),
                     started_at=started_at,
                     finished_at=finished_at,
                     updated_at=now,
                 )
             state.tasks = sorted(tasks.values(), key=lambda task: (task.updated_at, task.task_id))[-50:]
-            state.agents_active = sum(task.status in {"pending", "inProgress"} for task in state.tasks)
-            state.agents_completed = sum(
-                task.status in {"completed", "shutdown"} for task in state.tasks
-            )
-            state.agents_failed = sum(
-                task.status in {"failed", "interrupted", "notFound"} for task in state.tasks
-            )
+            self._refresh_agent_counts(state)
             state.latest_activity = f"Agent task {item.get('tool', '')}: {item.get('status', '')}".strip()
             self._record_activity(
                 state, item_type, state.latest_activity, str(item.get("status") or "inProgress")
@@ -365,9 +598,21 @@ class EventProjector:
                 if kind == "interrupted":
                     task_status = "interrupted"
                 elif kind in {"started", "interacted"}:
-                    task_status = "inProgress"
+                    task_status = (
+                        current.status
+                        if historical
+                        and current is not None
+                        and current.status in _TERMINAL_AGENT_TASK_STATUSES
+                        else "inProgress"
+                    )
                 else:
                     task_status = current.status if current else "pending"
+                finished_at = current.finished_at if current else 0
+                finished_at = (
+                    finished_at or now
+                    if task_status in _TERMINAL_AGENT_TASK_STATUSES
+                    else 0
+                )
                 tasks[agent_thread_id] = TaskState(
                     task_id=agent_thread_id,
                     title=current.title if current else f"Agent {agent_path or agent_thread_id[:8]}",
@@ -380,22 +625,13 @@ class EventProjector:
                     reasoning_effort=current.reasoning_effort if current else "",
                     message=current.message if current else "",
                     started_at=(current.started_at if current else 0) or now,
-                    finished_at=now if task_status == "interrupted" else 0,
+                    finished_at=finished_at,
                     updated_at=now,
                 )
                 state.tasks = sorted(
                     tasks.values(), key=lambda task: (task.updated_at, task.task_id)
                 )[-50:]
-                state.agents_active = sum(
-                    task.status in {"pending", "inProgress"} for task in state.tasks
-                )
-                state.agents_completed = sum(
-                    task.status in {"completed", "shutdown"} for task in state.tasks
-                )
-                state.agents_failed = sum(
-                    task.status in {"failed", "interrupted", "notFound"}
-                    for task in state.tasks
-                )
+                self._refresh_agent_counts(state)
             state.latest_activity = f"Subagent {kind}".strip()
             self._record_activity(state, item_type, state.latest_activity, kind)
             return

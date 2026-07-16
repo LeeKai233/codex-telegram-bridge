@@ -128,6 +128,8 @@ async def test_follow_existing_thread_subscribes_before_creating_channel_post(
     tmp_path: Path,
 ) -> None:
     coordinator, store, bridge, _dashboards = make_coordinator(tmp_path)
+    bridge.state.model = "gpt-5.6-sol"
+    bridge.state.reasoning_effort = "xhigh"
     store.set_telegram_binding({"channel_chat_id": -1001, "discussion_chat_id": -1002})
 
     space = await coordinator.follow_thread("thread-1")
@@ -136,6 +138,10 @@ async def test_follow_existing_thread_subscribes_before_creating_channel_post(
     assert space["thread_id"] == "thread-1"
     assert space["lifecycle"] == "pending"
     assert space["channel_post_id"] == 100
+    assert (space["normal_model"], space["normal_effort"]) == (
+        "gpt-5.6-sol",
+        "xhigh",
+    )
     store.close()
 
 

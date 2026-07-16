@@ -133,6 +133,7 @@ def test_bot_labels_default_to_generic_names_and_load_trimmed(tmp_path: Path) ->
         'discussion_bot_label = "  Session 助手  "\n',
         encoding="utf-8",
     )
+    config_path.chmod(0o600)
     loaded = Config.load(config_path)
     assert loaded.control_bot_label == "控制_[Bot]"
     assert loaded.discussion_bot_label == "Session 助手"
@@ -164,6 +165,7 @@ def test_ask_model_settings_default_to_inherited_and_load_trimmed(tmp_path: Path
         '[bridge]\nask_model = "  gpt-5.6-luna  "\nask_reasoning_effort = "  max  "\n',
         encoding="utf-8",
     )
+    config_path.chmod(0o600)
 
     loaded = Config.load(config_path)
     assert loaded.ask_model == "gpt-5.6-luna"
@@ -192,6 +194,7 @@ def test_loaded_paths_are_expanded(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     monkeypatch.setenv("HOME", str(tmp_path))
     config_path = tmp_path / "bridge.toml"
     config_path.write_text('[bridge]\nallowed_root = "~/workspace"\n', encoding="utf-8")
+    config_path.chmod(0o600)
     config = Config.load(config_path)
     assert config.allowed_root == (tmp_path / "workspace").resolve()
     assert os.path.isabs(config.allowed_root)

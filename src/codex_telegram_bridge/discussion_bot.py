@@ -137,6 +137,7 @@ class DiscussionBotController:
         self._ask_waiting_messages: dict[asyncio.Task[Any], tuple[int, int, str]] = {}
         self._interaction_tasks: dict[str, asyncio.Task[None]] = {}
         self._plan_recovery_done = False
+        self._plan_recovery_task: asyncio.Task[None] | None = None
 
     def install(self, application: Application) -> None:
         self._application = application
@@ -181,6 +182,10 @@ class DiscussionBotController:
         self.bridge.on_prompt_completed = self.prompt_completed
 
     async def stop(self) -> None:
+        if self._plan_recovery_task is not None:
+            self._plan_recovery_task.cancel()
+            await asyncio.gather(self._plan_recovery_task, return_exceptions=True)
+            self._plan_recovery_task = None
         interaction_tasks = list(self._interaction_tasks.values())
         self._interaction_tasks.clear()
         for task in interaction_tasks:
@@ -221,9 +226,35 @@ class DiscussionBotController:
                 ),
             )
         await self._recover_interactions()
-        if not self._plan_recovery_done:
-            self._plan_recovery_done = True
+        await self._ensure_plan_recovery()
+
+    async def _ensure_plan_recovery(self) -> None:
+        if self._plan_recovery_done:
+            return
+        client = getattr(self.bridge, "client", None)
+        if client is None or bool(getattr(client, "connected", True)):
             await self._recover_plan_executions()
+            self._plan_recovery_done = True
+            return
+        if self._plan_recovery_task is not None and not self._plan_recovery_task.done():
+            return
+        self._plan_recovery_task = asyncio.create_task(
+            self._recover_plan_executions_when_connected(client),
+            name="discussion-plan-recovery",
+        )
+
+    async def _recover_plan_executions_when_connected(self, client: object) -> None:
+        try:
+            await client.wait_connected(timeout=120)
+            await self._recover_plan_executions()
+            self._plan_recovery_done = True
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOGGER.exception("event=plan_execution_startup_recovery_failed")
+        finally:
+            if self._plan_recovery_task is asyncio.current_task():
+                self._plan_recovery_task = None
 
     async def _guard(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         del context
@@ -762,7 +793,11 @@ class DiscussionBotController:
             )
             return
         profile = await self._resolve_profile_or_suggest(
-            space, "planmode", parts[0], parts[1]
+            space,
+            "planmode",
+            parts[0],
+            parts[1],
+            prompt=parts[2] if len(parts) == 3 else None,
         )
         if profile is None:
             return
@@ -899,11 +934,6 @@ class DiscussionBotController:
         if profile is None:
             return
         if kind == "changemodel":
-            updated = await self.bridge.change_space_model(
-                str(space["space_id"]),
-                str(_value(profile, "model")),
-                str(_value(profile, "effort")),
-            )
             claimed = self.store.claim_interaction(
                 str(_value(draft, "scope_key")),
                 str(_value(draft, "flow_id")),
@@ -912,14 +942,13 @@ class DiscussionBotController:
             if claimed is None:
                 raise RuntimeError("这次交互已被新命令替换")
             self._cancel_interaction_timeout(str(_value(draft, "scope_key")))
+            updated = await self.bridge.change_space_model(
+                str(space["space_id"]),
+                str(_value(profile, "model")),
+                str(_value(profile, "effort")),
+            )
             await self._announce_model_change(updated, profile)
             return
-        await self.bridge.set_space_profile(
-            str(space["space_id"]),
-            "plan",
-            str(_value(profile, "model")),
-            str(_value(profile, "effort")),
-        )
         await self._advance_to_prompt_wait(draft, profile, space)
 
     async def _wait_for_plan_prompt(
@@ -953,6 +982,21 @@ class DiscussionBotController:
         )
         if advanced is None:
             raise RuntimeError("这次交互已被新命令替换")
+        try:
+            await self.bridge.set_space_profile(
+                str(space["space_id"]),
+                "plan",
+                str(_value(profile, "model")),
+                str(_value(profile, "effort")),
+            )
+        except Exception:
+            self.store.claim_interaction(
+                str(_value(advanced, "scope_key")),
+                str(_value(advanced, "flow_id")),
+                int(_value(advanced, "revision")),
+            )
+            self._cancel_interaction_timeout(str(_value(advanced, "scope_key")))
+            raise
         self._schedule_interaction_timeout(advanced)
         await self._send_plan_prompt_request(space, advanced)
 
@@ -1026,18 +1070,29 @@ class DiscussionBotController:
         command: str,
         model: str,
         effort: str,
+        *,
+        prompt: str | None = None,
     ) -> object | None:
         try:
             return await self.bridge.resolve_model_profile(model, effort)
         except ValueError:
-            suggestion = await self._profile_suggestion(command, model, effort)
+            suggestion = await self._profile_suggestion(
+                command, model, effort, prompt=prompt
+            )
             await self._send_space(
                 space,
                 f"模型或 effort 无效。你可能想发送：{inline_code(suggestion)}",
             )
             return None
 
-    async def _profile_suggestion(self, command: str, model: str, effort: str) -> str:
+    async def _profile_suggestion(
+        self,
+        command: str,
+        model: str,
+        effort: str,
+        *,
+        prompt: str | None = None,
+    ) -> str:
         options = await self.bridge.list_model_options()
         if not options:
             return f"/{command} <model> | <effort>"
@@ -1061,7 +1116,10 @@ class DiscussionBotController:
                 if effort_match
                 else str(_value(option, "default_effort") or efforts[0])
             )
-        return f"/{command} {selected_model} | {selected_effort or '<effort>'}"
+        suggestion = f"/{command} {selected_model} | {selected_effort or '<effort>'}"
+        if command == "planmode" and prompt:
+            suggestion += f" | {prompt}"
+        return suggestion
 
     async def _announce_model_change(self, space: object, profile: object) -> None:
         current_mode = str(_value(space, "current_mode", "normal"))
@@ -1415,9 +1473,7 @@ class DiscussionBotController:
         if action in {"plan_execute", "plan_continue"}:
             try:
                 self._ensure_latest_plan(space, payload)
-                state = self.store.get_thread(str(space.get("thread_id") or ""))
-                if state and (state.status == "active" or state.turn_status == "inProgress"):
-                    raise RuntimeError("当前 turn 正在运行，请稍后重试")
+                await self._ensure_plan_ready(space)
             except RuntimeError as exc:
                 await self.discussion.answer_callback(query, str(exc), show_alert=True)
                 return
@@ -1439,7 +1495,17 @@ class DiscussionBotController:
         try:
             await self._dispatch_callback(action, payload, space)
         except (KeyError, ValueError, RuntimeError, OSError, TelegramError, PathPolicyError) as exc:
-            await self._send_space(space, escape(str(exc)))
+            latest = self.store.latest_plan_publication(
+                str(space["space_id"]), int(space["generation"])
+            )
+            if (
+                action in {"plan_execute", "plan_continue"}
+                and latest is not None
+                and str(latest.get("status") or "") == "published"
+            ):
+                await self._send_plan_action_retry(space, latest, str(exc))
+            else:
+                await self._send_space(space, escape(str(exc)))
 
     async def _dispatch_callback(
         self, action: str, payload: dict[str, Any], space: dict[str, Any]
@@ -1748,6 +1814,13 @@ class DiscussionBotController:
                 client_message_id,
             )
             if status == "delivered":
+                self.store.complete_plan_action(
+                    str(space["space_id"]),
+                    int(space["generation"]),
+                    str(latest["item_id"]),
+                    expected_status="executing",
+                    status="executed",
+                )
                 await self._send_space(
                     space,
                     "已确认批准请求送达 Codex；当前 turn 不会重复创建。",
@@ -1773,6 +1846,14 @@ class DiscussionBotController:
                 priority=5,
             )
             return
+        if not self.store.complete_plan_action(
+            str(space["space_id"]),
+            int(space["generation"]),
+            str(latest["item_id"]),
+            expected_status="executing",
+            status="executed",
+        ):
+            raise RuntimeError("Plan 执行状态已变化，已阻止重复提交")
         await self._send_space(
             space,
             f"已批准 Plan 并开始执行。\nTurn {inline_code(str(turn.get('id') or '')[:8])}",
@@ -1785,6 +1866,15 @@ class DiscussionBotController:
     ) -> str:
         return (
             f"telegram-plan-execute-{space['space_id']}-{space['generation']}-"
+            f"{publication['item_id']}"
+        )
+
+    @staticmethod
+    def _plan_revision_client_message_id(
+        space: Mapping[str, Any], publication: Mapping[str, Any]
+    ) -> str:
+        return (
+            f"telegram-plan-revise-{space['space_id']}-{space['generation']}-"
             f"{publication['item_id']}"
         )
 
@@ -1839,7 +1929,7 @@ class DiscussionBotController:
         )
 
     async def _recover_plan_executions(self) -> None:
-        publications = getattr(self.store, "executing_plan_publications", None)
+        publications = getattr(self.store, "recoverable_plan_publications", None)
         reconcile = getattr(self.bridge, "reconcile_plan_execution", None)
         if publications is None or reconcile is None:
             return
@@ -1851,7 +1941,15 @@ class DiscussionBotController:
                 or int(space.get("generation") or 0) != int(publication.get("generation") or 0)
             ):
                 continue
-            client_message_id = self._plan_client_message_id(space, publication)
+            action_status = str(publication.get("status") or "")
+            if action_status == "executing":
+                client_message_id = self._plan_client_message_id(space, publication)
+                terminal_status = "executed"
+            else:
+                client_message_id = self._plan_revision_client_message_id(
+                    space, publication
+                )
+                terminal_status = "revision_started"
             try:
                 status = await reconcile(
                     str(space["space_id"]),
@@ -1867,19 +1965,26 @@ class DiscussionBotController:
                 )
                 continue
             if status == "delivered":
+                self.store.complete_plan_action(
+                    str(space["space_id"]),
+                    int(space["generation"]),
+                    str(publication["item_id"]),
+                    expected_status=action_status,
+                    status=terminal_status,
+                )
                 continue
             if status == "absent":
                 released = self.store.release_plan_action(
                     str(space["space_id"]),
                     int(space["generation"]),
                     str(publication["item_id"]),
-                    expected_status="executing",
+                    expected_status=action_status,
                 )
                 if released:
                     await self._send_plan_action_retry(
                         space,
                         publication,
-                        "服务重启前的批准请求没有送达 Codex，请使用新按钮重试。",
+                        "服务重启前的 Plan 操作没有送达 Codex，请使用新按钮重试。",
                     )
                 continue
             await self._send_space(
@@ -1893,6 +1998,9 @@ class DiscussionBotController:
     ) -> None:
         latest = self._ensure_latest_plan(space, payload)
         await self._profile_for_mode(space, "plan")
+        owner = self.store.get_owner()
+        if owner is None:
+            raise RuntimeError("owner 配对已失效")
         if not self.store.mark_plan_action(
             str(space["space_id"]),
             int(space["generation"]),
@@ -1900,36 +2008,46 @@ class DiscussionBotController:
             status="revising",
         ):
             raise RuntimeError("该 Plan 操作已处理或已过期")
-        owner = self.store.get_owner()
-        if owner is None:
-            raise RuntimeError("owner 配对已失效")
-        prompt = await self._send_space(
-            space,
-            "请回复这条消息，说明需要如何继续完善 Plan。",
-            reply_markup=ForceReply(
-                selective=True,
-                input_field_placeholder="输入 Plan 修改意见",
-            ),
-            priority=5,
-        )
-        nonce = self._reply_nonce(
-            int(space["discussion_chat_id"]), int(prompt.message_id)
-        )
-        self.store.put_callback(
-            nonce,
-            "reply_plan_revision",
-            {
-                "item_id": str(latest["item_id"]),
-                "thread_id": str(latest["thread_id"]),
-                "turn_id": str(latest["turn_id"]),
-            },
-            owner.user_id,
-            int(time.time()) + _PLAN_ACTION_SECONDS,
-            bot_role=DISCUSSION_ROLE,
-            chat_id=int(space["discussion_chat_id"]),
-            space_id=str(space["space_id"]),
-            generation=int(space["generation"]),
-        )
+        try:
+            prompt = await self._send_space(
+                space,
+                "请回复这条消息，说明需要如何继续完善 Plan。",
+                reply_markup=ForceReply(
+                    selective=True,
+                    input_field_placeholder="输入 Plan 修改意见",
+                ),
+                priority=5,
+            )
+            nonce = self._reply_nonce(
+                int(space["discussion_chat_id"]), int(prompt.message_id)
+            )
+            self.store.put_callback(
+                nonce,
+                "reply_plan_revision",
+                {
+                    "item_id": str(latest["item_id"]),
+                    "thread_id": str(latest["thread_id"]),
+                    "turn_id": str(latest["turn_id"]),
+                },
+                owner.user_id,
+                int(time.time()) + _PLAN_ACTION_SECONDS,
+                bot_role=DISCUSSION_ROLE,
+                chat_id=int(space["discussion_chat_id"]),
+                space_id=str(space["space_id"]),
+                generation=int(space["generation"]),
+            )
+        except Exception:
+            self.store.release_plan_action(
+                str(space["space_id"]),
+                int(space["generation"]),
+                str(latest["item_id"]),
+                expected_status="revising",
+            )
+            await self._send_plan_action_retry(
+                space,
+                latest,
+                "无法创建 Plan 修改请求，请使用新按钮重试。",
+            )
 
     async def forward_question(self, request_key: str, params: dict[str, Any]) -> None:
         thread_id = str(params.get("threadId") or "")
@@ -2186,6 +2304,17 @@ class DiscussionBotController:
         if not answer:
             await self._send_space(space, "回复内容不能为空。")
             raise ApplicationHandlerStop
+        if pending[0] == "reply_plan_revision":
+            try:
+                self._ensure_latest_plan(
+                    space,
+                    pending[1],
+                    allowed_statuses={"revising"},
+                )
+                await self._ensure_plan_ready(space)
+            except RuntimeError as exc:
+                await self._send_space(space, escape(str(exc)))
+                raise ApplicationHandlerStop from None
         consumed = self.store.consume_callback(nonce, user.id, **constraints)
         if consumed is None:
             await self._send_space(space, "这条回复请求已使用或过期。")
@@ -2210,30 +2339,98 @@ class DiscussionBotController:
                     update=update,
                 )
             else:
-                self._ensure_latest_plan(
+                publication = self._ensure_latest_plan(
                     space,
                     payload,
                     allowed_statuses={"revising"},
                 )
-                turn = await self._start_profiled_turn(
-                    space,
-                    (
-                        "Continue refining the current plan based on this feedback. "
-                        "Do not implement it yet.\n\n"
-                        f"{answer}"
-                    ),
-                    mode="plan",
-                    client_message_id=(
-                        f"telegram-plan-revise-{space['space_id']}-{space['generation']}-"
-                        f"{payload['item_id']}"
-                    ),
+                await self._ensure_plan_ready(space)
+                client_message_id = self._plan_revision_client_message_id(
+                    space, publication
                 )
+                try:
+                    turn = await self._start_profiled_turn(
+                        space,
+                        (
+                            "Continue refining the current plan based on this feedback. "
+                            "Do not implement it yet.\n\n"
+                            f"{answer}"
+                        ),
+                        mode="plan",
+                        client_message_id=client_message_id,
+                    )
+                except Exception:
+                    reconcile = getattr(self.bridge, "reconcile_plan_execution", None)
+                    status = (
+                        await reconcile(
+                            str(space["space_id"]),
+                            int(space["generation"]),
+                            str(publication["item_id"]),
+                            client_message_id,
+                        )
+                        if reconcile is not None
+                        else "unknown"
+                    )
+                    if status == "delivered":
+                        self.store.complete_plan_action(
+                            str(space["space_id"]),
+                            int(space["generation"]),
+                            str(publication["item_id"]),
+                            expected_status="revising",
+                            status="revision_started",
+                        )
+                        await self._send_space(
+                            space,
+                            "已确认 Plan 修改意见送达 Codex；不会重复提交。",
+                            priority=5,
+                        )
+                        raise ApplicationHandlerStop from None
+                    if status == "absent":
+                        self.store.release_plan_action(
+                            str(space["space_id"]),
+                            int(space["generation"]),
+                            str(publication["item_id"]),
+                            expected_status="revising",
+                        )
+                        await self._send_plan_action_retry(
+                            space,
+                            publication,
+                            "Plan 修改意见未送达 Codex，请使用新按钮重试。",
+                        )
+                        raise ApplicationHandlerStop from None
+                    await self._send_space(
+                        space,
+                        "Plan 修改意见的送达状态暂时无法确认。为避免重复提交，已暂停自动重试。",
+                        priority=5,
+                    )
+                    raise ApplicationHandlerStop from None
+                if not self.store.complete_plan_action(
+                    str(space["space_id"]),
+                    int(space["generation"]),
+                    str(publication["item_id"]),
+                    expected_status="revising",
+                    status="revision_started",
+                ):
+                    raise RuntimeError("Plan 修改状态已变化，已阻止重复提交")
                 await self._send_space(
                     space,
                     f"已提交 Plan 修改意见。\nTurn {inline_code(str(turn.get('id') or '')[:8])}",
                     priority=5,
                 )
         except RuntimeError as exc:
+            if action == "reply_plan_revision":
+                latest = self.store.latest_plan_publication(
+                    str(space["space_id"]), int(space["generation"])
+                )
+                if latest is not None and str(latest.get("status") or "") == "revising":
+                    self.store.release_plan_action(
+                        str(space["space_id"]),
+                        int(space["generation"]),
+                        str(latest["item_id"]),
+                        expected_status="revising",
+                    )
+                    await self._send_plan_action_retry(space, latest, str(exc))
+                    raise ApplicationHandlerStop from None
             await self._send_space(space, escape(str(exc)))
         raise ApplicationHandlerStop
 

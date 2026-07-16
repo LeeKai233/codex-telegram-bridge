@@ -104,6 +104,22 @@ class FakeStore:
         draft.claimed_at = int(time.time())
         return draft
 
+    def claim_live_interaction(
+        self, scope_key: str, flow_id: str, revision: int
+    ) -> Draft | None:
+        draft = self.drafts.get(scope_key)
+        if draft is None or draft.expires_at <= int(time.time()):
+            return None
+        return self.claim_interaction(scope_key, flow_id, revision)
+
+    def claim_expired_interaction(
+        self, scope_key: str, flow_id: str, revision: int
+    ) -> Draft | None:
+        draft = self.drafts.get(scope_key)
+        if draft is None or draft.expires_at > int(time.time()):
+            return None
+        return self.claim_interaction(scope_key, flow_id, revision)
+
     def delete_interaction(self, scope_key: str) -> None:
         self.drafts.pop(scope_key, None)
 
@@ -381,6 +397,62 @@ async def test_new_invalid_profile_suggests_canonical_command(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_new_invalid_mode_suggestion_preserves_directory_and_prompt(
+    tmp_path: Path,
+) -> None:
+    controller, _store, endpoint, _bridge, _coordinator, _deletions = build_controller(
+        tmp_path
+    )
+    target = tmp_path / "new-project"
+    try:
+        await controller.new(
+            make_update(
+                f"/new luna | max | nopln | {target} | keep this | exact prompt"
+            ),
+            SimpleNamespace(),
+        )
+
+        suggestion = endpoint.sent[-1]["markdown"]
+        assert f"/new gpt-5.6-luna | max | noplan | {target}" in suggestion
+        assert "keep this | exact prompt" in suggestion
+    finally:
+        await controller.stop()
+
+
+@pytest.mark.asyncio
+async def test_new_incomplete_arguments_suggest_a_complete_command(tmp_path: Path) -> None:
+    controller, _store, endpoint, _bridge, _coordinator, _deletions = build_controller(tmp_path)
+    try:
+        await controller.new(make_update("/new lunaa"), SimpleNamespace())
+
+        assert "你可能想发送" in endpoint.sent[-1]["markdown"]
+        assert "/new gpt-5.6-luna | max" in endpoint.sent[-1]["markdown"]
+    finally:
+        await controller.stop()
+
+
+@pytest.mark.asyncio
+async def test_new_missing_plan_effort_suggestion_preserves_tail(tmp_path: Path) -> None:
+    controller, _store, endpoint, _bridge, _coordinator, _deletions = build_controller(
+        tmp_path
+    )
+    target = tmp_path / "project"
+    try:
+        await controller.new(
+            make_update(
+                f"/new luna | max | planmode | sol | | {target} | first prompt"
+            ),
+            SimpleNamespace(),
+        )
+
+        suggestion = endpoint.sent[-1]["markdown"]
+        assert "planmode | gpt-5.6-sol | high" in suggestion
+        assert f"{target} | first prompt" in suggestion
+    finally:
+        await controller.stop()
+
+
+@pytest.mark.asyncio
 async def test_new_prompt_timeout_claims_hello_once(tmp_path: Path) -> None:
     controller, store, endpoint, _bridge, coordinator, _deletions = build_controller(tmp_path)
     try:
@@ -392,6 +464,78 @@ async def test_new_prompt_timeout_claims_hello_once(tmp_path: Path) -> None:
 
         assert [item["prompt"] for item in coordinator.created] == ["Hello"]
         assert "30 秒" in endpoint.sent[-2]["markdown"]
+    finally:
+        await controller.stop()
+
+
+@pytest.mark.asyncio
+async def test_new_late_prompt_cannot_replace_timeout_hello(tmp_path: Path) -> None:
+    controller, store, _endpoint, _bridge, coordinator, _deletions = build_controller(tmp_path)
+    try:
+        await controller.new(make_update("/new luna | max | noplan | project"), SimpleNamespace())
+        draft = next(iter(store.drafts.values()))
+        draft.expires_at = int(time.time()) - 1
+
+        await controller.observe_message(make_update("Late prompt"), SimpleNamespace())
+
+        assert [item["prompt"] for item in coordinator.created] == ["Hello"]
+    finally:
+        await controller.stop()
+
+
+@pytest.mark.asyncio
+async def test_confirmed_project_is_claimed_before_directory_creation(
+    tmp_path: Path,
+) -> None:
+    controller, store, _endpoint, bridge, _coordinator, _deletions = build_controller(
+        tmp_path
+    )
+    target = tmp_path / "confirmed-project"
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked_create(value: Path) -> Path:
+        assert value == target
+        entered.set()
+        await release.wait()
+        value.mkdir(parents=True)
+        return value
+
+    bridge.create_project_directory = blocked_create
+    try:
+        await controller.new(
+            make_update(f"/new luna | max | noplan | {target}"),
+            SimpleNamespace(),
+        )
+        confirming = next(iter(store.drafts.values()))
+        assert confirming.phase == "project_confirmation"
+        confirmed_revision = confirming.revision
+        callback = {
+            "scope_key": confirming.scope_key,
+            "flow_id": confirming.flow_id,
+            "revision": confirming.revision,
+            "event": "create_project",
+            "value": str(target),
+        }
+        task = asyncio.create_task(
+            controller._handle_new_callback(confirming.chat_id, callback)
+        )
+        await entered.wait()
+
+        applying = store.get_interaction(confirming.scope_key)
+        assert applying is not None
+        assert applying.phase == "creating_project"
+        assert (
+                store.claim_interaction(
+                    confirming.scope_key, confirming.flow_id, confirmed_revision
+                )
+            is None
+        )
+
+        release.set()
+        await task
+        waiting = store.get_interaction(confirming.scope_key)
+        assert waiting is not None and waiting.phase == "prompt"
     finally:
         await controller.stop()
 
@@ -412,8 +556,8 @@ async def test_perf_refreshes_frames_and_uses_one_fixed_deadline(
         assert endpoint.sent[-1]["markdown"].startswith("*🕛 动态性能*")
         assert endpoint.edited[0]["markdown"].startswith("*🕒 动态性能*")
         assert all(item["priority"] == 50 for item in endpoint.edited)
-        assert [item["message_ids"] for item in deletions.scheduled] == [(30,), (1000,)]
-        assert {item["delete_at"] for item in deletions.scheduled} == {10_000}
+        assert [item["message_ids"] for item in deletions.scheduled] == [(30, 1000)]
+        assert {item["delete_at"] for item in deletions.scheduled} == {10_001}
         assert {item["group_key"] for item in deletions.scheduled} == {"perf:90"}
     finally:
         await controller.stop()

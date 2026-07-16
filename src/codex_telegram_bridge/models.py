@@ -5,6 +5,40 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 
+@dataclass(frozen=True, slots=True)
+class ModelOption:
+    model: str
+    display_name: str
+    supported_efforts: tuple[str, ...]
+    default_effort: str
+    is_default: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ModelProfile:
+    model: str
+    effort: str
+
+
+@dataclass(slots=True)
+class InteractionDraft:
+    scope_key: str
+    flow_id: str
+    revision: int
+    kind: str
+    phase: str
+    payload: dict[str, Any]
+    user_id: int
+    bot_role: str
+    chat_id: int
+    space_id: str | None
+    generation: int
+    expires_at: int
+    claimed_at: int | None
+    created_at: int
+    updated_at: int
+
+
 @dataclass(slots=True)
 class PlanStep:
     step: str
@@ -79,6 +113,8 @@ class ThreadState:
     title: str = "Codex session"
     cwd: str = ""
     session_id: str = ""
+    model: str = ""
+    reasoning_effort: str = ""
     parent_thread_id: str | None = None
     agent_nickname: str = ""
     agent_role: str = ""
@@ -167,6 +203,11 @@ class SessionSpace:
     status_message_id: int | None = None
     pending_cwd: str = ""
     pending_prompt: str = ""
+    normal_model: str = ""
+    normal_effort: str = ""
+    plan_model: str = ""
+    plan_effort: str = ""
+    current_mode: str = "default"
     created_at: int = field(default_factory=lambda: int(time.time()))
     updated_at: int = field(default_factory=lambda: int(time.time()))
     last_error: str = ""

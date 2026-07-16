@@ -6,7 +6,13 @@ from pathlib import Path
 
 import pytest
 
-from codex_telegram_bridge.models import LifecycleActivity, PlanStep, TaskState, ThreadState
+from codex_telegram_bridge.models import (
+    LifecycleActivity,
+    PlanStep,
+    SessionSpace,
+    TaskState,
+    ThreadState,
+)
 from codex_telegram_bridge.views import (
     CHANNEL_POST_BUDGET,
     SESSIONS_MESSAGE_BUDGET,
@@ -124,7 +130,10 @@ def test_full_status_comment_has_plan_tasks_auth_update_and_plain_fallback() -> 
     )
     assert "~1\\. Inspect architecture~ ✅" in rendered.markdown
     assert "▶ *2\\. Implement routing*" in rendered.markdown
-    assert "*🧩 Tasks*  `2/3` · Active `1` · Failed `0`" in rendered.markdown
+    assert (
+        "*🧩 Agent Tasks*  `2/3` · Running `1` · Failed `0` · Interrupted `0`"
+        in rendered.markdown
+    )
     assert "*📥 Queue*  `2`" in rendered.markdown
     assert "🔓 TOTP 已认证 · 剩余 `30 min`" in rendered.markdown
     expires = time.strftime("%H:%M:%S", time.localtime(1_700_001_900))
@@ -198,6 +207,79 @@ def test_status_comment_lists_active_agents_before_bounded_terminal_history() ->
     assert "另有 1 个已结束 Agent" in rendered.plain
     assert "PRIVATE REASONING" not in rendered.markdown
     assert "PRIVATE REASONING" not in rendered.plain
+
+
+def test_status_comment_shows_animated_mode_and_main_and_subagent_profiles() -> None:
+    state = ThreadState(thread_id="parent", title="Profile status", status="active")
+    state.tasks = [
+        TaskState(
+            task_id="worker",
+            title="Implement command",
+            status="inProgress",
+            model="gpt-5.6-luna",
+            reasoning_effort="max",
+        )
+    ]
+    space = SessionSpace(
+        space_id="space-1",
+        lifecycle="active",
+        thread_id="parent",
+        normal_model="gpt-5.6-luna",
+        normal_effort="max",
+        plan_model="gpt-5.6-sol",
+        plan_effort="xhigh",
+        current_mode="plan",
+    )
+
+    rendered = render_status_comment(state, space=space, animation_frame=1)
+
+    assert rendered.markdown.startswith("*🧭 Plan mode · 🕒*")
+    assert "*🧠 Main*  `gpt-5.6-sol` · Effort `xhigh`" in rendered.markdown
+    assert "`gpt-5.6-luna/max`" in rendered.markdown
+    assert rendered.plain.startswith("🧭 Plan mode · 🕒")
+
+
+def test_status_comment_separates_interrupted_tasks_and_warns_on_goal_plan_mismatch() -> None:
+    state = ThreadState(
+        thread_id="parent",
+        status="idle",
+        goal={"status": "complete", "objective": "Ship safely"},
+        plan=[PlanStep("Implement", "completed"), PlanStep("Deploy", "inProgress")],
+        tasks=[
+            TaskState(
+                task_id="stopped-agent",
+                title="Stopped audit",
+                status="interrupted",
+                started_at=1_700_000_000,
+                finished_at=1_700_000_030,
+                updated_at=1_700_000_030,
+            )
+        ],
+    )
+
+    rendered = render_status_comment(state, now=1_700_000_120)
+
+    assert "Goal 已完成，但 Plan 仍有 1 项未完成" in rendered.markdown
+    assert (
+        "*🧩 Agent Tasks*  `1/1` · Running `0` · Failed `0` · Interrupted `1`"
+        in rendered.markdown
+    )
+    assert "WARNING: Goal 已完成，但 Plan 仍有 1 项未完成" in rendered.plain
+
+
+def test_status_comment_warns_when_complete_goal_still_has_running_subagent() -> None:
+    state = ThreadState(
+        thread_id="parent",
+        status="idle",
+        goal={"status": "complete", "objective": "Premature"},
+        plan=[PlanStep("Verify", "completed")],
+        tasks=[TaskState(task_id="live", title="Still running", status="inProgress")],
+    )
+
+    rendered = render_status_comment(state, now=1_700_000_120)
+
+    assert "Goal 已完成，但仍有 1 个 Subagent 运行中" in rendered.markdown
+    assert "WARNING: Goal 已完成，但仍有 1 个 Subagent 运行中" in rendered.plain
 
 
 def test_status_comment_expires_auth_and_stays_bounded_with_hostile_text() -> None:

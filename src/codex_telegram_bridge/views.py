@@ -228,6 +228,27 @@ def _task_counts(state: object) -> tuple[int, int, int, int]:
     return completed, completed + active + failed, active, failed
 
 
+def _agent_task_counts(state: object) -> tuple[int, int, int, int, int]:
+    tasks = _value(state, "tasks")
+    if tasks and isinstance(tasks, Sequence) and not isinstance(tasks, str | bytes):
+        statuses = [str(_value(task, "status", default="pending") or "pending") for task in tasks]
+        active_statuses = {"pending", "pendingInit", "active", "running", "inProgress"}
+        failed_statuses = {"failed", "errored", "notFound"}
+        interrupted_statuses = {"interrupted"}
+        terminal_statuses = {"completed", "shutdown"} | failed_statuses | interrupted_statuses
+        return (
+            sum(status in terminal_statuses for status in statuses),
+            len(statuses),
+            sum(status in active_statuses for status in statuses),
+            sum(status in failed_statuses for status in statuses),
+            sum(status in interrupted_statuses for status in statuses),
+        )
+    completed = int(_value(state, "agents_completed", default=0) or 0)
+    active = int(_value(state, "agents_active", default=0) or 0)
+    failed = int(_value(state, "agents_failed", default=0) or 0)
+    return completed + failed, completed + active + failed, active, failed, 0
+
+
 def _queue_count(state: object, explicit: int | None = None) -> int:
     return max(0, int(explicit if explicit is not None else (_value(state, "queue_count", default=0) or 0)))
 
@@ -520,6 +541,23 @@ def _agent_lines(task: object, now: int) -> tuple[str, str]:
     return markdown, plain
 
 
+def _main_profile(space: object | None, state: object) -> tuple[str, str, str]:
+    mode = str(_value(space, "current_mode", default="") or "")
+    if mode not in {"default", "plan"}:
+        mode = ""
+    if mode == "plan":
+        model = str(_value(space, "plan_model", default="") or "")
+        effort = str(_value(space, "plan_effort", default="") or "")
+    else:
+        model = str(_value(space, "normal_model", default="") or "")
+        effort = str(_value(space, "normal_effort", default="") or "")
+    model = model or str(_value(state, "model", default="") or "")
+    effort = effort or str(
+        _value(state, "reasoning_effort", "reasoningEffort", default="") or ""
+    )
+    return mode, model, effort
+
+
 def render_status_comment(
     state: object,
     *,
@@ -530,6 +568,7 @@ def render_status_comment(
     queue_count: int | None = None,
     auth_expires_at: object | None = None,
     heartbeat_seconds: int = 60,
+    animation_frame: int | None = None,
 ) -> RenderedMessage:
     now = int(time.time()) if now is None else now
     lifecycle = lifecycle or str(_value(space, "lifecycle", default="") or "") or None
@@ -537,30 +576,60 @@ def render_status_comment(
     goal_icon, goal_status, objective = _goal(state)
     steps = _steps(state)
     completed, plan_total = _plan_counts(state)
-    tasks_completed, tasks_total, tasks_active, tasks_failed = _task_counts(state)
+    tasks_finished, tasks_total, tasks_active, tasks_failed, tasks_interrupted = (
+        _agent_task_counts(state)
+    )
     queue = _queue_count(state, queue_count)
     duration = _duration(_total_duration(state, now, total_duration_seconds))
     title = clip(_title(state), 80)
     thread_id = _thread_id(state) or str(_value(space, "thread_id", default="Pending") or "Pending")
+    current_mode, main_model, main_effort = _main_profile(space, state)
     progress = 100.0 * completed / plan_total if plan_total else 0.0
-    markdown_lines = [
+    markdown_lines: list[str] = []
+    plain_lines: list[str] = []
+    if current_mode:
+        mode_icon, mode_label = ("🧭", "Plan mode") if current_mode == "plan" else ("⚙️", "Normal mode")
+        frame = ""
+        if animation_frame is not None:
+            frame = ("🕛", "🕒", "🕕", "🕘")[animation_frame % 4]
+        mode_header = f"{mode_icon} {mode_label}" + (f" · {frame}" if frame else "")
+        markdown_lines.extend([f"*{mode_header}*", ""])
+        plain_lines.extend([mode_header, ""])
+    markdown_lines.extend(
+        [
         f"*🤖 Codex · {escape(title)}*",
         f"{inline_code(thread_id, 80)} · {icon} {escape(status)} · 总执行 {inline_code(duration)}",
+        *(
+            [
+                f"*🧠 Main*  {inline_code(main_model or 'N/A', 80)} · "
+                f"Effort {inline_code(main_effort or 'N/A', 32)}"
+            ]
+            if current_mode or main_model or main_effort
+            else []
+        ),
         "",
         f"*🎯 Goal*  {goal_icon} {inline_code(goal_status)}",
         escape(clip(objective, 320)),
         "",
         f"*🧭 Plan*  {inline_code(f'{completed}/{plan_total}')}  {inline_code(ascii_bar(progress))}",
-    ]
-    plain_lines = [
+        ]
+    )
+    plain_lines.extend(
+        [
         f"🤖 Codex · {title}",
         f"{thread_id} · {icon} {status} · 总执行 {duration}",
+        *(
+            [f"🧠 Main · {main_model or 'N/A'} · Effort {main_effort or 'N/A'}"]
+            if current_mode or main_model or main_effort
+            else []
+        ),
         "",
         f"🎯 Goal · {goal_icon} {goal_status}",
         clip(objective, 320),
         "",
         f"🧭 Plan · {completed}/{plan_total} {ascii_bar(progress)}",
-    ]
+        ]
+    )
     visible_steps, hidden = _visible_steps(steps)
     if not visible_steps:
         markdown_lines.append("尚未创建计划")
@@ -572,18 +641,29 @@ def render_status_comment(
     if hidden:
         markdown_lines.append(escape(f"… 另有 {hidden} 项，使用 /plan 查看"))
         plain_lines.append(f"... 另有 {hidden} 项，使用 /plan 查看")
+    if goal_status == "complete" and plan_total and completed != plan_total:
+        remaining = plan_total - completed
+        warning = f"Goal 已完成，但 Plan 仍有 {remaining} 项未完成；状态不一致，请先同步 Plan。"
+        markdown_lines.append(f"⚠️ {escape(warning)}")
+        plain_lines.append(f"WARNING: {warning}")
+    if goal_status == "complete" and tasks_active:
+        warning = f"Goal 已完成，但仍有 {tasks_active} 个 Subagent 运行中；请先等待或结束任务。"
+        markdown_lines.append(f"⚠️ {escape(warning)}")
+        plain_lines.append(f"WARNING: {warning}")
     markdown_lines.extend(
         [
             "",
-            f"*🧩 Tasks*  {inline_code(f'{tasks_completed}/{tasks_total}')} · Active "
-            f"{inline_code(tasks_active)} · Failed {inline_code(tasks_failed)}",
+            f"*🧩 Agent Tasks*  {inline_code(f'{tasks_finished}/{tasks_total}')} · Running "
+            f"{inline_code(tasks_active)} · Failed {inline_code(tasks_failed)} · Interrupted "
+            f"{inline_code(tasks_interrupted)}",
             f"*📥 Queue*  {inline_code(queue)}",
         ]
     )
     plain_lines.extend(
         [
             "",
-            f"🧩 Tasks · {tasks_completed}/{tasks_total} · Active {tasks_active} · Failed {tasks_failed}",
+            f"🧩 Agent Tasks · {tasks_finished}/{tasks_total} · Running {tasks_active} · "
+            f"Failed {tasks_failed} · Interrupted {tasks_interrupted}",
             f"📥 Queue · {queue}",
         ]
     )
@@ -862,8 +942,8 @@ def render_help(
         commands = [
             ("/sessions [关键词]", "查找 Codex sessions"),
             ("/topics", "查看 Session 帖子"),
-            ("/new 目录 | prompt", "创建待认证帖子"),
-            ("/perf", "查看 WSL 性能"),
+            ("/new [model | effort | ...]", "交互或参数化创建 Session"),
+            ("/perf", "动态查看 30 秒 WSL 性能"),
             ("/help", "显示帮助"),
         ]
         title = f"🤖 {bot_label}"
@@ -881,6 +961,8 @@ def render_help(
             ("/prompt <text>", "发送 prompt"),
             ("/ask <question>", "独立提问，不影响当前任务"),
             ("/queue [text]", "查看或加入队列"),
+            ("/planmode [model | effort | prompt]", "切入 Plan Mode"),
+            ("/changemodel [model | effort]", "切换当前模式配置"),
             ("/plan", "查看完整计划"),
             ("/timeline", "查看近期事件"),
             ("/attach", "查看上传文件"),

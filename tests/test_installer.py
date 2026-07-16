@@ -214,6 +214,7 @@ def test_previous_installer_version_unit_is_owned_and_upgradable(tmp_path: Path)
         "[Unit]\nDescription=old\n",
         encoding="utf-8",
     )
+    unit.chmod(0o600)
     result = run_installer_shell(
         tmp_path,
         """

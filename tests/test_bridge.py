@@ -11,7 +11,13 @@ import codex_telegram_bridge.bridge as bridge_module
 from codex_telegram_bridge.bridge import Bridge
 from codex_telegram_bridge.codex import CodexRpcError
 from codex_telegram_bridge.config import Config
-from codex_telegram_bridge.models import SessionSpace, ThreadState
+from codex_telegram_bridge.models import (
+    ModelOption,
+    ModelProfile,
+    SessionSpace,
+    TaskState,
+    ThreadState,
+)
 from codex_telegram_bridge.store import Store
 
 
@@ -382,6 +388,146 @@ async def test_activate_pending_session_does_not_create_legacy_subscription(
     assert space is not None
     assert (space.lifecycle, space.thread_id) == ("active", "thread-new")
     assert (space.pending_cwd, space.pending_prompt) == ("", "")
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_model_profile_alias_and_effort_are_resolved_from_catalog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, store = make_bridge(tmp_path)
+
+    async def list_options() -> list[ModelOption]:
+        return [
+            ModelOption(
+                model="gpt-5.6-luna",
+                display_name="GPT-5.6 Luna",
+                supported_efforts=("high", "max"),
+                default_effort="high",
+                is_default=True,
+            )
+        ]
+
+    monkeypatch.setattr(bridge.client, "list_model_options", list_options)
+
+    assert await bridge.resolve_model_profile("luna", "MAX") == ModelProfile(
+        "gpt-5.6-luna", "max"
+    )
+    with pytest.raises(ValueError, match="unavailable for model"):
+        await bridge.resolve_model_profile("luna", "xhigh")
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_activate_pending_session_starts_with_explicit_plan_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, store = make_bridge(tmp_path)
+    store.save_session_space(
+        SessionSpace(
+            space_id="space-profiled",
+            space_type="pending_new",
+            pending_cwd=str(tmp_path),
+            pending_prompt="Plan first",
+            normal_model="gpt-5.6-luna",
+            normal_effort="max",
+            plan_model="gpt-5.6-luna",
+            plan_effort="low",
+            current_mode="plan",
+        )
+    )
+    started: list[dict[str, Any]] = []
+
+    async def resolve_profile(model: str, effort: str) -> ModelProfile:
+        return ModelProfile(model, effort)
+
+    async def resolve_mode(
+        mode: str, *, model: str | None = None, effort: str | None = None
+    ) -> dict[str, Any]:
+        return {
+            "mode": mode,
+            "settings": {"model": model, "reasoning_effort": effort},
+        }
+
+    async def start_thread(cwd: Path) -> dict[str, Any]:
+        return {
+            "id": "thread-profiled",
+            "cwd": str(cwd),
+            "status": {"type": "idle"},
+        }
+
+    async def start_turn(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+        started.append(kwargs)
+        return {"id": "turn-plan"}
+
+    async def ensure_window(*_args: Any) -> str:
+        return "window"
+
+    monkeypatch.setattr(bridge, "resolve_model_profile", resolve_profile)
+    monkeypatch.setattr(bridge.client, "resolve_collaboration_mode", resolve_mode)
+    monkeypatch.setattr(bridge.client, "start_thread", start_thread)
+    monkeypatch.setattr(bridge.client, "start_turn", start_turn)
+    monkeypatch.setattr(bridge.tmux, "ensure_window", ensure_window)
+
+    await bridge.activate_pending_session(
+        "space-profiled", client_message_id="telegram-profiled"
+    )
+
+    assert started[0]["collaboration_mode"] == {
+        "mode": "plan",
+        "settings": {"model": "gpt-5.6-luna", "reasoning_effort": "low"},
+    }
+    space = store.get_session_space("space-profiled")
+    assert space is not None and (space.current_mode, space.lifecycle) == ("plan", "active")
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_change_space_model_updates_current_mode_for_subsequent_turns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, store = make_bridge(tmp_path)
+    store.save_session_space(
+        SessionSpace(
+            space_id="space-change",
+            lifecycle="active",
+            thread_id="thread-change",
+            normal_model="old",
+            normal_effort="high",
+            plan_model="plan-old",
+            plan_effort="low",
+            current_mode="default",
+        )
+    )
+    store.save_thread(ThreadState(thread_id="thread-change", cwd=str(tmp_path), status="active"))
+    updates: list[tuple[str, dict[str, Any]]] = []
+
+    async def resolve_profile(_model: str, _effort: str) -> ModelProfile:
+        return ModelProfile("gpt-5.6-luna", "max")
+
+    async def resolve_mode(
+        mode: str, *, model: str | None = None, effort: str | None = None
+    ) -> dict[str, Any]:
+        return {
+            "mode": mode,
+            "settings": {"model": model, "reasoning_effort": effort},
+        }
+
+    async def update_settings(
+        thread_id: str, *, collaboration_mode: dict[str, Any]
+    ) -> None:
+        updates.append((thread_id, collaboration_mode))
+
+    monkeypatch.setattr(bridge, "resolve_model_profile", resolve_profile)
+    monkeypatch.setattr(bridge.client, "resolve_collaboration_mode", resolve_mode)
+    monkeypatch.setattr(bridge.client, "update_thread_settings", update_settings)
+
+    changed = await bridge.change_space_model("space-change", "luna", "max")
+
+    assert (changed.normal_model, changed.normal_effort) == ("gpt-5.6-luna", "max")
+    assert (changed.plan_model, changed.plan_effort) == ("plan-old", "low")
+    assert updates[0][0] == "thread-change"
+    assert updates[0][1]["mode"] == "default"
     store.close()
 
 
@@ -848,11 +994,16 @@ async def test_collaboration_turn_validates_space_generation_before_start(
         return {
             "id": "thread-plan",
             "cwd": str(tmp_path),
+            "model": "gpt-5.6-luna",
+            "reasoningEffort": "max",
             "status": {"type": "idle"},
         }
 
-    async def resolve_mode(mode: str) -> dict[str, Any]:
+    async def resolve_mode(
+        mode: str, *, model: str, effort: str
+    ) -> dict[str, Any]:
         assert mode == "default"
+        assert (model, effort) == ("gpt-5.6-luna", "max")
         space = store.get_session_space("space-plan")
         assert space is not None
         space.generation = 4
@@ -863,9 +1014,13 @@ async def test_collaboration_turn_validates_space_generation_before_start(
         started.append(kwargs)
         return {"id": "turn-plan"}
 
+    async def resolve_profile(model: str, effort: str) -> ModelProfile:
+        return ModelProfile(model, effort)
+
     monkeypatch.setattr(bridge.client, "resume_thread", resume_thread)
     monkeypatch.setattr(bridge.client, "resolve_collaboration_mode", resolve_mode)
     monkeypatch.setattr(bridge.client, "start_turn", start_turn)
+    monkeypatch.setattr(bridge, "resolve_model_profile", resolve_profile)
 
     with pytest.raises(ValueError, match="cannot be empty"):
         await bridge.start_space_collaboration_turn(
@@ -881,6 +1036,37 @@ async def test_collaboration_turn_validates_space_generation_before_start(
         )
 
     assert started == []
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_collaboration_turn_rejects_missing_effective_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, store = make_bridge(tmp_path)
+    store.save_session_space(
+        SessionSpace(
+            space_id="space-no-profile",
+            lifecycle="active",
+            thread_id="thread-no-profile",
+        )
+    )
+
+    async def resume_thread(_thread_id: str) -> dict[str, Any]:
+        return {
+            "id": "thread-no-profile",
+            "cwd": str(tmp_path),
+            "status": {"type": "idle"},
+        }
+
+    monkeypatch.setattr(bridge.client, "resume_thread", resume_thread)
+    with pytest.raises(RuntimeError, match="model/effort"):
+        await bridge.start_space_collaboration_turn(
+            "space-no-profile",
+            "Implement the plan",
+            mode="default",
+            client_message_id="tg-no-profile",
+        )
     store.close()
 
 
@@ -1047,4 +1233,88 @@ async def test_queued_space_prompt_registers_completion_receipt(
     assert (receipts[0]["space_id"], receipts[0]["generation"]) == ("space-queued", 2)
     assert receipts[0]["status"] == "completed"
     assert store.space_queue_entries("space-queued", 2) == []
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_subagent_activity_hydrates_effective_child_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, store = make_bridge(tmp_path)
+    store.save_thread(ThreadState(thread_id="parent", status="active"))
+
+    async def resume_thread(thread_id: str) -> dict[str, Any]:
+        assert thread_id == "child-luna"
+        return {
+            "id": thread_id,
+            "parentThreadId": "parent",
+            "model": "gpt-5.6-luna",
+            "reasoningEffort": "max",
+            "status": {"type": "active"},
+        }
+
+    monkeypatch.setattr(bridge.client, "resume_thread", resume_thread)
+    await bridge._on_notification(
+        "item/started",
+        {
+            "threadId": "parent",
+            "item": {
+                "id": "activity-child-luna",
+                "type": "subAgentActivity",
+                "agentThreadId": "child-luna",
+                "agentPath": "/root/reviewer",
+                "kind": "started",
+            },
+        },
+    )
+    task = bridge._subagent_profile_tasks["child-luna"]
+    await task
+
+    parent = store.get_thread("parent")
+    assert parent is not None
+    assert [(item.model, item.reasoning_effort) for item in parent.tasks] == [
+        ("gpt-5.6-luna", "max")
+    ]
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_restart_hydrates_profiles_for_persisted_subagent_tasks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, store = make_bridge(tmp_path)
+    store.save_thread(
+        ThreadState(
+            thread_id="parent",
+            status="active",
+            tasks=[
+                TaskState(
+                    task_id="child-sol",
+                    agent_thread_id="child-sol",
+                    agent_path="/root/worker",
+                    title="Difficult task",
+                    status="inProgress",
+                )
+            ],
+        )
+    )
+
+    async def resume_thread(thread_id: str) -> dict[str, Any]:
+        assert thread_id == "child-sol"
+        return {
+            "id": thread_id,
+            "parentThreadId": "parent",
+            "model": "gpt-5.6-sol",
+            "reasoningEffort": "xhigh",
+            "status": {"type": "active"},
+        }
+
+    monkeypatch.setattr(bridge.client, "resume_thread", resume_thread)
+    await bridge._hydrate_missing_subagent_profiles()
+
+    parent = store.get_thread("parent")
+    assert parent is not None
+    assert [(item.model, item.reasoning_effort) for item in parent.tasks] == [
+        ("gpt-5.6-sol", "xhigh")
+    ]
     store.close()

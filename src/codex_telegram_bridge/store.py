@@ -15,12 +15,13 @@ from pathlib import Path
 from typing import Any
 
 from .config import ensure_private_directory
-from .models import Owner, QueuedPrompt, SessionSpace, ThreadState
+from .models import InteractionDraft, Owner, QueuedPrompt, SessionSpace, ThreadState
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 CONTROL_BOT_ROLE = "control"
 _PLAN_PUBLICATION_RESULTS = frozenset({"published", "failed"})
 _PLAN_ACTION_STATUSES = frozenset({"executing", "revising"})
+_PLAN_ACTION_TERMINAL_STATUSES = frozenset({"executed", "revision_started"})
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS metadata (
@@ -78,6 +79,25 @@ CREATE TABLE IF NOT EXISTS callbacks (
     space_id TEXT,
     generation INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS interaction_drafts (
+    scope_key TEXT PRIMARY KEY,
+    flow_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    phase TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    user_id INTEGER NOT NULL,
+    bot_role TEXT NOT NULL,
+    chat_id INTEGER NOT NULL,
+    space_id TEXT,
+    generation INTEGER NOT NULL DEFAULT 0,
+    expires_at INTEGER NOT NULL,
+    claimed_at INTEGER,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_interaction_drafts_kind
+    ON interaction_drafts(kind, claimed_at, expires_at);
 CREATE TABLE IF NOT EXISTS pending_inputs (
     request_key TEXT PRIMARY KEY,
     request_id TEXT NOT NULL,
@@ -455,6 +475,12 @@ class Store:
             "status_message_id",
         ):
             space[name] = int(space[name]) if space.get(name) is not None else None
+        for name in ("normal_model", "normal_effort", "plan_model", "plan_effort"):
+            space[name] = str(space.get(name) or "").strip()
+        current_mode = str(space.get("current_mode") or "default")
+        if current_mode not in {"default", "plan"}:
+            raise ValueError(f"Unsupported session collaboration mode: {current_mode}")
+        space["current_mode"] = current_mode
         return space
 
     @staticmethod
@@ -903,6 +929,11 @@ class Store:
             "status_message_id",
             "pending_cwd",
             "pending_prompt",
+            "normal_model",
+            "normal_effort",
+            "plan_model",
+            "plan_effort",
+            "current_mode",
             "created_at",
             "updated_at",
             "last_error",
@@ -1206,7 +1237,7 @@ class Store:
             connection.execute(
                 "UPDATE plan_publications SET status='superseded', updated_at=? "
                 "WHERE space_id=? AND generation=? AND id<? "
-                "AND status IN ('publishing', 'published', 'failed', 'revising')",
+                "AND status<>'superseded'",
                 (now, space_id, int(generation), publication_id),
             )
             return True
@@ -1288,6 +1319,294 @@ class Store:
                 ),
             )
         return cursor.rowcount == 1
+
+    def release_plan_action(
+        self,
+        space_id: str,
+        generation: int,
+        item_id: str,
+        *,
+        expected_status: str = "executing",
+    ) -> bool:
+        if expected_status not in _PLAN_ACTION_STATUSES:
+            raise ValueError("Plan action status is invalid")
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                "UPDATE plan_publications SET status='published', updated_at=? "
+                "WHERE space_id=? AND generation=? AND item_id=? AND status=? "
+                "AND id=(SELECT MAX(id) FROM plan_publications "
+                "WHERE space_id=? AND generation=?)",
+                (
+                    int(time.time()),
+                    space_id,
+                    int(generation),
+                    item_id,
+                    expected_status,
+                    space_id,
+                    int(generation),
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def complete_plan_action(
+        self,
+        space_id: str,
+        generation: int,
+        item_id: str,
+        *,
+        expected_status: str,
+        status: str,
+    ) -> bool:
+        if expected_status not in _PLAN_ACTION_STATUSES:
+            raise ValueError("Plan action status is invalid")
+        if status not in _PLAN_ACTION_TERMINAL_STATUSES:
+            raise ValueError("Plan action terminal status is invalid")
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                "UPDATE plan_publications SET status=?, updated_at=? "
+                "WHERE space_id=? AND generation=? AND item_id=? AND status=? "
+                "AND id=(SELECT MAX(id) FROM plan_publications "
+                "WHERE space_id=? AND generation=?)",
+                (
+                    status,
+                    int(time.time()),
+                    space_id,
+                    int(generation),
+                    item_id,
+                    expected_status,
+                    space_id,
+                    int(generation),
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def executing_plan_publications(self) -> list[dict[str, Any]]:
+        return self.recoverable_plan_publications({"executing"})
+
+    def recoverable_plan_publications(
+        self, statuses: set[str] | frozenset[str] = _PLAN_ACTION_STATUSES
+    ) -> list[dict[str, Any]]:
+        selected = frozenset(str(value) for value in statuses)
+        if not selected or not selected <= _PLAN_ACTION_STATUSES:
+            raise ValueError("Plan recovery statuses are invalid")
+        placeholders = ",".join("?" for _ in selected)
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT space_id, generation, item_id, thread_id, turn_id, status, "
+                "message_ids_json, created_at, updated_at FROM plan_publications "
+                f"WHERE status IN ({placeholders}) ORDER BY updated_at, id",
+                tuple(sorted(selected)),
+            ).fetchall()
+        return [
+            {
+                "space_id": str(row[0]),
+                "generation": int(row[1]),
+                "item_id": str(row[2]),
+                "thread_id": str(row[3]),
+                "turn_id": str(row[4]),
+                "status": str(row[5]),
+                "message_ids": json.loads(str(row[6])),
+                "created_at": int(row[7]),
+                "updated_at": int(row[8]),
+            }
+            for row in rows
+        ]
+
+    @staticmethod
+    def _interaction_from_row(row: sqlite3.Row) -> InteractionDraft:
+        payload = json.loads(str(row[5]))
+        if not isinstance(payload, dict):
+            payload = {}
+        return InteractionDraft(
+            scope_key=str(row[0]),
+            flow_id=str(row[1]),
+            revision=int(row[2]),
+            kind=str(row[3]),
+            phase=str(row[4]),
+            payload=payload,
+            user_id=int(row[6]),
+            bot_role=str(row[7]),
+            chat_id=int(row[8]),
+            space_id=str(row[9]) if row[9] is not None else None,
+            generation=int(row[10]),
+            expires_at=int(row[11]),
+            claimed_at=int(row[12]) if row[12] is not None else None,
+            created_at=int(row[13]),
+            updated_at=int(row[14]),
+        )
+
+    def replace_interaction(
+        self,
+        scope_key: str,
+        *,
+        kind: str,
+        phase: str,
+        payload: Mapping[str, Any],
+        user_id: int,
+        bot_role: str,
+        chat_id: int,
+        expires_at: int,
+        space_id: str | None = None,
+        generation: int = 0,
+    ) -> InteractionDraft:
+        if not all(value.strip() for value in (scope_key, kind, phase, bot_role)):
+            raise ValueError("Interaction identifiers must not be empty")
+        if generation < 0:
+            raise ValueError("Interaction generation must not be negative")
+        now = int(time.time())
+        flow_id = uuid.uuid4().hex
+        encoded = _json_mapping(payload)
+        with self._lock, self._connection:
+            self._connection.execute(
+                "INSERT INTO interaction_drafts(scope_key, flow_id, revision, kind, phase, "
+                "payload_json, user_id, bot_role, chat_id, space_id, generation, expires_at, "
+                "claimed_at, created_at, updated_at) VALUES(?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "NULL, ?, ?) ON CONFLICT(scope_key) DO UPDATE SET flow_id=excluded.flow_id, "
+                "revision=1, kind=excluded.kind, phase=excluded.phase, "
+                "payload_json=excluded.payload_json, user_id=excluded.user_id, "
+                "bot_role=excluded.bot_role, chat_id=excluded.chat_id, space_id=excluded.space_id, "
+                "generation=excluded.generation, expires_at=excluded.expires_at, claimed_at=NULL, "
+                "created_at=excluded.created_at, updated_at=excluded.updated_at",
+                (
+                    scope_key,
+                    flow_id,
+                    kind,
+                    phase,
+                    encoded,
+                    int(user_id),
+                    bot_role,
+                    int(chat_id),
+                    space_id,
+                    int(generation),
+                    int(expires_at),
+                    now,
+                    now,
+                ),
+            )
+        draft = self.get_interaction(scope_key)
+        if draft is None:
+            raise RuntimeError("Interaction draft could not be persisted")
+        return draft
+
+    def get_interaction(self, scope_key: str) -> InteractionDraft | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT scope_key, flow_id, revision, kind, phase, payload_json, user_id, "
+                "bot_role, chat_id, space_id, generation, expires_at, claimed_at, created_at, "
+                "updated_at FROM interaction_drafts WHERE scope_key=? AND claimed_at IS NULL",
+                (scope_key,),
+            ).fetchone()
+        return self._interaction_from_row(row) if row else None
+
+    def advance_interaction(
+        self,
+        scope_key: str,
+        flow_id: str,
+        revision: int,
+        *,
+        phase: str,
+        payload: Mapping[str, Any],
+        expires_at: int,
+    ) -> InteractionDraft | None:
+        now = int(time.time())
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                "UPDATE interaction_drafts SET revision=revision+1, phase=?, payload_json=?, "
+                "expires_at=?, updated_at=? WHERE scope_key=? AND flow_id=? AND revision=? "
+                "AND claimed_at IS NULL AND expires_at>?",
+                (
+                    phase,
+                    _json_mapping(payload),
+                    int(expires_at),
+                    now,
+                    scope_key,
+                    flow_id,
+                    int(revision),
+                    now,
+                ),
+            )
+        return self.get_interaction(scope_key) if cursor.rowcount == 1 else None
+
+    def claim_interaction(
+        self, scope_key: str, flow_id: str, revision: int
+    ) -> InteractionDraft | None:
+        return self._claim_interaction(scope_key, flow_id, revision)
+
+    def claim_live_interaction(
+        self, scope_key: str, flow_id: str, revision: int
+    ) -> InteractionDraft | None:
+        return self._claim_interaction(
+            scope_key, flow_id, revision, expiry="live"
+        )
+
+    def claim_expired_interaction(
+        self, scope_key: str, flow_id: str, revision: int
+    ) -> InteractionDraft | None:
+        return self._claim_interaction(
+            scope_key, flow_id, revision, expiry="expired"
+        )
+
+    def _claim_interaction(
+        self,
+        scope_key: str,
+        flow_id: str,
+        revision: int,
+        *,
+        expiry: str | None = None,
+    ) -> InteractionDraft | None:
+        if expiry not in {None, "live", "expired"}:
+            raise ValueError("Interaction expiry condition is invalid")
+        now = int(time.time())
+        expiry_sql = (
+            " AND expires_at>?"
+            if expiry == "live"
+            else " AND expires_at<=?"
+            if expiry == "expired"
+            else ""
+        )
+        params: tuple[object, ...] = (scope_key, flow_id, int(revision))
+        if expiry is not None:
+            params = (*params, now)
+        with self._immediate_transaction() as connection:
+            row = connection.execute(
+                "SELECT scope_key, flow_id, revision, kind, phase, payload_json, user_id, "
+                "bot_role, chat_id, space_id, generation, expires_at, claimed_at, created_at, "
+                "updated_at FROM interaction_drafts WHERE scope_key=? AND flow_id=? "
+                f"AND revision=? AND claimed_at IS NULL{expiry_sql}",
+                params,
+            ).fetchone()
+            if row is None:
+                return None
+            cursor = connection.execute(
+                "UPDATE interaction_drafts SET claimed_at=?, updated_at=? WHERE scope_key=? "
+                f"AND flow_id=? AND revision=? AND claimed_at IS NULL{expiry_sql}",
+                (now, now, *params),
+            )
+            if cursor.rowcount != 1:
+                return None
+        claimed = self._interaction_from_row(row)
+        claimed.claimed_at = now
+        claimed.updated_at = now
+        return claimed
+
+    def delete_interaction(self, scope_key: str) -> None:
+        with self._lock, self._connection:
+            self._connection.execute("DELETE FROM interaction_drafts WHERE scope_key=?", (scope_key,))
+
+    def list_interactions(self, kind: str | None = None) -> list[InteractionDraft]:
+        query = (
+            "SELECT scope_key, flow_id, revision, kind, phase, payload_json, user_id, bot_role, "
+            "chat_id, space_id, generation, expires_at, claimed_at, created_at, updated_at "
+            "FROM interaction_drafts WHERE claimed_at IS NULL"
+        )
+        params: tuple[object, ...] = ()
+        if kind is not None:
+            query += " AND kind=?"
+            params = (kind,)
+        query += " ORDER BY updated_at, scope_key"
+        with self._lock:
+            rows = self._connection.execute(query, params).fetchall()
+        return [self._interaction_from_row(row) for row in rows]
 
     def put_callback(
         self,
@@ -1567,6 +1886,10 @@ class Store:
         with self._lock, self._connection:
             self._connection.execute(
                 "DELETE FROM callbacks WHERE expires_at < ? OR used_at IS NOT NULL", (now,)
+            )
+            self._connection.execute(
+                "DELETE FROM interaction_drafts WHERE claimed_at IS NOT NULL AND updated_at < ?",
+                (now - 86400,),
             )
             self._connection.execute("DELETE FROM events WHERE created_at < ?", (now - event_days * 86400,))
             self._connection.execute(
@@ -2071,6 +2394,7 @@ class Store:
             connection.execute("DELETE FROM owner")
             connection.execute("DELETE FROM telegram_binding")
             connection.execute("DELETE FROM callbacks")
+            connection.execute("DELETE FROM interaction_drafts")
             connection.execute("DELETE FROM pending_inputs")
             connection.execute("DELETE FROM question_resolutions")
             connection.execute("DELETE FROM prompt_runs")

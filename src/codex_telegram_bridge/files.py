@@ -343,6 +343,88 @@ class PathPolicy:
             raise PathPolicyError("目标不是目录")
         return candidate
 
+    def prepare_directory_creation(self, value: str | Path) -> Path | None:
+        raw = str(value).strip()
+        if not raw:
+            raise PathPolicyError("目录路径不能为空")
+        lexical = Path(raw).expanduser()
+        if not lexical.is_absolute():
+            return None
+        lexical = Path(os.path.abspath(lexical))
+        if not self._inside_root(lexical):
+            raise PathPolicyError(f"路径必须位于 {self.root} 下")
+        if self._sensitive(lexical):
+            raise PathPolicyError("拒绝创建敏感路径")
+        if lexical.exists():
+            return self.validate_directory(lexical)
+
+        ancestor = lexical
+        while not ancestor.exists():
+            parent = ancestor.parent
+            if parent == ancestor:
+                raise PathPolicyError("目录没有可验证的父路径")
+            ancestor = parent
+        try:
+            resolved_ancestor = ancestor.resolve(strict=True)
+            metadata = os.stat(resolved_ancestor, follow_symlinks=False)
+        except OSError as exc:
+            raise PathPolicyError(f"无法验证目录父路径: {ancestor}") from exc
+        if not self._inside_root(resolved_ancestor):
+            raise PathPolicyError(f"路径必须位于 {self.root} 下")
+        if self._sensitive(resolved_ancestor):
+            raise PathPolicyError("拒绝创建敏感路径")
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise PathPolicyError("目录父路径不是目录")
+        return lexical
+
+    def create_directory(self, value: str | Path) -> Path:
+        raw = str(value).strip()
+        if not raw:
+            raise PathPolicyError("目录路径不能为空")
+        target = Path(raw).expanduser()
+        if not target.is_absolute():
+            raise PathPolicyError("只能创建明确的绝对目录路径")
+        target = Path(os.path.abspath(target))
+        if not self._inside_root(target):
+            raise PathPolicyError(f"路径必须位于 {self.root} 下")
+        if self._sensitive(target):
+            raise PathPolicyError("拒绝创建敏感路径")
+
+        relative = target.relative_to(self.root)
+        directory_flags = (
+            getattr(os, "O_PATH", os.O_RDONLY)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptors: list[int] = []
+        try:
+            current = os.open(self.root, directory_flags)
+            descriptors.append(current)
+            root_metadata = os.fstat(current)
+            if (root_metadata.st_dev, root_metadata.st_ino) != self._root_identity:
+                raise PathPolicyError("允许的根目录已被替换")
+            for part in relative.parts:
+                try:
+                    child = os.open(part, directory_flags, dir_fd=current)
+                except FileNotFoundError:
+                    os.mkdir(part, mode=0o700, dir_fd=current)
+                    child = os.open(part, directory_flags, dir_fd=current)
+                metadata = os.fstat(child)
+                if not stat.S_ISDIR(metadata.st_mode):
+                    os.close(child)
+                    raise PathPolicyError("目标路径包含非目录组件")
+                descriptors.append(child)
+                current = child
+        except PathPolicyError:
+            raise
+        except OSError as exc:
+            raise PathPolicyError(f"无法安全创建目录: {target}") from exc
+        finally:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
+        return target
+
     def validate_file(self, value: str | Path, *, check_size: bool = True) -> FileCandidate:
         path = self._resolve_inside_root(value)
         try:

@@ -211,8 +211,10 @@ Control Bot private chat:
 /pair <code>                 pair the single owner
 /sessions [search]           browse recent Codex sessions
 /topics                      show followed session posts
-/new <directory> | <prompt>  create a TOTP-gated pending session
-/perf                        show WSL/Codex resource usage temporarily
+/new                         choose normal/Plan profiles, project, and first prompt interactively
+/new <model> | <effort> [ | noplan | <cwd> [ | <prompt> ] ]
+/new <model> | <effort> | planmode | <plan-model> | <plan-effort> [ | <cwd> [ | <prompt> ] ]
+/perf                        update WSL/Codex resource usage every ~1s for 30s
 /help                        show context-appropriate help
 ```
 
@@ -226,6 +228,10 @@ Discussion Bot session comments:
 /prompt <text>               send a prompt to the fixed session
 /queue [text]                view or append to the FIFO prompt queue
 /ask <question>              ask through an isolated temporary fork
+/planmode                    choose a Plan profile and prompt interactively
+/planmode <model> | <effort> [ | <prompt> ]
+/changemodel                 choose the current mode's model and effort interactively
+/changemodel <model> | <effort>
 /plan                        show the complete plan
 /timeline                    show recent structured events
 /attach                      create or find the matching tmux window

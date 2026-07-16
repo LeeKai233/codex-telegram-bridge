@@ -150,12 +150,35 @@ class SessionSpaceCoordinator:
                 "thread_id": thread_id,
                 "title": state.title,
                 "pending_cwd": state.cwd,
+                "normal_model": state.model,
+                "normal_effort": state.reasoning_effort,
+                "plan_model": state.model,
+                "plan_effort": state.reasoning_effort,
+                "current_mode": "default",
             },
             render_channel_post(state, lifecycle="active"),
         )
 
-    async def create_pending(self, cwd: Path, prompt: str) -> dict[str, Any]:
+    async def create_pending(
+        self,
+        cwd: Path,
+        prompt: str,
+        *,
+        normal_model: str = "",
+        normal_effort: str = "",
+        plan_model: str | None = None,
+        plan_effort: str | None = None,
+        current_mode: str = "default",
+    ) -> dict[str, Any]:
         cwd = self.bridge.path_policy.validate_directory(cwd)
+        if current_mode not in {"default", "plan"}:
+            raise ValueError(f"Unsupported collaboration mode: {current_mode!r}")
+        if bool(normal_model) != bool(normal_effort):
+            raise ValueError("Normal model and effort must be provided together")
+        if bool(plan_model) != bool(plan_effort):
+            raise ValueError("Plan model and effort must be provided together")
+        if current_mode == "plan" and not (plan_model and plan_effort):
+            raise ValueError("Plan mode requires a model and effort")
         value = {
             "space_id": uuid.uuid4().hex,
             "space_type": "pending_new",
@@ -164,6 +187,11 @@ class SessionSpaceCoordinator:
             "title": prompt[:80] or "New Codex session",
             "pending_cwd": str(cwd),
             "pending_prompt": prompt,
+            "normal_model": normal_model,
+            "normal_effort": normal_effort,
+            "plan_model": plan_model or "",
+            "plan_effort": plan_effort or "",
+            "current_mode": current_mode,
         }
         return await self._create_space(value, render_pending_space(value))
 

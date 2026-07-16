@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -56,6 +57,7 @@ class MemoryStore:
         self.queue: list[dict[str, Any]] = []
         self.publications: list[dict[str, Any]] = []
         self.released: list[tuple[str, int, str, str]] = []
+        self.completed: list[tuple[str, int, str, str, str]] = []
 
     def get_owner(self) -> Owner:
         return self.owner
@@ -160,6 +162,26 @@ class MemoryStore:
 
     def executing_plan_publications(self) -> list[dict[str, Any]]:
         return list(self.publications)
+
+    def recoverable_plan_publications(self) -> list[dict[str, Any]]:
+        return [
+            {**publication, "status": str(publication.get("status") or "executing")}
+            for publication in self.publications
+        ]
+
+    def complete_plan_action(
+        self,
+        space_id: str,
+        generation: int,
+        item_id: str,
+        *,
+        expected_status: str,
+        status: str,
+    ) -> bool:
+        self.completed.append(
+            (space_id, generation, item_id, expected_status, status)
+        )
+        return True
 
     def release_plan_action(
         self,
@@ -350,6 +372,23 @@ async def test_invalid_profile_returns_a_normalized_command_suggestion(
 
 
 @pytest.mark.asyncio
+async def test_invalid_planmode_profile_suggestion_preserves_prompt(
+    command_runtime: SimpleNamespace,
+) -> None:
+    runtime = command_runtime
+
+    await runtime.controller.planmode(
+        update("/planmode lunaa | mx | keep this | exact prompt"),
+        SimpleNamespace(),
+    )
+
+    assert (
+        "/planmode gpt-5.6-luna | max | keep this | exact prompt"
+        in runtime.sent[-1]["markdown"]
+    )
+
+
+@pytest.mark.asyncio
 async def test_planmode_interaction_advances_revision_then_claims_first_prompt(
     command_runtime: SimpleNamespace,
 ) -> None:
@@ -376,6 +415,55 @@ async def test_planmode_interaction_advances_revision_then_claims_first_prompt(
     assert consumed is True
     assert runtime.bridge.turns[-1]["prompt"] == "Draft a plan"
     assert runtime.store.get_interaction(waiting.scope_key) is None
+
+
+@pytest.mark.asyncio
+async def test_profile_effort_claims_revision_before_profile_side_effect(
+    command_runtime: SimpleNamespace,
+) -> None:
+    runtime = command_runtime
+    controller = runtime.controller
+    await controller._begin_profile_interaction(dict(SPACE), "planmode")
+    await controller._profile_model_selected(
+        dict(SPACE), runtime.store.callbacks[0][1]
+    )
+    effort_payload = runtime.store.callbacks[-1][1]
+    selecting = next(iter(runtime.store.drafts.values()))
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked_set_profile(
+        space_id: str, mode: str, model: str, effort: str
+    ) -> dict[str, Any]:
+        entered.set()
+        await release.wait()
+        runtime.bridge.profile_sets.append((space_id, mode, model, effort))
+        return runtime.store.spaces[space_id]
+
+    runtime.bridge.set_space_profile = blocked_set_profile
+    task = asyncio.create_task(
+        controller._profile_effort_selected(dict(SPACE), effort_payload)
+    )
+    await entered.wait()
+
+    waiting = runtime.store.get_interaction(selecting.scope_key)
+    assert waiting is not None
+    assert (waiting.revision, waiting.phase) == (3, "await_prompt")
+    assert (
+        runtime.store.claim_interaction(
+            selecting.scope_key, selecting.flow_id, selecting.revision
+        )
+        is None
+    )
+
+    release.set()
+    await task
+    assert runtime.bridge.profile_sets[-1] == (
+        "space-command",
+        "plan",
+        "gpt-5.6-luna",
+        "max",
+    )
 
 
 @pytest.mark.asyncio
@@ -465,4 +553,66 @@ async def test_expired_prompt_and_absent_plan_execution_are_recovered(
         ("space-command", 3, "item-plan", "executing")
     ]
     assert "没有送达 Codex" in runtime.sent[-1]["markdown"]
+    assert runtime.sent[-1]["reply_markup"] is not None
+
+
+@pytest.mark.asyncio
+async def test_startup_plan_recovery_waits_for_codex_connection(
+    command_runtime: SimpleNamespace,
+) -> None:
+    runtime = command_runtime
+    connected = asyncio.Event()
+
+    class Client:
+        connected = False
+
+        async def wait_connected(self, timeout: float) -> None:
+            assert timeout == 120
+            await connected.wait()
+
+    runtime.bridge.client = Client()
+    runtime.store.publications = [
+        {
+            "space_id": "space-command",
+            "generation": 3,
+            "item_id": "item-startup",
+            "thread_id": "thread-command",
+            "turn_id": "turn-plan",
+        }
+    ]
+
+    await runtime.controller._ensure_plan_recovery()
+
+    task = runtime.controller._plan_recovery_task
+    assert task is not None
+    assert runtime.store.released == []
+    connected.set()
+    await task
+    assert runtime.controller._plan_recovery_done
+    assert runtime.store.released == [
+        ("space-command", 3, "item-startup", "executing")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_startup_releases_revision_that_was_not_delivered(
+    command_runtime: SimpleNamespace,
+) -> None:
+    runtime = command_runtime
+    runtime.store.publications = [
+        {
+            "space_id": "space-command",
+            "generation": 3,
+            "item_id": "item-revision",
+            "thread_id": "thread-command",
+            "turn_id": "turn-plan",
+            "status": "revising",
+        }
+    ]
+
+    await runtime.controller._recover_plan_executions()
+
+    assert runtime.store.released == [
+        ("space-command", 3, "item-revision", "revising")
+    ]
     assert runtime.sent[-1]["reply_markup"] is not None

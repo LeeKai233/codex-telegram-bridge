@@ -18,7 +18,13 @@ from codex_telegram_bridge.control_bot import ControlBotController
 from codex_telegram_bridge.deletions import MessageDeletionManager
 from codex_telegram_bridge.discussion_bot import DiscussionBotController
 from codex_telegram_bridge.metrics import MetricsSnapshot
-from codex_telegram_bridge.models import Owner, SessionSpace, ThreadState
+from codex_telegram_bridge.models import (
+    ModelOption,
+    ModelProfile,
+    Owner,
+    SessionSpace,
+    ThreadState,
+)
 from codex_telegram_bridge.space_coordinator import SessionSpaceCoordinator
 from codex_telegram_bridge.space_dashboard import SpaceDashboardManager
 from codex_telegram_bridge.store import Store
@@ -138,6 +144,7 @@ class FakeBridge:
         self.ask_waiters: dict[str, asyncio.Future[str]] = {}
         self.collaboration_calls: list[dict[str, Any]] = []
         self.collaboration_error: RuntimeError | None = None
+        self.reconcile_status = "unknown"
         self.on_question: Any = None
         self.on_notice: Any = None
         self.on_question_resolved: Any = None
@@ -147,6 +154,22 @@ class FakeBridge:
     async def resolve_directory(self, description: str) -> list[Path]:
         assert description
         return self.directory_candidates
+
+    async def list_model_options(self) -> list[ModelOption]:
+        return [
+            ModelOption(
+                model="gpt-5.6-luna",
+                display_name="GPT-5.6 Luna",
+                supported_efforts=("high", "max"),
+                default_effort="high",
+                is_default=True,
+            )
+        ]
+
+    async def resolve_model_profile(self, model: str, effort: str) -> ModelProfile:
+        if model not in {"gpt-5.6-luna", "luna"} or effort not in {"high", "max"}:
+            raise ValueError("invalid model profile")
+        return ModelProfile("gpt-5.6-luna", effort)
 
     async def list_sessions(
         self, *, search_term: str | None = None, limit: int = 200
@@ -261,6 +284,15 @@ class FakeBridge:
         if self.collaboration_error is not None:
             raise self.collaboration_error
         return {"id": f"turn-{len(self.collaboration_calls)}"}
+
+    async def reconcile_plan_execution(
+        self,
+        _space_id: str,
+        _generation: int,
+        _item_id: str,
+        _client_message_id: str,
+    ) -> str:
+        return self.reconcile_status
 
 
 class FakeSecurity:
@@ -727,7 +759,7 @@ async def test_space_dashboard_keeps_channel_native_comments_and_status_controls
 @pytest.mark.asyncio
 async def test_new_session_is_activated_only_after_totp_inside_its_comment_thread(rig: Rig) -> None:
     new_update = update_for_message(
-        "/new project | Build the feature",
+        "/new gpt-5.6-luna | max | noplan | project | Build the feature",
         update_id=80,
         message_id=20,
         chat_id=OWNER_CHAT_ID,
@@ -738,6 +770,11 @@ async def test_new_session_is_activated_only_after_totp_inside_its_comment_threa
     [space] = rig.store.list_spaces()
     assert space["space_type"] == "pending_new"
     assert space["thread_id"] is None
+    assert (space["normal_model"], space["normal_effort"], space["current_mode"]) == (
+        "gpt-5.6-luna",
+        "max",
+        "default",
+    )
     assert rig.bridge.activation_calls == []
 
     root = automatic_forward(int(space["channel_post_id"]), 503)
@@ -767,7 +804,7 @@ async def test_new_session_is_activated_only_after_totp_inside_its_comment_threa
 
 
 @pytest.mark.asyncio
-async def test_perf_schedules_command_and_reply_for_same_60_second_deadline(
+async def test_perf_updates_then_deletes_command_and_reply_after_30_seconds(
     rig: Rig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr("codex_telegram_bridge.control_bot.time.time", lambda: 10_000)
@@ -781,13 +818,15 @@ async def test_perf_schedules_command_and_reply_for_same_60_second_deadline(
 
     await rig.control.perf(update, SimpleNamespace())
 
-    due = rig.store.due_message_deletions(now=10_060)
+    due = rig.store.due_message_deletions(now=10_030)
     assert [(item["bot_role"], item["chat_id"], item["message_id"]) for item in due] == [
         (CONTROL_ROLE, OWNER_CHAT_ID, 30),
         (CONTROL_ROLE, OWNER_CHAT_ID, 1000),
     ]
-    assert {item["delete_at"] for item in due} == {10_060}
+    assert {item["delete_at"] for item in due} == {10_030}
     assert {item["group_key"] for item in due} == {"perf:90"}
+    assert "动态性能" in rig.control_endpoint.sent[-1]["markdown"]
+    await rig.control.stop()
 
 
 @pytest.mark.asyncio
@@ -1288,7 +1327,7 @@ async def test_plan_article_buttons_preserve_nonce_while_locked_then_execute_onc
         bot_role=DISCUSSION_ROLE,
         chat_id=DISCUSSION_CHAT_ID,
     ) is None
-    assert rig.store.latest_plan_publication("space-plan", 1)["status"] == "executing"
+    assert rig.store.latest_plan_publication("space-plan", 1)["status"] == "executed"
 
     await rig.discussion.callback(update, SimpleNamespace())
     assert len(rig.bridge.collaboration_calls) == 1
@@ -1345,6 +1384,103 @@ async def test_plan_revision_force_reply_starts_plan_turn(rig: Rig) -> None:
     assert call["mode"] == "plan"
     assert "Do not implement it yet" in call["prompt"]
     assert "rollback verification" in call["prompt"]
+    assert (
+        rig.store.latest_plan_publication("space-revise", 1)["status"]
+        == "revision_started"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_plan_revision_reconciles_without_duplicate(rig: Rig) -> None:
+    space = add_active_space(
+        rig,
+        space_id="space-revise-delivered",
+        thread_id="thread-revise-delivered",
+        root_message_id=526,
+        channel_post_id=126,
+    )
+    rig.security.unlocked.add("space-revise-delivered")
+    await rig.discussion.plan_completed(
+        "thread-revise-delivered",
+        "turn-plan",
+        "item-plan",
+        "Review this plan once.",
+    )
+    await rig.discussion._dispatch_callback(
+        "plan_continue",
+        {
+            "item_id": "item-plan",
+            "thread_id": "thread-revise-delivered",
+            "turn_id": "turn-plan",
+        },
+        space,
+    )
+    prompt_message_id = rig.discussion_endpoint.next_message_id - 1
+    rig.bridge.collaboration_error = RuntimeError("response lost")
+    rig.bridge.reconcile_status = "delivered"
+    reply = update_for_message(
+        "Add rollback checks.",
+        update_id=131,
+        message_id=51,
+        chat_id=DISCUSSION_CHAT_ID,
+        chat_type=ChatType.SUPERGROUP,
+        message_thread_id=526,
+        reply_to_message=SimpleNamespace(
+            message_id=prompt_message_id,
+            message_thread_id=526,
+            is_automatic_forward=False,
+        ),
+    )
+
+    with pytest.raises(ApplicationHandlerStop):
+        await rig.discussion.reply_to_intent(reply, SimpleNamespace())
+
+    publication = rig.store.latest_plan_publication("space-revise-delivered", 1)
+    assert publication is not None and publication["status"] == "revision_started"
+    assert rig.store.recoverable_plan_publications() == []
+    assert len(rig.bridge.collaboration_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_plan_revision_prompt_failure_releases_fresh_action_buttons(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    space = add_active_space(
+        rig,
+        space_id="space-revise-send-fail",
+        thread_id="thread-revise-send-fail",
+        root_message_id=527,
+        channel_post_id=127,
+    )
+    await rig.discussion.plan_completed(
+        "thread-revise-send-fail",
+        "turn-plan",
+        "item-plan",
+        "Plan can be revised.",
+    )
+    original_send = rig.discussion._send_space
+    attempts = 0
+
+    async def fail_once(*args: Any, **kwargs: Any) -> Any:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("Telegram send failed")
+        return await original_send(*args, **kwargs)
+
+    monkeypatch.setattr(rig.discussion, "_send_space", fail_once)
+    await rig.discussion._begin_plan_revision(
+        space,
+        {
+            "item_id": "item-plan",
+            "thread_id": "thread-revise-send-fail",
+            "turn_id": "turn-plan",
+        },
+    )
+
+    publication = rig.store.latest_plan_publication("space-revise-send-fail", 1)
+    assert publication is not None and publication["status"] == "published"
+    assert rig.discussion_endpoint.sent[-1]["reply_markup"] is not None
 
 
 @pytest.mark.asyncio
@@ -1370,11 +1506,44 @@ async def test_failed_plan_execute_is_not_dispatched_twice(rig: Rig) -> None:
     }
     rig.bridge.collaboration_error = RuntimeError("start failed")
 
-    with pytest.raises(RuntimeError, match="start failed"):
-        await rig.discussion._execute_plan(space, payload)
+    await rig.discussion._execute_plan(space, payload)
     with pytest.raises(RuntimeError, match="已处理"):
         await rig.discussion._execute_plan(space, payload)
 
+    assert len(rig.bridge.collaboration_calls) == 1
+    assert "暂停自动重试" in rig.discussion_endpoint.sent[-1]["markdown"]
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_plan_execute_marks_delivered_action_terminal(rig: Rig) -> None:
+    space = add_active_space(
+        rig,
+        space_id="space-plan-delivered",
+        thread_id="thread-plan-delivered",
+        root_message_id=525,
+        channel_post_id=125,
+    )
+    await rig.discussion.plan_completed(
+        "thread-plan-delivered",
+        "turn-plan",
+        "item-plan",
+        "Execute once.",
+    )
+    rig.bridge.collaboration_error = RuntimeError("response lost")
+    rig.bridge.reconcile_status = "delivered"
+
+    await rig.discussion._execute_plan(
+        space,
+        {
+            "item_id": "item-plan",
+            "thread_id": "thread-plan-delivered",
+            "turn_id": "turn-plan",
+        },
+    )
+
+    publication = rig.store.latest_plan_publication("space-plan-delivered", 1)
+    assert publication is not None and publication["status"] == "executed"
+    assert rig.store.recoverable_plan_publications() == []
     assert len(rig.bridge.collaboration_calls) == 1
 
 

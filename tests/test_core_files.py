@@ -86,6 +86,58 @@ def test_open_outbound_reads_from_anchored_descriptor(tmp_path: Path) -> None:
     assert sha256_file(path, policy=policy) == sha256_file(path)
 
 
+def test_project_directory_creation_is_explicit_anchored_and_private(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    policy = PathPolicy(root, upload_limit=1000)
+    target = root / "projects" / "new-session"
+
+    assert policy.prepare_directory_creation("relative/project") is None
+    assert policy.prepare_directory_creation(target) == target
+    assert not target.exists()
+
+    created = policy.create_directory(target)
+
+    assert created == target.resolve()
+    assert created.is_dir()
+    assert (root / "projects").stat().st_mode & 0o777 == 0o700
+    assert created.stat().st_mode & 0o777 == 0o700
+
+
+def test_project_directory_creation_rejects_escape_and_symlink_ancestor(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    outside = tmp_path / "outside"
+    root.mkdir()
+    outside.mkdir()
+    policy = PathPolicy(root, upload_limit=1000)
+    link = root / "linked"
+    link.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(PathPolicyError, match="位于"):
+        policy.prepare_directory_creation(outside / "project")
+    with pytest.raises(PathPolicyError, match="位于"):
+        policy.prepare_directory_creation(link / "project")
+    with pytest.raises(PathPolicyError, match="敏感"):
+        policy.prepare_directory_creation(root / ".codex" / "project")
+
+
+def test_project_creation_rejects_final_symlink_swapped_after_confirmation(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    alternate = root / "another-project"
+    alternate.mkdir()
+    target = root / "confirmed-project"
+    policy = PathPolicy(root, upload_limit=1000)
+
+    assert policy.prepare_directory_creation(target) == target
+    target.symlink_to(alternate, target_is_directory=True)
+
+    with pytest.raises(PathPolicyError, match="非目录|安全创建"):
+        policy.create_directory(target)
+
+
 def test_inbox_download_uses_part_then_atomic_commit(tmp_path: Path) -> None:
     inbox = tmp_path / "inbox"
     destination = prepare_inbox_path(
