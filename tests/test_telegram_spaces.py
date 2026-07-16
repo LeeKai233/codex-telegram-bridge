@@ -142,6 +142,19 @@ class FakeBridge:
         assert description
         return self.directory_candidates
 
+    async def list_sessions(
+        self, *, search_term: str | None = None, limit: int = 200
+    ) -> list[ThreadState]:
+        states = self.store.list_threads()
+        if search_term:
+            term = search_term.casefold()
+            states = [
+                state
+                for state in states
+                if term in state.thread_id.casefold() or term in state.title.casefold()
+            ]
+        return states[:limit]
+
     async def refresh(self, thread_id: str) -> ThreadState:
         state = self.store.get_thread(thread_id)
         if state is None:
@@ -716,6 +729,75 @@ async def test_perf_schedules_command_and_reply_for_same_60_second_deadline(
     ]
     assert {item["delete_at"] for item in due} == {10_060}
     assert {item["group_key"] for item in due} == {"perf:90"}
+
+
+@pytest.mark.asyncio
+async def test_sessions_uses_one_fixed_deadline_without_extending_on_pagination(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("codex_telegram_bridge.control_bot.time.time", lambda: 10_000)
+    for index in range(6):
+        rig.store.save_thread(
+            ThreadState(
+                thread_id=f"thread-{index}",
+                title=f"Session {index}",
+                cwd=str(rig.config.allowed_root),
+                status="idle",
+            )
+        )
+    update = update_for_message(
+        "/sessions",
+        update_id=91,
+        message_id=31,
+        chat_id=OWNER_CHAT_ID,
+        chat_type=ChatType.PRIVATE,
+    )
+
+    async def assert_command_scheduled_before_reply(_payload: dict[str, Any], _reply: Any) -> None:
+        due = rig.store.due_message_deletions(now=10_900)
+        assert [(item["message_id"], item["delete_at"]) for item in due] == [
+            (31, 10_900)
+        ]
+
+    rig.control_endpoint.before_send_returns = assert_command_scheduled_before_reply
+    await rig.control.sessions(update, SimpleNamespace())
+
+    due_before_page = rig.store.due_message_deletions(now=10_900)
+    assert [(item["message_id"], item["delete_at"]) for item in due_before_page] == [
+        (31, 10_900),
+        (1000, 10_900),
+    ]
+    assert {item["group_key"] for item in due_before_page} == {"sessions:91"}
+
+    first_markup = rig.control_endpoint.sent[-1]["reply_markup"]
+    next_page = first_markup.inline_keyboard[-1][-1]
+    assert next_page.text == ">>"
+    monkeypatch.setattr("codex_telegram_bridge.store.time.time", lambda: 10_061)
+    assert rig.store.peek_callback(
+        str(next_page.callback_data)[3:],
+        OWNER_ID,
+        bot_role=CONTROL_ROLE,
+        chat_id=OWNER_CHAT_ID,
+    ) is None
+
+    page_update = update_for_message(
+        "",
+        update_id=92,
+        message_id=1000,
+        chat_id=OWNER_CHAT_ID,
+        chat_type=ChatType.PRIVATE,
+    )
+    await rig.control._show_sessions(page_update, query="", page=2, edit=True)
+
+    assert rig.control_endpoint.edited[-1]["message_id"] == 1000
+    due_after_page = rig.store.due_message_deletions(now=10_900)
+    assert [
+        (item["message_id"], item["delete_at"], item["group_key"])
+        for item in due_after_page
+    ] == [
+        (31, 10_900, "sessions:91"),
+        (1000, 10_900, "sessions:91"),
+    ]
 
 
 @pytest.mark.asyncio

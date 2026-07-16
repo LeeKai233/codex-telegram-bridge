@@ -50,6 +50,8 @@ _PRIVATE_COMMANDS = (
     ("help", "显示帮助"),
 )
 
+_SESSIONS_DELETE_SECONDS = 15 * 60
+
 
 class ControlBotController:
     def __init__(
@@ -149,7 +151,30 @@ class ControlBotController:
 
     async def sessions(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         del context
-        await self._show_sessions(update, query=raw_arguments(update), page=1, edit=False)
+        chat = update.effective_chat
+        message = update.effective_message
+        if not chat or not message:
+            return
+        deadline = int(time.time()) + _SESSIONS_DELETE_SECONDS
+        group_key = f"sessions:{update.update_id}"
+        self.deletions.schedule(
+            CONTROL_ROLE,
+            chat.id,
+            [message.message_id],
+            delete_at=deadline,
+            group_key=group_key,
+        )
+        reply = await self._show_sessions(
+            update, query=raw_arguments(update), page=1, edit=False
+        )
+        if reply is not None:
+            self.deletions.schedule(
+                CONTROL_ROLE,
+                chat.id,
+                [int(reply.message_id)],
+                delete_at=deadline,
+                group_key=group_key,
+            )
 
     async def _show_sessions(
         self,
@@ -158,7 +183,7 @@ class ControlBotController:
         query: str,
         page: int,
         edit: bool,
-    ) -> None:
+    ) -> Any | None:
         chat = update.effective_chat
         if not chat:
             return
@@ -191,20 +216,19 @@ class ControlBotController:
         markup = InlineKeyboardMarkup(rows)
         message = update.effective_message
         if edit and message:
-            await self.endpoint.edit_text(
+            return await self.endpoint.edit_text(
                 chat.id,
                 message.message_id,
                 view.message.markdown,
                 plain=view.message.plain,
                 reply_markup=markup,
             )
-        else:
-            await self.endpoint.send_text(
-                chat.id,
-                view.message.markdown,
-                plain=view.message.plain,
-                reply_markup=markup,
-            )
+        return await self.endpoint.send_text(
+            chat.id,
+            view.message.markdown,
+            plain=view.message.plain,
+            reply_markup=markup,
+        )
 
     async def topics(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         del context
