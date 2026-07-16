@@ -154,6 +154,40 @@ def test_bot_labels_reject_invalid_values(tmp_path: Path, field: str, value: obj
         make_config(tmp_path, **{field: value})
 
 
+def test_ask_model_settings_default_to_inherited_and_load_trimmed(tmp_path: Path) -> None:
+    default = make_config(tmp_path)
+    assert default.ask_model is None
+    assert default.ask_reasoning_effort is None
+
+    config_path = tmp_path / "bridge.toml"
+    config_path.write_text(
+        '[bridge]\nask_model = "  gpt-5.6-luna  "\nask_reasoning_effort = "  max  "\n',
+        encoding="utf-8",
+    )
+
+    loaded = Config.load(config_path)
+    assert loaded.ask_model == "gpt-5.6-luna"
+    assert loaded.ask_reasoning_effort == "max"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("ask_model", ""),
+        ("ask_reasoning_effort", "  "),
+        ("ask_model", "bad\nmodel"),
+        ("ask_reasoning_effort", "bad\teffort"),
+        ("ask_model", "x" * 129),
+        ("ask_reasoning_effort", 5),
+    ],
+)
+def test_ask_model_settings_reject_invalid_values(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    with pytest.raises(ValueError, match=field):
+        make_config(tmp_path, **{field: value})
+
+
 def test_loaded_paths_are_expanded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     config_path = tmp_path / "bridge.toml"

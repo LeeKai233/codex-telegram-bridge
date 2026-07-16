@@ -684,7 +684,12 @@ async def test_ask_space_question_uses_isolated_client_without_mutating_primary_
             thread_id="thread-primary",
         )
     )
-    calls: list[tuple[str, Path, str, str]] = []
+    bridge.config = replace(
+        bridge.config,
+        ask_model="gpt-5.6-luna",
+        ask_reasoning_effort="max",
+    )
+    calls: list[tuple[str, Path, str, str, str | None, str | None]] = []
 
     async def ask_fork_question(
         thread_id: str,
@@ -692,8 +697,10 @@ async def test_ask_space_question_uses_isolated_client_without_mutating_primary_
         question: str,
         *,
         client_message_id: str,
+        model: str | None,
+        effort: str | None,
     ) -> str:
-        calls.append((thread_id, cwd, question, client_message_id))
+        calls.append((thread_id, cwd, question, client_message_id, model, effort))
         return "isolated answer"
 
     monkeypatch.setattr(bridge.client, "ask_fork_question", ask_fork_question)
@@ -705,7 +712,14 @@ async def test_ask_space_question_uses_isolated_client_without_mutating_primary_
     state = store.get_thread("thread-primary")
     assert answer == "isolated answer"
     assert calls == [
-        ("thread-primary", tmp_path.resolve(), "What does this error mean?", "tg-ask-1")
+        (
+            "thread-primary",
+            tmp_path.resolve(),
+            "What does this error mean?",
+            "tg-ask-1",
+            "gpt-5.6-luna",
+            "max",
+        )
     ]
     assert state is not None
     assert (state.turn_id, state.turn_status, state.status) == (

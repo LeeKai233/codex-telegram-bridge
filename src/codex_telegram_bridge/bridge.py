@@ -402,6 +402,8 @@ class Bridge:
             cwd,
             question,
             client_message_id=client_message_id,
+            model=self.config.ask_model,
+            effort=self.config.ask_reasoning_effort,
         )
 
     async def dispatch_space_queue(

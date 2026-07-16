@@ -526,6 +526,59 @@ class CodexClient:
         goal = (result or {}).get("goal")
         return dict(goal) if isinstance(goal, dict) else None
 
+    async def list_collaboration_modes(self) -> list[Json]:
+        """Return validated collaboration-mode masks advertised by app-server."""
+        try:
+            result = await self.request("collaborationMode/list", {})
+        except CodexRpcError as exc:
+            raise RuntimeError(
+                "This Codex app-server does not provide collaboration modes"
+            ) from exc
+        if not isinstance(result, dict) or not isinstance(result.get("data"), list):
+            raise RuntimeError("Codex returned an invalid collaboration-mode response")
+
+        modes: list[Json] = []
+        for item in result["data"]:
+            if not isinstance(item, dict):
+                raise RuntimeError("Codex returned an invalid collaboration-mode entry")
+            name = item.get("name")
+            mode = item.get("mode")
+            model = item.get("model")
+            effort = item.get("reasoning_effort")
+            if not isinstance(name, str) or not name.strip():
+                raise RuntimeError("Codex returned a collaboration mode without a name")
+            if mode is not None and mode not in {"default", "plan"}:
+                raise RuntimeError(f"Codex returned an unknown collaboration mode: {mode!r}")
+            if model is not None and not isinstance(model, str):
+                raise RuntimeError("Codex returned an invalid collaboration-mode model")
+            if effort is not None and not isinstance(effort, str):
+                raise RuntimeError("Codex returned an invalid collaboration-mode effort")
+            modes.append(dict(item))
+        return modes
+
+    async def resolve_collaboration_mode(self, mode: str) -> Json:
+        """Build a turn/start collaborationMode payload or fail closed."""
+        if mode not in {"default", "plan"}:
+            raise ValueError(f"Unsupported collaboration mode: {mode!r}")
+        for item in await self.list_collaboration_modes():
+            if item.get("mode") != mode:
+                continue
+            model = item.get("model")
+            effort = item.get("reasoning_effort")
+            if not isinstance(model, str) or not model.strip():
+                raise RuntimeError(f"Codex collaboration mode {mode!r} has no model")
+            if effort is not None and (not isinstance(effort, str) or not effort.strip()):
+                raise RuntimeError(f"Codex collaboration mode {mode!r} has invalid effort")
+            return {
+                "mode": mode,
+                "settings": {
+                    "model": model,
+                    "reasoning_effort": effort,
+                    "developer_instructions": None,
+                },
+            }
+        raise RuntimeError(f"Codex collaboration mode {mode!r} is unavailable")
+
     async def start_thread(self, cwd: Path, *, ephemeral: bool = False, read_only: bool = False) -> Json:
         params: Json = {
             "cwd": str(cwd),
@@ -574,6 +627,8 @@ class CodexClient:
         question: str,
         *,
         client_message_id: str,
+        model: str | None = None,
+        effort: str | None = None,
         timeout: float = 180.0,
     ) -> str:
         fork_id: str | None = None
@@ -593,14 +648,27 @@ class CodexClient:
                 isolated = _IsolatedQuestion(thread_id=fork_id, future=future)
                 self._isolated_questions[fork_id] = isolated
 
-                turn = await self.start_turn(
-                    fork_id,
-                    [text_input(question)],
-                    client_message_id=client_message_id,
-                    cwd=cwd,
-                    sandbox_policy={"type": "readOnly", "networkAccess": False},
-                    approval_policy="never",
-                )
+                try:
+                    turn = await self.start_turn(
+                        fork_id,
+                        [text_input(question)],
+                        client_message_id=client_message_id,
+                        cwd=cwd,
+                        sandbox_policy={"type": "readOnly", "networkAccess": False},
+                        approval_policy="never",
+                        model=model,
+                        effort=effort,
+                    )
+                except CodexRpcError as exc:
+                    if model is not None or effort is not None:
+                        model_label = model or "inherited model"
+                        effort_label = effort or "inherited effort"
+                        raise RuntimeError(
+                            "Configured /ask model or effort was rejected by Codex "
+                            f"({model_label}, {effort_label}): "
+                            f"{exc.error.get('message', 'unknown app-server error')}"
+                        ) from exc
+                    raise
                 turn_id = str(turn.get("id") or "")
                 if not turn_id:
                     raise RuntimeError("Codex did not return an ID for the side-question turn")
@@ -649,7 +717,12 @@ class CodexClient:
         cwd: Path | None = None,
         sandbox_policy: Json | None = None,
         approval_policy: str | None = None,
+        model: str | None = None,
+        effort: str | None = None,
+        collaboration_mode: Json | None = None,
     ) -> Json:
+        if collaboration_mode is not None and (model is not None or effort is not None):
+            raise ValueError("collaboration_mode cannot be combined with model or effort")
         params: Json = {"threadId": thread_id, "input": inputs}
         if client_message_id:
             params["clientUserMessageId"] = client_message_id
@@ -661,6 +734,12 @@ class CodexClient:
             params["sandboxPolicy"] = sandbox_policy
         if approval_policy is not None:
             params["approvalPolicy"] = approval_policy
+        if model is not None:
+            params["model"] = model
+        if effort is not None:
+            params["effort"] = effort
+        if collaboration_mode is not None:
+            params["collaborationMode"] = collaboration_mode
         result = await self.request("turn/start", params, timeout=60)
         return dict((result or {}).get("turn") or {})
 

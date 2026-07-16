@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 
 import codex_telegram_bridge.codex as codex_module
-from codex_telegram_bridge.codex import CodexClient
+from codex_telegram_bridge.codex import CodexClient, CodexRpcError
 
 
 @pytest.mark.asyncio
@@ -90,12 +90,113 @@ async def test_start_turn_passes_security_overrides(tmp_path: Path) -> None:
         cwd=tmp_path,
         sandbox_policy=policy,
         approval_policy="never",
+        model="gpt-5.6-luna",
+        effort="max",
     )
 
     params = calls[0][1]
     assert params["cwd"] == str(tmp_path)
     assert params["sandboxPolicy"] == policy
     assert params["approvalPolicy"] == "never"
+    assert params["model"] == "gpt-5.6-luna"
+    assert params["effort"] == "max"
+
+
+@pytest.mark.asyncio
+async def test_start_turn_passes_resolved_collaboration_mode() -> None:
+    client = CodexClient(Path("/tmp/not-used.sock"))
+    calls: list[tuple[str, dict[str, Any], float]] = []
+
+    async def request(method: str, params: dict[str, Any], timeout: float = 30.0) -> dict[str, Any]:
+        calls.append((method, params, timeout))
+        return {"turn": {"id": "turn-plan"}}
+
+    client.request = request  # type: ignore[method-assign]
+    collaboration_mode = {
+        "mode": "plan",
+        "settings": {
+            "model": "gpt-5.6-sol",
+            "reasoning_effort": "xhigh",
+            "developer_instructions": None,
+        },
+    }
+
+    await client.start_turn(
+        "thread-1",
+        [{"type": "text", "text": "plan"}],
+        collaboration_mode=collaboration_mode,
+    )
+
+    assert calls[0][1]["collaborationMode"] == collaboration_mode
+    with pytest.raises(ValueError, match="cannot be combined"):
+        await client.start_turn(
+            "thread-1",
+            [{"type": "text", "text": "invalid"}],
+            model="gpt-5.6-sol",
+            collaboration_mode=collaboration_mode,
+        )
+
+
+@pytest.mark.asyncio
+async def test_collaboration_modes_are_validated_and_resolved() -> None:
+    client = CodexClient(Path("/tmp/not-used.sock"))
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def request(
+        method: str, params: dict[str, Any], timeout: float = 30.0
+    ) -> dict[str, Any]:
+        del timeout
+        calls.append((method, params))
+        return {
+            "data": [
+                {
+                    "name": "Plan",
+                    "mode": "plan",
+                    "model": "gpt-5.6-sol",
+                    "reasoning_effort": "xhigh",
+                },
+                {
+                    "name": "Default",
+                    "mode": "default",
+                    "model": "gpt-5.6-sol",
+                    "reasoning_effort": "high",
+                },
+            ]
+        }
+
+    client.request = request  # type: ignore[method-assign]
+
+    resolved = await client.resolve_collaboration_mode("plan")
+
+    assert calls == [("collaborationMode/list", {})]
+    assert resolved == {
+        "mode": "plan",
+        "settings": {
+            "model": "gpt-5.6-sol",
+            "reasoning_effort": "xhigh",
+            "developer_instructions": None,
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_collaboration_modes_fail_closed_on_missing_or_invalid_capability() -> None:
+    client = CodexClient(Path("/tmp/not-used.sock"))
+
+    async def unavailable(
+        method: str, params: dict[str, Any], timeout: float = 30.0
+    ) -> dict[str, Any]:
+        del method, params, timeout
+        return {"data": [{"name": "Default", "mode": "default", "model": None}]}
+
+    client.request = unavailable  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="has no model"):
+        await client.resolve_collaboration_mode("default")
+    with pytest.raises(RuntimeError, match="unavailable"):
+        await client.resolve_collaboration_mode("plan")
+    with pytest.raises(ValueError, match="Unsupported"):
+        await client.resolve_collaboration_mode("review")
 
 
 @pytest.mark.asyncio
@@ -286,6 +387,49 @@ async def test_isolated_question_timeout_interrupts_exact_turn_and_deletes_fork(
     assert ("turn/interrupt", {"threadId": "fork-timeout", "turnId": "turn-timeout"}) in calls
     assert ("thread/delete", {"threadId": "fork-timeout"}) in calls
     assert client._isolated_questions == {}
+    assert client._ephemeral_thread_ids == set()
+
+
+@pytest.mark.asyncio
+async def test_isolated_question_model_override_failure_is_scoped_and_clear(
+    tmp_path: Path,
+) -> None:
+    client = CodexClient(Path("/tmp/not-used.sock"))
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def request(
+        method: str, params: dict[str, Any], timeout: float = 30.0
+    ) -> dict[str, Any]:
+        del timeout
+        calls.append((method, params))
+        if method == "thread/fork":
+            return {"thread": {"id": "fork-unsupported", "ephemeral": True}}
+        if method == "turn/start":
+            raise CodexRpcError(method, {"message": "unknown model gpt-5.6-luna"})
+        if method == "thread/list":
+            return {"data": [{"id": "primary"}]}
+        return {}
+
+    client.request = request  # type: ignore[method-assign]
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"Configured /ask model or effort was rejected.*gpt-5\.6-luna, max",
+    ):
+        await client.ask_fork_question(
+            "primary",
+            tmp_path,
+            "question?",
+            client_message_id="telegram-model",
+            model="gpt-5.6-luna",
+            effort="max",
+        )
+
+    turn_params = next(params for method, params in calls if method == "turn/start")
+    assert turn_params["model"] == "gpt-5.6-luna"
+    assert turn_params["effort"] == "max"
+    assert ("thread/delete", {"threadId": "fork-unsupported"}) in calls
+    assert await client.list_threads(limit=1) == [{"id": "primary"}]
     assert client._ephemeral_thread_ids == set()
 
 

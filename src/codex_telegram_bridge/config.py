@@ -120,6 +120,24 @@ def _normalize_bot_label(name: str, value: object) -> str:
     return normalized
 
 
+def _normalize_optional_codex_setting(name: str, value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a string or omitted")
+    if any(
+        unicodedata.category(character) == "Cc" or character in "\u2028\u2029"
+        for character in value
+    ):
+        raise ValueError(f"{name} must not contain control characters or newlines")
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError(f"{name} must not be empty when configured")
+    if len(normalized) > 128:
+        raise ValueError(f"{name} must not exceed 128 characters")
+    return normalized
+
+
 def _read_private_text(path: Path, *, max_bytes: int = 4096) -> str:
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -169,10 +187,18 @@ class Config:
     minimum_free_bytes: int = 256_000_000
     control_bot_label: str = "Control Bot"
     discussion_bot_label: str = "Discussion Bot"
+    ask_model: str | None = None
+    ask_reasoning_effort: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("control_bot_label", "discussion_bot_label"):
             object.__setattr__(self, name, _normalize_bot_label(name, getattr(self, name)))
+        for name in ("ask_model", "ask_reasoning_effort"):
+            object.__setattr__(
+                self,
+                name,
+                _normalize_optional_codex_setting(name, getattr(self, name)),
+            )
         positive = {
             "dashboard_debounce_seconds": self.dashboard_debounce_seconds,
             "heartbeat_seconds": self.heartbeat_seconds,
