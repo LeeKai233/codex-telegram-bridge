@@ -3,7 +3,8 @@ from __future__ import annotations
 import contextlib
 import logging
 import re
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, BinaryIO
 
@@ -18,6 +19,7 @@ from telegram import (
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import AIORateLimiter, Application
+from telegram.request import HTTPXRequest
 
 from .markdown import MAX_MESSAGE_LENGTH
 from .outbound import OutboundMessenger
@@ -27,17 +29,78 @@ LOGGER = logging.getLogger(__name__)
 CONTROL_ROLE = "control"
 DISCUSSION_ROLE = "discussion"
 ALLOWED_UPDATES = ["message", "callback_query"]
+POLLING_CONNECTION_POOL_SIZE = 2
+POLLING_READ_TIMEOUT_SECONDS = 30.0
+POLLING_CONNECT_TIMEOUT_SECONDS = 10.0
+POLLING_POOL_TIMEOUT_SECONDS = 10.0
 
 
-def build_application(token: str) -> Application:
+@dataclass(slots=True)
+class PollingHealth:
+    role: str
+    last_success_at: float = field(default_factory=time.monotonic)
+    last_error_type: str | None = None
+    failure_count: int = 0
+    consecutive_failures: int = 0
+
+    def mark_started(self) -> None:
+        self.last_success_at = time.monotonic()
+
+    def mark_success(self) -> None:
+        self.last_success_at = time.monotonic()
+        self.consecutive_failures = 0
+
+    def mark_failure(self, error_type: str) -> None:
+        self.last_error_type = error_type
+        self.failure_count += 1
+        self.consecutive_failures += 1
+
+    def stale_for(self, seconds: float, *, now: float | None = None) -> bool:
+        current = time.monotonic() if now is None else now
+        return current - self.last_success_at >= seconds
+
+
+class PollingHealthRequest(HTTPXRequest):
+    """Record successful getUpdates responses without touching outbound requests."""
+
+    __slots__ = ("health",)
+
+    def __init__(self, health: PollingHealth, **kwargs: Any) -> None:
+        self.health = health
+        super().__init__(**kwargs)
+
+    async def do_request(self, *args: Any, **kwargs: Any) -> tuple[int, bytes]:
+        try:
+            result = await super().do_request(*args, **kwargs)
+        except Exception as exc:
+            self.health.mark_failure(type(exc).__name__)
+            raise
+        if result[0] == 200:
+            self.health.mark_success()
+        else:
+            self.health.mark_failure(f"http_{result[0]}")
+        return result
+
+
+def build_application(token: str, polling_health: PollingHealth | None = None) -> Application:
     """Build a sequential PTB application whose lifecycle is owned by ``main``."""
-    return (
+    builder = (
         Application.builder()
         .token(token)
         .concurrent_updates(False)
         .rate_limiter(AIORateLimiter())
-        .build()
     )
+    if polling_health is not None:
+        builder = builder.get_updates_request(
+            PollingHealthRequest(
+                polling_health,
+                connection_pool_size=POLLING_CONNECTION_POOL_SIZE,
+                read_timeout=POLLING_READ_TIMEOUT_SECONDS,
+                connect_timeout=POLLING_CONNECT_TIMEOUT_SECONDS,
+                pool_timeout=POLLING_POOL_TIMEOUT_SECONDS,
+            )
+        )
+    return builder.build()
 
 
 def plain_from_markdown(markdown: str) -> str:

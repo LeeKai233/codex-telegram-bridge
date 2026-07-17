@@ -24,6 +24,9 @@ LOGGER = logging.getLogger(__name__)
 HANDSHAKE_EMOJI = "🤝"
 DISCONNECT_EMOJI = "👋"
 REDACTED_BOT_TOKEN = "[REDACTED_TELEGRAM_BOT_TOKEN]"
+POLLING_HEALTH_CHECK_SECONDS = 15.0
+POLLING_STALE_SECONDS = 90.0
+POLLING_RESTART_COOLDOWN_SECONDS = 30.0
 
 
 def _redact_log_value(value: Any, token: str) -> Any:
@@ -199,6 +202,78 @@ async def _health_monitor(
             await presence.probe()
 
 
+class PollingSupervisor:
+    """Restart only a stale Telegram updater while preserving application state."""
+
+    def __init__(
+        self,
+        applications: Sequence[Any],
+        polling_health: Sequence[Any],
+        allowed_updates: Sequence[str],
+        *,
+        stale_after: float = POLLING_STALE_SECONDS,
+        restart_cooldown: float = POLLING_RESTART_COOLDOWN_SECONDS,
+    ) -> None:
+        if polling_health and len(applications) != len(polling_health):
+            raise ValueError("applications and polling_health must have the same length")
+        self.targets = tuple(zip(applications, polling_health, strict=True)) if polling_health else ()
+        self.allowed_updates = list(allowed_updates)
+        self.stale_after = stale_after
+        self.restart_cooldown = restart_cooldown
+        self._cooldown_until: dict[str, float] = {}
+
+    async def monitor(self, stop_event: asyncio.Event, *, interval: float) -> None:
+        while not stop_event.is_set():
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=interval)
+            except TimeoutError:
+                await self.check_once()
+
+    async def check_once(self) -> None:
+        now = time.monotonic()
+        for application, health in self.targets:
+            if not health.stale_for(self.stale_after, now=now):
+                continue
+            if now < self._cooldown_until.get(health.role, 0.0):
+                continue
+            self._cooldown_until[health.role] = now + self.restart_cooldown
+            await self._restart(application, health)
+
+    async def _restart(self, application: Any, health: Any) -> None:
+        updater = getattr(application, "updater", None)
+        if updater is None:
+            LOGGER.error("event=telegram_polling_restart_skipped bot_role=%s reason=no_updater", health.role)
+            return
+        stale_since = health.last_success_at
+        LOGGER.warning(
+            "event=telegram_polling_stale bot_role=%s age_seconds=%.1f failures=%s "
+            "last_error=%s action=restart",
+            health.role,
+            max(0.0, time.monotonic() - health.last_success_at),
+            health.consecutive_failures,
+            health.last_error_type or "none",
+        )
+        try:
+            if getattr(updater, "running", True):
+                await updater.stop()
+            await updater.start_polling(
+                allowed_updates=self.allowed_updates,
+                drop_pending_updates=False,
+            )
+        except Exception as exc:
+            health.last_success_at = stale_since
+            health.mark_failure(type(exc).__name__)
+            LOGGER.exception(
+                "event=telegram_polling_restart_failed bot_role=%s error_type=%s",
+                health.role,
+                type(exc).__name__,
+            )
+            return
+        health.mark_started()
+        self._cooldown_until.pop(health.role, None)
+        LOGGER.info("event=telegram_polling_restarted bot_role=%s", health.role)
+
+
 @dataclass(slots=True)
 class Runtime:
     application: Any
@@ -206,6 +281,7 @@ class Runtime:
     store: Store
     presence: ConnectionPresence
     allowed_updates: list[str]
+    polling_health: tuple[Any, ...] = ()
     discussion_application: Any | None = None
     telegram_runtime: Any | None = None
 
@@ -288,6 +364,7 @@ def _build_runtime(config: Config) -> Runtime:
         ALLOWED_UPDATES,
         CONTROL_ROLE,
         DISCUSSION_ROLE,
+        PollingHealth,
         TelegramEndpoint,
         build_application,
     )
@@ -300,8 +377,10 @@ def _build_runtime(config: Config) -> Runtime:
         raise RuntimeError("两个 Telegram Bot 必须使用不同 token")
     store = Store(config.database_path)
     try:
-        control_application = build_application(control_token)
-        discussion_application = build_application(discussion_token)
+        control_polling_health = PollingHealth(CONTROL_ROLE)
+        discussion_polling_health = PollingHealth(DISCUSSION_ROLE)
+        control_application = build_application(control_token, control_polling_health)
+        discussion_application = build_application(discussion_token, discussion_polling_health)
         control_messenger = OutboundMessenger()
         discussion_messenger = OutboundMessenger()
         control_endpoint = TelegramEndpoint(
@@ -376,6 +455,7 @@ def _build_runtime(config: Config) -> Runtime:
             store,
             presence,
             list(ALLOWED_UPDATES),
+            polling_health=(control_polling_health, discussion_polling_health),
             discussion_application=discussion_application,
             telegram_runtime=telegram_runtime,
         )
@@ -413,6 +493,12 @@ async def run_service(config: Config, stop_event: asyncio.Event | None = None) -
     telegram_attempted = False
     presence_started = False
     health_task: asyncio.Task[None] | None = None
+    polling_health_task: asyncio.Task[None] | None = None
+    polling_supervisor = PollingSupervisor(
+        applications,
+        tuple(getattr(runtime, "polling_health", ())),
+        runtime.allowed_updates,
+    )
     try:
         for application in applications:
             await application.initialize()
@@ -424,6 +510,8 @@ async def run_service(config: Config, stop_event: asyncio.Event | None = None) -
                 drop_pending_updates=False,
             )
             polling.append(application)
+        for health in getattr(runtime, "polling_health", ()):
+            health.mark_started()
         telegram_runtime = getattr(runtime, "telegram_runtime", None)
         if telegram_runtime is not None:
             telegram_attempted = True
@@ -440,9 +528,17 @@ async def run_service(config: Config, stop_event: asyncio.Event | None = None) -
             _health_monitor(runtime.presence, stop_event, interval),
             name="telegram-connection-health",
         )
+        polling_health_task = asyncio.create_task(
+            polling_supervisor.monitor(stop_event, interval=POLLING_HEALTH_CHECK_SECONDS),
+            name="telegram-polling-health",
+        )
         LOGGER.info("Codex Telegram Bridge is running")
         await stop_event.wait()
     finally:
+        if polling_health_task is not None:
+            polling_health_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await polling_health_task
         if health_task is not None:
             health_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):

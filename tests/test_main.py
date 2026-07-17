@@ -150,7 +150,7 @@ def test_build_runtime_installs_redaction_before_application_builder(
     config.forum_bot_token_path.chmod(0o600)
     logger = logging.getLogger("telegram.builder-redaction-test")
 
-    def fail_builder(value: str) -> None:
+    def fail_builder(value: str, _polling_health: Any = None) -> None:
         try:
             raise InvalidToken(value)
         except InvalidToken:
