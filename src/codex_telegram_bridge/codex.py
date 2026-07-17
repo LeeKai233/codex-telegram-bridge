@@ -725,7 +725,7 @@ class CodexClient:
             "cwd": str(cwd),
             "ephemeral": ephemeral,
             "sandbox": "read-only" if read_only else "workspace-write",
-            "approvalPolicy": "never",
+            "approvalPolicy": "never" if read_only else "on-request",
         }
         result = await self.request("thread/start", params, timeout=60)
         return dict((result or {}).get("thread") or {})
@@ -770,7 +770,7 @@ class CodexClient:
         client_message_id: str,
         model: str | None = None,
         effort: str | None = None,
-        timeout: float = 180.0,
+        timeout: float = 300.0,
     ) -> str:
         fork_id: str | None = None
         turn_id: str | None = None

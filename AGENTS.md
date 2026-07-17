@@ -1,19 +1,18 @@
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **codex-telegram-bridge** (10133 symbols, 28293 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **codex-telegram-bridge** (3433 symbols, 7764 relationships, 265 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > Index stale? Run `node .gitnexus/run.cjs analyze` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? `npx gitnexus analyze` (npm 11 crash → `npm i -g gitnexus`; #1939).
 
 ## Always Do
 
-- **MUST run impact analysis before editing any symbol.** Before modifying a function, class, or method, run `impact({target: "symbolName", direction: "upstream"})` and report the blast radius (direct callers, affected processes, risk level) to the user. For unified PDG impact, add `mode: "pdg"` with optional `line: <N>` — it returns statement-level `affectedStatements` over CDG + REACHING_DEF and inter-procedural symbols in `interproceduralByDepth`/`byDepth`; no-layer/degraded PDG results are UNKNOWN-risk notes (`--pdg` layer).
+- **MUST run impact analysis before editing any symbol.** Before modifying a function, class, or method, run `impact({target: "symbolName", direction: "upstream"})` and report the blast radius (direct callers, affected processes, risk level) to the user.
 - **MUST run `detect_changes()` before committing** to verify your changes only affect expected symbols and execution flows. For regression review, compare against the default branch: `detect_changes({scope: "compare", base_ref: "main"})`.
 - **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before proceeding with edits.
 - When exploring unfamiliar code, use `query({search_query: "concept"})` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
 - When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use `context({name: "symbolName"})`.
 - For security review, `explain({target: "fileOrSymbol"})` lists taint findings (source→sink flows; needs `analyze --pdg`).
-- For control/data dependence, `pdg_query({mode: "controls", target: "fileOrSymbol"})` answers "under what condition does X run?" (CDG, incl. guard clauses) and `pdg_query({mode: "flows", target, variable})` traces "where does variable Y flow?" (REACHING_DEF). `--pdg` layer.
 
 ## Never Do
 
@@ -54,6 +53,9 @@ This project is indexed by GitNexus as **codex-telegram-bridge** (10133 symbols,
 - Read-only exploration and review are behavioral contracts verified by Git diff; they are not security boundaries.
 - Subagents must not control systemd, install packages, edit credentials, touch other worktrees, push, publish releases, or modify unrelated user files.
 - The root agent alone integrates commits, resolves cross-lane contracts, runs final review, performs deployment, and reports results.
+- If the primary model is `gpt-5.6-luna` with `max` effort, do not spawn or distribute any subagent; the root agent handles all lanes directly.
+- Before completing a Goal, the root must mark every Plan item `completed` and verify the visible counter is `N/N`. A complete Goal with pending or in-progress Plan items is an invalid final state.
+- Before completing a Goal, the root must confirm every subagent is completed, interrupted, or closed and that no child remains active.
 - Before spawning any lane, the root must select and record its agent role, model, effort, and routing reason. Do not treat implicit parent inheritance as a routing decision.
 - Default routing is `bridge-explorer`=`gpt-5.6-terra/high`, `bridge-worker`=`gpt-5.6-sol/high`, and `bridge-reviewer`=`gpt-5.6-luna/max`; keep architecture, CRITICAL paths, and final integration with the root at `gpt-5.6-sol/xhigh` unless the user overrides it.
 - Keep the existing untracked `assets/` directory outside agent scope unless the user explicitly assigns it.

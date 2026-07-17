@@ -12,6 +12,12 @@ from typing import Any
 
 from telegram import Bot
 
+from .approval import (
+    ApprovalDecision,
+    approval_decision_is_available,
+    command_approval_decisions,
+    normalize_command_approval_params,
+)
 from .codex import CodexClient, CodexRpcError, file_input, text_input
 from .config import Config
 from .dashboard import DashboardManager
@@ -27,6 +33,7 @@ from .tmux import TmuxManager
 LOGGER = logging.getLogger(__name__)
 Json = dict[str, Any]
 QuestionHandler = Callable[[str, Json], Awaitable[None]]
+CommandApprovalHandler = Callable[[str, Json], Awaitable[None]]
 NoticeHandler = Callable[[str, str | None], Awaitable[None]]
 StateChangeHandler = Callable[[ThreadState, str], Awaitable[None]]
 QuestionResolvedHandler = Callable[[str], Awaitable[None]]
@@ -61,6 +68,10 @@ async def _noop_question(request_key: str, params: Json) -> None:
     del request_key, params
 
 
+async def _noop_command_approval(request_key: str, params: Json) -> None:
+    del request_key, params
+
+
 async def _noop_notice(message: str, thread_id: str | None) -> None:
     del message, thread_id
 
@@ -88,6 +99,7 @@ class Bridge:
         self.bot = bot
         self.messenger = messenger
         self.on_question: QuestionHandler = _noop_question
+        self.on_command_approval: CommandApprovalHandler = _noop_command_approval
         self.on_notice: NoticeHandler = _noop_notice
         self.on_state_change: StateChangeHandler = _noop_state_change
         self.on_question_resolved: QuestionResolvedHandler = _noop_question_resolved
@@ -391,7 +403,7 @@ class Bridge:
             client_message_id=client_message_id,
             cwd=cwd,
             sandbox_policy=_workspace_write_policy(),
-            approval_policy="never",
+            approval_policy="on-request",
         )
         await self.dashboard.schedule(state, immediate=True)
         return state
@@ -457,7 +469,7 @@ class Bridge:
                         client_message_id=client_message_id,
                         cwd=cwd,
                         sandbox_policy=_workspace_write_policy(),
-                        approval_policy="never",
+                        approval_policy="on-request",
                         collaboration_mode=collaboration_mode,
                     )
                 except Exception as exc:
@@ -651,7 +663,7 @@ class Bridge:
                 client_message_id=client_message_id,
                 cwd=cwd,
                 sandbox_policy=_workspace_write_policy(),
-                approval_policy="never",
+                approval_policy="on-request",
                 collaboration_mode=collaboration_mode,
             )
             if not (turn or {}).get("id"):
@@ -824,7 +836,7 @@ class Bridge:
             client_message_id=client_message_id,
             cwd=cwd,
             sandbox_policy=_workspace_write_policy(),
-            approval_policy="never",
+            approval_policy="on-request",
         )
         turn_id = str((turn or {}).get("id") or "")
         if space_id is not None and generation is not None:
@@ -915,7 +927,7 @@ class Bridge:
                     client_message_id=client_message_id,
                     cwd=cwd,
                     sandbox_policy=_workspace_write_policy(),
-                    approval_policy="never",
+                    approval_policy="on-request",
                 )
                 turn_id = str((turn or {}).get("id") or "")
                 if space_id is not None and generation is not None:
@@ -1189,6 +1201,75 @@ class Bridge:
         self._pending_requests.pop(request_key, None)
         self.store.delete_pending_input(request_key)
 
+    async def answer_command_approval(
+        self,
+        request_key: str,
+        decision: ApprovalDecision,
+    ) -> None:
+        stored = self.store.get_pending_input(request_key)
+        if not stored:
+            raise RuntimeError("该命令审批已过期或已由其他客户端处理")
+        generation = int(stored["generation"])
+        if generation != self.client.generation:
+            await self._retire_command_approval(request_key)
+            raise RuntimeError("Codex 连接已经重建，原命令审批已失效")
+        metadata = next(
+            (
+                value
+                for value in stored["questions"]
+                if isinstance(value, dict) and value.get("_bridge_request_kind") == "command_approval"
+            ),
+            None,
+        )
+        if metadata is None:
+            raise RuntimeError("该请求不是可由 Telegram 处理的命令审批")
+        method = str(metadata.get("_bridge_approval_method") or "")
+        raw_available = metadata.get("_bridge_available_decisions")
+        if "_bridge_available_decisions" in metadata:
+            available = raw_available if isinstance(raw_available, list) else []
+        else:
+            raw_params = metadata.get("params")
+            available = command_approval_decisions(
+                method,
+                raw_params if isinstance(raw_params, dict) else {},
+            )
+        if not approval_decision_is_available(decision, available):
+            raise ValueError("命令审批决定不在当前请求允许的选项中")
+        if method == "execCommandApproval":
+            if not isinstance(decision, str):
+                raise ValueError("命令审批决定无效")
+            mapped = {
+                "accept": "approved",
+                "acceptForSession": "approved_for_session",
+                "decline": "denied",
+                "cancel": "abort",
+            }[decision]
+        elif method == "item/commandExecution/requestApproval":
+            mapped = decision
+        else:
+            raise RuntimeError("未知的命令审批协议")
+        raw_request_id = stored["request_id"]
+        try:
+            request_id = json.loads(str(raw_request_id))
+        except json.JSONDecodeError:
+            request_id = raw_request_id
+        if not isinstance(request_id, int | str):
+            request_id = str(raw_request_id)
+        try:
+            await self.client.respond(request_id, {"decision": mapped})
+        except Exception:
+            if generation != self.client.generation:
+                await self._retire_command_approval(request_key)
+            raise
+        await self._notify_question_resolved(request_key)
+        self._pending_requests.pop(request_key, None)
+        self.store.delete_pending_input(request_key)
+
+    async def _retire_command_approval(self, request_key: str) -> None:
+        await self._notify_question_resolved(request_key)
+        self._pending_requests.pop(request_key, None)
+        self.store.delete_pending_input(request_key)
+
     async def _on_notification(self, method: str, params: Json) -> None:
         if method == "serverRequest/resolved":
             raw_request_id = params.get("requestId")
@@ -1404,12 +1485,44 @@ class Bridge:
             )
             await self.on_question(request_key, params)
             return
+        if method in {"item/commandExecution/requestApproval", "execCommandApproval"}:
+            approval_params = normalize_command_approval_params(method, params)
+            thread_id = str(approval_params.get("threadId") or "") or None
+            available_decisions = command_approval_decisions(method, approval_params)
+            request_key = f"approval:{uuid.uuid4().hex[:16]}"
+            expires = int(time.time()) + max(
+                self.config.callback_seconds,
+                self.config.totp_unlock_seconds,
+            )
+            self._pending_requests[request_key] = (request_id, generation)
+            approval_metadata = {
+                "_bridge_request_kind": "command_approval",
+                "_bridge_approval_method": method,
+                "_bridge_available_decisions": available_decisions,
+                "params": approval_params,
+            }
+            self.store.put_pending_input(
+                request_key,
+                json.dumps(request_id),
+                generation,
+                str(approval_params.get("threadId") or ""),
+                str(approval_params.get("turnId") or ""),
+                str(approval_params.get("itemId") or ""),
+                [approval_metadata],
+                expires,
+            )
+            LOGGER.info(
+                "event=command_approval_requested request_key=%s thread_id=%s method=%s",
+                request_key,
+                str(thread_id or "")[:8],
+                method,
+            )
+            await self.on_command_approval(request_key, approval_params)
+            return
         if method in {
-            "item/commandExecution/requestApproval",
             "item/fileChange/requestApproval",
             "item/permissions/requestApproval",
             "applyPatchApproval",
-            "execCommandApproval",
         }:
             await self.on_notice("Codex 正在等待本机审批；Bot 不会自动批准", thread_id)
             return

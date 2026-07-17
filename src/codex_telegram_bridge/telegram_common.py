@@ -4,6 +4,7 @@ import contextlib
 import logging
 import re
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -11,6 +12,7 @@ from typing import Any, BinaryIO
 from telegram import (
     Bot,
     ForceReply,
+    InlineKeyboardButton,
     InlineKeyboardMarkup,
     LinkPreviewOptions,
     ReplyParameters,
@@ -33,6 +35,21 @@ POLLING_CONNECTION_POOL_SIZE = 2
 POLLING_READ_TIMEOUT_SECONDS = 30.0
 POLLING_CONNECT_TIMEOUT_SECONDS = 10.0
 POLLING_POOL_TIMEOUT_SECONDS = 10.0
+
+
+def balanced_button_rows(
+    buttons: Sequence[InlineKeyboardButton], *, columns: int = 3
+) -> list[list[InlineKeyboardButton]]:
+    """Group buttons into rows and avoid a singleton trailing row when possible."""
+    if columns < 1:
+        raise ValueError("columns must be positive")
+    values = list(buttons)
+    if not values:
+        return []
+    rows = [values[index : index + columns] for index in range(0, len(values), columns)]
+    if len(rows) > 1 and len(rows[-1]) == 1:
+        rows[-1].insert(0, rows[-2].pop())
+    return rows
 
 
 @dataclass(slots=True)

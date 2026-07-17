@@ -286,9 +286,12 @@ sandbox for Codex itself.
 - The Control Bot accepts one private-chat owner. The Discussion Bot accepts that owner only in the
   validated private discussion group and mapped channel comment threads.
 - TOTP leases are per session and process-local; a restart locks all session writes again.
-- Sensitive Codex questions and approval requests are not forwarded to Telegram.
-- New and queued turns use fixed sandbox/approval defaults. Steering inherits the active local
-  turn's permissions, so use Queue when that inheritance is undesirable.
+- Sensitive Codex questions are not forwarded to Telegram. Command execution approvals for
+  non-full-access workspace turns are forwarded to the owner in the Session discussion and can
+  be approved once, approved for the Session, or declined with one-use TOTP-protected buttons.
+- New and queued workspace turns use `on-request` approval policy; read-only `/ask` forks keep
+  approvals disabled. Steering inherits the active local turn's permissions, so use Queue when
+  that inheritance is undesirable.
 - Token values are hidden during entry, stored in private files, and redacted from Bridge logs.
 - Callback actions bind Bot role, chat, owner, session generation, and a short-lived one-use nonce.
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -1333,6 +1334,313 @@ async def test_plan_article_buttons_preserve_nonce_while_locked_then_execute_onc
     await rig.discussion.callback(update, SimpleNamespace())
     assert len(rig.bridge.collaboration_calls) == 1
     assert "已使用或过期" in rig.discussion_endpoint.callback_answers[-1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_plan_callback_uses_callback_message_chat_for_real_telegram_updates(rig: Rig) -> None:
+    add_active_space(
+        rig,
+        space_id="space-plan-callback-chat",
+        thread_id="thread-plan-callback-chat",
+        root_message_id=528,
+        channel_post_id=128,
+    )
+    rig.security.unlocked.add("space-plan-callback-chat")
+    await rig.discussion.plan_completed(
+        "thread-plan-callback-chat",
+        "turn-plan",
+        "item-plan",
+        "Execute from the callback message chat.",
+    )
+    publication = rig.store.latest_plan_publication("space-plan-callback-chat", 1)
+    assert publication is not None
+    markup = rig.discussion_endpoint.sent[-1]["reply_markup"]
+    execute = markup.inline_keyboard[0][0]
+    callback_message = SimpleNamespace(
+        chat=SimpleNamespace(id=DISCUSSION_CHAT_ID, type=ChatType.SUPERGROUP),
+        chat_id=DISCUSSION_CHAT_ID,
+        message_id=2028,
+        message_thread_id=528,
+        reply_to_message=None,
+        text=None,
+        caption=None,
+        is_automatic_forward=False,
+        sender_chat=None,
+    )
+    query = SimpleNamespace(data=execute.callback_data, message=callback_message)
+    update = SimpleNamespace(
+        update_id=8128,
+        callback_query=query,
+        effective_user=SimpleNamespace(id=OWNER_ID),
+        effective_chat=SimpleNamespace(id=OWNER_CHAT_ID, type=ChatType.PRIVATE),
+        effective_message=callback_message,
+    )
+
+    await rig.discussion._guard(update, SimpleNamespace())
+    await rig.discussion.callback(update, SimpleNamespace())
+
+    assert len(rig.bridge.collaboration_calls) == 1
+    assert rig.store.latest_plan_publication("space-plan-callback-chat", 1)["status"] == "executed"
+
+
+@pytest.mark.asyncio
+async def test_command_approval_is_forwarded_and_consumed_from_discussion_callback(
+    rig: Rig,
+) -> None:
+    add_active_space(
+        rig,
+        space_id="space-command-approval",
+        thread_id="thread-command-approval",
+        root_message_id=529,
+        channel_post_id=129,
+    )
+    request_key = "approval:request-1"
+    rig.store.put_pending_input(
+        request_key,
+        "91",
+        1,
+        "thread-command-approval",
+        "turn-command-approval",
+        "item-command-approval",
+        [
+            {
+                "_bridge_request_kind": "command_approval",
+                "_bridge_approval_method": "item/commandExecution/requestApproval",
+            }
+        ],
+        int(time.time()) + 300,
+    )
+    decisions: list[tuple[str, str]] = []
+
+    async def answer(request: str, decision: str) -> None:
+        decisions.append((request, decision))
+
+    rig.bridge.answer_command_approval = answer  # type: ignore[attr-defined]
+    await rig.discussion.forward_command_approval(
+        request_key,
+        {
+            "threadId": "thread-command-approval",
+            "turnId": "turn-command-approval",
+            "itemId": "item-command-approval",
+            "command": "rm -i example.txt",
+            "cwd": str(rig.config.allowed_root),
+            "reason": "needs confirmation",
+        },
+    )
+
+    message = rig.discussion_endpoint.sent[-1]
+    assert "请求执行命令" in message["markdown"]
+    assert [button.text for button in message["reply_markup"].inline_keyboard[0]] == [
+        "批准执行",
+        "本 Session 放行",
+        "拒绝",
+    ]
+    approval_messages = rig.store.question_messages(request_key)
+    assert len(approval_messages) == 1
+    assert approval_messages[0]["message_kind"] == "approval"
+
+    rig.security.unlocked.add("space-command-approval")
+    button = message["reply_markup"].inline_keyboard[0][1]
+    callback_message = SimpleNamespace(
+        chat=SimpleNamespace(id=DISCUSSION_CHAT_ID, type=ChatType.SUPERGROUP),
+        chat_id=DISCUSSION_CHAT_ID,
+        message_id=message["reply_parameters"].message_id if message["reply_parameters"] else 2030,
+        message_thread_id=529,
+        reply_to_message=None,
+        text=None,
+        caption=None,
+        is_automatic_forward=False,
+        sender_chat=None,
+    )
+    query = SimpleNamespace(data=button.callback_data, message=callback_message)
+    update = SimpleNamespace(
+        callback_query=query,
+        effective_user=SimpleNamespace(id=OWNER_ID),
+        effective_chat=SimpleNamespace(id=DISCUSSION_CHAT_ID, type=ChatType.SUPERGROUP),
+        effective_message=callback_message,
+    )
+
+    await rig.discussion.callback(update, SimpleNamespace())
+    await rig.discussion.callback(update, SimpleNamespace())
+
+    assert decisions == [(request_key, "acceptForSession")]
+    assert rig.store.peek_callback(
+        str(button.callback_data)[3:],
+        OWNER_ID,
+        bot_role=DISCUSSION_ROLE,
+        chat_id=DISCUSSION_CHAT_ID,
+    ) is None
+    assert "已批准本 Session" in rig.discussion_endpoint.sent[-1]["markdown"]
+
+
+@pytest.mark.asyncio
+async def test_command_approval_buttons_follow_available_decision_order(rig: Rig) -> None:
+    add_active_space(
+        rig,
+        space_id="space-command-choices",
+        thread_id="thread-command-choices",
+        root_message_id=530,
+        channel_post_id=130,
+    )
+    request_key = "approval:request-choices"
+    exec_amendment = {
+        "acceptWithExecpolicyAmendment": {
+            "execpolicy_amendment": ["bash", "-lc", "echo hello"],
+        }
+    }
+    network_amendment = {
+        "applyNetworkPolicyAmendment": {
+            "network_policy_amendment": {"action": "allow", "host": "example.com"},
+        }
+    }
+    available = ["cancel", exec_amendment, network_amendment, "accept"]
+    params = {
+        "threadId": "thread-command-choices",
+        "turnId": "turn-command-choices",
+        "itemId": "item-command-choices",
+        "command": ["bash", "-lc", "echo hello"],
+        "cwd": str(rig.config.allowed_root),
+        "availableDecisions": available,
+    }
+    rig.store.put_pending_input(
+        request_key,
+        "92",
+        1,
+        "thread-command-choices",
+        "turn-command-choices",
+        "item-command-choices",
+        [
+            {
+                "_bridge_request_kind": "command_approval",
+                "_bridge_approval_method": "item/commandExecution/requestApproval",
+                "_bridge_available_decisions": available,
+                "params": params,
+            }
+        ],
+        int(time.time()) + 300,
+    )
+
+    await rig.discussion.forward_command_approval(request_key, params)
+
+    message = rig.discussion_endpoint.sent[-1]
+    buttons = [button for row in message["reply_markup"].inline_keyboard for button in row]
+    assert [button.text for button in buttons] == [
+        "拒绝并中止 Turn",
+        "批准并应用命令规则",
+        "应用网络允许规则",
+        "批准执行",
+    ]
+    assert "['bash'" not in message["markdown"]
+    callback_decisions: list[Any] = []
+    for button in buttons:
+        callback = rig.store.peek_callback(
+            str(button.callback_data)[3:],
+            OWNER_ID,
+            bot_role=DISCUSSION_ROLE,
+            chat_id=DISCUSSION_CHAT_ID,
+        )
+        assert callback is not None
+        callback_decisions.append(callback[1]["decision"])
+    assert callback_decisions == available
+
+
+@pytest.mark.asyncio
+async def test_failed_command_approval_response_creates_fresh_retry_callback(rig: Rig) -> None:
+    add_active_space(
+        rig,
+        space_id="space-command-retry",
+        thread_id="thread-command-retry",
+        root_message_id=531,
+        channel_post_id=131,
+    )
+    request_key = "approval:request-retry"
+    params = {
+        "threadId": "thread-command-retry",
+        "turnId": "turn-command-retry",
+        "itemId": "item-command-retry",
+        "command": "git status",
+        "cwd": str(rig.config.allowed_root),
+        "availableDecisions": ["accept"],
+    }
+    rig.store.put_pending_input(
+        request_key,
+        "93",
+        1,
+        "thread-command-retry",
+        "turn-command-retry",
+        "item-command-retry",
+        [
+            {
+                "_bridge_request_kind": "command_approval",
+                "_bridge_approval_method": "item/commandExecution/requestApproval",
+                "_bridge_available_decisions": ["accept"],
+                "params": params,
+            }
+        ],
+        int(time.time()) + 300,
+    )
+    attempts: list[tuple[str, Any]] = []
+
+    async def answer(request: str, decision: Any) -> None:
+        attempts.append((request, decision))
+        if len(attempts) == 1:
+            raise OSError("app-server send failed")
+
+    rig.bridge.answer_command_approval = answer  # type: ignore[attr-defined]
+    await rig.discussion.forward_command_approval(request_key, params)
+    first = rig.discussion_endpoint.sent[-1]["reply_markup"].inline_keyboard[0][0]
+    rig.security.unlocked.add("space-command-retry")
+    callback_message = SimpleNamespace(
+        chat=SimpleNamespace(id=DISCUSSION_CHAT_ID, type=ChatType.SUPERGROUP),
+        chat_id=DISCUSSION_CHAT_ID,
+        message_id=2031,
+        message_thread_id=531,
+        reply_to_message=None,
+        text=None,
+        caption=None,
+        is_automatic_forward=False,
+        sender_chat=None,
+    )
+
+    await rig.discussion.callback(
+        SimpleNamespace(
+            update_id=8131,
+            callback_query=SimpleNamespace(data=first.callback_data, message=callback_message),
+            effective_user=SimpleNamespace(id=OWNER_ID),
+            effective_chat=SimpleNamespace(id=DISCUSSION_CHAT_ID, type=ChatType.SUPERGROUP),
+            effective_message=callback_message,
+        ),
+        SimpleNamespace(),
+    )
+
+    retry_message = rig.discussion_endpoint.sent[-1]
+    retry_button = retry_message["reply_markup"].inline_keyboard[0][0]
+    assert "审批需重试" in retry_message["markdown"]
+    assert retry_button.callback_data != first.callback_data
+    assert rig.store.peek_callback(
+        str(first.callback_data)[3:],
+        OWNER_ID,
+        bot_role=DISCUSSION_ROLE,
+        chat_id=DISCUSSION_CHAT_ID,
+    ) is None
+    assert rig.store.pop_question_resolution(request_key) is None
+
+    await rig.discussion.callback(
+        SimpleNamespace(
+            update_id=8132,
+            callback_query=SimpleNamespace(data=retry_button.callback_data, message=callback_message),
+            effective_user=SimpleNamespace(id=OWNER_ID),
+            effective_chat=SimpleNamespace(id=DISCUSSION_CHAT_ID, type=ChatType.SUPERGROUP),
+            effective_message=callback_message,
+        ),
+        SimpleNamespace(),
+    )
+
+    assert attempts == [(request_key, "accept"), (request_key, "accept")]
+    resolution = rig.store.pop_question_resolution(request_key)
+    assert resolution is not None
+    assert resolution["answers"] == {"decision": ["accept"]}
+    assert "已批准本次命令" in rig.discussion_endpoint.sent[-1]["markdown"]
 
 
 @pytest.mark.asyncio

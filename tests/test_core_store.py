@@ -1151,19 +1151,73 @@ def test_cleanup_durably_schedules_expired_and_orphan_question_messages(
             "live", "2", 5, "thread-1", "turn-2", "item-2", [], int(time.time()) + 60
         )
         store.record_question_message("live", "forum", -1002, 303)
+        store.put_pending_input(
+            "approval:expired", "3", 6, "thread-2", "turn-3", "item-3", [], 50
+        )
+        store.record_question_message("approval:expired", "forum", -1002, 304, message_kind="approval")
+        store.put_pending_input(
+            "approval:live", "4", 7, "thread-2", "turn-4", "item-4", [], int(time.time()) + 60
+        )
+        store.record_question_message("approval:live", "forum", -1002, 305, message_kind="approval")
 
         store.cleanup()
 
         due = store.due_message_deletions()
-        assert [item["message_id"] for item in due] == [301, 302]
-        assert [item["group_key"] for item in due] == [
+        assert {item["message_id"] for item in due} == {301, 302, 304}
+        assert {item["group_key"] for item in due} == {
             "question:expired",
             "question:orphan",
-        ]
+            "question:approval:expired",
+        }
         assert store.get_pending_input("expired") is None
         assert store.question_messages("expired") == []
         assert store.question_messages("orphan") == []
         assert store.get_pending_input("live") is not None
         assert [item["message_id"] for item in store.question_messages("live")] == [303]
+        assert store.get_pending_input("approval:expired") is None
+        assert store.question_messages("approval:expired") == []
+        assert store.get_pending_input("approval:live") is not None
+        assert [item["message_id"] for item in store.question_messages("approval:live")] == [305]
+    finally:
+        store.close()
+
+
+def test_startup_retirement_includes_unexpired_command_approvals(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    try:
+        request_key = "approval:previous-runtime"
+        store.put_pending_input(
+            request_key,
+            "91",
+            8,
+            "thread-approval",
+            "turn-approval",
+            "item-approval",
+            [],
+            10_000,
+        )
+        store.record_question_message(
+            request_key,
+            "discussion",
+            -1002,
+            306,
+            message_kind="approval",
+        )
+        assert store.save_question_resolution(
+            request_key,
+            {"decision": ["accept"]},
+            source="telegram",
+        )
+
+        retired = store.retire_question_requests(include_unexpired=True, now=100)
+
+        assert retired == [request_key]
+        assert store.get_pending_input(request_key) is None
+        assert store.question_messages(request_key) == []
+        assert store.pop_question_resolution(request_key) is None
+        due = store.due_message_deletions(now=100)
+        assert [(item["message_id"], item["group_key"]) for item in due] == [
+            (306, f"question:{request_key}")
+        ]
     finally:
         store.close()

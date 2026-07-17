@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from pathlib import Path
 from typing import Any
 
@@ -62,7 +63,7 @@ async def test_resume_thread_tolerates_missing_initial_page() -> None:
 
 
 @pytest.mark.asyncio
-async def test_start_thread_defaults_to_workspace_write_without_approvals(tmp_path: Path) -> None:
+async def test_start_thread_defaults_to_workspace_write_with_approval_prompts(tmp_path: Path) -> None:
     client = CodexClient(Path("/tmp/not-used.sock"))
     calls: list[tuple[str, dict[str, Any], float]] = []
 
@@ -75,7 +76,30 @@ async def test_start_thread_defaults_to_workspace_write_without_approvals(tmp_pa
     await client.start_thread(tmp_path)
 
     assert calls[0][1]["sandbox"] == "workspace-write"
+    assert calls[0][1]["approvalPolicy"] == "on-request"
+
+
+@pytest.mark.asyncio
+async def test_start_thread_keeps_read_only_fork_without_approvals(tmp_path: Path) -> None:
+    client = CodexClient(Path("/tmp/not-used.sock"))
+    calls: list[tuple[str, dict[str, Any], float]] = []
+
+    async def request(method: str, params: dict[str, Any], timeout: float = 30.0) -> dict[str, Any]:
+        calls.append((method, params, timeout))
+        return {"thread": {"id": "thread-read-only"}}
+
+    client.request = request  # type: ignore[method-assign]
+
+    await client.start_thread(tmp_path, read_only=True)
+
+    assert calls[0][1]["sandbox"] == "read-only"
     assert calls[0][1]["approvalPolicy"] == "never"
+
+
+def test_ask_fork_question_defaults_to_five_minutes() -> None:
+    timeout = inspect.signature(CodexClient.ask_fork_question).parameters["timeout"].default
+
+    assert timeout == 300.0
 
 
 @pytest.mark.asyncio

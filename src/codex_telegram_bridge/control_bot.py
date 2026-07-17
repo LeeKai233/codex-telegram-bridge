@@ -42,7 +42,13 @@ from .security import SecurityManager
 from .space_coordinator import SessionSpaceCoordinator
 from .space_dashboard import private_message_link
 from .store import Store
-from .telegram_common import CONTROL_ROLE, TelegramEndpoint, command_name, raw_arguments
+from .telegram_common import (
+    CONTROL_ROLE,
+    TelegramEndpoint,
+    balanced_button_rows,
+    command_name,
+    raw_arguments,
+)
 from .views import render_help, render_sessions_page, render_status_comment
 
 LOGGER = logging.getLogger(__name__)
@@ -508,23 +514,21 @@ class ControlBotController:
         if not options:
             raise RuntimeError("当前没有可用模型。")
         event = "plan_model" if plan else "normal_model"
-        rows = [
-            [
-                self._new_button(
-                    chat_id,
-                    draft,
-                    event,
-                    str(option.model),
-                    self._model_label(option),
-                )
-            ]
+        buttons = [
+            self._new_button(
+                chat_id,
+                draft,
+                event,
+                str(option.model),
+                self._model_label(option),
+            )
             for option in options
         ]
         mode = "Plan Mode" if plan else "Normal Mode"
         await self.endpoint.send_text(
             chat_id,
             f"请选择 {mode} 使用的模型：",
-            reply_markup=InlineKeyboardMarkup(rows),
+            reply_markup=InlineKeyboardMarkup(balanced_button_rows(buttons)),
         )
 
     async def _show_effort_choices(self, chat_id: int, draft: Any, *, plan: bool) -> None:
@@ -532,22 +536,20 @@ class ControlBotController:
         model = str(draft.payload[key])
         option = await self._model_option(model)
         event = "plan_effort" if plan else "normal_effort"
-        rows = [
-            [
-                self._new_button(
-                    chat_id,
-                    draft,
-                    event,
-                    effort,
-                    f"{effort}{'（默认）' if effort == option.default_effort else ''}",
-                )
-            ]
+        buttons = [
+            self._new_button(
+                chat_id,
+                draft,
+                event,
+                effort,
+                f"{effort}{'（默认）' if effort == option.default_effort else ''}",
+            )
             for effort in option.supported_efforts
         ]
         await self.endpoint.send_text(
             chat_id,
             f"请选择 {inline_code(model)} 的 effort：",
-            reply_markup=InlineKeyboardMarkup(rows),
+            reply_markup=InlineKeyboardMarkup(balanced_button_rows(buttons)),
         )
 
     async def _show_plan_choice(self, chat_id: int, draft: Any) -> None:

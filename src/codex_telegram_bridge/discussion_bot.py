@@ -7,6 +7,7 @@ import html
 import logging
 import re
 import secrets
+import shlex
 import time
 import uuid
 from collections.abc import Mapping
@@ -38,6 +39,12 @@ from telegram.ext import (
     filters,
 )
 
+from .approval import (
+    ApprovalDecision,
+    approval_decision_is_available,
+    approval_decision_kind,
+    command_approval_decisions,
+)
 from .bridge import Bridge
 from .config import Config
 from .deletions import MessageDeletionManager
@@ -52,6 +59,7 @@ from .store import Store
 from .telegram_common import (
     DISCUSSION_ROLE,
     TelegramEndpoint,
+    balanced_button_rows,
     command_name,
     human_bytes,
     raw_arguments,
@@ -178,6 +186,7 @@ class DiscussionBotController:
         application.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, self.upload), group=1)
         application.add_error_handler(self.error)
         self.bridge.on_question = self.forward_question
+        self.bridge.on_command_approval = self.forward_command_approval
         self.bridge.on_notice = self.forward_notice
         self.bridge.on_question_resolved = self.question_resolved
         self.bridge.on_plan_completed = self.plan_completed
@@ -258,9 +267,16 @@ class DiscussionBotController:
             if self._plan_recovery_task is asyncio.current_task():
                 self._plan_recovery_task = None
 
+    @staticmethod
+    def _chat_for_update(update: Update) -> Any:
+        callback = update.callback_query
+        callback_message = getattr(callback, "message", None) if callback else None
+        callback_chat = getattr(callback_message, "chat", None)
+        return callback_chat or update.effective_chat
+
     async def _guard(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         del context
-        chat = update.effective_chat
+        chat = self._chat_for_update(update)
         user = update.effective_user
         message = update.effective_message
         if not chat or chat.type != ChatType.SUPERGROUP:
@@ -585,7 +601,7 @@ class DiscussionBotController:
                 client_message_id=client_message_id,
             )
         except TimeoutError:
-            rendered = render_ask_error(ask_id, "等待 Codex 回答超时（180 秒）。")
+            rendered = render_ask_error(ask_id, "等待 Codex 回答超时（300 秒）。")
         except asyncio.CancelledError:
             try:
                 self._schedule_ask_deletion(int(space["discussion_chat_id"]), waiting_message_id, ask_id)
@@ -837,26 +853,24 @@ class DiscussionBotController:
             payload={},
             expires_at=int(time.time()) + _INTERACTION_SECONDS,
         )
-        rows = [
-            [
-                self._interaction_button(
-                    clip(
-                        str(_value(option, "display_name") or _value(option, "model")),
-                        60,
-                    ),
-                    "profile_model",
-                    draft,
-                    {"model": str(_value(option, "model"))},
-                    space,
-                )
-            ]
+        buttons = [
+            self._interaction_button(
+                clip(
+                    str(_value(option, "display_name") or _value(option, "model")),
+                    60,
+                ),
+                "profile_model",
+                draft,
+                {"model": str(_value(option, "model"))},
+                space,
+            )
             for option in options
         ]
         label = "Plan Mode" if kind == "planmode" else "当前模式"
         await self._send_space(
             space,
             f"请选择 {label} 使用的模型：",
-            reply_markup=InlineKeyboardMarkup(rows),
+            reply_markup=InlineKeyboardMarkup(balanced_button_rows(buttons)),
         )
 
     async def _profile_model_selected(self, space: dict[str, Any], payload: dict[str, Any]) -> None:
@@ -886,22 +900,20 @@ class DiscussionBotController:
         if advanced is None:
             raise RuntimeError("这次交互已被新命令替换")
         self._schedule_interaction_timeout(advanced)
-        rows = [
-            [
-                self._interaction_button(
-                    effort,
-                    "profile_effort",
-                    advanced,
-                    {"model": model, "effort": effort},
-                    space,
-                )
-            ]
+        buttons = [
+            self._interaction_button(
+                effort,
+                "profile_effort",
+                advanced,
+                {"model": model, "effort": effort},
+                space,
+            )
             for effort in efforts
         ]
         await self._send_space(
             space,
             f"模型 {inline_code(model)} 支持以下 effort：",
-            reply_markup=InlineKeyboardMarkup(rows),
+            reply_markup=InlineKeyboardMarkup(balanced_button_rows(buttons)),
         )
 
     async def _profile_effort_selected(self, space: dict[str, Any], payload: dict[str, Any]) -> None:
@@ -1401,9 +1413,15 @@ class DiscussionBotController:
         del context
         query = update.callback_query
         user = update.effective_user
-        chat = update.effective_chat
+        chat = self._chat_for_update(update)
         if not query or not user or not chat:
             return
+        LOGGER.info(
+            "event=telegram_callback_received update_id=%s chat_id=%s user_id=%s",
+            getattr(update, "update_id", "unknown"),
+            chat.id,
+            user.id,
+        )
         data = str(query.data or "")
         pending = (
             self.store.peek_callback(data[3:], user.id, bot_role=DISCUSSION_ROLE, chat_id=chat.id)
@@ -1411,6 +1429,11 @@ class DiscussionBotController:
             else None
         )
         if not pending:
+            LOGGER.warning(
+                "event=telegram_callback_rejected reason=missing_or_expired chat_id=%s data_prefix=%s",
+                chat.id,
+                data[:12],
+            )
             await self.discussion.answer_callback(
                 query, "按钮已使用或过期，请重新执行命令。", show_alert=True
             )
@@ -1418,9 +1441,19 @@ class DiscussionBotController:
         action, payload = pending
         space = self.store.get_space(str(payload.get("space_id") or ""))
         if not space or int(payload.get("generation") or 0) != int(space["generation"]):
+            LOGGER.warning(
+                "event=telegram_callback_rejected reason=stale_space action=%s chat_id=%s",
+                action,
+                chat.id,
+            )
             await self.discussion.answer_callback(query, "Session 状态已变化。", show_alert=True)
             return
         if not self.security.is_space_unlocked(str(space["space_id"])):
+            LOGGER.info(
+                "event=telegram_callback_rejected reason=locked action=%s space_id=%s",
+                action,
+                str(space["space_id"])[:12],
+            )
             await self.discussion.answer_callback(
                 query,
                 "写操作已锁定，请先发送 /totp <验证码>。认证后可再次点击原按钮。",
@@ -1450,6 +1483,11 @@ class DiscussionBotController:
             generation=int(space["generation"]),
         )
         if consumed is None:
+            LOGGER.warning(
+                "event=telegram_callback_rejected reason=consumed action=%s space_id=%s",
+                action,
+                str(space["space_id"])[:12],
+            )
             await self.discussion.answer_callback(
                 query, "按钮已使用或过期，请重新执行命令。", show_alert=True
             )
@@ -1459,6 +1497,13 @@ class DiscussionBotController:
         try:
             await self._dispatch_callback(action, payload, space)
         except (KeyError, ValueError, RuntimeError, OSError, TelegramError, PathPolicyError) as exc:
+            LOGGER.warning(
+                "event=telegram_callback_failed action=%s space_id=%s error_type=%s error=%s",
+                action,
+                str(space["space_id"])[:12],
+                type(exc).__name__,
+                str(exc)[:240],
+            )
             latest = self.store.latest_plan_publication(str(space["space_id"]), int(space["generation"]))
             if (
                 action in {"plan_execute", "plan_continue"}
@@ -1504,6 +1549,9 @@ class DiscussionBotController:
         elif action == "question":
             self._ensure_unlocked(space)
             await self._record_question_answer(space, payload)
+        elif action == "command_approval":
+            self._ensure_unlocked(space)
+            await self._answer_command_approval(space, payload)
         elif action in {"question_custom", "question_clarify"}:
             self._ensure_unlocked(space)
             await self._begin_question_reply(
@@ -2017,6 +2065,117 @@ class DiscussionBotController:
                 latest,
                 "无法创建 Plan 修改请求，请使用新按钮重试。",
             )
+
+    async def forward_command_approval(
+        self,
+        request_key: str,
+        params: dict[str, Any],
+        *,
+        retry: bool = False,
+    ) -> None:
+        thread_id = str(params.get("threadId") or "")
+        space = self.store.get_space_by_thread(thread_id)
+        if not space or space.get("lifecycle") != "active":
+            await self.forward_notice(
+                "Codex 正在等待命令审批；当前 Session 没有可用的 Telegram Space，请在本机处理。",
+                thread_id or None,
+            )
+            LOGGER.warning(
+                "event=command_approval_unforwarded request_key=%s thread_id=%s",
+                request_key,
+                thread_id[:8],
+            )
+            return
+        raw_command = params.get("command")
+        if isinstance(raw_command, list):
+            command = shlex.join(str(value) for value in raw_command)
+        else:
+            command = str(raw_command or "未知命令")
+        command = clip(command, 1600)
+        cwd = clip(str(params.get("cwd") or "未知目录"), 500)
+        reason = clip(str(params.get("reason") or "该命令需要额外权限。"), 500)
+        stored = self.store.get_pending_input(request_key)
+        metadata = next(
+            (
+                value
+                for value in (stored["questions"] if stored else [])
+                if isinstance(value, dict) and value.get("_bridge_request_kind") == "command_approval"
+            ),
+            None,
+        )
+        method = str(metadata.get("_bridge_approval_method") or "") if metadata else ""
+        if metadata and "_bridge_available_decisions" in metadata:
+            raw_available = metadata.get("_bridge_available_decisions")
+            available: list[ApprovalDecision] = raw_available if isinstance(raw_available, list) else []
+        else:
+            available = command_approval_decisions(method, params)
+        ttl = max(self.config.callback_seconds, self.config.totp_unlock_seconds)
+        buttons = [
+            self._button(
+                self._command_approval_button_label(decision),
+                "command_approval",
+                {"request_key": request_key, "decision": decision},
+                space,
+                ttl_seconds=ttl,
+            )
+            for decision in available
+        ]
+        markup = InlineKeyboardMarkup(balanced_button_rows(buttons)) if buttons else None
+        heading = "*⚠️ Codex 命令审批需重试*" if retry else "*⚠️ Codex 请求执行命令*"
+        instruction = (
+            "上一选择未送达 Codex，请使用下面的新按钮。"
+            if retry
+            else "请确认是否允许本次命令。"
+        )
+        if not buttons:
+            instruction = "该请求没有可由 Telegram 提交的决定，请在本机处理。"
+        message = await self._send_space(
+            space,
+            "\n".join(
+                [
+                    heading,
+                    f"Session {inline_code(thread_id[:8])}",
+                    f"命令：{inline_code(command)}",
+                    f"目录：{inline_code(cwd)}",
+                    f"原因：{escape(reason)}",
+                    instruction,
+                ]
+            ),
+            reply_markup=markup,
+            priority=5,
+        )
+        lock = self._question_locks.setdefault(request_key, asyncio.Lock())
+        async with lock:
+            resolved = request_key in self._resolved_questions
+            if not resolved and self.store.get_pending_input(request_key):
+                self.store.record_question_message(
+                    request_key,
+                    DISCUSSION_ROLE,
+                    int(space["discussion_chat_id"]),
+                    int(message.message_id),
+                    message_kind="approval",
+                )
+            else:
+                resolved = True
+        if resolved:
+            await self._delete_question_message(space, request_key, int(message.message_id))
+
+    @staticmethod
+    def _command_approval_button_label(decision: ApprovalDecision) -> str:
+        kind = approval_decision_kind(decision)
+        if kind == "accept":
+            return "批准执行"
+        if kind == "acceptForSession":
+            return "本 Session 放行"
+        if kind == "acceptWithExecpolicyAmendment":
+            return "批准并应用命令规则"
+        if kind == "applyNetworkPolicyAmendment":
+            detail = decision.get("applyNetworkPolicyAmendment", {})
+            amendment = detail.get("network_policy_amendment", {}) if isinstance(detail, dict) else {}
+            return "应用网络允许规则" if amendment.get("action") == "allow" else "应用网络拒绝规则"
+        if kind == "cancel":
+            return "拒绝并中止 Turn"
+        return "拒绝"
 
     async def forward_question(self, request_key: str, params: dict[str, Any]) -> None:
         thread_id = str(params.get("threadId") or "")
@@ -2553,6 +2712,71 @@ class DiscussionBotController:
             raise RuntimeError("该问题已提交，不能更改答案")
         await self.bridge.answer_question(request_key, persisted)
         self._question_answers.pop(request_key, None)
+
+    async def _answer_command_approval(self, space: dict[str, Any], payload: dict[str, Any]) -> None:
+        request_key = str(payload.get("request_key") or "")
+        decision = payload.get("decision")
+        stored = self.store.get_pending_input(request_key)
+        if not stored or str(stored["thread_id"]) != str(space["thread_id"]):
+            raise RuntimeError("该命令审批已过期或不属于当前 Session")
+        metadata = next(
+            (
+                value
+                for value in stored["questions"]
+                if isinstance(value, dict) and value.get("_bridge_request_kind") == "command_approval"
+            ),
+            None,
+        )
+        if metadata is None:
+            raise RuntimeError("该请求不是可由 Telegram 处理的命令审批")
+        method = str(metadata.get("_bridge_approval_method") or "")
+        raw_available = metadata.get("_bridge_available_decisions")
+        if "_bridge_available_decisions" in metadata:
+            available = raw_available if isinstance(raw_available, list) else []
+        else:
+            raw_params = metadata.get("params")
+            available = command_approval_decisions(
+                method,
+                raw_params if isinstance(raw_params, dict) else {},
+            )
+        if not approval_decision_is_available(decision, available):
+            raise ValueError("命令审批决定不在当前请求允许的选项中")
+        if not self.store.save_question_resolution(
+            request_key,
+            {"decision": [decision]},
+            source="telegram",
+        ):
+            raise RuntimeError("该命令审批已提交，不能重复处理")
+        try:
+            await self.bridge.answer_command_approval(request_key, decision)
+        except Exception as exc:
+            self.store.pop_question_resolution(request_key)
+            retry_stored = self.store.get_pending_input(request_key)
+            retry_params = metadata.get("params")
+            if (
+                retry_stored
+                and str(retry_stored["thread_id"]) == str(space["thread_id"])
+                and isinstance(retry_params, dict)
+            ):
+                LOGGER.warning(
+                    "event=command_approval_response_retry request_key=%s error_type=%s error=%s",
+                    request_key,
+                    type(exc).__name__,
+                    _redacted_error(exc),
+                )
+                await self.forward_command_approval(request_key, retry_params, retry=True)
+                return
+            raise RuntimeError("Codex 连接已经重建，原命令审批已失效") from exc
+        kind = approval_decision_kind(decision)
+        labels = {
+            "accept": "已批准本次命令执行。",
+            "acceptForSession": "已批准本 Session 后续命令执行。",
+            "acceptWithExecpolicyAmendment": "已批准命令并应用命令规则。",
+            "applyNetworkPolicyAmendment": "已提交网络策略决定。",
+            "decline": "已拒绝本次命令执行。",
+            "cancel": "已拒绝命令并中止当前 Turn。",
+        }
+        await self._send_space(space, labels.get(kind, "命令审批已提交。"), priority=5)
 
     async def question_resolved(self, request_key: str) -> None:
         lock = self._question_locks.setdefault(request_key, asyncio.Lock())

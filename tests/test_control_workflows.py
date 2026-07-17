@@ -346,6 +346,40 @@ async def test_new_interactive_flow_captures_project_and_prompt(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
+async def test_model_and_effort_choices_use_balanced_three_column_rows(tmp_path: Path) -> None:
+    controller, store, endpoint, bridge, _coordinator, _deletions = build_controller(tmp_path)
+    bridge.options = [
+        SimpleNamespace(
+            model=f"model-{index}",
+            display_name=f"Model {index}",
+            supported_efforts=("low", "medium", "high", "max"),
+            default_effort="high",
+            is_default=index == 0,
+        )
+        for index in range(4)
+    ]
+    draft = store.replace_interaction(
+        "control:70:7:new",
+        kind="new",
+        phase="normal_model",
+        payload={},
+        user_id=7,
+        bot_role="control",
+        chat_id=70,
+        expires_at=int(time.time()) + 300,
+    )
+
+    await controller._show_model_choices(70, draft, plan=False)
+    model_markup = endpoint.sent[-1]["reply_markup"]
+    assert [len(row) for row in model_markup.inline_keyboard] == [2, 2]
+
+    draft.payload["normal_model"] = "model-0"
+    await controller._show_effort_choices(70, draft, plan=False)
+    effort_markup = endpoint.sent[-1]["reply_markup"]
+    assert [len(row) for row in effort_markup.inline_keyboard] == [2, 2]
+
+
+@pytest.mark.asyncio
 async def test_new_parameterized_plan_preserves_pipe_in_prompt(tmp_path: Path) -> None:
     controller, _store, _endpoint, _bridge, coordinator, _deletions = build_controller(tmp_path)
     try:

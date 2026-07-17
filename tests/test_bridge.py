@@ -128,7 +128,7 @@ async def test_ambiguous_queue_delivery_requires_reconciliation_before_retry(
     ) -> None:
         assert kwargs["cwd"] == tmp_path
         assert kwargs["sandbox_policy"]["type"] == "workspaceWrite"
-        assert kwargs["approval_policy"] == "never"
+        assert kwargs["approval_policy"] == "on-request"
         calls.append(f"start-{client_message_id}")
         raise TimeoutError("turn/start result is unknown")
 
@@ -598,6 +598,199 @@ async def test_resolved_server_request_notifies_before_pending_input_is_deleted(
     assert existed_during_hook == [True]
     assert store.get_pending_input("request-key") is None
     assert "request-key" not in bridge._pending_requests
+    store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "decision", "wire_decision"),
+    (
+        ("item/commandExecution/requestApproval", "accept", "accept"),
+        (
+            "item/commandExecution/requestApproval",
+            "acceptForSession",
+            "acceptForSession",
+        ),
+        ("item/commandExecution/requestApproval", "decline", "decline"),
+        ("execCommandApproval", "accept", "approved"),
+        ("execCommandApproval", "acceptForSession", "approved_for_session"),
+        ("execCommandApproval", "decline", "denied"),
+    ),
+)
+async def test_command_approval_persists_and_responds_with_protocol_decision(
+    tmp_path: Path,
+    method: str,
+    decision: str,
+    wire_decision: str,
+) -> None:
+    bridge, store = make_bridge(tmp_path)
+    request_keys: list[str] = []
+    responses: list[tuple[int | str, dict[str, Any]]] = []
+
+    async def forward(request_key: str, _params: dict[str, Any]) -> None:
+        request_keys.append(request_key)
+
+    async def respond(request_id: int | str, result: dict[str, Any]) -> None:
+        responses.append((request_id, result))
+
+    bridge.on_command_approval = forward
+    bridge.client.respond = respond  # type: ignore[method-assign]
+    params = {
+        "threadId": "thread-approval",
+        "turnId": "turn-approval",
+        "itemId": "item-approval",
+        "command": "git status",
+        "cwd": str(tmp_path),
+        "reason": "command needs approval",
+    }
+
+    await bridge._on_server_request(42, method, params, bridge.client.generation)
+
+    assert len(request_keys) == 1
+    request_key = request_keys[0]
+    assert request_key.startswith("approval:")
+    stored = store.get_pending_input(request_key)
+    assert stored is not None
+    assert stored["request_id"] == "42"
+    assert stored["questions"][0]["_bridge_approval_method"] == method
+
+    await bridge.answer_command_approval(request_key, decision)
+
+    assert responses == [(42, {"decision": wire_decision})]
+    assert store.get_pending_input(request_key) is None
+    assert request_key not in bridge._pending_requests
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_command_approval_validates_and_preserves_available_decisions(tmp_path: Path) -> None:
+    bridge, store = make_bridge(tmp_path)
+    request_keys: list[str] = []
+    responses: list[tuple[int | str, dict[str, Any]]] = []
+    amendment = {
+        "acceptWithExecpolicyAmendment": {
+            "execpolicy_amendment": ["git", "status"],
+        }
+    }
+
+    async def forward(request_key: str, _params: dict[str, Any]) -> None:
+        request_keys.append(request_key)
+
+    async def respond(request_id: int | str, result: dict[str, Any]) -> None:
+        responses.append((request_id, result))
+
+    bridge.on_command_approval = forward
+    bridge.client.respond = respond  # type: ignore[method-assign]
+    await bridge._on_server_request(
+        "approval-rpc-id",
+        "item/commandExecution/requestApproval",
+        {
+            "threadId": "thread-approval",
+            "turnId": "turn-approval",
+            "itemId": "item-approval",
+            "command": "git status",
+            "availableDecisions": ["cancel", amendment],
+        },
+        bridge.client.generation,
+    )
+
+    [request_key] = request_keys
+    stored = store.get_pending_input(request_key)
+    assert stored is not None
+    assert stored["questions"][0]["_bridge_available_decisions"] == ["cancel", amendment]
+
+    with pytest.raises(ValueError, match="不在当前请求允许"):
+        await bridge.answer_command_approval(request_key, "acceptForSession")
+
+    assert responses == []
+    assert store.get_pending_input(request_key) is not None
+
+    await bridge.answer_command_approval(request_key, amendment)
+
+    assert responses == [("approval-rpc-id", {"decision": amendment})]
+    assert store.get_pending_input(request_key) is None
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_command_approval_normalizes_conversation_and_call_ids(tmp_path: Path) -> None:
+    bridge, store = make_bridge(tmp_path)
+    forwarded: list[tuple[str, dict[str, Any]]] = []
+    responses: list[tuple[int | str, dict[str, Any]]] = []
+
+    async def forward(request_key: str, params: dict[str, Any]) -> None:
+        forwarded.append((request_key, params))
+
+    async def respond(request_id: int | str, result: dict[str, Any]) -> None:
+        responses.append((request_id, result))
+
+    bridge.on_command_approval = forward
+    bridge.client.respond = respond  # type: ignore[method-assign]
+    await bridge._on_server_request(
+        73,
+        "execCommandApproval",
+        {
+            "conversationId": "legacy-conversation",
+            "callId": "legacy-call",
+            "command": ["git", "status", "--short"],
+            "cwd": str(tmp_path),
+            "parsedCmd": [],
+        },
+        bridge.client.generation,
+    )
+
+    [(request_key, params)] = forwarded
+    assert params["threadId"] == "legacy-conversation"
+    assert params["itemId"] == "legacy-call"
+    stored = store.get_pending_input(request_key)
+    assert stored is not None
+    assert stored["thread_id"] == "legacy-conversation"
+    assert stored["item_id"] == "legacy-call"
+
+    await bridge.answer_command_approval(request_key, "cancel")
+
+    assert responses == [(73, {"decision": "abort"})]
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_command_approval_retires_after_transport_generation_changes(tmp_path: Path) -> None:
+    bridge, store = make_bridge(tmp_path)
+    request_keys: list[str] = []
+    resolved: list[str] = []
+
+    async def forward(request_key: str, _params: dict[str, Any]) -> None:
+        request_keys.append(request_key)
+
+    async def question_resolved(request_key: str) -> None:
+        resolved.append(request_key)
+
+    async def fail_after_reconnect(_request_id: int | str, _result: dict[str, Any]) -> None:
+        bridge.client.generation += 1
+        raise OSError("connection replaced")
+
+    bridge.on_command_approval = forward
+    bridge.on_question_resolved = question_resolved
+    bridge.client.respond = fail_after_reconnect  # type: ignore[method-assign]
+    await bridge._on_server_request(
+        74,
+        "item/commandExecution/requestApproval",
+        {
+            "threadId": "thread-reconnect",
+            "turnId": "turn-reconnect",
+            "itemId": "item-reconnect",
+            "command": "git status",
+        },
+        bridge.client.generation,
+    )
+
+    [request_key] = request_keys
+    with pytest.raises(OSError, match="connection replaced"):
+        await bridge.answer_command_approval(request_key, "accept")
+
+    assert resolved == [request_key]
+    assert store.get_pending_input(request_key) is None
+    assert request_key not in bridge._pending_requests
     store.close()
 
 
