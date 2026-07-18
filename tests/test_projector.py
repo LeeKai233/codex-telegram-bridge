@@ -5,7 +5,13 @@ from pathlib import Path
 import pytest
 
 import codex_telegram_bridge.projector as projector_module
-from codex_telegram_bridge.models import PlanStep, SessionSpace, TaskState, ThreadState
+from codex_telegram_bridge.models import (
+    LifecycleActivity,
+    PlanStep,
+    SessionSpace,
+    TaskState,
+    ThreadState,
+)
 from codex_telegram_bridge.projector import EventProjector
 from codex_telegram_bridge.store import Store
 
@@ -39,6 +45,150 @@ async def test_repeated_status_transition_is_processed_after_an_intervening_even
         "turn/started",
         "thread/status/changed",
     ]
+    store.close()
+
+
+def test_old_thread_state_without_recovery_flag_loads_as_not_recoverable() -> None:
+    state = ThreadState.from_dict({"thread_id": "legacy", "last_error": "old failure"})
+
+    assert state.last_error == "old failure"
+    assert state.last_error_recoverable is False
+
+
+@pytest.mark.asyncio
+async def test_retryable_error_clears_on_healthy_status_but_remains_in_timeline(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    projector = EventProjector(store)
+
+    await projector.ingest(
+        "error",
+        {
+            "threadId": "thread-recovery",
+            "willRetry": True,
+            "error": {"message": "Reconnecting"},
+        },
+    )
+    retrying = store.get_thread("thread-recovery")
+    assert retrying is not None
+    assert retrying.last_error == "Reconnecting"
+    assert retrying.last_error_recoverable is True
+    assert retrying.recent_activity[-1].status == "retrying"
+
+    await projector.ingest(
+        "thread/status/changed",
+        {"threadId": "thread-recovery", "status": {"type": "idle"}},
+    )
+
+    recovered = store.get_thread("thread-recovery")
+    assert recovered is not None
+    assert recovered.last_error == ""
+    assert recovered.last_error_recoverable is False
+    assert recovered.latest_activity == "连接已恢复"
+    assert all(activity.status != "retrying" for activity in recovered.recent_activity)
+    assert [event["kind"] for event in store.timeline("thread-recovery")] == [
+        "error",
+        "thread/status/changed",
+    ]
+    store.close()
+
+
+def test_retryable_error_requires_strictly_newer_healthy_snapshot(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    projector = EventProjector(store)
+    retrying = ThreadState(
+        thread_id="thread-snapshot",
+        status="systemError",
+        updated_at=100,
+        last_error="Reconnecting",
+        last_error_recoverable=True,
+        recent_activity=[
+            LifecycleActivity(kind="error", text="Reconnecting", status="retrying", timestamp=100)
+        ],
+    )
+    store.save_thread(retrying)
+
+    for updated_at in (0, 99, 100):
+        payload = {
+            "id": "thread-snapshot",
+            "status": {"type": "idle"},
+        }
+        if updated_at:
+            payload["updatedAt"] = updated_at
+        state = projector.apply_thread(payload)
+        assert state.last_error == "Reconnecting"
+        assert state.last_error_recoverable is True
+
+    recovered = projector.apply_thread(
+        {
+            "id": "thread-snapshot",
+            "updatedAt": 101,
+            "status": {"type": "idle"},
+        }
+    )
+    assert recovered.last_error == ""
+    assert recovered.last_error_recoverable is False
+    assert recovered.latest_activity == "连接已恢复"
+    assert all(activity.status != "retrying" for activity in recovered.recent_activity)
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_turn_ends_retry_state_but_keeps_terminal_error(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    projector = EventProjector(store)
+    await projector.ingest(
+        "error",
+        {
+            "threadId": "thread-failed",
+            "willRetry": True,
+            "error": {"message": "Temporary transport failure"},
+        },
+    )
+
+    await projector.ingest(
+        "turn/completed",
+        {
+            "threadId": "thread-failed",
+            "turn": {
+                "id": "turn-failed",
+                "status": "failed",
+                "error": {"message": "Terminal failure"},
+                "items": [],
+            },
+        },
+    )
+
+    state = store.get_thread("thread-failed")
+    assert state is not None
+    assert state.last_error == "Terminal failure"
+    assert state.last_error_recoverable is False
+    assert state.turn_status == "failed"
+    assert all(activity.status != "retrying" for activity in state.recent_activity)
+
+    await projector.ingest(
+        "turn/started",
+        {
+            "threadId": "thread-failed",
+            "turn": {"id": "turn-retry", "status": "inProgress", "items": []},
+        },
+    )
+    started = store.get_thread("thread-failed")
+    assert started is not None
+    assert started.last_error == "Terminal failure"
+
+    await projector.ingest(
+        "turn/completed",
+        {
+            "threadId": "thread-failed",
+            "turn": {"id": "turn-retry", "status": "completed", "items": []},
+        },
+    )
+    recovered = store.get_thread("thread-failed")
+    assert recovered is not None
+    assert recovered.last_error == ""
+    assert recovered.last_error_recoverable is False
     store.close()
 
 

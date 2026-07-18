@@ -1026,7 +1026,7 @@ async def test_ask_space_question_uses_isolated_client_without_mutating_primary_
     bridge.config = replace(
         bridge.config,
         ask_model="gpt-5.6-luna",
-        ask_reasoning_effort="max",
+        ask_reasoning_effort="medium",
     )
     calls: list[tuple[str, Path, str, str, str | None, str | None]] = []
 
@@ -1057,7 +1057,7 @@ async def test_ask_space_question_uses_isolated_client_without_mutating_primary_
             "What does this error mean?",
             "tg-ask-1",
             "gpt-5.6-luna",
-            "max",
+            "medium",
         )
     ]
     assert state is not None
@@ -1067,6 +1067,34 @@ async def test_ask_space_question_uses_isolated_client_without_mutating_primary_
         "active",
     )
     assert store.space_queue_entries("space-primary", 1) == []
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_resolve_files_uses_configured_utility_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, store = make_bridge(tmp_path)
+    store.save_thread(ThreadState(thread_id="thread-files", cwd=str(tmp_path), status="idle"))
+    calls: list[tuple[str, Path, str, str | None, str | None]] = []
+
+    async def resolve_files(
+        thread_id: str,
+        cwd: Path,
+        description: str,
+        *,
+        model: str | None,
+        effort: str | None,
+    ) -> list[Any]:
+        calls.append((thread_id, cwd, description, model, effort))
+        return []
+
+    monkeypatch.setattr(bridge.resolver, "resolve_files", resolve_files)
+
+    assert await bridge.resolve_files("thread-files", "the report") == []
+    assert calls == [
+        ("thread-files", tmp_path.resolve(), "the report", "gpt-5.6-luna", "medium")
+    ]
     store.close()
 
 
@@ -1312,6 +1340,106 @@ async def test_plan_completion_hook_uses_authoritative_item_once(
         ("thread-plan", "turn-plan", "plan-1", "1. Inspect\n2. Verify"),
         ("thread-plan", "turn-next", "plan-1", "1. Inspect\n2. Verify"),
     ]
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_tui_plan_approval_hook_uses_live_item_started_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, store = make_bridge(tmp_path)
+    received: list[tuple[str, str]] = []
+
+    async def ingest(_method: str, _params: dict[str, Any]) -> None:
+        pass
+
+    async def turn_started(thread_id: str, turn_id: str) -> None:
+        received.append((thread_id, turn_id))
+
+    monkeypatch.setattr(bridge.projector, "ingest", ingest)
+    bridge.on_tui_plan_approved = turn_started
+
+    await bridge._on_notification(
+        "turn/started",
+        {
+            "threadId": "thread-tui",
+            "turn": {
+                "id": "turn-tui",
+                "status": "inProgress",
+                "items": [],
+            },
+        },
+    )
+    assert received == []
+
+    await bridge._on_notification(
+        "item/started",
+        {
+            "threadId": "thread-tui",
+            "turnId": "turn-tui",
+            "item": {
+                "id": "message-tui",
+                "type": "userMessage",
+                "clientId": None,
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Implement the plan.",
+                        "text_elements": [],
+                    }
+                ],
+            },
+        },
+    )
+
+    assert received == [("thread-tui", "turn-tui")]
+    store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("client_id", "text"),
+    (
+        ("telegram-prompt", "Implement the plan."),
+        ("telegram-queued", "Run queued work"),
+        (None, "Run unrelated work"),
+        ("", "Implement the plan."),
+        (None, " Implement the plan. "),
+    ),
+)
+async def test_tui_plan_approval_hook_ignores_unrelated_items(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client_id: str | None,
+    text: str,
+) -> None:
+    bridge, store = make_bridge(tmp_path)
+    received: list[tuple[str, str]] = []
+
+    async def ingest(_method: str, _params: dict[str, Any]) -> None:
+        pass
+
+    async def turn_started(thread_id: str, turn_id: str) -> None:
+        received.append((thread_id, turn_id))
+
+    monkeypatch.setattr(bridge.projector, "ingest", ingest)
+    bridge.on_tui_plan_approved = turn_started
+
+    await bridge._on_notification(
+        "item/started",
+        {
+            "threadId": "thread-plan",
+            "turnId": "turn-unrelated",
+            "item": {
+                "id": "message-unrelated",
+                "type": "userMessage",
+                "clientId": client_id,
+                "content": [{"type": "text", "text": text, "text_elements": []}],
+            },
+        },
+    )
+
+    assert received == []
     store.close()
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 from pathlib import Path
 from typing import Any
 
@@ -487,6 +488,61 @@ async def test_isolated_fork_questions_are_correlated_and_read_only(tmp_path: Pa
         "fork-one",
         "fork-two",
     }
+    assert not any(method == "thread/read" for method, _ in calls)
+    assert client._ephemeral_thread_ids == set()
+
+
+@pytest.mark.asyncio
+async def test_ephemeral_turn_without_base_thread_uses_notifications_instead_of_thread_read(
+    tmp_path: Path,
+) -> None:
+    client = CodexClient(Path("/tmp/not-used.sock"))
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def request(
+        method: str, params: dict[str, Any], timeout: float = 30.0
+    ) -> dict[str, Any]:
+        del timeout
+        calls.append((method, params))
+        if method == "thread/start":
+            return {"thread": {"id": "resolver-thread", "ephemeral": True}}
+        if method == "turn/start":
+            await client._dispatch_notification(
+                "turn/completed",
+                {
+                    "threadId": "resolver-thread",
+                    "turn": {
+                        "id": "resolver-turn",
+                        "status": "completed",
+                        "items": [
+                            {
+                                "id": "resolver-answer",
+                                "type": "agentMessage",
+                                "text": json.dumps({"paths": ["report.pdf"]}),
+                            }
+                        ],
+                    },
+                },
+            )
+            return {"turn": {"id": "resolver-turn", "status": "inProgress", "items": []}}
+        return {}
+
+    client.request = request  # type: ignore[method-assign]
+
+    answer = await client.run_ephemeral_turn(
+        tmp_path,
+        "Find the resume PDF",
+        output_schema={"type": "object"},
+    )
+
+    assert answer == json.dumps({"paths": ["report.pdf"]})
+    assert not any(method == "thread/read" for method, _ in calls)
+    assert any(
+        method == "thread/start"
+        and params["ephemeral"] is True
+        and params["sandbox"] == "read-only"
+        for method, params in calls
+    )
     assert client._ephemeral_thread_ids == set()
 
 
@@ -545,7 +601,7 @@ async def test_isolated_question_model_override_failure_is_scoped_and_clear(
 
     with pytest.raises(
         RuntimeError,
-        match=r"Configured /ask model or effort was rejected.*gpt-5\.6-luna, max",
+        match=r"Configured utility model or effort was rejected.*gpt-5\.6-luna, max",
     ):
         await client.ask_fork_question(
             "primary",

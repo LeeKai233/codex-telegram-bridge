@@ -35,6 +35,7 @@ _IMMEDIATE_REASONS = {
     "thread/goal/cleared",
     "thread/status/changed",
     "thread/settings/updated",
+    "thread/resynced",
     "turn/plan/updated",
 }
 

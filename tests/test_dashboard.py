@@ -425,6 +425,45 @@ async def test_space_dashboard_edits_channel_and_discussion_concurrently(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_resynced_thread_refreshes_space_dashboard_immediately(tmp_path: Path) -> None:
+    config = replace(
+        Config.default(),
+        config_dir=tmp_path / "config",
+        state_dir=tmp_path / "state",
+        allowed_root=tmp_path,
+    )
+    store = Store(config.database_path)
+    store.create_space(
+        {
+            "space_id": "space-resynced",
+            "lifecycle": "active",
+            "thread_id": "thread-resynced",
+        }
+    )
+    manager = SpaceDashboardManager(
+        config,
+        store,
+        StaticSecurity(),  # type: ignore[arg-type]
+        RecordingEndpoint(),  # type: ignore[arg-type]
+        RecordingEndpoint(),  # type: ignore[arg-type]
+    )
+    scheduled: list[tuple[str, bool]] = []
+
+    async def schedule_space(space_id: str, *, immediate: bool = False) -> None:
+        scheduled.append((space_id, immediate))
+
+    manager.schedule_space = schedule_space  # type: ignore[method-assign]
+
+    await manager.on_thread_change(
+        ThreadState(thread_id="thread-resynced", status="idle"),
+        "thread/resynced",
+    )
+
+    assert scheduled == [("space-resynced", True)]
+    store.close()
+
+
+@pytest.mark.asyncio
 async def test_space_dashboard_start_has_no_periodic_animation_writes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

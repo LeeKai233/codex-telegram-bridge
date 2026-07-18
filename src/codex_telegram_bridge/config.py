@@ -178,8 +178,8 @@ class Config:
     minimum_free_bytes: int = 256_000_000
     control_bot_label: str = "Control Bot"
     discussion_bot_label: str = "Discussion Bot"
-    ask_model: str | None = None
-    ask_reasoning_effort: str | None = None
+    ask_model: str | None = "gpt-5.6-luna"
+    ask_reasoning_effort: str | None = "medium"
 
     def __post_init__(self) -> None:
         for name in ("control_bot_label", "discussion_bot_label"):

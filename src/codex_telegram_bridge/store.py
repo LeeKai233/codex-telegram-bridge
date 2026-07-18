@@ -17,11 +17,14 @@ from typing import Any
 from .config import ensure_private_directory
 from .models import InteractionDraft, Owner, QueuedPrompt, SessionSpace, ThreadState
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 CONTROL_BOT_ROLE = "control"
 _PLAN_PUBLICATION_RESULTS = frozenset({"published", "failed"})
 _PLAN_ACTION_STATUSES = frozenset({"executing", "revising"})
-_PLAN_ACTION_TERMINAL_STATUSES = frozenset({"executed", "revision_started"})
+_PLAN_ACTION_TERMINAL_STATUSES = frozenset({"executed", "revision_started", "dismissed"})
+_PLAN_UI_REPAIR_STATUSES = frozenset(
+    {"published", "executing", "revising", "executed", "revision_started", "dismissed", "superseded"}
+)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS metadata (
@@ -217,7 +220,11 @@ CREATE TABLE IF NOT EXISTS plan_publications (
     thread_id TEXT NOT NULL,
     turn_id TEXT NOT NULL,
     status TEXT NOT NULL,
+    plan_text TEXT NOT NULL DEFAULT '',
     message_ids_json TEXT NOT NULL DEFAULT '[]',
+    action_message_ids_json TEXT NOT NULL DEFAULT '[]',
+    tui_prompt_seen_at INTEGER,
+    decision_turn_id TEXT NOT NULL DEFAULT '',
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     UNIQUE(space_id, generation, item_id, revision_key)
@@ -316,6 +323,28 @@ class Store:
                     "message_ids_json, created_at, updated_at FROM plan_publications_v6"
                 )
                 self._connection.execute("DROP TABLE plan_publications_v6")
+            plan_columns = _columns(self._connection, "plan_publications")
+            plan_additions = {
+                "plan_text": "TEXT NOT NULL DEFAULT ''",
+                "action_message_ids_json": "TEXT NOT NULL DEFAULT '[]'",
+                "tui_prompt_seen_at": "INTEGER",
+                "decision_turn_id": "TEXT NOT NULL DEFAULT ''",
+            }
+            for name, declaration in plan_additions.items():
+                if name not in plan_columns:
+                    self._connection.execute(
+                        f"ALTER TABLE plan_publications ADD COLUMN {name} {declaration}"
+                    )
+            self._connection.execute(
+                "UPDATE plan_publications SET plan_text=COALESCE(("
+                "SELECT json_extract(events.payload_json, '$.item.text') FROM events "
+                "WHERE events.thread_id=plan_publications.thread_id "
+                "AND events.kind IN ('item/completed', 'item/started') "
+                "AND json_extract(events.payload_json, '$.turnId')=plan_publications.turn_id "
+                "AND json_extract(events.payload_json, '$.item.id')=plan_publications.item_id "
+                "AND json_extract(events.payload_json, '$.item.type')='plan' "
+                "ORDER BY events.created_at DESC LIMIT 1), '') WHERE plan_text=''"
+            )
             if _columns(self._connection, "telegram_updates_legacy"):
                 legacy_columns = _columns(self._connection, "telegram_updates_legacy")
                 sequence = "COALESCE(sequence, rowid)" if "sequence" in legacy_columns else "rowid"
@@ -1193,6 +1222,7 @@ class Store:
         revision_key: str = "",
         thread_id: str,
         turn_id: str,
+        plan_text: str = "",
         stale_after: int = 300,
     ) -> bool:
         if not all(value.strip() for value in (space_id, item_id, thread_id, turn_id)):
@@ -1205,8 +1235,8 @@ class Store:
         with self._immediate_transaction() as connection:
             cursor = connection.execute(
                 "INSERT OR IGNORE INTO plan_publications(space_id, generation, item_id, "
-                "revision_key, thread_id, turn_id, status, created_at, updated_at) "
-                "VALUES(?, ?, ?, ?, ?, ?, 'publishing', ?, ?)",
+                "revision_key, thread_id, turn_id, status, plan_text, created_at, updated_at) "
+                "VALUES(?, ?, ?, ?, ?, ?, 'publishing', ?, ?, ?)",
                 (
                     space_id,
                     int(generation),
@@ -1214,6 +1244,7 @@ class Store:
                     revision_key,
                     thread_id,
                     turn_id,
+                    plan_text,
                     now,
                     now,
                 ),
@@ -1242,8 +1273,10 @@ class Store:
                     return False
                 retry = connection.execute(
                     "UPDATE plan_publications SET status='publishing', message_ids_json='[]', "
-                    "thread_id=?, turn_id=?, updated_at=? WHERE id=? AND status=? AND updated_at=?",
-                    (thread_id, turn_id, now, publication_id, str(row[1]), int(row[2])),
+                    "action_message_ids_json='[]', tui_prompt_seen_at=NULL, decision_turn_id='', "
+                    "thread_id=?, turn_id=?, plan_text=?, updated_at=? "
+                    "WHERE id=? AND status=? AND updated_at=?",
+                    (thread_id, turn_id, plan_text, now, publication_id, str(row[1]), int(row[2])),
                 )
                 if retry.rowcount != 1:
                     return False
@@ -1287,24 +1320,42 @@ class Store:
     def latest_plan_publication(self, space_id: str, generation: int) -> dict[str, Any] | None:
         with self._lock:
             row = self._connection.execute(
-                "SELECT item_id, revision_key, thread_id, turn_id, status, message_ids_json, created_at, "
-                "updated_at FROM plan_publications WHERE space_id=? AND generation=? "
+                "SELECT item_id, revision_key, thread_id, turn_id, status, plan_text, "
+                "message_ids_json, action_message_ids_json, tui_prompt_seen_at, decision_turn_id, "
+                "created_at, updated_at FROM plan_publications WHERE space_id=? AND generation=? "
                 "ORDER BY id DESC LIMIT 1",
                 (space_id, int(generation)),
             ).fetchone()
         if row is None:
             return None
+        return self._plan_publication_from_row(row, space_id=space_id, generation=generation)
+
+    @staticmethod
+    def _plan_publication_from_row(
+        row: sqlite3.Row | tuple[Any, ...], *, space_id: str | None = None, generation: int | None = None
+    ) -> dict[str, Any]:
+        offset = 0
+        if space_id is None or generation is None:
+            space_id = str(row[0])
+            generation = int(row[1])
+            offset = 2
         return {
             "space_id": space_id,
-            "generation": int(generation),
-            "item_id": str(row[0]),
-            "revision_key": str(row[1]),
-            "thread_id": str(row[2]),
-            "turn_id": str(row[3]),
-            "status": str(row[4]),
-            "message_ids": json.loads(str(row[5])),
-            "created_at": int(row[6]),
-            "updated_at": int(row[7]),
+            "generation": generation,
+            "item_id": str(row[offset]),
+            "revision_key": str(row[offset + 1]),
+            "thread_id": str(row[offset + 2]),
+            "turn_id": str(row[offset + 3]),
+            "status": str(row[offset + 4]),
+            "plan_text": str(row[offset + 5]),
+            "message_ids": json.loads(str(row[offset + 6])),
+            "action_message_ids": json.loads(str(row[offset + 7])),
+            "tui_prompt_seen_at": (
+                int(row[offset + 8]) if row[offset + 8] is not None else None
+            ),
+            "decision_turn_id": str(row[offset + 9]),
+            "created_at": int(row[offset + 10]),
+            "updated_at": int(row[offset + 11]),
         }
 
     def mark_plan_action(
@@ -1377,6 +1428,7 @@ class Store:
         revision_key: str = "",
         expected_status: str,
         status: str,
+        decision_turn_id: str = "",
     ) -> bool:
         if expected_status not in _PLAN_ACTION_STATUSES:
             raise ValueError("Plan action status is invalid")
@@ -1384,12 +1436,13 @@ class Store:
             raise ValueError("Plan action terminal status is invalid")
         with self._lock, self._connection:
             cursor = self._connection.execute(
-                "UPDATE plan_publications SET status=?, updated_at=? "
+                "UPDATE plan_publications SET status=?, decision_turn_id=?, updated_at=? "
                 "WHERE space_id=? AND generation=? AND item_id=? AND revision_key=? AND status=? "
                 "AND id=(SELECT MAX(id) FROM plan_publications "
                 "WHERE space_id=? AND generation=?)",
                 (
                     status,
+                    decision_turn_id,
                     int(time.time()),
                     space_id,
                     int(generation),
@@ -1401,6 +1454,157 @@ class Store:
                 ),
             )
         return cursor.rowcount == 1
+
+    def mark_external_plan_action(
+        self,
+        space_id: str,
+        generation: int,
+        item_id: str,
+        *,
+        revision_key: str = "",
+        status: str = "executed",
+        decision_turn_id: str = "",
+        expected_statuses: set[str] | frozenset[str] = frozenset({"published"}),
+    ) -> bool:
+        if status not in _PLAN_ACTION_TERMINAL_STATUSES:
+            raise ValueError("Plan action terminal status is invalid")
+        selected = frozenset(str(value) for value in expected_statuses)
+        allowed = frozenset({"published"}) | _PLAN_ACTION_STATUSES
+        if not selected or not selected <= allowed:
+            raise ValueError("Plan action expected status is invalid")
+        placeholders = ",".join("?" for _ in selected)
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                "UPDATE plan_publications SET status=?, decision_turn_id=?, updated_at=? "
+                "WHERE space_id=? AND generation=? AND item_id=? AND revision_key=? "
+                f"AND status IN ({placeholders}) AND id=(SELECT MAX(id) FROM plan_publications "
+                "WHERE space_id=? AND generation=?)",
+                (
+                    status,
+                    decision_turn_id,
+                    int(time.time()),
+                    space_id,
+                    int(generation),
+                    item_id,
+                    revision_key,
+                    *sorted(selected),
+                    space_id,
+                    int(generation),
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def mark_tui_plan_prompt_seen(
+        self, space_id: str, generation: int, item_id: str, *, revision_key: str = ""
+    ) -> bool:
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                "UPDATE plan_publications SET tui_prompt_seen_at=COALESCE(tui_prompt_seen_at, ?), "
+                "updated_at=? WHERE space_id=? AND generation=? AND item_id=? AND revision_key=? "
+                "AND status='published' AND id=(SELECT MAX(id) FROM plan_publications "
+                "WHERE space_id=? AND generation=?)",
+                (
+                    int(time.time()),
+                    int(time.time()),
+                    space_id,
+                    int(generation),
+                    item_id,
+                    revision_key,
+                    space_id,
+                    int(generation),
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def append_plan_action_message(
+        self,
+        space_id: str,
+        generation: int,
+        item_id: str,
+        message_id: int,
+        *,
+        revision_key: str = "",
+    ) -> bool:
+        with self._lock, self._connection:
+            row = self._connection.execute(
+                "SELECT action_message_ids_json FROM plan_publications WHERE space_id=? "
+                "AND generation=? AND item_id=? AND revision_key=?",
+                (space_id, int(generation), item_id, revision_key),
+            ).fetchone()
+            if row is None:
+                return False
+            values = [int(value) for value in json.loads(str(row[0]))]
+            if int(message_id) not in values:
+                values.append(int(message_id))
+            cursor = self._connection.execute(
+                "UPDATE plan_publications SET action_message_ids_json=?, updated_at=? "
+                "WHERE space_id=? AND generation=? AND item_id=? AND revision_key=?",
+                (
+                    json.dumps(values),
+                    int(time.time()),
+                    space_id,
+                    int(generation),
+                    item_id,
+                    revision_key,
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def retire_plan_callbacks(self, space_id: str, generation: int) -> int:
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                "UPDATE callbacks SET used_at=? WHERE space_id=? AND generation=? "
+                "AND used_at IS NULL AND action IN ('plan_execute', 'plan_continue')",
+                (int(time.time()), space_id, int(generation)),
+            )
+        return int(cursor.rowcount)
+
+    def retire_stale_plan_callbacks(
+        self, space_id: str, generation: int, item_id: str, revision_key: str
+    ) -> int:
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                "UPDATE callbacks SET used_at=? WHERE space_id=? AND generation=? "
+                "AND used_at IS NULL AND action IN ('plan_execute', 'plan_continue') "
+                "AND (json_extract(payload_json, '$.item_id')<>? "
+                "OR json_extract(payload_json, '$.revision_key')<>?)",
+                (int(time.time()), space_id, int(generation), item_id, revision_key),
+            )
+        return int(cursor.rowcount)
+
+    def find_tui_plan_approval_turn(
+        self, thread_id: str, *, after: int, prompt: str
+    ) -> str | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT json_extract(payload_json, '$.turnId') FROM events WHERE thread_id=? "
+                "AND created_at>=? AND kind='item/started' "
+                "AND json_extract(payload_json, '$.item.type')='userMessage' "
+                "AND json_extract(payload_json, '$.item.clientId') IS NULL "
+                "AND json_extract(payload_json, '$.item.content[0].type')='text' "
+                "AND json_extract(payload_json, '$.item.content[0].text')=? "
+                "ORDER BY created_at, rowid LIMIT 1",
+                (thread_id, int(after), prompt),
+            ).fetchone()
+        return str(row[0]) if row is not None and row[0] else None
+
+    def plan_publications_for_ui_repair(self) -> list[dict[str, Any]]:
+        placeholders = ",".join("?" for _ in _PLAN_UI_REPAIR_STATUSES)
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT publications.space_id, publications.generation, publications.item_id, "
+                "publications.revision_key, publications.thread_id, publications.turn_id, "
+                "publications.status, publications.plan_text, publications.message_ids_json, "
+                "publications.action_message_ids_json, publications.tui_prompt_seen_at, "
+                "publications.decision_turn_id, publications.created_at, publications.updated_at "
+                "FROM plan_publications AS publications JOIN session_spaces AS spaces "
+                "ON spaces.space_id=publications.space_id "
+                "AND spaces.generation=publications.generation "
+                "WHERE spaces.lifecycle='active' "
+                f"AND publications.status IN ({placeholders}) ORDER BY publications.id",
+                tuple(sorted(_PLAN_UI_REPAIR_STATUSES)),
+            ).fetchall()
+        return [self._plan_publication_from_row(row) for row in rows]
 
     def executing_plan_publications(self) -> list[dict[str, Any]]:
         return self.recoverable_plan_publications({"executing"})
@@ -1415,25 +1619,12 @@ class Store:
         with self._lock:
             rows = self._connection.execute(
                 "SELECT space_id, generation, item_id, revision_key, thread_id, turn_id, status, "
-                "message_ids_json, created_at, updated_at FROM plan_publications "
+                "plan_text, message_ids_json, action_message_ids_json, tui_prompt_seen_at, "
+                "decision_turn_id, created_at, updated_at FROM plan_publications "
                 f"WHERE status IN ({placeholders}) ORDER BY updated_at, id",
                 tuple(sorted(selected)),
             ).fetchall()
-        return [
-            {
-                "space_id": str(row[0]),
-                "generation": int(row[1]),
-                "item_id": str(row[2]),
-                "revision_key": str(row[3]),
-                "thread_id": str(row[4]),
-                "turn_id": str(row[5]),
-                "status": str(row[6]),
-                "message_ids": json.loads(str(row[7])),
-                "created_at": int(row[8]),
-                "updated_at": int(row[9]),
-            }
-            for row in rows
-        ]
+        return [self._plan_publication_from_row(row) for row in rows]
 
     @staticmethod
     def _interaction_from_row(row: sqlite3.Row) -> InteractionDraft:

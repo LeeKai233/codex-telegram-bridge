@@ -12,12 +12,14 @@ from typing import Any
 import pytest
 from telegram import Chat, ForceReply, MessageOriginChannel
 from telegram.constants import ChatType, ParseMode
+from telegram.error import TelegramError
 from telegram.ext import ApplicationHandlerStop
 
 from codex_telegram_bridge.config import Config
 from codex_telegram_bridge.control_bot import ControlBotController
 from codex_telegram_bridge.deletions import MessageDeletionManager
 from codex_telegram_bridge.discussion_bot import DiscussionBotController
+from codex_telegram_bridge.files import FileCandidate
 from codex_telegram_bridge.metrics import MetricsSnapshot
 from codex_telegram_bridge.models import (
     ModelOption,
@@ -80,6 +82,12 @@ class RecordingEndpoint:
     async def edit_text(self, chat_id: int, message_id: int, markdown: str, **kwargs: Any) -> Any:
         self.edited.append(
             {"chat_id": chat_id, "message_id": message_id, "markdown": markdown, **kwargs}
+        )
+        return True
+
+    async def edit_reply_markup(self, chat_id: int, message_id: int, **kwargs: Any) -> Any:
+        self.edited.append(
+            {"chat_id": chat_id, "message_id": message_id, "reply_markup": kwargs.get("reply_markup")}
         )
         return True
 
@@ -512,6 +520,24 @@ def add_active_space(
         space_id,
     )
     return space
+
+
+def record_tui_plan_approval(rig: Rig, thread_id: str, turn_id: str) -> None:
+    assert rig.store.record_event(
+        f"tui-plan-approval:{turn_id}",
+        thread_id,
+        "item/started",
+        {
+            "threadId": thread_id,
+            "turnId": turn_id,
+            "item": {
+                "id": f"item-{turn_id}",
+                "type": "userMessage",
+                "clientId": None,
+                "content": [{"type": "text", "text": "Implement the plan."}],
+            },
+        },
+    )
 
 
 @pytest.mark.asyncio
@@ -1291,10 +1317,14 @@ async def test_plan_article_buttons_preserve_nonce_while_locked_then_execute_onc
     )
 
     article = rig.discussion_endpoint.sent[-1]
+    article_message_id = rig.discussion_endpoint.next_message_id - 1
     assert article["parse_mode"] == ParseMode.HTML
     assert "<b>Build plan</b>" in article["markdown"]
     assert "<unsafe>" not in article["markdown"]
-    execute, revise = article["reply_markup"].inline_keyboard[0]
+    execute, revise = (
+        article["reply_markup"].inline_keyboard[0][0],
+        article["reply_markup"].inline_keyboard[1][0],
+    )
     assert [execute.text, revise.text] == ["批准并执行", "继续完善计划"]
     execute_nonce = str(execute.callback_data)[3:]
     expiry = rig.store._connection.execute(  # noqa: SLF001
@@ -1330,6 +1360,12 @@ async def test_plan_article_buttons_preserve_nonce_while_locked_then_execute_onc
         chat_id=DISCUSSION_CHAT_ID,
     ) is None
     assert rig.store.latest_plan_publication("space-plan", 1)["status"] == "executed"
+    assert any(
+        edit["reply_markup"] is None
+        and edit["message_id"] == article_message_id
+        for edit in rig.discussion_endpoint.edited
+        if "reply_markup" in edit
+    )
 
     await rig.discussion.callback(update, SimpleNamespace())
     assert len(rig.bridge.collaboration_calls) == 1
@@ -1384,6 +1420,586 @@ async def test_plan_callback_uses_callback_message_chat_for_real_telegram_update
 
 
 @pytest.mark.asyncio
+async def test_tui_plan_selection_retires_telegram_actions(rig: Rig) -> None:
+    add_active_space(
+        rig,
+        space_id="space-plan-tui",
+        thread_id="thread-plan-tui",
+        root_message_id=527,
+        channel_post_id=127,
+    )
+    await rig.discussion.plan_completed(
+        "thread-plan-tui",
+        "turn-plan",
+        "item-plan",
+        "Execute this from the TUI.",
+    )
+    article = rig.discussion_endpoint.sent[-1]
+    article_message_id = rig.discussion_endpoint.next_message_id - 1
+    execute = article["reply_markup"].inline_keyboard[0][0]
+
+    await rig.discussion.plan_turn_started("thread-plan-tui", "turn-tui")
+
+    publication = rig.store.latest_plan_publication("space-plan-tui", 1)
+    assert publication is not None and publication["status"] == "executed"
+    assert rig.store.peek_callback(
+        str(execute.callback_data)[3:],
+        OWNER_ID,
+        bot_role=DISCUSSION_ROLE,
+        chat_id=DISCUSSION_CHAT_ID,
+    ) is None
+    assert any(
+        edit.get("message_id") == article_message_id
+        and edit.get("reply_markup") is None
+        and "已批准并开始执行" in edit.get("markdown", "")
+        for edit in rig.discussion_endpoint.edited
+    )
+
+
+@pytest.mark.asyncio
+async def test_tui_plan_prompt_disappearance_deletes_every_plan_chunk(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class PromptSequence:
+        def __init__(self) -> None:
+            self.states = iter((True, False))
+
+        async def plan_prompt_visible(self, _thread_id: str) -> bool:
+            return next(self.states, False)
+
+    rig.bridge.tmux = PromptSequence()
+    monkeypatch.setattr(
+        "codex_telegram_bridge.discussion_bot._PLAN_PROMPT_POLL_SECONDS", 0
+    )
+    monkeypatch.setattr(
+        "codex_telegram_bridge.discussion_bot._PLAN_DECISION_GRACE_SECONDS", 0
+    )
+    add_active_space(
+        rig,
+        space_id="space-plan-dismissed",
+        thread_id="thread-plan-dismissed",
+        root_message_id=529,
+        channel_post_id=129,
+    )
+    text = "\n\n".join(
+        f"{index}. Verify deletion for chunk {index}: " + "detail " * 80
+        for index in range(1, 16)
+    )
+
+    await rig.discussion.plan_completed(
+        "thread-plan-dismissed",
+        "turn-plan",
+        "item-plan",
+        text,
+    )
+    tasks = list(rig.discussion._plan_prompt_tasks.values())  # noqa: SLF001
+    assert tasks
+    await asyncio.gather(*tasks)
+
+    publication = rig.store.latest_plan_publication("space-plan-dismissed", 1)
+    assert publication is not None and publication["status"] == "dismissed"
+    assert len(publication["message_ids"]) > 1
+    assert set(publication["message_ids"]) == {
+        message_id
+        for chat_id, message_id in rig.discussion_endpoint.deleted
+        if chat_id == DISCUSSION_CHAT_ID
+    }
+
+
+@pytest.mark.asyncio
+async def test_unobserved_absent_tui_prompt_keeps_plan_actions(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checked = asyncio.Event()
+
+    class MissingPrompt:
+        async def plan_prompt_visible(self, _thread_id: str) -> bool:
+            checked.set()
+            return False
+
+    rig.bridge.tmux = MissingPrompt()
+    monkeypatch.setattr(
+        "codex_telegram_bridge.discussion_bot._PLAN_PROMPT_POLL_SECONDS", 0.01
+    )
+    add_active_space(
+        rig,
+        space_id="space-plan-unobserved",
+        thread_id="thread-plan-unobserved",
+        root_message_id=530,
+        channel_post_id=130,
+    )
+    await rig.discussion.plan_completed(
+        "thread-plan-unobserved",
+        "turn-plan",
+        "item-plan",
+        "Keep this actionable.",
+    )
+    await asyncio.wait_for(checked.wait(), timeout=1)
+    await asyncio.sleep(0)
+
+    publication = rig.store.latest_plan_publication("space-plan-unobserved", 1)
+    assert publication is not None and publication["status"] == "published"
+    assert publication["tui_prompt_seen_at"] is None
+    assert rig.discussion_endpoint.deleted == []
+    await rig.discussion.stop()
+
+
+@pytest.mark.asyncio
+async def test_telegram_plan_choices_update_the_original_articles(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "codex_telegram_bridge.discussion_bot._PLAN_DECISION_GRACE_SECONDS", 0
+    )
+    execute_space = add_active_space(
+        rig,
+        space_id="space-plan-article-execute",
+        thread_id="thread-plan-article-execute",
+        root_message_id=534,
+        channel_post_id=134,
+    )
+    await rig.discussion.plan_completed(
+        "thread-plan-article-execute",
+        "turn-plan",
+        "item-plan",
+        "Execute this article plan.",
+    )
+    execute_article_id = rig.discussion_endpoint.next_message_id - 1
+    execute_publication = rig.store.latest_plan_publication(
+        "space-plan-article-execute", 1
+    )
+    assert execute_publication is not None
+
+    await rig.discussion._execute_plan(
+        execute_space,
+        {
+            "item_id": "item-plan",
+            "revision_key": execute_publication["revision_key"],
+            "thread_id": "thread-plan-article-execute",
+            "turn_id": "turn-plan",
+        },
+    )
+
+    assert any(
+        edit.get("message_id") == execute_article_id
+        and edit.get("reply_markup") is None
+        and "已批准并开始执行" in edit.get("markdown", "")
+        for edit in rig.discussion_endpoint.edited
+    )
+
+    revise_space = add_active_space(
+        rig,
+        space_id="space-plan-article-revise",
+        thread_id="thread-plan-article-revise",
+        root_message_id=535,
+        channel_post_id=135,
+    )
+    await rig.discussion.plan_completed(
+        "thread-plan-article-revise",
+        "turn-plan",
+        "item-plan",
+        "Revise this article plan.",
+    )
+    revise_article_id = rig.discussion_endpoint.next_message_id - 1
+    revise_publication = rig.store.latest_plan_publication(
+        "space-plan-article-revise", 1
+    )
+    assert revise_publication is not None
+
+    await rig.discussion._begin_plan_revision(
+        revise_space,
+        {
+            "item_id": "item-plan",
+            "revision_key": revise_publication["revision_key"],
+            "thread_id": "thread-plan-article-revise",
+            "turn_id": "turn-plan",
+        },
+    )
+
+    assert any(
+        edit.get("message_id") == revise_article_id
+        and edit.get("reply_markup") is None
+        and "已选择继续完善计划" in edit.get("markdown", "")
+        for edit in rig.discussion_endpoint.edited
+    )
+    await rig.discussion.stop()
+
+
+@pytest.mark.asyncio
+async def test_new_plan_marks_superseded_article_and_retires_old_callback(
+    rig: Rig,
+) -> None:
+    add_active_space(
+        rig,
+        space_id="space-plan-superseded-ui",
+        thread_id="thread-plan-superseded-ui",
+        root_message_id=536,
+        channel_post_id=136,
+    )
+    await rig.discussion.plan_completed(
+        "thread-plan-superseded-ui",
+        "turn-plan",
+        "item-plan",
+        "First article plan.",
+    )
+    first_article_id = rig.discussion_endpoint.next_message_id - 1
+    first_button = rig.discussion_endpoint.sent[-1]["reply_markup"].inline_keyboard[0][0]
+
+    await rig.discussion.plan_completed(
+        "thread-plan-superseded-ui",
+        "turn-plan",
+        "item-plan",
+        "Second article plan.",
+    )
+
+    assert any(
+        edit.get("message_id") == first_article_id
+        and edit.get("reply_markup") is None
+        and "已被更新版本替代" in edit.get("markdown", "")
+        for edit in rig.discussion_endpoint.edited
+    )
+    assert rig.store.peek_callback(
+        str(first_button.callback_data)[3:],
+        OWNER_ID,
+        bot_role=DISCUSSION_ROLE,
+        chat_id=DISCUSSION_CHAT_ID,
+    ) is None
+    await rig.discussion.stop()
+
+
+@pytest.mark.asyncio
+async def test_startup_repairs_plan_from_historical_exact_tui_approval(rig: Rig) -> None:
+    add_active_space(
+        rig,
+        space_id="space-plan-startup-tui",
+        thread_id="thread-plan-startup-tui",
+        root_message_id=537,
+        channel_post_id=137,
+    )
+    await rig.discussion.plan_completed(
+        "thread-plan-startup-tui",
+        "turn-plan",
+        "item-plan",
+        "Repair this plan on startup.",
+    )
+    article_id = rig.discussion_endpoint.next_message_id - 1
+    execute_button = rig.discussion_endpoint.sent[-1]["reply_markup"].inline_keyboard[0][0]
+    record_tui_plan_approval(
+        rig,
+        "thread-plan-startup-tui",
+        "turn-tui-startup",
+    )
+
+    await rig.discussion._repair_plan_publications()
+
+    publication = rig.store.latest_plan_publication("space-plan-startup-tui", 1)
+    assert publication is not None
+    assert publication["status"] == "executed"
+    assert publication["decision_turn_id"] == "turn-tui-startup"
+    assert rig.bridge.collaboration_calls == []
+    assert rig.store.peek_callback(
+        str(execute_button.callback_data)[3:],
+        OWNER_ID,
+        bot_role=DISCUSSION_ROLE,
+        chat_id=DISCUSSION_CHAT_ID,
+    ) is None
+    assert any(
+        edit.get("message_id") == article_id
+        and edit.get("reply_markup") is None
+        and "已批准并开始执行" in edit.get("markdown", "")
+        for edit in rig.discussion_endpoint.edited
+    )
+
+
+@pytest.mark.asyncio
+async def test_tg_tui_plan_race_does_not_start_a_second_collaboration_turn(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    space = add_active_space(
+        rig,
+        space_id="space-plan-tg-tui-race",
+        thread_id="thread-plan-tg-tui-race",
+        root_message_id=538,
+        channel_post_id=138,
+    )
+    await rig.discussion.plan_completed(
+        "thread-plan-tg-tui-race",
+        "turn-plan",
+        "item-plan",
+        "Approve this plan once.",
+    )
+    publication = rig.store.latest_plan_publication("space-plan-tg-tui-race", 1)
+    assert publication is not None
+
+    async def approve_from_tui(thread_id: str) -> None:
+        record_tui_plan_approval(rig, thread_id, "turn-tui-race")
+        await rig.discussion.plan_turn_started(thread_id, "turn-tui-race")
+
+    monkeypatch.setattr(rig.discussion, "_dismiss_tmux_plan_prompt", approve_from_tui)
+    monkeypatch.setattr(
+        "codex_telegram_bridge.discussion_bot._PLAN_DECISION_GRACE_SECONDS", 0
+    )
+
+    await rig.discussion._execute_plan(
+        space,
+        {
+            "item_id": "item-plan",
+            "revision_key": publication["revision_key"],
+            "thread_id": "thread-plan-tg-tui-race",
+            "turn_id": "turn-plan",
+        },
+    )
+
+    current = rig.store.latest_plan_publication("space-plan-tg-tui-race", 1)
+    assert current is not None
+    assert current["status"] == "executed"
+    assert current["decision_turn_id"] == "turn-tui-race"
+    assert rig.bridge.collaboration_calls == []
+
+
+@pytest.mark.asyncio
+async def test_startup_replays_failed_dismissed_plan_message_deletion(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    space = add_active_space(
+        rig,
+        space_id="space-plan-dismiss-replay",
+        thread_id="thread-plan-dismiss-replay",
+        root_message_id=539,
+        channel_post_id=139,
+    )
+    plan_text = "\n\n".join(
+        f"{index}. Replay deletion chunk {index}: " + "detail " * 80
+        for index in range(1, 16)
+    )
+    await rig.discussion.plan_completed(
+        "thread-plan-dismiss-replay",
+        "turn-plan",
+        "item-plan",
+        plan_text,
+    )
+    publication = rig.store.latest_plan_publication("space-plan-dismiss-replay", 1)
+    assert publication is not None
+    assert rig.store.mark_external_plan_action(
+        "space-plan-dismiss-replay",
+        1,
+        "item-plan",
+        revision_key=publication["revision_key"],
+        status="dismissed",
+    )
+    await rig.discussion._cancel_plan_prompt_monitor(publication)
+    failed_ids: list[int] = []
+
+    async def fail_delete(
+        _chat_id: int, message_id: int, *, priority: int = 0
+    ) -> bool:
+        del priority
+        failed_ids.append(message_id)
+        return False
+
+    original_delete = rig.discussion_endpoint.delete_message
+    monkeypatch.setattr(rig.discussion_endpoint, "delete_message", fail_delete)
+    await rig.discussion._repair_plan_publications()
+
+    assert set(failed_ids) == set(publication["message_ids"])
+    assert rig.discussion_endpoint.deleted == []
+
+    monkeypatch.setattr(rig.discussion_endpoint, "delete_message", original_delete)
+    await rig.discussion._repair_plan_publications()
+
+    assert set(publication["message_ids"]) == {
+        message_id
+        for chat_id, message_id in rig.discussion_endpoint.deleted
+        if chat_id == int(space["discussion_chat_id"])
+    }
+
+
+@pytest.mark.asyncio
+async def test_getfile_reports_resolver_timeout_in_the_discussion(rig: Rig) -> None:
+    space = add_active_space(
+        rig,
+        space_id="space-getfile-timeout",
+        thread_id="thread-getfile-timeout",
+        root_message_id=526,
+        channel_post_id=126,
+    )
+
+    async def resolve_files(_thread_id: str, _description: str) -> list[Any]:
+        raise TimeoutError
+
+    rig.bridge.resolve_files = resolve_files  # type: ignore[attr-defined]
+    rig.discussion._require_active_unlocked = lambda _update: space  # type: ignore[method-assign]
+
+    await rig.discussion.getfile(
+        SimpleNamespace(
+            effective_message=SimpleNamespace(text="/getfile report", caption=None)
+        ),
+        SimpleNamespace(),
+    )
+
+    assert "正在查找并校验文件" in rig.discussion_endpoint.sent[-1]["markdown"]
+    assert "文件搜索超时" in rig.discussion_endpoint.edited[-1]["markdown"]
+
+
+@pytest.mark.asyncio
+async def test_getfile_sends_progress_before_resolver_finishes(rig: Rig) -> None:
+    space = add_active_space(
+        rig,
+        space_id="space-getfile-progress",
+        thread_id="thread-getfile-progress",
+        root_message_id=527,
+        channel_post_id=127,
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def resolve_files(_thread_id: str, _description: str) -> list[Any]:
+        started.set()
+        await release.wait()
+        return []
+
+    rig.bridge.resolve_files = resolve_files  # type: ignore[attr-defined]
+    rig.discussion._require_active_unlocked = lambda _update: space  # type: ignore[method-assign]
+    task = asyncio.create_task(
+        rig.discussion.getfile(
+            SimpleNamespace(
+                effective_message=SimpleNamespace(text="/getfile report", caption=None)
+            ),
+            SimpleNamespace(),
+        )
+    )
+
+    await started.wait()
+    assert "正在查找并校验文件" in rig.discussion_endpoint.sent[-1]["markdown"]
+    assert rig.discussion_endpoint.edited == []
+    release.set()
+    await task
+
+    assert "没有找到" in rig.discussion_endpoint.edited[-1]["markdown"]
+
+
+@pytest.mark.asyncio
+async def test_getfile_edit_failure_resends_result_and_deletes_progress(rig: Rig) -> None:
+    space = add_active_space(
+        rig,
+        space_id="space-getfile-fallback",
+        thread_id="thread-getfile-fallback",
+        root_message_id=528,
+        channel_post_id=128,
+    )
+
+    async def resolve_files(_thread_id: str, _description: str) -> list[Any]:
+        return []
+
+    async def edit_text(_chat_id: int, _message_id: int, _markdown: str, **_kwargs: Any) -> Any:
+        raise TelegramError("edit failed")
+
+    rig.bridge.resolve_files = resolve_files  # type: ignore[attr-defined]
+    rig.discussion._require_active_unlocked = lambda _update: space  # type: ignore[method-assign]
+    rig.discussion_endpoint.edit_text = edit_text  # type: ignore[method-assign]
+
+    await rig.discussion.getfile(
+        SimpleNamespace(
+            effective_message=SimpleNamespace(text="/getfile report", caption=None)
+        ),
+        SimpleNamespace(),
+    )
+
+    assert "正在查找并校验文件" in rig.discussion_endpoint.sent[-2]["markdown"]
+    assert "没有找到" in rig.discussion_endpoint.sent[-1]["markdown"]
+    assert rig.discussion_endpoint.deleted[-1] == (
+        int(space["discussion_chat_id"]),
+        2000,
+    )
+
+
+@pytest.mark.asyncio
+async def test_getfile_edits_progress_into_scoped_file_choice(rig: Rig, tmp_path: Path) -> None:
+    space = add_active_space(
+        rig,
+        space_id="space-getfile-success",
+        thread_id="thread-getfile-success",
+        root_message_id=529,
+        channel_post_id=129,
+    )
+    report = tmp_path / "report.pdf"
+    report.write_bytes(b"pdf")
+    metadata = report.stat()
+    candidate = FileCandidate(
+        path=report,
+        size=metadata.st_size,
+        modified_at=int(metadata.st_mtime),
+        device=metadata.st_dev,
+        inode=metadata.st_ino,
+        modified_ns=metadata.st_mtime_ns,
+    )
+
+    async def resolve_files(_thread_id: str, _description: str) -> list[FileCandidate]:
+        return [candidate]
+
+    rig.bridge.resolve_files = resolve_files  # type: ignore[attr-defined]
+    rig.discussion._require_active_unlocked = lambda _update: space  # type: ignore[method-assign]
+
+    await rig.discussion.getfile(
+        SimpleNamespace(
+            effective_message=SimpleNamespace(text="/getfile report", caption=None)
+        ),
+        SimpleNamespace(),
+    )
+
+    edit = rig.discussion_endpoint.edited[-1]
+    assert "请选择要发送的文件" in edit["markdown"]
+    button = edit["reply_markup"].inline_keyboard[0][0]
+    callback = rig.store.peek_callback(
+        str(button.callback_data)[3:],
+        OWNER_ID,
+        bot_role=DISCUSSION_ROLE,
+        chat_id=int(space["discussion_chat_id"]),
+        space_id=str(space["space_id"]),
+        generation=int(space["generation"]),
+    )
+    assert callback is not None
+    action, payload = callback
+    assert action == "send_file"
+    assert payload["path"] == str(report)
+    assert payload["inode"] == metadata.st_ino
+    assert payload["modified_ns"] == metadata.st_mtime_ns
+
+
+@pytest.mark.asyncio
+async def test_getfile_discards_result_after_space_generation_changes(rig: Rig) -> None:
+    space = add_active_space(
+        rig,
+        space_id="space-getfile-stale",
+        thread_id="thread-getfile-stale",
+        root_message_id=530,
+        channel_post_id=130,
+    )
+
+    async def resolve_files(_thread_id: str, _description: str) -> list[Any]:
+        assert rig.store.close_space(
+            str(space["space_id"]), expected_generation=int(space["generation"])
+        ) is not None
+        return []
+
+    rig.bridge.resolve_files = resolve_files  # type: ignore[attr-defined]
+    rig.discussion._require_active_unlocked = lambda _update: space  # type: ignore[method-assign]
+
+    await rig.discussion.getfile(
+        SimpleNamespace(
+            effective_message=SimpleNamespace(text="/getfile report", caption=None)
+        ),
+        SimpleNamespace(),
+    )
+
+    assert rig.discussion_endpoint.edited == []
+    assert rig.discussion_endpoint.deleted[-1] == (
+        int(space["discussion_chat_id"]),
+        2000,
+    )
+
+
+@pytest.mark.asyncio
 async def test_command_approval_is_forwarded_and_consumed_from_discussion_callback(
     rig: Rig,
 ) -> None:
@@ -1430,21 +2046,25 @@ async def test_command_approval_is_forwarded_and_consumed_from_discussion_callba
 
     message = rig.discussion_endpoint.sent[-1]
     assert "请求执行命令" in message["markdown"]
-    assert [button.text for button in message["reply_markup"].inline_keyboard[0]] == [
+    assert [
+        button.text
+        for row in message["reply_markup"].inline_keyboard
+        for button in row
+    ] == [
         "批准执行",
         "本 Session 放行",
         "拒绝",
     ]
     approval_messages = rig.store.question_messages(request_key)
     assert len(approval_messages) == 1
-    assert approval_messages[0]["message_kind"] == "approval"
+    assert approval_messages[0]["message_kind"] == "summary_anchor"
 
     rig.security.unlocked.add("space-command-approval")
-    button = message["reply_markup"].inline_keyboard[0][1]
+    button = message["reply_markup"].inline_keyboard[1][0]
     callback_message = SimpleNamespace(
         chat=SimpleNamespace(id=DISCUSSION_CHAT_ID, type=ChatType.SUPERGROUP),
         chat_id=DISCUSSION_CHAT_ID,
-        message_id=message["reply_parameters"].message_id if message["reply_parameters"] else 2030,
+        message_id=rig.discussion_endpoint.next_message_id - 1,
         message_thread_id=529,
         reply_to_message=None,
         text=None,
@@ -1471,6 +2091,9 @@ async def test_command_approval_is_forwarded_and_consumed_from_discussion_callba
         chat_id=DISCUSSION_CHAT_ID,
     ) is None
     assert "已批准本 Session" in rig.discussion_endpoint.sent[-1]["markdown"]
+    await rig.discussion.question_resolved(request_key)
+    assert "Codex 命令审批 · 已处理" in rig.discussion_endpoint.edited[-1]["markdown"]
+    assert rig.discussion_endpoint.deleted == []
 
 
 @pytest.mark.asyncio
@@ -1832,7 +2455,10 @@ async def test_failed_plan_execute_is_not_dispatched_twice(rig: Rig) -> None:
         await rig.discussion._execute_plan(space, payload)
 
     assert len(rig.bridge.collaboration_calls) == 1
-    assert "暂停自动重试" in rig.discussion_endpoint.sent[-1]["markdown"]
+    assert any(
+        "送达状态待确认" in edit.get("markdown", "")
+        for edit in rig.discussion_endpoint.edited
+    )
 
 
 @pytest.mark.asyncio
@@ -1918,13 +2544,13 @@ async def test_republished_plan_with_reused_item_rejects_old_button_without_cons
     await rig.discussion.callback(old_update, SimpleNamespace())
 
     assert rig.bridge.collaboration_calls == []
-    assert "已过期" in rig.discussion_endpoint.callback_answers[-1]["text"]
+    assert "过期" in rig.discussion_endpoint.callback_answers[-1]["text"]
     assert rig.store.peek_callback(
         old_nonce,
         OWNER_ID,
         bot_role=DISCUSSION_ROLE,
         chat_id=DISCUSSION_CHAT_ID,
-    ) is not None
+    ) is None
 
     new_update = SimpleNamespace(
         callback_query=SimpleNamespace(data=new_button.callback_data),
@@ -1990,7 +2616,7 @@ async def test_plan_button_rechecks_revision_after_readiness_await(
         OWNER_ID,
         bot_role=DISCUSSION_ROLE,
         chat_id=DISCUSSION_CHAT_ID,
-    ) is not None
+    ) is None
 
 
 @pytest.mark.asyncio

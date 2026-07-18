@@ -39,8 +39,11 @@ StateChangeHandler = Callable[[ThreadState, str], Awaitable[None]]
 QuestionResolvedHandler = Callable[[str], Awaitable[None]]
 PlanCompletedHandler = Callable[[str, str, str, str], Awaitable[None]]
 PromptCompletedHandler = Callable[[Json], Awaitable[None]]
+TuiPlanApprovedHandler = Callable[[str, str], Awaitable[None]]
 
 _FINAL_TURN_STATUSES = {"completed", "failed", "interrupted"}
+# The Codex TUI emits this fixed input after "Yes, implement this plan" is selected.
+TUI_PLAN_APPROVAL_PROMPT = "Implement the plan."
 
 
 def _workspace_write_policy() -> Json:
@@ -62,6 +65,22 @@ def _turn_error_kind(error: object) -> str:
     if isinstance(info, dict) and info:
         return str(next(iter(info)))
     return "turnFailed" if error else ""
+
+
+def _is_tui_plan_approval_item(item: object) -> bool:
+    if not isinstance(item, dict) or item.get("type") != "userMessage":
+        return False
+    if item.get("clientId") is not None:
+        return False
+    content = item.get("content")
+    if not isinstance(content, list) or len(content) != 1:
+        return False
+    item = content[0]
+    return (
+        isinstance(item, dict)
+        and item.get("type") == "text"
+        and item.get("text") == TUI_PLAN_APPROVAL_PROMPT
+    )
 
 
 async def _noop_question(request_key: str, params: Json) -> None:
@@ -92,6 +111,10 @@ async def _noop_prompt_completed(run: Json) -> None:
     del run
 
 
+async def _noop_tui_plan_approved(thread_id: str, turn_id: str) -> None:
+    del thread_id, turn_id
+
+
 class Bridge:
     def __init__(self, config: Config, store: Store, bot: Bot, messenger: OutboundMessenger) -> None:
         self.config = config
@@ -105,6 +128,7 @@ class Bridge:
         self.on_question_resolved: QuestionResolvedHandler = _noop_question_resolved
         self.on_plan_completed: PlanCompletedHandler = _noop_plan_completed
         self.on_prompt_completed: PromptCompletedHandler = _noop_prompt_completed
+        self.on_tui_plan_approved: TuiPlanApprovedHandler = _noop_tui_plan_approved
         self.dashboard = DashboardManager(
             bot,
             store,
@@ -1145,7 +1169,13 @@ class Bridge:
 
     async def resolve_files(self, thread_id: str, description: str) -> list[FileCandidate]:
         state = self.store.get_thread(thread_id) or await self.refresh(thread_id)
-        return await self.resolver.resolve_files(thread_id, Path(state.cwd), description)
+        return await self.resolver.resolve_files(
+            thread_id,
+            Path(state.cwd),
+            description,
+            model=self.config.ask_model,
+            effort=self.config.ask_reasoning_effort,
+        )
 
     async def send_upload(
         self,
@@ -1291,6 +1321,19 @@ class Bridge:
                 self.store.delete_pending_input(key)
             return
         await self.projector.ingest(method, params)
+        if method == "item/started":
+            item = params.get("item") or {}
+            thread_id = str(params.get("threadId") or "")
+            turn_id = str(params.get("turnId") or "")
+            if thread_id and turn_id and _is_tui_plan_approval_item(item):
+                try:
+                    await self.on_tui_plan_approved(thread_id, turn_id)
+                except Exception:
+                    LOGGER.exception(
+                        "event=tui_plan_approval_hook_failed thread_id=%s turn_id=%s",
+                        thread_id[:8],
+                        turn_id[:8],
+                    )
         self._schedule_subagent_profile_refresh(method, params)
         if method == "item/completed":
             item = params.get("item") or {}

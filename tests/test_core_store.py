@@ -339,6 +339,106 @@ def test_v6_plan_publications_migrate_and_accept_same_item_new_revision(
         store.close()
 
 
+def test_v7_plan_publication_migration_backfills_text_and_tui_state(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE events (
+            event_key TEXT PRIMARY KEY,
+            thread_id TEXT,
+            kind TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+        CREATE TABLE plan_publications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            space_id TEXT NOT NULL,
+            generation INTEGER NOT NULL,
+            item_id TEXT NOT NULL,
+            revision_key TEXT NOT NULL DEFAULT '',
+            thread_id TEXT NOT NULL,
+            turn_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            message_ids_json TEXT NOT NULL DEFAULT '[]',
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            UNIQUE(space_id, generation, item_id, revision_key)
+        );
+        INSERT INTO events VALUES(
+            'plan-event', 'thread-1', 'item/completed',
+            '{"threadId":"thread-1","turnId":"turn-plan",' ||
+            '"item":{"id":"item-plan","type":"plan",' ||
+            '"text":"Persist this plan."}}',
+            10
+        );
+        INSERT INTO plan_publications(
+            space_id, generation, item_id, revision_key, thread_id, turn_id,
+            status, message_ids_json, created_at, updated_at
+        ) VALUES(
+            'space-1', 1, 'item-plan', 'revision-1', 'thread-1', 'turn-plan',
+            'published', '[101,102]', 10, 10
+        );
+        PRAGMA user_version=7;
+        """
+    )
+    connection.close()
+
+    store = Store(path)
+    try:
+        assert store.schema_version == SCHEMA_VERSION
+        assert store.last_backup_path is not None
+        publication = store.latest_plan_publication("space-1", 1)
+        assert publication is not None
+        assert publication["plan_text"] == "Persist this plan."
+        assert publication["action_message_ids"] == []
+        assert publication["tui_prompt_seen_at"] is None
+        assert publication["decision_turn_id"] == ""
+
+        assert store.append_plan_action_message(
+            "space-1", 1, "item-plan", 103, revision_key="revision-1"
+        )
+        assert store.mark_tui_plan_prompt_seen(
+            "space-1", 1, "item-plan", revision_key="revision-1"
+        )
+        assert store.record_event(
+            "approval-event",
+            "thread-1",
+            "item/started",
+            {
+                "threadId": "thread-1",
+                "turnId": "turn-execute",
+                "item": {
+                    "id": "message-1",
+                    "type": "userMessage",
+                    "clientId": None,
+                    "content": [{"type": "text", "text": "Implement the plan."}],
+                },
+            },
+        )
+        assert store.find_tui_plan_approval_turn(
+            "thread-1", after=10, prompt="Implement the plan."
+        ) == "turn-execute"
+        assert store.mark_external_plan_action(
+            "space-1",
+            1,
+            "item-plan",
+            revision_key="revision-1",
+            status="executed",
+            decision_turn_id="turn-execute",
+            expected_statuses={"published"},
+        )
+        publication = store.latest_plan_publication("space-1", 1)
+        assert publication is not None
+        assert publication["action_message_ids"] == [103]
+        assert publication["tui_prompt_seen_at"] is not None
+        assert publication["decision_turn_id"] == "turn-execute"
+    finally:
+        store.close()
+
+
 def test_plan_publication_revision_key_deduplicates_events_but_allows_updates(
     tmp_path: Path,
 ) -> None:

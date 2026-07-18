@@ -169,6 +169,26 @@ class MemoryStore:
             for publication in self.publications
         ]
 
+    def plan_publications_for_ui_repair(self) -> list[dict[str, Any]]:
+        return []
+
+    def latest_plan_publication(
+        self, _space_id: str, _generation: int
+    ) -> dict[str, Any] | None:
+        return None
+
+    def append_plan_action_message(
+        self,
+        _space_id: str,
+        _generation: int,
+        _item_id: str,
+        _message_id: int,
+        *,
+        revision_key: str = "",
+    ) -> bool:
+        del revision_key
+        return True
+
     def complete_plan_action(
         self,
         space_id: str,
@@ -410,7 +430,9 @@ async def test_planmode_interaction_advances_revision_then_claims_first_prompt(
     with pytest.raises(RuntimeError, match="替换或已经过期"):
         controller._current_draft(model_payload, phase="select_model")
 
-    action, effort_payload = runtime.store.callbacks[-1]
+    action, effort_payload = next(
+        item for item in reversed(runtime.store.callbacks) if item[0] == "profile_effort"
+    )
     assert action == "profile_effort"
     await controller._profile_effort_selected(dict(SPACE), effort_payload)
     waiting = next(iter(runtime.store.drafts.values()))
@@ -432,7 +454,9 @@ async def test_profile_effort_claims_revision_before_profile_side_effect(
     await controller._profile_model_selected(
         dict(SPACE), runtime.store.callbacks[0][1]
     )
-    effort_payload = runtime.store.callbacks[-1][1]
+    effort_payload = next(
+        payload for action, payload in reversed(runtime.store.callbacks) if action == "profile_effort"
+    )
     selecting = next(iter(runtime.store.drafts.values()))
     entered = asyncio.Event()
     release = asyncio.Event()
@@ -469,6 +493,38 @@ async def test_profile_effort_claims_revision_before_profile_side_effect(
         "gpt-5.6-luna",
         "max",
     )
+
+
+@pytest.mark.asyncio
+async def test_profile_choices_update_the_selected_telegram_messages(
+    command_runtime: SimpleNamespace,
+) -> None:
+    runtime = command_runtime
+    edits: list[dict[str, Any]] = []
+
+    async def edit_text(chat_id: int, message_id: int, markdown: str, **kwargs: Any) -> bool:
+        edits.append(
+            {"chat_id": chat_id, "message_id": message_id, "markdown": markdown, **kwargs}
+        )
+        return True
+
+    runtime.controller.discussion = SimpleNamespace(edit_text=edit_text)
+    await runtime.controller._begin_profile_interaction(dict(SPACE), "planmode")
+    model_payload = runtime.store.callbacks[0][1]
+    await runtime.controller._profile_model_selected(
+        dict(SPACE), model_payload, message_id=77, chat_id=int(SPACE["discussion_chat_id"])
+    )
+    effort_payload = next(
+        payload for action, payload in reversed(runtime.store.callbacks) if action == "profile_effort"
+    )
+    await runtime.controller._profile_effort_selected(
+        dict(SPACE), effort_payload, message_id=78, chat_id=int(SPACE["discussion_chat_id"])
+    )
+
+    assert [entry["message_id"] for entry in edits] == [77, 78]
+    assert "已选择模型" in edits[0]["markdown"]
+    assert "已选择 effort" in edits[1]["markdown"]
+    assert all(entry["reply_markup"] is None for entry in edits)
 
 
 @pytest.mark.asyncio

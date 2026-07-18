@@ -160,10 +160,10 @@ def test_bot_labels_reject_invalid_values(tmp_path: Path, field: str, value: obj
         make_config(tmp_path, **{field: value})
 
 
-def test_ask_model_settings_default_to_inherited_and_load_trimmed(tmp_path: Path) -> None:
+def test_ask_model_settings_default_to_luna_medium_and_load_trimmed(tmp_path: Path) -> None:
     default = make_config(tmp_path)
-    assert default.ask_model is None
-    assert default.ask_reasoning_effort is None
+    assert default.ask_model == "gpt-5.6-luna"
+    assert default.ask_reasoning_effort == "medium"
 
     config_path = tmp_path / "bridge.toml"
     config_path.write_text(

@@ -35,8 +35,6 @@ POLLING_CONNECTION_POOL_SIZE = 2
 POLLING_READ_TIMEOUT_SECONDS = 30.0
 POLLING_CONNECT_TIMEOUT_SECONDS = 10.0
 POLLING_POOL_TIMEOUT_SECONDS = 10.0
-
-
 def balanced_button_rows(
     buttons: Sequence[InlineKeyboardButton], *, columns: int = 3
 ) -> list[list[InlineKeyboardButton]]:
@@ -46,6 +44,8 @@ def balanced_button_rows(
     values = list(buttons)
     if not values:
         return []
+    if columns == 1:
+        return [[button] for button in values]
     rows = [values[index : index + columns] for index in range(0, len(values), columns)]
     if len(rows) > 1 and len(rows[-1]) == 1:
         rows[-1].insert(0, rows[-2].pop())
@@ -243,6 +243,28 @@ class TelegramEndpoint:
         except TelegramError as exc:
             LOGGER.debug("Unable to delete Telegram message (%s)", type(exc).__name__)
             return False
+
+    async def edit_reply_markup(
+        self,
+        chat_id: int,
+        message_id: int,
+        *,
+        reply_markup: InlineKeyboardMarkup | None = None,
+        priority: int = 10,
+    ) -> Any:
+        try:
+            return await self.messenger.call(
+                lambda: self.bot.edit_message_reply_markup(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    reply_markup=reply_markup,
+                ),
+                priority=priority,
+            )
+        except BadRequest as exc:
+            if "message is not modified" in str(exc).casefold():
+                return True
+            raise
 
     async def send_document(
         self,

@@ -761,39 +761,46 @@ class CodexClient:
         with contextlib.suppress(CodexRpcError):
             await self.request("thread/delete", {"threadId": thread_id}, timeout=30)
 
-    async def ask_fork_question(
+    async def run_ephemeral_turn(
         self,
-        thread_id: str,
         cwd: Path,
-        question: str,
+        prompt: str,
         *,
-        client_message_id: str,
+        client_message_id: str | None = None,
+        base_thread_id: str | None = None,
+        developer_instructions: str | None = None,
+        output_schema: Json | None = None,
         model: str | None = None,
         effort: str | None = None,
         timeout: float = 300.0,
     ) -> str:
-        fork_id: str | None = None
+        thread_id: str | None = None
         turn_id: str | None = None
         isolated: _IsolatedQuestion | None = None
         try:
             async with asyncio.timeout(timeout):
-                fork = await self.fork_thread(
-                    thread_id,
-                    cwd,
-                    developer_instructions=SIDE_QUESTION_INSTRUCTIONS,
-                )
-                fork_id = str(fork.get("id") or "")
-                if not fork_id:
-                    raise RuntimeError("Codex did not return an ID for the side-question fork")
-                future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
-                isolated = _IsolatedQuestion(thread_id=fork_id, future=future)
-                self._isolated_questions[fork_id] = isolated
+                if base_thread_id:
+                    thread = await self.fork_thread(
+                        base_thread_id,
+                        cwd,
+                        developer_instructions=developer_instructions,
+                    )
+                else:
+                    thread = await self.start_thread(cwd, ephemeral=True, read_only=True)
+                thread_id = str(thread.get("id") or "")
+                if not thread_id:
+                    raise RuntimeError("Codex did not return an ID for the ephemeral thread")
+                self._ephemeral_thread_ids.add(thread_id)
 
+                future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+                isolated = _IsolatedQuestion(thread_id=thread_id, future=future)
+                self._isolated_questions[thread_id] = isolated
                 try:
                     turn = await self.start_turn(
-                        fork_id,
-                        [text_input(question)],
-                        client_message_id=client_message_id,
+                        thread_id,
+                        [text_input(prompt)],
+                        client_message_id=client_message_id or f"ephemeral-{thread_id}",
+                        output_schema=output_schema,
                         cwd=cwd,
                         sandbox_policy={"type": "readOnly", "networkAccess": False},
                         approval_policy="never",
@@ -805,23 +812,21 @@ class CodexClient:
                         model_label = model or "inherited model"
                         effort_label = effort or "inherited effort"
                         raise RuntimeError(
-                            "Configured /ask model or effort was rejected by Codex "
+                            "Configured utility model or effort was rejected by Codex "
                             f"({model_label}, {effort_label}): "
                             f"{exc.error.get('message', 'unknown app-server error')}"
                         ) from exc
                     raise
                 turn_id = str(turn.get("id") or "")
                 if not turn_id:
-                    raise RuntimeError("Codex did not return an ID for the side-question turn")
+                    raise RuntimeError("Codex did not return an ID for the ephemeral turn")
                 isolated.bind_turn(turn_id)
                 if str(turn.get("status") or "inProgress") != "inProgress":
-                    isolated.ingest("turn/completed", {"threadId": fork_id, "turn": turn})
+                    isolated.ingest("turn/completed", {"threadId": thread_id, "turn": turn})
                 return await future
-        except TimeoutError as exc:
-            raise TimeoutError(f"Codex side question timed out after {timeout:g} seconds") from exc
         finally:
-            if fork_id and self._isolated_questions.get(fork_id) is isolated:
-                self._isolated_questions.pop(fork_id, None)
+            if thread_id and self._isolated_questions.get(thread_id) is isolated:
+                self._isolated_questions.pop(thread_id, None)
             if isolated:
                 if not isolated.future.done():
                     isolated.future.cancel()
@@ -830,18 +835,43 @@ class CodexClient:
             interrupt_id = turn_id
             if not interrupt_id and isolated and len(isolated.turns) == 1:
                 interrupt_id = next(iter(isolated.turns))
-            if fork_id and interrupt_id and (
+            if thread_id and interrupt_id and (
                 not isolated or not isolated.turn_is_terminal(interrupt_id)
             ):
                 await self._best_effort_request(
                     "turn/interrupt",
-                    {"threadId": fork_id, "turnId": interrupt_id},
+                    {"threadId": thread_id, "turnId": interrupt_id},
                 )
-            if fork_id:
+            if thread_id:
                 try:
-                    await self._best_effort_request("thread/delete", {"threadId": fork_id})
+                    await self._best_effort_request("thread/delete", {"threadId": thread_id})
                 finally:
-                    self._ephemeral_thread_ids.discard(fork_id)
+                    self._ephemeral_thread_ids.discard(thread_id)
+
+    async def ask_fork_question(
+        self,
+        thread_id: str,
+        cwd: Path,
+        question: str,
+        *,
+        client_message_id: str,
+        model: str | None = None,
+        effort: str | None = None,
+        timeout: float = 300.0,
+    ) -> str:
+        try:
+            return await self.run_ephemeral_turn(
+                cwd,
+                question,
+                client_message_id=client_message_id,
+                base_thread_id=thread_id,
+                developer_instructions=SIDE_QUESTION_INSTRUCTIONS,
+                model=model,
+                effort=effort,
+                timeout=timeout,
+            )
+        except TimeoutError as exc:
+            raise TimeoutError(f"Codex side question timed out after {timeout:g} seconds") from exc
 
     async def _best_effort_request(self, method: str, params: Json) -> None:
         with contextlib.suppress(Exception):

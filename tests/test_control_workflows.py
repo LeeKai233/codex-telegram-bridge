@@ -322,8 +322,8 @@ async def test_new_interactive_flow_captures_project_and_prompt(tmp_path: Path) 
     controller, store, endpoint, _bridge, coordinator, _deletions = build_controller(tmp_path)
     try:
         await controller.new(make_update("/new"), SimpleNamespace())
-        await click_last_button(controller, store, endpoint, label="GPT 5.6 Luna（默认）")
-        await click_last_button(controller, store, endpoint, label="max（默认）")
+        await click_last_button(controller, store, endpoint, label="GPT 5.6 Luna")
+        await click_last_button(controller, store, endpoint, label="max")
         await click_last_button(controller, store, endpoint, label="否")
 
         await controller.observe_message(make_update("project"), SimpleNamespace())
@@ -346,7 +346,7 @@ async def test_new_interactive_flow_captures_project_and_prompt(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
-async def test_model_and_effort_choices_use_balanced_three_column_rows(tmp_path: Path) -> None:
+async def test_model_and_effort_choices_use_explicit_column_rows(tmp_path: Path) -> None:
     controller, store, endpoint, bridge, _coordinator, _deletions = build_controller(tmp_path)
     bridge.options = [
         SimpleNamespace(
@@ -370,13 +370,34 @@ async def test_model_and_effort_choices_use_balanced_three_column_rows(tmp_path:
     )
 
     await controller._show_model_choices(70, draft, plan=False)
+    assert endpoint.sent[-1]["markdown"] == "请选择 当前模式 使用的模型："
     model_markup = endpoint.sent[-1]["reply_markup"]
-    assert [len(row) for row in model_markup.inline_keyboard] == [2, 2]
+    assert [len(row) for row in model_markup.inline_keyboard] == [2, 2, 1]
+    assert [button.text for row in model_markup.inline_keyboard for button in row] == [
+        "Model 0",
+        "Model 1",
+        "Model 2",
+        "Model 3",
+        "退出",
+    ]
 
     draft.payload["normal_model"] = "model-0"
     await controller._show_effort_choices(70, draft, plan=False)
+    assert endpoint.sent[-1]["markdown"] == "模型 `model-0` 支持以下 effort："
     effort_markup = endpoint.sent[-1]["reply_markup"]
-    assert [len(row) for row in effort_markup.inline_keyboard] == [2, 2]
+    assert [len(row) for row in effort_markup.inline_keyboard] == [2, 2, 1]
+    assert [button.text for row in effort_markup.inline_keyboard for button in row] == [
+        "low",
+        "medium",
+        "high",
+        "max",
+        "退出",
+    ]
+
+    await controller._show_plan_choice(70, draft)
+    plan_markup = endpoint.sent[-1]["reply_markup"]
+    assert [len(row) for row in plan_markup.inline_keyboard] == [1, 1, 1]
+    assert [row[0].text for row in plan_markup.inline_keyboard] == ["是", "否", "退出"]
 
 
 @pytest.mark.asyncio

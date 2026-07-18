@@ -96,3 +96,38 @@ class TmuxManager:
 
     async def window_for(self, thread_id: str) -> str | None:
         return await asyncio.to_thread(self._find_window, thread_id)
+
+    async def dismiss_plan_prompt(self, thread_id: str) -> bool:
+        return await asyncio.to_thread(self._dismiss_plan_prompt, thread_id)
+
+    async def plan_prompt_visible(self, thread_id: str) -> bool | None:
+        return await asyncio.to_thread(self._plan_prompt_visible, thread_id)
+
+    def _capture_plan_prompt(self, thread_id: str) -> tuple[str, bool] | None:
+        window = self._find_window(thread_id)
+        if not window:
+            return None
+        captured = self._run(
+            "capture-pane",
+            "-p",
+            "-t",
+            window,
+            "-S",
+            "-40",
+            check=False,
+        )
+        if captured.returncode != 0:
+            return None
+        return window, "Implement this plan?" in captured.stdout
+
+    def _plan_prompt_visible(self, thread_id: str) -> bool | None:
+        captured = self._capture_plan_prompt(thread_id)
+        return captured[1] if captured is not None else None
+
+    def _dismiss_plan_prompt(self, thread_id: str) -> bool:
+        captured = self._capture_plan_prompt(thread_id)
+        if captured is None or not captured[1]:
+            return False
+        window = captured[0]
+        self._run("send-keys", "-t", window, "Escape", check=False)
+        return True

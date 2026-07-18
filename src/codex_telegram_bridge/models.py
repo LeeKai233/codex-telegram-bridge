@@ -147,6 +147,7 @@ class ThreadState:
     dashboard_message_id: int | None = None
     subscribed: bool = False
     last_error: str = ""
+    last_error_recoverable: bool = False
 
     @property
     def short_id(self) -> str:

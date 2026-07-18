@@ -26,3 +26,11 @@ def test_balanced_button_rows_avoids_singleton_trailing_rows(
 
     assert [len(row) for row in rows] == row_lengths
     assert [button.text for row in rows for button in row] == [str(index) for index in range(count)]
+
+
+def test_balanced_button_rows_preserves_single_column_rows() -> None:
+    buttons = [InlineKeyboardButton(str(index), callback_data=str(index)) for index in range(3)]
+
+    rows = balanced_button_rows(buttons, columns=1)
+
+    assert [len(row) for row in rows] == [1, 1, 1]

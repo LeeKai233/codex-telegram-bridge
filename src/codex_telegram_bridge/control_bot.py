@@ -354,7 +354,7 @@ class ControlBotController:
             await self._show_plan_choice(chat.id, draft)
             return
         if cwd is None:
-            await self._ask_for_project(chat.id)
+            await self._ask_for_project(chat.id, draft)
             return
         await self._handle_project_value(draft, cwd, initial_prompt=prompt)
 
@@ -438,6 +438,8 @@ class ControlBotController:
             await self.endpoint.answer_callback(query)
             return
         await self.endpoint.answer_callback(query)
+        callback_message = getattr(query, "message", None)
+        callback_message_id = getattr(callback_message, "message_id", None)
         try:
             if action == "sessions_page":
                 await self._show_sessions(
@@ -451,7 +453,11 @@ class ControlBotController:
             elif action == "follow_space":
                 await self._follow(chat.id, str(payload["thread_id"]))
             elif action == "new_flow":
-                await self._handle_new_callback(chat.id, payload)
+                await self._handle_new_callback(
+                    chat.id,
+                    payload,
+                    message_id=int(callback_message_id) if callback_message_id is not None else None,
+                )
         except (KeyError, ValueError, RuntimeError, OSError, TelegramError) as exc:
             await self.endpoint.send_text(chat.id, escape(str(exc)))
 
@@ -514,21 +520,19 @@ class ControlBotController:
         if not options:
             raise RuntimeError("当前没有可用模型。")
         event = "plan_model" if plan else "normal_model"
-        buttons = [
-            self._new_button(
-                chat_id,
-                draft,
+        choices = [
+            (
                 event,
                 str(option.model),
-                self._model_label(option),
+                clip(str(option.display_name or option.model), 60),
             )
             for option in options
         ]
-        mode = "Plan Mode" if plan else "Normal Mode"
+        mode = "Plan Mode" if plan else "当前模式"
         await self.endpoint.send_text(
             chat_id,
             f"请选择 {mode} 使用的模型：",
-            reply_markup=InlineKeyboardMarkup(balanced_button_rows(buttons)),
+            reply_markup=self._new_choice_markup(chat_id, draft, choices, columns=2),
         )
 
     async def _show_effort_choices(self, chat_id: int, draft: Any, *, plan: bool) -> None:
@@ -536,36 +540,32 @@ class ControlBotController:
         model = str(draft.payload[key])
         option = await self._model_option(model)
         event = "plan_effort" if plan else "normal_effort"
-        buttons = [
-            self._new_button(
-                chat_id,
-                draft,
-                event,
-                effort,
-                f"{effort}{'（默认）' if effort == option.default_effort else ''}",
-            )
-            for effort in option.supported_efforts
-        ]
+        choices = [(event, effort, effort) for effort in option.supported_efforts]
         await self.endpoint.send_text(
             chat_id,
-            f"请选择 {inline_code(model)} 的 effort：",
-            reply_markup=InlineKeyboardMarkup(balanced_button_rows(buttons)),
+            f"模型 {inline_code(model)} 支持以下 effort：",
+            reply_markup=self._new_choice_markup(chat_id, draft, choices, columns=3),
         )
 
     async def _show_plan_choice(self, chat_id: int, draft: Any) -> None:
-        rows = [
-            [
-                self._new_button(chat_id, draft, "plan_choice", "yes", "是"),
-                self._new_button(chat_id, draft, "plan_choice", "no", "否"),
-            ]
-        ]
         await self.endpoint.send_text(
             chat_id,
             "新 Session 是否先进入 Plan Mode？",
-            reply_markup=InlineKeyboardMarkup(rows),
+            reply_markup=self._new_choice_markup(
+                chat_id,
+                draft,
+                [("plan_choice", "yes", "是"), ("plan_choice", "no", "否")],
+                columns=1,
+            ),
         )
 
-    async def _handle_new_callback(self, chat_id: int, callback: dict[str, Any]) -> None:
+    async def _handle_new_callback(
+        self,
+        chat_id: int,
+        callback: dict[str, Any],
+        *,
+        message_id: int | None = None,
+    ) -> None:
         scope_key = str(callback["scope_key"])
         draft = self.store.get_interaction(scope_key)
         if (
@@ -583,10 +583,26 @@ class ControlBotController:
         event = str(callback["event"])
         value = str(callback.get("value") or "")
         payload = dict(draft.payload)
+        if event == "cancel":
+            self.store.delete_interaction(draft.scope_key)
+            self._cancel_new_timeout(draft.scope_key)
+            await self._edit_choice_message(
+                chat_id,
+                message_id,
+                "已退出 `/new`。",
+                plain="已退出 /new。",
+            )
+            return
         if event == "normal_model" and draft.phase == "normal_model":
             payload["normal_model"] = value
             updated = self._advance_new(draft, "normal_effort", payload)
             if updated:
+                await self._edit_choice_message(
+                    chat_id,
+                    message_id,
+                    f"已选择模型 {inline_code(value)}。",
+                    plain=f"已选择模型 {value}。",
+                )
                 await self._show_effort_choices(chat_id, updated, plan=False)
             return
         if event == "normal_effort" and draft.phase == "normal_effort":
@@ -596,22 +612,46 @@ class ControlBotController:
             payload.update({"normal_model": profile.model, "normal_effort": profile.effort})
             updated = self._advance_new(draft, "plan_choice", payload)
             if updated:
+                await self._edit_choice_message(
+                    chat_id,
+                    message_id,
+                    f"已选择 effort {inline_code(profile.effort)}。",
+                    plain=f"已选择 effort {profile.effort}。",
+                )
                 await self._show_plan_choice(chat_id, updated)
             return
         if event == "plan_choice" and draft.phase == "plan_choice":
             if value == "yes":
                 updated = self._advance_new(draft, "plan_model", payload)
                 if updated:
+                    await self._edit_choice_message(
+                        chat_id,
+                        message_id,
+                        "已选择：进入 Plan Mode。",
+                        plain="已选择：进入 Plan Mode。",
+                    )
                     await self._show_model_choices(chat_id, updated, plan=True)
             elif value == "no":
                 updated = self._advance_new(draft, "project", payload)
                 if updated:
-                    await self._ask_for_project(chat_id)
+                    await self._edit_choice_message(
+                        chat_id,
+                        message_id,
+                        "已选择：不进入 Plan Mode。",
+                        plain="已选择：不进入 Plan Mode。",
+                    )
+                    await self._ask_for_project(chat_id, updated)
             return
         if event == "plan_model" and draft.phase == "plan_model":
             payload["plan_model"] = value
             updated = self._advance_new(draft, "plan_effort", payload)
             if updated:
+                await self._edit_choice_message(
+                    chat_id,
+                    message_id,
+                    f"已选择模型 {inline_code(value)}。",
+                    plain=f"已选择模型 {value}。",
+                )
                 await self._show_effort_choices(chat_id, updated, plan=True)
             return
         if event == "plan_effort" and draft.phase == "plan_effort":
@@ -621,7 +661,13 @@ class ControlBotController:
             payload.update({"plan_model": profile.model, "plan_effort": profile.effort})
             updated = self._advance_new(draft, "project", payload)
             if updated:
-                await self._ask_for_project(chat_id)
+                await self._edit_choice_message(
+                    chat_id,
+                    message_id,
+                    f"已选择 effort {inline_code(profile.effort)}。",
+                    plain=f"已选择 effort {profile.effort}。",
+                )
+                await self._ask_for_project(chat_id, updated)
             return
         if event == "project" and draft.phase == "project_choice":
             await self._handle_project_value(
@@ -680,22 +726,15 @@ class ControlBotController:
             updated = self._advance_new(draft, "project_choice", payload)
             if updated is None:
                 return
-            rows = [
-                [
-                    self._new_button(
-                        draft.chat_id,
-                        updated,
-                        "project",
-                        str(path),
-                        compact_path(str(path))[:50],
-                    )
-                ]
+            choices = [
+                ("project", str(path), compact_path(str(path))[:50])
                 for path in candidates[:8]
             ]
+            message = "找到多个项目，请选择工作目录："
             await self.endpoint.send_text(
                 draft.chat_id,
-                "找到多个项目，请选择工作目录：",
-                reply_markup=InlineKeyboardMarkup(rows),
+                message,
+                reply_markup=self._new_choice_markup(draft.chat_id, updated, choices, columns=1),
             )
             return
         try:
@@ -706,26 +745,26 @@ class ControlBotController:
         if target is None:
             updated = self._advance_new(draft, "project", payload)
             if updated:
+                message = "没有找到匹配项目。请发送允许目录中的明确路径。"
                 await self.endpoint.send_text(
                     draft.chat_id,
-                    "没有找到匹配项目。请发送允许目录中的明确路径。",
+                    message,
+                    reply_markup=self._new_choice_markup(draft.chat_id, updated, [], columns=1),
                 )
             return
         payload["project_target"] = str(target)
         updated = self._advance_new(draft, "project_confirmation", payload)
         if updated is None:
             return
-        button = self._new_button(
-            draft.chat_id,
-            updated,
-            "create_project",
-            str(target),
-            "创建目录",
-        )
         await self.endpoint.send_text(
             draft.chat_id,
             f"目录 {inline_code(compact_path(str(target)))} 不存在，是否创建？",
-            reply_markup=InlineKeyboardMarkup([[button]]),
+            reply_markup=self._new_choice_markup(
+                draft.chat_id,
+                updated,
+                [("create_project", str(target), "创建目录")],
+                columns=1,
+            ),
         )
 
     async def _accept_project(
@@ -750,11 +789,15 @@ class ControlBotController:
         if initial_prompt:
             await self._finish_new_prompt(updated, initial_prompt)
             return
-        hello = self._new_button(draft.chat_id, updated, "hello", "Hello", "Hello")
         await self.endpoint.send_text(
             draft.chat_id,
             "请发送第一条 prompt。30 秒内未发送时将使用 `Hello`。",
-            reply_markup=InlineKeyboardMarkup([[hello]]),
+            reply_markup=self._new_choice_markup(
+                draft.chat_id,
+                updated,
+                [("hello", "Hello", "Hello")],
+                columns=1,
+            ),
         )
 
     async def _finish_new_prompt(
@@ -785,10 +828,16 @@ class ControlBotController:
         finally:
             self.store.delete_interaction(claimed.scope_key)
 
-    async def _ask_for_project(self, chat_id: int) -> None:
+    async def _ask_for_project(self, chat_id: int, draft: Any | None = None) -> None:
+        message = "请发送项目地址或项目描述；下一条文本消息会被识别为项目。"
         await self.endpoint.send_text(
             chat_id,
-            "请发送项目地址或项目描述；下一条文本消息会被识别为项目。",
+            message,
+            reply_markup=(
+                self._new_choice_markup(chat_id, draft, [], columns=1)
+                if draft is not None
+                else None
+            ),
         )
 
     def _advance_new(
@@ -947,18 +996,55 @@ class ControlBotController:
             chat_id,
         )
 
+    def _new_choice_markup(
+        self,
+        chat_id: int,
+        draft: Any,
+        choices: list[tuple[str, str, str]],
+        *,
+        columns: int,
+    ) -> InlineKeyboardMarkup:
+        buttons = [
+            self._new_button(chat_id, draft, event, value, label)
+            for event, value, label in choices
+        ]
+        return InlineKeyboardMarkup(
+            [
+                *balanced_button_rows(buttons, columns=columns),
+                [self._new_button(chat_id, draft, "cancel", "", "退出")],
+            ]
+        )
+
+    async def _edit_choice_message(
+        self,
+        chat_id: int,
+        message_id: int | None,
+        markdown: str,
+        *,
+        plain: str,
+    ) -> None:
+        if message_id is None:
+            return
+        try:
+            await self.endpoint.edit_text(
+                chat_id,
+                message_id,
+                markdown,
+                plain=plain,
+                reply_markup=None,
+            )
+        except TelegramError:
+            LOGGER.warning(
+                "event=control_choice_cleanup_failed chat_id=%s message_id=%s",
+                chat_id,
+                message_id,
+            )
+
     async def _model_option(self, model: str) -> Any:
         for option in await self.bridge.list_model_options():
             if str(option.model) == model:
                 return option
         raise ValueError(f"模型 {model!r} 已不可用，请重新执行 /new")
-
-    @staticmethod
-    def _model_label(option: Any) -> str:
-        label = str(option.display_name or option.model)
-        if option.is_default:
-            label += "（默认）"
-        return label[:60]
 
     @staticmethod
     def _new_scope(chat_id: int, user_id: int) -> str:

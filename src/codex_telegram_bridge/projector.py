@@ -57,6 +57,7 @@ class EventProjector:
         thread_id = str(payload.get("id") or "")
         persisted = self.store.get_thread(thread_id)
         state = persisted or ThreadState(thread_id=thread_id)
+        persisted_updated_at = state.updated_at
         incoming_updated_at = int(payload.get("updatedAt") or 0)
         stale_payload = bool(
             persisted is not None
@@ -87,6 +88,19 @@ class EventProjector:
             if isinstance(status, dict):
                 state.status = str(status.get("type") or state.status)
                 state.active_flags = [str(value) for value in status.get("activeFlags") or []]
+                if (
+                    incoming_updated_at > persisted_updated_at
+                    and state.status in {"active", "idle"}
+                    and self._clear_recoverable_error(state)
+                ):
+                    state.latest_activity = "连接已恢复"
+                    self._record_activity(
+                        state,
+                        "thread/resynced",
+                        state.latest_activity,
+                        "recovered",
+                        timestamp=incoming_updated_at,
+                    )
         turns = (
             []
             if stale_payload
@@ -379,8 +393,14 @@ class EventProjector:
             status = params.get("status") or {}
             state.status = str(status.get("type") or state.status)
             state.active_flags = [str(value) for value in status.get("activeFlags") or []]
-            state.latest_activity = f"Session {state.status}"
-            self._record_activity(state, method, state.latest_activity, state.status)
+            recovered = state.status in {"active", "idle"} and self._clear_recoverable_error(state)
+            state.latest_activity = "连接已恢复" if recovered else f"Session {state.status}"
+            self._record_activity(
+                state,
+                method,
+                state.latest_activity,
+                "recovered" if recovered else state.status,
+            )
             return True
         if method == "thread/settings/updated":
             state.latest_activity = "Session settings updated"
@@ -413,7 +433,7 @@ class EventProjector:
             state.turn_duration_ms = max(0, int(turn.get("durationMs") or 0))
             state.status = "active"
             state.latest_activity = "Turn 已开始"
-            state.last_error = ""
+            self._clear_recoverable_error(state)
             self._record_activity(state, method, state.latest_activity, state.turn_status)
             return True
         if method == "turn/completed":
@@ -426,7 +446,14 @@ class EventProjector:
                 state.turn_duration_ms = max(0, duration_ms)
             error = turn.get("error")
             if isinstance(error, dict):
+                self._finish_recoverable_error(state)
                 state.last_error = str(error.get("message") or "Turn failed")
+            elif state.turn_status == "completed":
+                self._clear_recoverable_error(state)
+                state.last_error = ""
+                state.last_error_recoverable = False
+            elif state.turn_status in {"failed", "interrupted"}:
+                self._finish_recoverable_error(state)
             turn_activity = f"Turn {state.turn_status}"
             state.latest_activity = turn_activity
             for item in turn.get("items") or []:
@@ -458,8 +485,9 @@ class EventProjector:
         if method == "error":
             error = params.get("error") or {}
             state.last_error = str(error.get("message") or "Codex error")
-            state.latest_activity = "正在重试" if params.get("willRetry") else "执行失败"
-            status = "retrying" if params.get("willRetry") else "failed"
+            state.last_error_recoverable = bool(params.get("willRetry"))
+            state.latest_activity = "正在重试" if state.last_error_recoverable else "执行失败"
+            status = "retrying" if state.last_error_recoverable else "failed"
             self._record_activity(state, method, state.last_error, status)
             return True
         if method in {"warning", "guardianWarning", "deprecationNotice", "configWarning"}:
@@ -467,6 +495,26 @@ class EventProjector:
             self._record_activity(state, method, state.latest_activity, "warning")
             return True
         return False
+
+    @staticmethod
+    def _clear_recoverable_error(state: ThreadState) -> bool:
+        if not state.last_error_recoverable:
+            return False
+        state.last_error = ""
+        EventProjector._finish_recoverable_error(state)
+        return True
+
+    @staticmethod
+    def _finish_recoverable_error(state: ThreadState) -> bool:
+        if not state.last_error_recoverable:
+            return False
+        state.last_error_recoverable = False
+        state.recent_activity = [
+            activity
+            for activity in state.recent_activity
+            if not (activity.kind == "error" and activity.status == "retrying")
+        ]
+        return True
 
     def _apply_item(
         self,

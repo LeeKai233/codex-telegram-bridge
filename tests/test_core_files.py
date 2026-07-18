@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import time
 from io import BytesIO
@@ -15,6 +16,7 @@ from codex_telegram_bridge.files import (
     safe_filename,
     sha256_file,
 )
+from codex_telegram_bridge.resolver import CodexResolver, DirectoryIndex
 
 
 @pytest.mark.parametrize(
@@ -48,6 +50,38 @@ def test_sensitive_files_are_rejected(tmp_path: Path, relative: str) -> None:
     policy = PathPolicy(tmp_path, upload_limit=1000)
     with pytest.raises(PathPolicyError, match="敏感"):
         policy.validate_file(path)
+
+
+@pytest.mark.asyncio
+async def test_resolver_relative_file_paths_are_anchored_to_session_cwd(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    report = project / "report.txt"
+    report.write_text("report", encoding="utf-8")
+
+    calls: list[dict[str, object]] = []
+
+    class Client:
+        async def run_ephemeral_turn(
+            self, _cwd: Path, _prompt: str, **kwargs: object
+        ) -> str:
+            calls.append(kwargs)
+            return json.dumps({"paths": ["report.txt"]})
+
+    policy = PathPolicy(tmp_path, upload_limit=1000)
+    resolver = CodexResolver(Client(), policy, DirectoryIndex(tmp_path))  # type: ignore[arg-type]
+
+    candidates = await resolver.resolve_files(
+        "thread",
+        project,
+        "the report",
+        model="gpt-5.6-luna",
+        effort="medium",
+    )
+
+    assert [candidate.path for candidate in candidates] == [report.resolve()]
+    assert calls[0]["model"] == "gpt-5.6-luna"
+    assert calls[0]["effort"] == "medium"
 
 
 def test_path_outside_root_and_symlink_escape_are_rejected(tmp_path: Path) -> None:
