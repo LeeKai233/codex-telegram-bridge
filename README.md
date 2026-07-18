@@ -27,7 +27,7 @@ not Telegram Forum Topics, are the stable session boundary.
 
 ## Supported host
 
-The v0.2.0 installer intentionally has a narrow host contract:
+The v0.2.5 installer intentionally has a narrow host contract:
 
 - Ubuntu or Debian under WSL2.
 - systemd enabled in WSL and available as PID 1.
@@ -59,7 +59,7 @@ unnecessary administrator privileges.
 Run the version-pinned installer from a WSL terminal:
 
 ```bash
-bash -c 'set -Eeuo pipefail; url="https://github.com/LeeKai233/codex-telegram-bridge/releases/download/v0.2.0/install.sh"; sha256="064eb387dce1849a21163bfcb642d5dfb579a7c1aba390e94ba2e9de49d3d2e3"; installer="$(mktemp)"; cleanup() { rm -f -- "$installer"; }; trap cleanup EXIT; curl --proto "=https" --tlsv1.2 -fsSL --retry 3 --retry-all-errors -o "$installer" "$url"; printf "%s  %s\n" "$sha256" "$installer" | sha256sum -c -; bash "$installer"'
+bash -c 'set -Eeuo pipefail; url="https://github.com/LeeKai233/codex-telegram-bridge/releases/download/v0.2.5/install.sh"; sha256="319752820e12dadfd36eb59d898057731b718330eee6c21fb9e55df8009e3eb2"; installer="$(mktemp)"; cleanup() { rm -f -- "$installer"; }; trap cleanup EXIT; curl --proto "=https" --tlsv1.2 -fsSL --retry 3 --retry-all-errors -o "$installer" "$url"; printf "%s  %s\n" "$sha256" "$installer" | sha256sum -c -; bash "$installer"'
 ```
 
 The installer:
@@ -68,7 +68,7 @@ The installer:
    space, and network access.
 2. Installs missing `ca-certificates`, `curl`, `git`, and `tmux` packages.
 3. Installs pinned uv 0.11.28 without editing shell profiles, then installs uv-managed Python 3.14.
-4. Installs Bridge v0.2.0 into `~/.local/bin` from the matching immutable Git tag.
+4. Installs Bridge v0.2.5 into `~/.local/bin` from the matching immutable Git tag.
 5. Installs the latest official standalone Codex release into `~/.local/bin` and verifies the
    required `app-server --listen unix://` and `--remote unix://` capabilities.
 6. Pauses while you configure and authenticate Codex in another WSL terminal.
@@ -81,7 +81,7 @@ The installer enables user lingering so both services return after WSL/systemd r
 not copy another machine's Codex configuration, authentication, skills, MCP servers, hooks, Bridge
 database, or Telegram credentials.
 
-The bootstrap downloads the immutable `v0.2.0` release asset to a temporary file, verifies the
+The bootstrap downloads the immutable `v0.2.5` release asset to a temporary file, verifies the
 SHA-256 shown above, and only then executes it with terminal input still attached. The installer
 also pins and verifies the official uv and Codex installer-script contents. Codex itself is
 intentionally selected as the latest official standalone release at installation time; its
@@ -259,11 +259,17 @@ allowed_root = "/home/your-user"
 tmux_session = "CodexBot"
 control_bot_label = "@my_control_bot"
 discussion_bot_label = "@my_discussion_bot"
+ask_model = "gpt-5.6-luna"
+ask_reasoning_effort = "medium"
 dashboard_debounce_seconds = 0.5
 heartbeat_seconds = 60
 totp_unlock_seconds = 1800
 disconnect_threshold_seconds = 30
 ```
+
+`ask_model` and `ask_reasoning_effort` select the read-only utility profile used by both `/ask`
+and `/getfile`. They default to `gpt-5.6-luna` and `medium`; neither command changes the parent
+Session model or effort.
 
 Dashboard Braille frames advance with each real status refresh. The bridge does not issue
 animation-only Telegram edits, so active work remains visually dynamic without consuming the

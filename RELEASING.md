@@ -32,8 +32,8 @@ release tag before release immutability is enabled.
 
    ```bash
    release_dir="$(mktemp -d)"
-   cp install.sh dist/codex_telegram_bridge-0.2.0-py3-none-any.whl \
-      dist/codex_telegram_bridge-0.2.0.tar.gz "$release_dir/"
+   cp install.sh dist/codex_telegram_bridge-0.2.5-py3-none-any.whl \
+      dist/codex_telegram_bridge-0.2.5.tar.gz "$release_dir/"
    (cd "$release_dir" && sha256sum install.sh *.whl *.tar.gz >SHA256SUMS)
    ```
 
@@ -42,11 +42,11 @@ release tag before release immutability is enabled.
 
    ```bash
    release_sha="$(git rev-parse HEAD)"
-   gh release create v0.2.0 --repo LeeKai233/codex-telegram-bridge \
-      --draft --target "$release_sha" --title "v0.2.0" \
+   gh release create v0.2.5 --repo LeeKai233/codex-telegram-bridge \
+      --draft --target "$release_sha" --title "v0.2.5" \
       "$release_dir/install.sh" "$release_dir/SHA256SUMS" \
-      "$release_dir/codex_telegram_bridge-0.2.0-py3-none-any.whl" \
-      "$release_dir/codex_telegram_bridge-0.2.0.tar.gz"
+      "$release_dir/codex_telegram_bridge-0.2.5-py3-none-any.whl" \
+      "$release_dir/codex_telegram_bridge-0.2.5.tar.gz"
    ```
 
 4. Review the draft assets and notes, then publish once. Confirm the release is marked immutable,
@@ -55,17 +55,26 @@ release tag before release immutability is enabled.
 
 ## Public smoke test
 
-From a temporary directory with no project checkout:
+From a temporary directory with no project checkout, download and verify every public release
+asset before testing the pinned tag:
 
 ```bash
-curl -fL -o install.sh \
-  https://github.com/LeeKai233/codex-telegram-bridge/releases/download/v0.2.0/install.sh
-sha256sum install.sh
-UV_TOOL_DIR="$PWD/tools" UV_TOOL_BIN_DIR="$PWD/bin" \
+release_dir="$(mktemp -d)"
+cd "$release_dir"
+base="https://github.com/LeeKai233/codex-telegram-bridge/releases/download/v0.2.5"
+for asset in install.sh SHA256SUMS \
+  codex_telegram_bridge-0.2.5-py3-none-any.whl \
+  codex_telegram_bridge-0.2.5.tar.gz; do
+  curl --proto "=https" --tlsv1.2 -fL --retry 3 --retry-all-errors \
+    -o "$asset" "$base/$asset"
+done
+sha256sum -c SHA256SUMS
+bash install.sh --version
+UV_TOOL_DIR="$release_dir/tools" UV_TOOL_BIN_DIR="$release_dir/bin" \
   uv tool install --python 3.14 \
-  git+https://github.com/LeeKai233/codex-telegram-bridge@v0.2.0
-"$PWD/bin/codex-tg" --help
-"$PWD/bin/codex-telegram-bridge" --help
+  git+https://github.com/LeeKai233/codex-telegram-bridge@v0.2.5
+"$release_dir/bin/codex-tg" --help
+"$release_dir/bin/codex-telegram-bridge" --help
 ```
 
 Run the README bootstrap only on a supported WSL2 host that passes `install.sh --check-only`. Never

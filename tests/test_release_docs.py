@@ -11,6 +11,8 @@ ROOT = Path(__file__).resolve().parents[1]
 README = ROOT / "README.md"
 INSTALLER = ROOT / "install.sh"
 PYPROJECT = ROOT / "pyproject.toml"
+PACKAGE_INIT = ROOT / "src" / "codex_telegram_bridge" / "__init__.py"
+RELEASING = ROOT / "RELEASING.md"
 SYSTEMD = ROOT / "systemd"
 
 EXPECTED_SDIST_INCLUDES = [
@@ -30,7 +32,7 @@ def bootstrap_command() -> str:
     return next(
         line
         for line in README.read_text(encoding="utf-8").splitlines()
-        if line.startswith("bash -c '") and "releases/download/v0.2.0/install.sh" in line
+        if line.startswith("bash -c '") and "releases/download/v0.2.5/install.sh" in line
     )
 
 
@@ -52,12 +54,20 @@ def test_release_version_is_consistent_across_public_artifacts() -> None:
     version = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["project"]["version"]
     installer = INSTALLER.read_text(encoding="utf-8")
     readme = README.read_text(encoding="utf-8")
+    package_init = PACKAGE_INIT.read_text(encoding="utf-8")
+    releasing = RELEASING.read_text(encoding="utf-8")
     installer_match = re.search(r'^readonly INSTALLER_VERSION="([^"]+)"$', installer, re.MULTILINE)
+    package_match = re.search(r'^__version__ = "([^"]+)"$', package_init, re.MULTILINE)
 
-    assert version == "0.2.0"
+    assert version == "0.2.5"
     assert installer_match is not None and installer_match.group(1) == version
+    assert package_match is not None and package_match.group(1) == version
     assert f"releases/download/v{version}/install.sh" in readme
     assert f"Bridge v{version}" in readme
+    assert f"gh release create v{version}" in releasing
+    assert f"codex_telegram_bridge-{version}-py3-none-any.whl" in releasing
+    assert f"codex_telegram_bridge-{version}.tar.gz" in releasing
+    assert "sha256sum -c SHA256SUMS" in releasing
     for unit in SYSTEMD.glob("*.service"):
         assert f"# X-CodexTelegramBridge-Installer-Version: v{version}" in unit.read_text(
             encoding="utf-8"

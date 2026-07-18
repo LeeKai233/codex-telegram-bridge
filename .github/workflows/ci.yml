@@ -33,15 +33,28 @@ jobs:
           uv build
           python - <<'PY'
           import tarfile
+          import zipfile
           from pathlib import Path, PurePosixPath
 
           sdist = next(Path("dist").glob("*.tar.gz"))
           with tarfile.open(sdist, "r:gz") as archive:
-              members = [PurePosixPath(member.name) for member in archive.getmembers()]
-          forbidden = {"assets", ".codegraph", ".gitnexus"}
-          leaked = sorted(str(member) for member in members if forbidden & set(member.parts))
+              sdist_members = [PurePosixPath(member.name) for member in archive.getmembers()]
+          wheel = next(Path("dist").glob("*.whl"))
+          with zipfile.ZipFile(wheel) as archive:
+              wheel_members = [PurePosixPath(member) for member in archive.namelist()]
+          members = sdist_members + wheel_members
+          forbidden = {"assets", ".codegraph", ".gitnexus", "__pycache__"}
+          leaked = sorted(
+              str(member)
+              for member in members
+              if forbidden & set(member.parts) or member.suffix in {".pyc", ".pyo"}
+          )
           if leaked:
               raise SystemExit(f"forbidden local files in sdist: {leaked}")
+          if not any(member.name == "approval.py" for member in wheel_members):
+              raise SystemExit("approval.py is missing from the wheel")
+          if any(member.name == "bot.py" for member in members):
+              raise SystemExit("retired bot.py leaked into a release artifact")
           PY
           export UV_TOOL_DIR="$RUNNER_TEMP/codex-tg-tools"
           export UV_TOOL_BIN_DIR="$RUNNER_TEMP/codex-tg-bin"
