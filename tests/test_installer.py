@@ -48,6 +48,12 @@ def managed_unit() -> str:
     return f"{UNIT_MARKER}\n{UNIT_VERSION}\n[Unit]\nDescription=test\n"
 
 
+def next_patch_version(version_marker: str) -> str:
+    version = version_marker.rsplit("v", maxsplit=1)[-1]
+    major, minor, patch = (int(part) for part in version.split("."))
+    return f"{major}.{minor}.{patch + 1}"
+
+
 def test_failed_script_download_is_nonzero_and_cleaned_up(tmp_path: Path) -> None:
     result = run_installer_shell(
         tmp_path,
@@ -229,7 +235,9 @@ grep -Fxq "$UNIT_VERSION" "$USER_UNIT_DIR/codex-telegram-app-server.service"
     assert result.returncode == 0, result.stderr
 
 
-@pytest.mark.parametrize("future_version", ["0.2.1", "1.0.0"])
+@pytest.mark.parametrize(
+    "future_version", [next_patch_version(UNIT_VERSION), "1.0.0"]
+)
 def test_future_installer_version_unit_is_not_owned(
     tmp_path: Path, future_version: str
 ) -> None:
