@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 import logging
+from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,6 +27,30 @@ class ThreadPage:
     data: list[Json]
     next_cursor: str | None = None
     backwards_cursor: str | None = None
+
+
+@dataclass(slots=True)
+class _PendingRpc:
+    future: asyncio.Future[Json]
+    connection_token: object
+    permit_released: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _NotificationEnvelope:
+    method: str
+    params: Json
+    connection_token: object
+
+
+@dataclass(frozen=True, slots=True)
+class _ServerRequestEnvelope:
+    request_id: int | str
+    method: str
+    params: Json
+    generation: int
+    connection_token: object
+    thread_key: str
 
 
 @dataclass(slots=True)
@@ -167,17 +192,45 @@ class CodexClient:
         on_notification: NotificationHandler = _noop_notification,
         on_server_request: ServerRequestHandler = _noop_server_request,
         on_connection: ConnectionHandler = _noop_connection,
+        notification_capacity: int = 1024,
+        server_request_capacity: int = 128,
+        server_request_concurrency: int = 8,
+        pending_rpc_limit: int = 128,
+        admission_timeout: float = 10.0,
+        send_timeout: float = 10.0,
     ) -> None:
+        if min(
+            notification_capacity,
+            server_request_capacity,
+            server_request_concurrency,
+            pending_rpc_limit,
+        ) <= 0:
+            raise ValueError("Codex queue limits must be positive")
         self.socket_path = socket_path
         self.on_notification = on_notification
         self.on_server_request = on_server_request
         self.on_connection = on_connection
         self._websocket: ClientConnection | None = None
-        self._pending: dict[int, asyncio.Future[Json]] = {}
+        self._connection_token: object | None = None
+        self._pending: dict[int, _PendingRpc] = {}
+        self._pending_slots = asyncio.Semaphore(pending_rpc_limit)
+        self._pending_rpc_limit = pending_rpc_limit
+        self.admission_timeout = admission_timeout
+        self.send_timeout = send_timeout
         self._ephemeral_request_ids: set[int] = set()
         self._ephemeral_thread_ids: set[str] = set()
         self._isolated_questions: dict[str, _IsolatedQuestion] = {}
+        self.notification_capacity = notification_capacity
+        self._notification_queue: asyncio.Queue[_NotificationEnvelope] | None = None
+        self._notification_task: asyncio.Task[None] | None = None
+        self.server_request_capacity = server_request_capacity
+        self.server_request_concurrency = server_request_concurrency
+        self._server_request_queue: deque[_ServerRequestEnvelope] = deque()
         self._server_request_tasks: set[asyncio.Task[None]] = set()
+        self._server_request_envelopes: dict[asyncio.Task[None], _ServerRequestEnvelope] = {}
+        self._server_active_threads: set[str] = set()
+        self._connection_callback_tasks: set[asyncio.Task[None]] = set()
+        self._connected_callback_task: asyncio.Task[None] | None = None
         self._request_id = 0
         self._send_lock = asyncio.Lock()
         self._connected = asyncio.Event()
@@ -210,6 +263,9 @@ class CodexClient:
             self._runner = None
             self._connected.clear()
             await self._fail_pending(CodexDisconnected("Codex app-server client stopped"))
+            await self._stop_notification_consumer()
+            await self._cancel_connection_callbacks()
+            self._connection_token = None
 
     async def wait_connected(self, timeout: float = 15.0) -> None:
         try:
@@ -222,6 +278,10 @@ class CodexClient:
         while not self._stopping.is_set():
             reason: str | None = None
             reader: asyncio.Task[None] | None = None
+            notification_task: asyncio.Task[None] | None = None
+            websocket: ClientConnection | None = None
+            connection_token = object()
+            next_generation = self.generation + 1
             try:
                 websocket = await unix_connect(
                     path=str(self.socket_path),
@@ -236,12 +296,34 @@ class CodexClient:
                     max_queue=64,
                 )
                 self._websocket = websocket
-                reader = asyncio.create_task(self._reader(websocket), name="codex-app-server-reader")
+                self._connection_token = connection_token
+                notification_queue: asyncio.Queue[_NotificationEnvelope] = asyncio.Queue(
+                    maxsize=self.notification_capacity
+                )
+                self._notification_queue = notification_queue
+                notification_task = asyncio.create_task(
+                    self._notification_consumer(notification_queue, connection_token),
+                    name="codex-notification-consumer",
+                )
+                self._notification_task = notification_task
+                self.generation = next_generation
+                reader = asyncio.create_task(
+                    self._reader(
+                        websocket,
+                        connection_token=connection_token,
+                        generation=next_generation,
+                        notification_queue=notification_queue,
+                    ),
+                    name="codex-app-server-reader",
+                )
                 await self._initialize()
-                self.generation += 1
                 self._connected.set()
                 delay = 1.0
-                await self.on_connection(True, self.generation, None)
+                self._connected_callback_task = self._schedule_connection_callback(
+                    True,
+                    self.generation,
+                    None,
+                )
                 await reader
                 reason = "connection closed"
             except asyncio.CancelledError:
@@ -251,15 +333,36 @@ class CodexClient:
                 LOGGER.warning("Codex app-server connection failed: %s", reason)
             finally:
                 self._connected.clear()
-                self._websocket = None
+                callback = self._connected_callback_task
+                if callback is not None and not callback.done():
+                    callback.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await callback
+                self._connected_callback_task = None
                 if reader and not reader.done():
                     reader.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await reader
+                if notification_task and not notification_task.done():
+                    notification_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await notification_task
+                if self._notification_task is notification_task:
+                    self._notification_task = None
+                    self._notification_queue = None
+                await self._cancel_server_request_tasks()
                 await self._fail_pending(
                     CodexDisconnected(reason or "Codex app-server disconnected")
                 )
-                await self.on_connection(False, self.generation, reason)
+                if websocket is not None:
+                    with contextlib.suppress(Exception):
+                        await websocket.close(code=1001, reason="connection cycle ended")
+                if self._websocket is websocket:
+                    self._websocket = None
+                if self._connection_token is connection_token:
+                    self._connection_token = None
+                self._schedule_connection_callback(False, self.generation, reason)
+                await asyncio.sleep(0)
             if not self._stopping.is_set():
                 with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(self._stopping.wait(), timeout=delay)
@@ -285,7 +388,28 @@ class CodexClient:
             raise RuntimeError("Invalid initialize response")
         await self._send({"method": "initialized", "params": {}})
 
-    async def _reader(self, websocket: ClientConnection) -> None:
+    async def _reader(
+        self,
+        websocket: ClientConnection,
+        *,
+        connection_token: object | None = None,
+        generation: int | None = None,
+        notification_queue: asyncio.Queue[_NotificationEnvelope] | None = None,
+    ) -> None:
+        token = connection_token or self._connection_token or object()
+        current_generation = self.generation if generation is None else generation
+        if self._websocket is None:
+            self._websocket = websocket
+        if self._connection_token is None:
+            self._connection_token = token
+        owns_queue = notification_queue is None
+        queue = notification_queue or asyncio.Queue(maxsize=self.notification_capacity)
+        consumer: asyncio.Task[None] | None = None
+        if owns_queue:
+            consumer = asyncio.create_task(
+                self._notification_consumer(queue, token),
+                name="codex-notification-consumer-local",
+            )
         try:
             async for raw in websocket:
                 if not isinstance(raw, str):
@@ -300,54 +424,173 @@ class CodexClient:
                 request_id = message.get("id")
                 method = message.get("method")
                 if request_id is not None and method is None:
+                    pending = self._pending.get(request_id)
+                    if pending is None or pending.connection_token is not token:
+                        continue
                     self._register_ephemeral_response(request_id, message)
-                    future = self._pending.pop(request_id, None)
-                    if future and not future.done():
-                        future.set_result(message)
+                    if not pending.future.done():
+                        pending.future.set_result(message)
                     continue
                 params = message.get("params")
                 params = params if isinstance(params, dict) else {}
                 if request_id is not None and isinstance(method, str):
-                    task = asyncio.create_task(
-                        self._dispatch_server_request(
-                            request_id, method, params, self.generation
-                        ),
-                        name=f"codex-server-request-{method}",
+                    self._enqueue_server_request(
+                        request_id,
+                        method,
+                        params,
+                        current_generation,
+                        token,
                     )
-                    self._server_request_tasks.add(task)
-                    task.add_done_callback(self._server_request_finished)
                 elif isinstance(method, str):
-                    # Lifecycle notifications are ordered on the wire. Preserve that order so a
-                    # late item event cannot overwrite a newer plan or thread status.
-                    await self._dispatch_notification(method, params)
+                    try:
+                        queue.put_nowait(_NotificationEnvelope(method, params, token))
+                    except asyncio.QueueFull as exc:
+                        raise CodexDisconnected(
+                            f"Codex notification queue exceeded {self.notification_capacity} entries"
+                        ) from exc
         except ConnectionClosed as exc:
             if not self._stopping.is_set():
                 raise CodexDisconnected(str(exc)) from exc
+        finally:
+            if owns_queue and consumer is not None:
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(queue.join(), timeout=1.0)
+                consumer.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await consumer
 
-    async def _send(self, message: Json) -> None:
-        websocket = self._websocket
-        if not websocket:
+    async def _notification_consumer(
+        self,
+        queue: asyncio.Queue[_NotificationEnvelope],
+        connection_token: object,
+    ) -> None:
+        while True:
+            envelope = await queue.get()
+            try:
+                if envelope.connection_token is not connection_token:
+                    continue
+                try:
+                    await self._dispatch_notification(envelope.method, envelope.params)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    LOGGER.error(
+                        "Codex notification handler failed (%s)",
+                        type(exc).__name__,
+                    )
+            finally:
+                queue.task_done()
+
+    async def _stop_notification_consumer(self) -> None:
+        task = self._notification_task
+        self._notification_task = None
+        self._notification_queue = None
+        if task is None or task.done():
+            return
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    def _schedule_connection_callback(
+        self,
+        connected: bool,
+        generation: int,
+        reason: str | None,
+    ) -> asyncio.Task[None]:
+        task = asyncio.create_task(
+            self._run_connection_callback(connected, generation, reason),
+            name=f"codex-connection-callback-{'up' if connected else 'down'}-{generation}",
+        )
+        self._connection_callback_tasks.add(task)
+        task.add_done_callback(self._connection_callback_finished)
+        return task
+
+    async def _run_connection_callback(
+        self,
+        connected: bool,
+        generation: int,
+        reason: str | None,
+    ) -> None:
+        try:
+            await self.on_connection(connected, generation, reason)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            LOGGER.error(
+                "Codex connection callback failed connected=%s generation=%s error_type=%s",
+                connected,
+                generation,
+                type(exc).__name__,
+            )
+
+    def _connection_callback_finished(self, task: asyncio.Task[None]) -> None:
+        self._connection_callback_tasks.discard(task)
+
+    async def _cancel_connection_callbacks(self) -> None:
+        tasks = tuple(self._connection_callback_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._connection_callback_tasks.clear()
+
+    async def _send(
+        self,
+        message: Json,
+        *,
+        websocket: ClientConnection | None = None,
+        connection_token: object | None = None,
+    ) -> None:
+        target = websocket or self._websocket
+        token = connection_token or self._connection_token
+        if target is None or token is None:
             raise CodexDisconnected("Codex app-server is not connected")
+        if self._websocket is not target or self._connection_token is not token:
+            raise CodexDisconnected("Codex app-server connection generation is stale")
         encoded = json.dumps(message, ensure_ascii=False, separators=(",", ":"))
-        async with self._send_lock:
-            await websocket.send(encoded)
+        try:
+            async with self._send_lock:
+                if self._websocket is not target or self._connection_token is not token:
+                    raise CodexDisconnected("Codex app-server connection generation is stale")
+                await asyncio.wait_for(target.send(encoded), timeout=self.send_timeout)
+        except TimeoutError as exc:
+            with contextlib.suppress(Exception):
+                await target.close(code=1011, reason="send timeout")
+            raise CodexDisconnected("Codex app-server send timed out") from exc
 
     def _next_request_id(self) -> int:
         self._request_id += 1
         return self._request_id
 
     async def _request_on_connection(self, method: str, params: Json, timeout: float = 30.0) -> Any:
+        websocket = self._websocket
+        connection_token = self._connection_token
+        if websocket is None or connection_token is None:
+            raise CodexDisconnected("Codex app-server is not connected")
+        try:
+            await asyncio.wait_for(
+                self._pending_slots.acquire(),
+                timeout=self.admission_timeout,
+            )
+        except TimeoutError as exc:
+            raise TimeoutError("Codex RPC admission queue is full") from exc
         request_id = self._next_request_id()
         future: asyncio.Future[Json] = asyncio.get_running_loop().create_future()
-        self._pending[request_id] = future
+        pending = _PendingRpc(future, connection_token)
+        self._pending[request_id] = pending
         if method in {"thread/start", "thread/fork"} and params.get("ephemeral") is True:
             self._ephemeral_request_ids.add(request_id)
         try:
-            await self._send({"id": request_id, "method": method, "params": params})
+            await self._send(
+                {"id": request_id, "method": method, "params": params},
+                websocket=websocket,
+                connection_token=connection_token,
+            )
             response = await asyncio.wait_for(future, timeout)
         finally:
             self._pending.pop(request_id, None)
             self._ephemeral_request_ids.discard(request_id)
+            self._release_rpc_slot(pending)
         if isinstance(response.get("error"), dict):
             raise CodexRpcError(method, response["error"])
         return response.get("result")
@@ -356,40 +599,146 @@ class CodexClient:
         await self.wait_connected()
         return await self._request_on_connection(method, params or {}, timeout)
 
-    async def respond(self, request_id: int | str, result: Json) -> None:
+    async def respond(
+        self,
+        request_id: int | str,
+        result: Json,
+        *,
+        generation: int | None = None,
+    ) -> None:
+        if generation is not None and generation != self.generation:
+            raise CodexDisconnected("Codex server request belongs to a stale generation")
         await self._send({"id": request_id, "result": result})
 
-    async def respond_error(self, request_id: int | str, code: int, message: str) -> None:
+    async def respond_error(
+        self,
+        request_id: int | str,
+        code: int,
+        message: str,
+        *,
+        generation: int | None = None,
+    ) -> None:
+        if generation is not None and generation != self.generation:
+            raise CodexDisconnected("Codex server request belongs to a stale generation")
         await self._send({"id": request_id, "error": {"code": code, "message": message}})
+
+    def _enqueue_server_request(
+        self,
+        request_id: int | str,
+        method: str,
+        params: Json,
+        generation: int,
+        connection_token: object,
+    ) -> None:
+        if len(self._server_request_queue) >= self.server_request_capacity:
+            raise CodexDisconnected(
+                f"Codex server request queue exceeded {self.server_request_capacity} entries"
+            )
+        thread_id = self._notification_thread_id(params)
+        thread_key = thread_id or f"request:{request_id}"
+        self._server_request_queue.append(
+            _ServerRequestEnvelope(
+                request_id,
+                method,
+                params,
+                generation,
+                connection_token,
+                thread_key,
+            )
+        )
+        self._pump_server_requests()
+
+    def _pump_server_requests(self) -> None:
+        while (
+            self._server_request_queue
+            and len(self._server_request_tasks) < self.server_request_concurrency
+        ):
+            selected_index = next(
+                (
+                    index
+                    for index, envelope in enumerate(self._server_request_queue)
+                    if envelope.thread_key not in self._server_active_threads
+                ),
+                None,
+            )
+            if selected_index is None:
+                return
+            envelope = self._server_request_queue[selected_index]
+            del self._server_request_queue[selected_index]
+            self._server_active_threads.add(envelope.thread_key)
+            task = asyncio.create_task(
+                self._dispatch_server_request(
+                    envelope.request_id,
+                    envelope.method,
+                    envelope.params,
+                    envelope.generation,
+                    connection_token=envelope.connection_token,
+                ),
+                name=f"codex-server-request-{envelope.method}",
+            )
+            self._server_request_tasks.add(task)
+            self._server_request_envelopes[task] = envelope
+            task.add_done_callback(self._server_request_finished)
 
     def _server_request_finished(self, task: asyncio.Task[None]) -> None:
         self._server_request_tasks.discard(task)
-        if task.cancelled():
-            return
-        error = task.exception()
-        if error is not None:
-            LOGGER.error("Codex server request handler failed: %s", error)
+        envelope = self._server_request_envelopes.pop(task, None)
+        if envelope is not None:
+            self._server_active_threads.discard(envelope.thread_key)
+        if not task.cancelled():
+            error = task.exception()
+            if error is not None:
+                LOGGER.error(
+                    "Codex server request handler failed (%s)",
+                    type(error).__name__,
+                )
+        if not self._stopping.is_set():
+            self._pump_server_requests()
 
     async def _cancel_server_request_tasks(self) -> None:
+        self._server_request_queue.clear()
         while self._server_request_tasks:
             tasks = tuple(self._server_request_tasks)
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             self._server_request_tasks.difference_update(tasks)
+        self._server_request_envelopes.clear()
+        self._server_active_threads.clear()
 
     async def _fail_pending(self, error: Exception) -> None:
         await self._cancel_server_request_tasks()
         pending, self._pending = self._pending, {}
         self._ephemeral_request_ids.clear()
-        for future in pending.values():
-            if not future.done():
-                future.set_exception(error)
+        for request in pending.values():
+            if not request.future.done():
+                request.future.set_exception(error)
+            self._release_rpc_slot(request)
         isolated, self._isolated_questions = self._isolated_questions, {}
         self._ephemeral_thread_ids.clear()
         for question in isolated.values():
             if not question.future.done():
                 question.future.set_exception(error)
+
+    def _release_rpc_slot(self, pending: _PendingRpc) -> None:
+        if pending.permit_released:
+            return
+        pending.permit_released = True
+        self._pending_slots.release()
+
+    def health_snapshot(self) -> dict[str, Any]:
+        queue = self._notification_queue
+        return {
+            "connected": self.connected,
+            "generation": self.generation,
+            "pending_rpc": len(self._pending),
+            "pending_rpc_capacity": self._pending_rpc_limit,
+            "notification_queued": queue.qsize() if queue is not None else 0,
+            "notification_capacity": self.notification_capacity,
+            "server_request_queued": len(self._server_request_queue),
+            "server_request_running": len(self._server_request_tasks),
+            "server_request_capacity": self.server_request_capacity,
+        }
 
     def _register_ephemeral_response(self, request_id: Any, message: Json) -> None:
         if request_id not in self._ephemeral_request_ids or isinstance(message.get("error"), dict):
@@ -428,14 +777,23 @@ class CodexClient:
         await self.on_notification(method, params)
 
     async def _dispatch_server_request(
-        self, request_id: int | str, method: str, params: Json, generation: int
+        self,
+        request_id: int | str,
+        method: str,
+        params: Json,
+        generation: int,
+        *,
+        connection_token: object | None = None,
     ) -> None:
+        if connection_token is not None and connection_token is not self._connection_token:
+            raise CodexDisconnected("Codex server request belongs to a stale connection")
         thread_id = self._notification_thread_id(params)
         if thread_id and thread_id in self._ephemeral_thread_ids:
             await self.respond_error(
                 request_id,
                 -32600,
                 "Interactive requests are disabled for isolated side questions",
+                generation=generation,
             )
             return
         await self.on_server_request(request_id, method, params, generation)

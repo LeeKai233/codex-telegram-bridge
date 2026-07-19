@@ -1,17 +1,19 @@
 # X-CodexTelegramBridge-Installer: managed
-# X-CodexTelegramBridge-Installer-Version: v0.2.5
+# X-CodexTelegramBridge-Installer-Version: v0.2.6
 [Unit]
 Description=Codex Telegram Bridge
 Documentation=https://github.com/LeeKai233/codex-telegram-bridge
 Wants=network-online.target
 After=network-online.target codex-telegram-app-server.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
 WorkingDirectory=%h
 ExecStart=/usr/bin/env CODEX_HOME=%h/.codex %h/.local/bin/codex-telegram-bridge
 Restart=on-failure
-RestartSec=5s
+RestartSec=30s
 TimeoutStopSec=45s
 KillSignal=SIGTERM
 KillMode=process

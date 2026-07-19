@@ -17,8 +17,14 @@ from typing import Any
 from .config import ensure_private_directory
 from .models import InteractionDraft, Owner, QueuedPrompt, SessionSpace, ThreadState
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 10
 CONTROL_BOT_ROLE = "control"
+EVENT_RETENTION_DAYS = 7
+EVENT_RECEIPT_LIMIT = 100_000
+TIMELINE_PER_THREAD_LIMIT = 500
+OUTBOUND_TERMINAL_LIMIT = 10_000
+MAINTENANCE_BATCH_SIZE = 500
+MAINTENANCE_BUSY_TIMEOUT_MS = 1_000
 _PLAN_PUBLICATION_RESULTS = frozenset({"published", "failed"})
 _PLAN_ACTION_STATUSES = frozenset({"executing", "revising"})
 _PLAN_ACTION_TERMINAL_STATUSES = frozenset({"executed", "revision_started", "dismissed"})
@@ -49,14 +55,33 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     active INTEGER NOT NULL DEFAULT 1,
     created_at INTEGER NOT NULL
 );
-CREATE TABLE IF NOT EXISTS events (
+CREATE TABLE IF NOT EXISTS event_receipts (
     event_key TEXT PRIMARY KEY,
-    thread_id TEXT,
+    thread_id TEXT NOT NULL,
     kind TEXT NOT NULL,
-    payload_json TEXT NOT NULL,
     created_at INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_events_thread_created ON events(thread_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_event_receipts_created
+    ON event_receipts(created_at DESC);
+CREATE TABLE IF NOT EXISTS timeline_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_key TEXT NOT NULL UNIQUE,
+    thread_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_timeline_thread_created
+    ON timeline_events(thread_id, created_at DESC, id DESC);
+CREATE TABLE IF NOT EXISTS tui_plan_approvals (
+    event_key TEXT PRIMARY KEY,
+    thread_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tui_plan_approvals_lookup
+    ON tui_plan_approvals(thread_id, prompt, created_at, event_key);
 CREATE TABLE IF NOT EXISTS prompt_queue (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     thread_id TEXT NOT NULL,
@@ -231,6 +256,39 @@ CREATE TABLE IF NOT EXISTS plan_publications (
 );
 CREATE INDEX IF NOT EXISTS idx_plan_publications_latest
     ON plan_publications(space_id, generation, id DESC);
+CREATE TABLE IF NOT EXISTS outbound_intents (
+    intent_id TEXT PRIMARY KEY,
+    bot_role TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    lane TEXT NOT NULL,
+    chat_id INTEGER,
+    payload_fingerprint TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    error_type TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_outbound_intents_status
+    ON outbound_intents(status, updated_at DESC);
+CREATE TABLE IF NOT EXISTS runtime_lifecycle (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    runtime_id TEXT NOT NULL,
+    state TEXT NOT NULL,
+    owner_chat_id INTEGER,
+    startup_disconnect_state TEXT NOT NULL,
+    handshake_state TEXT NOT NULL,
+    shutdown_disconnect_state TEXT NOT NULL,
+    started_at INTEGER NOT NULL,
+    ready_at INTEGER,
+    stopped_at INTEGER,
+    updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS health_snapshots (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    snapshot_json TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+);
 """
 
 
@@ -246,6 +304,106 @@ def _json_mapping(value: Mapping[str, Any]) -> str:
     return json.dumps(dict(value), ensure_ascii=False, separators=(",", ":"))
 
 
+def _managed_thread_ids(connection: sqlite3.Connection) -> set[str]:
+    roots = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT thread_id FROM subscriptions WHERE active=1 "
+            "UNION SELECT thread_id FROM session_spaces "
+            "WHERE lifecycle!='closed' AND thread_id IS NOT NULL"
+        )
+        if row[0]
+    }
+    states: dict[str, dict[str, Any]] = {}
+    if _columns(connection, "threads"):
+        for thread_id, raw in connection.execute("SELECT thread_id, state_json FROM threads"):
+            try:
+                value = json.loads(str(raw))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if isinstance(value, dict):
+                states[str(thread_id)] = value
+    managed = set(roots)
+    pending = list(roots)
+    while pending:
+        state = states.get(pending.pop())
+        if state is None:
+            continue
+        for task in state.get("tasks") or []:
+            if not isinstance(task, dict):
+                continue
+            child_id = str(
+                task.get("agent_thread_id")
+                or task.get("agentThreadId")
+                or task.get("task_id")
+                or task.get("taskId")
+                or ""
+            )
+            if child_id and child_id not in managed:
+                managed.add(child_id)
+                pending.append(child_id)
+    return managed
+
+
+def _compact_event_payload(kind: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+    compact: dict[str, Any] = {}
+    for name in ("threadId", "turnId"):
+        value = payload.get(name)
+        if value:
+            compact[name] = str(value)[:160]
+    status = payload.get("status")
+    if isinstance(status, dict):
+        compact["status"] = {
+            "type": str(status.get("type") or "")[:80],
+            "activeFlags": [str(value)[:80] for value in status.get("activeFlags") or []][:16],
+        }
+    elif status is not None:
+        compact["status"] = str(status)[:80]
+    turn = payload.get("turn")
+    if isinstance(turn, dict):
+        compact["turn"] = {
+            "id": str(turn.get("id") or "")[:160],
+            "status": str(turn.get("status") or "")[:80],
+        }
+    item = payload.get("item")
+    if isinstance(item, dict):
+        compact["item"] = {
+            "id": str(item.get("id") or "")[:160],
+            "type": str(item.get("type") or "")[:80],
+            "status": str(item.get("status") or "")[:80],
+        }
+    error = payload.get("error")
+    if isinstance(error, dict):
+        compact["error"] = {"message": " ".join(str(error.get("message") or "").split())[:360]}
+    elif error:
+        compact["error"] = {"message": " ".join(str(error).split())[:360]}
+    if "willRetry" in payload:
+        compact["willRetry"] = bool(payload.get("willRetry"))
+    if kind in {"warning", "guardianWarning", "deprecationNotice", "configWarning"}:
+        message = payload.get("message") or payload.get("text")
+        if message:
+            compact["message"] = " ".join(str(message).split())[:360]
+    return compact
+
+
+def _tui_plan_approval(payload: Mapping[str, Any]) -> tuple[str, str] | None:
+    item = payload.get("item")
+    if (
+        not isinstance(item, dict)
+        or item.get("type") != "userMessage"
+        or item.get("clientId") is not None
+    ):
+        return None
+    content = item.get("content")
+    if not isinstance(content, list) or len(content) != 1 or not isinstance(content[0], dict):
+        return None
+    first = content[0]
+    if first.get("type") != "text" or first.get("text") != "Implement the plan.":
+        return None
+    turn_id = str(payload.get("turnId") or "")
+    return (turn_id, "Implement the plan.") if turn_id else None
+
+
 class Store:
     def __init__(self, path: Path) -> None:
         ensure_private_directory(path.parent)
@@ -256,13 +414,18 @@ class Store:
         had_database = path.is_file() and path.stat().st_size > 0
         self._connection = sqlite3.connect(path, check_same_thread=False, timeout=30.0)
         self._connection.row_factory = sqlite3.Row
-        with self._lock:
-            self._connection.execute("PRAGMA busy_timeout=30000")
-            self._connection.execute("PRAGMA foreign_keys=ON")
-            self._migrate(had_database=had_database)
-            self._connection.execute("PRAGMA journal_mode=WAL")
-            self._connection.execute("PRAGMA synchronous=FULL")
-            self._connection.commit()
+        try:
+            with self._lock:
+                self._connection.execute("PRAGMA busy_timeout=30000")
+                self._connection.execute("PRAGMA foreign_keys=ON")
+                self._migrate(had_database=had_database)
+                self._connection.execute("PRAGMA journal_mode=WAL")
+                self._connection.execute("PRAGMA synchronous=FULL")
+                self._connection.commit()
+        except BaseException:
+            self._connection.close()
+            self._closed = True
+            raise
         os.chmod(path, 0o600)
 
     @property
@@ -289,6 +452,86 @@ class Store:
         os.chmod(backup, 0o600)
         self.last_backup_path = backup
         return backup
+
+    def _migrate_events_v10(self) -> None:
+        managed = sorted(_managed_thread_ids(self._connection))
+        self._connection.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS migration_managed_threads("
+            "thread_id TEXT PRIMARY KEY) WITHOUT ROWID"
+        )
+        self._connection.execute("DELETE FROM migration_managed_threads")
+        self._connection.executemany(
+            "INSERT INTO migration_managed_threads(thread_id) VALUES(?)",
+            ((thread_id,) for thread_id in managed),
+        )
+        cutoff = int(time.time()) - EVENT_RETENTION_DAYS * 86400
+        self._connection.execute(
+            "INSERT OR IGNORE INTO event_receipts(event_key, thread_id, kind, created_at) "
+            "SELECT events.event_key, events.thread_id, events.kind, events.created_at "
+            "FROM events JOIN migration_managed_threads AS managed "
+            "ON managed.thread_id=events.thread_id WHERE events.created_at>=? "
+            "ORDER BY events.created_at DESC, events.rowid DESC LIMIT ?",
+            (cutoff, EVENT_RECEIPT_LIMIT),
+        )
+        for thread_id in managed:
+            rows = self._connection.execute(
+                "SELECT event_key, kind, payload_json, created_at FROM events "
+                "WHERE thread_id=? AND created_at>=? "
+                "ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                (thread_id, cutoff, TIMELINE_PER_THREAD_LIMIT),
+            ).fetchall()
+            timeline_rows: list[tuple[str, str, str, str, int]] = []
+            for row in reversed(rows):
+                try:
+                    raw = json.loads(str(row[2]))
+                except (TypeError, ValueError):
+                    raw = {}
+                payload = raw if isinstance(raw, dict) else {}
+                timeline_rows.append(
+                    (
+                        str(row[0]),
+                        thread_id,
+                        str(row[1]),
+                        _json_mapping(_compact_event_payload(str(row[1]), payload)),
+                        int(row[3]),
+                    )
+                )
+            self._connection.executemany(
+                "INSERT OR IGNORE INTO timeline_events("
+                "event_key, thread_id, kind, payload_json, created_at) VALUES(?, ?, ?, ?, ?)",
+                timeline_rows,
+            )
+        cursor = self._connection.execute(
+            "SELECT events.event_key, events.thread_id, events.payload_json, events.created_at "
+            "FROM events JOIN migration_managed_threads AS managed "
+            "ON managed.thread_id=events.thread_id "
+            "WHERE events.kind='item/started' AND events.created_at>=? "
+            "ORDER BY events.created_at, events.rowid",
+            (cutoff,),
+        )
+        while True:
+            rows = cursor.fetchmany(MAINTENANCE_BATCH_SIZE)
+            if not rows:
+                break
+            approvals: list[tuple[str, str, str, str, int]] = []
+            for row in rows:
+                try:
+                    raw = json.loads(str(row[2]))
+                except (TypeError, ValueError):
+                    continue
+                semantic = _tui_plan_approval(raw if isinstance(raw, dict) else {})
+                if semantic is not None:
+                    approvals.append(
+                        (str(row[0]), str(row[1]), semantic[0], semantic[1], int(row[3]))
+                    )
+            self._connection.executemany(
+                "INSERT OR IGNORE INTO tui_plan_approvals("
+                "event_key, thread_id, turn_id, prompt, created_at) VALUES(?, ?, ?, ?, ?)",
+                approvals,
+            )
+        self._connection.execute("DROP INDEX IF EXISTS idx_events_thread_created")
+        self._connection.execute("DROP TABLE events")
+        self._connection.execute("DROP TABLE migration_managed_threads")
 
     def _migrate(self, *, had_database: bool) -> None:
         current = int(self._connection.execute("PRAGMA user_version").fetchone()[0])
@@ -335,16 +578,18 @@ class Store:
                     self._connection.execute(
                         f"ALTER TABLE plan_publications ADD COLUMN {name} {declaration}"
                     )
-            self._connection.execute(
-                "UPDATE plan_publications SET plan_text=COALESCE(("
-                "SELECT json_extract(events.payload_json, '$.item.text') FROM events "
-                "WHERE events.thread_id=plan_publications.thread_id "
-                "AND events.kind IN ('item/completed', 'item/started') "
-                "AND json_extract(events.payload_json, '$.turnId')=plan_publications.turn_id "
-                "AND json_extract(events.payload_json, '$.item.id')=plan_publications.item_id "
-                "AND json_extract(events.payload_json, '$.item.type')='plan' "
-                "ORDER BY events.created_at DESC LIMIT 1), '') WHERE plan_text=''"
-            )
+            if _columns(self._connection, "events"):
+                self._connection.execute(
+                    "UPDATE plan_publications SET plan_text=COALESCE(("
+                    "SELECT json_extract(events.payload_json, '$.item.text') FROM events "
+                    "WHERE events.thread_id=plan_publications.thread_id "
+                    "AND events.kind IN ('item/completed', 'item/started') "
+                    "AND json_extract(events.payload_json, '$.turnId')=plan_publications.turn_id "
+                    "AND json_extract(events.payload_json, '$.item.id')=plan_publications.item_id "
+                    "AND json_extract(events.payload_json, '$.item.type')='plan' "
+                    "ORDER BY events.created_at DESC LIMIT 1), '') WHERE plan_text=''"
+                )
+                self._migrate_events_v10()
             if _columns(self._connection, "telegram_updates_legacy"):
                 legacy_columns = _columns(self._connection, "telegram_updates_legacy")
                 sequence = "COALESCE(sequence, rowid)" if "sequence" in legacy_columns else "rowid"
@@ -438,6 +683,238 @@ class Store:
         with self._lock:
             row = self._connection.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()
         return json.loads(row[0]) if row else default
+
+    def create_outbound_intent(
+        self,
+        *,
+        bot_role: str,
+        operation: str,
+        lane: str,
+        chat_id: int | None,
+        payload_fingerprint: str,
+    ) -> str:
+        intent_id = str(uuid.uuid4())
+        now = int(time.time())
+        with self._lock, self._connection:
+            self._connection.execute(
+                "INSERT INTO outbound_intents(intent_id, bot_role, operation, lane, chat_id, "
+                "payload_fingerprint, status, created_at, updated_at) "
+                "VALUES(?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+                (
+                    intent_id,
+                    bot_role,
+                    operation,
+                    lane,
+                    chat_id,
+                    payload_fingerprint,
+                    now,
+                    now,
+                ),
+            )
+        return intent_id
+
+    def update_outbound_intent(
+        self,
+        intent_id: str,
+        *,
+        status: str,
+        attempts: int,
+        error_type: str | None = None,
+    ) -> None:
+        if status not in {"pending", "retrying", "delivered", "uncertain", "failed"}:
+            raise ValueError("Outbound intent status is invalid")
+        with self._lock, self._connection:
+            self._connection.execute(
+                "UPDATE outbound_intents SET status=?, attempts=?, error_type=?, updated_at=? "
+                "WHERE intent_id=?",
+                (status, attempts, error_type, int(time.time()), intent_id),
+            )
+
+    def outbound_intents(self, *, status: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        if limit <= 0:
+            return []
+        sql = (
+            "SELECT intent_id, bot_role, operation, lane, chat_id, payload_fingerprint, status, "
+            "attempts, error_type, created_at, updated_at FROM outbound_intents"
+        )
+        params: tuple[Any, ...]
+        if status is None:
+            sql += " ORDER BY updated_at DESC LIMIT ?"
+            params = (limit,)
+        else:
+            sql += " WHERE status=? ORDER BY updated_at DESC LIMIT ?"
+            params = (status, limit)
+        with self._lock:
+            rows = self._connection.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def recover_outbound_intents(self) -> int:
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                "UPDATE outbound_intents SET status='uncertain', error_type='ProcessRestart', "
+                "updated_at=? WHERE status IN ('pending', 'retrying')",
+                (int(time.time()),),
+            )
+        return max(0, int(cursor.rowcount))
+
+    def begin_runtime_lifecycle(self, owner_chat_id: int | None) -> dict[str, Any]:
+        runtime_id = str(uuid.uuid4())
+        now = int(time.time())
+        with self._immediate_transaction() as connection:
+            row = connection.execute(
+                "SELECT runtime_id, state, owner_chat_id, shutdown_disconnect_state "
+                "FROM runtime_lifecycle WHERE singleton=1"
+            ).fetchone()
+            legacy_active = bool(self._meta_on(connection, "telegram_runtime_active", False))
+            legacy_chat_id = int(self._meta_on(connection, "telegram_runtime_chat_id", 0)) or None
+            previous_active = bool(row and str(row[1]) != "stopped") or (row is None and legacy_active)
+            previous_chat_id = int(row[2]) if row and row[2] is not None else legacy_chat_id
+            previous_shutdown = str(row[3]) if row else "pending"
+            startup_disconnect = (
+                "pending"
+                if owner_chat_id is not None
+                and previous_active
+                and previous_chat_id == owner_chat_id
+                and previous_shutdown == "pending"
+                else "skipped"
+            )
+            connection.execute(
+                "INSERT INTO runtime_lifecycle(singleton, runtime_id, state, owner_chat_id, "
+                "startup_disconnect_state, handshake_state, shutdown_disconnect_state, "
+                "started_at, ready_at, stopped_at, updated_at) "
+                "VALUES(1, ?, 'starting', ?, ?, 'pending', 'pending', ?, NULL, NULL, ?) "
+                "ON CONFLICT(singleton) DO UPDATE SET runtime_id=excluded.runtime_id, "
+                "state=excluded.state, owner_chat_id=excluded.owner_chat_id, "
+                "startup_disconnect_state=excluded.startup_disconnect_state, "
+                "handshake_state=excluded.handshake_state, "
+                "shutdown_disconnect_state=excluded.shutdown_disconnect_state, "
+                "started_at=excluded.started_at, ready_at=NULL, stopped_at=NULL, "
+                "updated_at=excluded.updated_at",
+                (runtime_id, owner_chat_id, startup_disconnect, now, now),
+            )
+            self._set_meta_on(connection, "telegram_runtime_active", True)
+            self._set_meta_on(connection, "telegram_runtime_chat_id", owner_chat_id or 0)
+            self._set_meta_on(connection, "telegram_disconnect_pending", startup_disconnect == "pending")
+        return self.runtime_lifecycle() or {}
+
+    def bind_runtime_owner(self, runtime_id: str, owner_chat_id: int) -> bool:
+        now = int(time.time())
+        with self._immediate_transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE runtime_lifecycle SET owner_chat_id=?, handshake_state='pending', "
+                "updated_at=? WHERE singleton=1 AND runtime_id=? "
+                "AND (owner_chat_id IS NULL OR owner_chat_id!=?)",
+                (owner_chat_id, now, runtime_id, owner_chat_id),
+            )
+            if cursor.rowcount:
+                self._set_meta_on(connection, "telegram_runtime_chat_id", owner_chat_id)
+        return bool(cursor.rowcount)
+
+    def claim_runtime_notice(self, runtime_id: str, notice: str) -> bool:
+        column = self._runtime_notice_column(notice)
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                f"UPDATE runtime_lifecycle SET {column}='attempting', updated_at=? "
+                "WHERE singleton=1 AND runtime_id=? "
+                f"AND {column}='pending'",
+                (int(time.time()), runtime_id),
+            )
+        return bool(cursor.rowcount)
+
+    def complete_runtime_notice(self, runtime_id: str, notice: str, outcome: str) -> None:
+        if outcome not in {"delivered", "uncertain", "failed", "skipped"}:
+            raise ValueError("Runtime notice outcome is invalid")
+        column = self._runtime_notice_column(notice)
+        with self._immediate_transaction() as connection:
+            connection.execute(
+                f"UPDATE runtime_lifecycle SET {column}=?, updated_at=? "
+                "WHERE singleton=1 AND runtime_id=?",
+                (outcome, int(time.time()), runtime_id),
+            )
+            if notice == "startup_disconnect":
+                self._set_meta_on(connection, "telegram_disconnect_pending", False)
+
+    def mark_runtime_ready(self, runtime_id: str) -> None:
+        now = int(time.time())
+        with self._lock, self._connection:
+            self._connection.execute(
+                "UPDATE runtime_lifecycle SET state='ready', ready_at=?, updated_at=? "
+                "WHERE singleton=1 AND runtime_id=?",
+                (now, now, runtime_id),
+            )
+
+    def finish_runtime_lifecycle(self, runtime_id: str) -> None:
+        now = int(time.time())
+        with self._immediate_transaction() as connection:
+            connection.execute(
+                "UPDATE runtime_lifecycle SET state='stopped', stopped_at=?, updated_at=? "
+                "WHERE singleton=1 AND runtime_id=?",
+                (now, now, runtime_id),
+            )
+            self._set_meta_on(connection, "telegram_runtime_active", False)
+            self._set_meta_on(connection, "telegram_disconnect_pending", False)
+
+    def runtime_lifecycle(self) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT runtime_id, state, owner_chat_id, startup_disconnect_state, "
+                "handshake_state, shutdown_disconnect_state, started_at, ready_at, stopped_at, "
+                "updated_at FROM runtime_lifecycle WHERE singleton=1"
+            ).fetchone()
+        return dict(row) if row else None
+
+    def write_health_snapshot(self, snapshot: Mapping[str, Any]) -> None:
+        now = int(time.time())
+        payload = _json_mapping(snapshot)
+        connection = sqlite3.connect(self.path, timeout=1.0)
+        connection.execute(f"PRAGMA busy_timeout={MAINTENANCE_BUSY_TIMEOUT_MS}")
+        try:
+            with connection:
+                connection.execute(
+                "INSERT INTO health_snapshots(singleton, snapshot_json, updated_at) "
+                "VALUES(1, ?, ?) ON CONFLICT(singleton) DO UPDATE SET "
+                "snapshot_json=excluded.snapshot_json, updated_at=excluded.updated_at",
+                (payload, now),
+            )
+        finally:
+            connection.close()
+
+    def health_snapshot(self) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT snapshot_json, updated_at FROM health_snapshots WHERE singleton=1"
+            ).fetchone()
+        if row is None:
+            return None
+        value = json.loads(str(row[0]))
+        snapshot = value if isinstance(value, dict) else {}
+        snapshot["updated_at"] = int(row[1])
+        return snapshot
+
+    @staticmethod
+    def _runtime_notice_column(notice: str) -> str:
+        columns = {
+            "startup_disconnect": "startup_disconnect_state",
+            "handshake": "handshake_state",
+            "shutdown_disconnect": "shutdown_disconnect_state",
+        }
+        try:
+            return columns[notice]
+        except KeyError as exc:
+            raise ValueError("Runtime notice is invalid") from exc
+
+    @staticmethod
+    def _meta_on(connection: sqlite3.Connection, key: str, default: Any) -> Any:
+        row = connection.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()
+        return json.loads(row[0]) if row else default
+
+    @staticmethod
+    def _set_meta_on(connection: sqlite3.Connection, key: str, value: Any) -> None:
+        connection.execute(
+            "INSERT INTO metadata(key, value) VALUES(?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, json.dumps(value, ensure_ascii=False)),
+        )
 
     def set_owner(self, owner: Owner) -> bool:
         with self._lock, self._connection:
@@ -1048,20 +1525,52 @@ class Store:
             ).fetchall()
         return {str(row[0]): int(row[1]) if row[1] is not None else None for row in rows}
 
-    def record_event(self, event_key: str, thread_id: str | None, kind: str, payload: dict[str, Any]) -> bool:
+    def is_managed_thread(self, thread_id: str | None) -> bool:
+        if not thread_id:
+            return False
+        with self._lock:
+            return thread_id in _managed_thread_ids(self._connection)
+
+    def record_event(
+        self,
+        event_key: str,
+        thread_id: str | None,
+        kind: str,
+        payload: dict[str, Any],
+        *,
+        managed: bool = False,
+    ) -> bool:
+        if not thread_id or (not managed and not self.is_managed_thread(thread_id)):
+            return False
+        created_at = int(time.time())
+        compact = _json_mapping(_compact_event_payload(kind, payload))
+        approval = _tui_plan_approval(payload) if kind == "item/started" else None
         with self._lock, self._connection:
             cursor = self._connection.execute(
-                "INSERT OR IGNORE INTO events(event_key, thread_id, kind, payload_json, created_at) "
-                "VALUES(?, ?, ?, ?, ?)",
-                (event_key, thread_id, kind, json.dumps(payload, ensure_ascii=False), int(time.time())),
+                "INSERT OR IGNORE INTO event_receipts(event_key, thread_id, kind, created_at) "
+                "VALUES(?, ?, ?, ?)",
+                (event_key, thread_id, kind, created_at),
             )
-        return cursor.rowcount == 1
+            if cursor.rowcount != 1:
+                return False
+            self._connection.execute(
+                "INSERT INTO timeline_events(event_key, thread_id, kind, payload_json, created_at) "
+                "VALUES(?, ?, ?, ?, ?)",
+                (event_key, thread_id, kind, compact, created_at),
+            )
+            if approval is not None:
+                self._connection.execute(
+                    "INSERT OR IGNORE INTO tui_plan_approvals("
+                    "event_key, thread_id, turn_id, prompt, created_at) VALUES(?, ?, ?, ?, ?)",
+                    (event_key, thread_id, approval[0], approval[1], created_at),
+                )
+        return True
 
     def timeline(self, thread_id: str, limit: int = 50) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._connection.execute(
-                "SELECT kind, payload_json, created_at FROM events WHERE thread_id=? "
-                "ORDER BY created_at DESC LIMIT ?",
+                "SELECT kind, payload_json, created_at FROM timeline_events WHERE thread_id=? "
+                "ORDER BY created_at DESC, id ASC LIMIT ?",
                 (thread_id, limit),
             ).fetchall()
         return [{"kind": row[0], "payload": json.loads(row[1]), "created_at": int(row[2])} for row in rows]
@@ -1577,13 +2086,8 @@ class Store:
     ) -> str | None:
         with self._lock:
             row = self._connection.execute(
-                "SELECT json_extract(payload_json, '$.turnId') FROM events WHERE thread_id=? "
-                "AND created_at>=? AND kind='item/started' "
-                "AND json_extract(payload_json, '$.item.type')='userMessage' "
-                "AND json_extract(payload_json, '$.item.clientId') IS NULL "
-                "AND json_extract(payload_json, '$.item.content[0].type')='text' "
-                "AND json_extract(payload_json, '$.item.content[0].text')=? "
-                "ORDER BY created_at, rowid LIMIT 1",
+                "SELECT turn_id FROM tui_plan_approvals WHERE thread_id=? "
+                "AND created_at>=? AND prompt=? ORDER BY created_at, event_key LIMIT 1",
                 (thread_id, int(after), prompt),
             ).fetchone()
         return str(row[0]) if row is not None and row[0] else None
@@ -1839,6 +2343,66 @@ class Store:
                     generation,
                 ),
             )
+
+    def ensure_callback(
+        self,
+        nonce: str,
+        action: str,
+        payload: dict[str, Any],
+        user_id: int,
+        expires_at: int,
+        *,
+        bot_role: str = CONTROL_BOT_ROLE,
+        chat_id: int | None = None,
+        space_id: str | None = None,
+        generation: int = 0,
+    ) -> str:
+        payload_json = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        now = int(time.time())
+        with self._immediate_transaction() as connection:
+            row = connection.execute(
+                "SELECT nonce FROM callbacks WHERE action=? AND payload_json=? AND user_id=? "
+                "AND bot_role=? AND chat_id IS ? AND space_id IS ? AND generation=? "
+                "AND used_at IS NULL AND expires_at>=? ORDER BY expires_at DESC LIMIT 1",
+                (
+                    action,
+                    payload_json,
+                    user_id,
+                    bot_role,
+                    chat_id,
+                    space_id,
+                    generation,
+                    now,
+                ),
+            ).fetchone()
+            if row is not None:
+                existing = str(row[0])
+                connection.execute(
+                    "UPDATE callbacks SET expires_at=MAX(expires_at, ?) WHERE nonce=?",
+                    (expires_at, existing),
+                )
+                return existing
+            connection.execute(
+                "INSERT INTO callbacks(nonce, action, payload_json, user_id, expires_at, bot_role, "
+                "chat_id, space_id, generation) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    nonce,
+                    action,
+                    payload_json,
+                    user_id,
+                    expires_at,
+                    bot_role,
+                    chat_id,
+                    space_id,
+                    generation,
+                ),
+            )
+        return nonce
 
     def consume_callback(
         self,
@@ -2108,46 +2672,197 @@ class Store:
     def cleanup(
         self,
         *,
-        event_days: int = 30,
+        event_days: int = EVENT_RETENTION_DAYS,
         update_days: int = 30,
         keep_recent_updates: int = 1000,
-    ) -> None:
+    ) -> dict[str, int]:
         if event_days <= 0 or update_days <= 0 or keep_recent_updates < 0:
             raise ValueError("Cleanup limits are invalid")
+        connection = sqlite3.connect(self.path, timeout=1.0)
+        connection.row_factory = sqlite3.Row
+        connection.execute(f"PRAGMA busy_timeout={MAINTENANCE_BUSY_TIMEOUT_MS}")
+        connection.execute("PRAGMA foreign_keys=ON")
+        try:
+            return self._cleanup_on_connection(
+                connection,
+                event_days=event_days,
+                update_days=update_days,
+                keep_recent_updates=keep_recent_updates,
+            )
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _delete_in_batches(
+        connection: sqlite3.Connection,
+        table: str,
+        where: str,
+        params: tuple[Any, ...],
+    ) -> int:
+        deleted = 0
+        while True:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = connection.execute(
+                    f"DELETE FROM {table} WHERE rowid IN ("
+                    f"SELECT rowid FROM {table} WHERE {where} LIMIT ?)",
+                    (*params, MAINTENANCE_BATCH_SIZE),
+                )
+            except BaseException:
+                connection.rollback()
+                raise
+            else:
+                connection.commit()
+            count = max(0, int(cursor.rowcount))
+            deleted += count
+            if count < MAINTENANCE_BATCH_SIZE:
+                return deleted
+
+    @staticmethod
+    def _delete_ranked_timeline_batches(connection: sqlite3.Connection) -> int:
+        deleted = 0
+        while True:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = connection.execute(
+                    "DELETE FROM timeline_events WHERE id IN (SELECT id FROM ("
+                    "SELECT id, ROW_NUMBER() OVER(PARTITION BY thread_id "
+                    "ORDER BY created_at DESC, id DESC) AS ordinal FROM timeline_events"
+                    ") WHERE ordinal>? LIMIT ?)",
+                    (TIMELINE_PER_THREAD_LIMIT, MAINTENANCE_BATCH_SIZE),
+                )
+            except BaseException:
+                connection.rollback()
+                raise
+            else:
+                connection.commit()
+            count = max(0, int(cursor.rowcount))
+            deleted += count
+            if count < MAINTENANCE_BATCH_SIZE:
+                return deleted
+
+    @staticmethod
+    def _retire_questions_on(connection: sqlite3.Connection, now: int) -> int:
+        retired = 0
+        while True:
+            rows = connection.execute(
+                "SELECT request_key FROM pending_inputs "
+                "WHERE expires_at IS NOT NULL AND expires_at < ? "
+                "UNION SELECT messages.request_key FROM question_messages AS messages "
+                "LEFT JOIN pending_inputs AS pending ON pending.request_key=messages.request_key "
+                "WHERE pending.request_key IS NULL ORDER BY request_key LIMIT ?",
+                (now, MAINTENANCE_BATCH_SIZE),
+            ).fetchall()
+            if not rows:
+                return retired
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                for row in rows:
+                    request_key = str(row[0])
+                    messages = connection.execute(
+                        "SELECT bot_role, chat_id, message_id FROM question_messages "
+                        "WHERE request_key=? ORDER BY created_at, message_id",
+                        (request_key,),
+                    ).fetchall()
+                    for bot_role, chat_id, message_id in messages:
+                        connection.execute(
+                            "INSERT INTO scheduled_deletions("
+                            "bot_role, chat_id, message_id, delete_at, group_key, created_at) "
+                            "VALUES(?, ?, ?, ?, ?, ?) "
+                            "ON CONFLICT(bot_role, chat_id, message_id) DO UPDATE SET "
+                            "delete_at=excluded.delete_at, group_key=excluded.group_key, "
+                            "attempts=0, last_error=NULL",
+                            (
+                                str(bot_role),
+                                int(chat_id),
+                                int(message_id),
+                                now,
+                                f"question:{request_key}",
+                                now,
+                            ),
+                        )
+                    connection.execute(
+                        "DELETE FROM question_messages WHERE request_key=?", (request_key,)
+                    )
+                    connection.execute("DELETE FROM pending_inputs WHERE request_key=?", (request_key,))
+                    connection.execute(
+                        "DELETE FROM question_resolutions WHERE request_key=?", (request_key,)
+                    )
+            except BaseException:
+                connection.rollback()
+                raise
+            else:
+                connection.commit()
+            retired += len(rows)
+
+    @classmethod
+    def _cleanup_on_connection(
+        cls,
+        connection: sqlite3.Connection,
+        *,
+        event_days: int,
+        update_days: int,
+        keep_recent_updates: int,
+    ) -> dict[str, int]:
         now = int(time.time())
-        self.retire_question_requests(now=now)
-        with self._lock, self._connection:
-            self._connection.execute(
-                "DELETE FROM callbacks WHERE expires_at < ? OR used_at IS NOT NULL", (now,)
-            )
-            self._connection.execute(
-                "DELETE FROM interaction_drafts WHERE claimed_at IS NOT NULL AND updated_at < ?",
+        retention_cutoff = now - event_days * 86400
+        connection.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS maintenance_managed_threads("
+            "thread_id TEXT PRIMARY KEY) WITHOUT ROWID"
+        )
+        connection.execute("DELETE FROM maintenance_managed_threads")
+        connection.executemany(
+            "INSERT INTO maintenance_managed_threads(thread_id) VALUES(?)",
+            ((thread_id,) for thread_id in sorted(_managed_thread_ids(connection))),
+        )
+        connection.commit()
+        deleted: dict[str, int] = {
+            "retired_questions": cls._retire_questions_on(connection, now),
+            "callbacks": cls._delete_in_batches(
+                connection, "callbacks", "expires_at < ? OR used_at IS NOT NULL", (now,)
+            ),
+            "interactions": cls._delete_in_batches(
+                connection,
+                "interaction_drafts",
+                "claimed_at IS NOT NULL AND updated_at < ?",
                 (now - 86400,),
-            )
-            self._connection.execute("DELETE FROM events WHERE created_at < ?", (now - event_days * 86400,))
-            self._connection.execute(
-                "DELETE FROM telegram_updates WHERE received_at < ? "
-                "AND sequence NOT IN ("
-                "SELECT sequence FROM telegram_updates "
-                "ORDER BY sequence DESC LIMIT ?)",
+            ),
+            "event_receipts": cls._delete_in_batches(
+                connection, "event_receipts", "created_at < ?", (retention_cutoff,)
+            ),
+            "timeline": cls._delete_in_batches(
+                connection,
+                "timeline_events",
+                "created_at < ? OR thread_id NOT IN ("
+                "SELECT thread_id FROM maintenance_managed_threads)",
+                (retention_cutoff,),
+            ),
+            "tui_approvals": cls._delete_in_batches(
+                connection, "tui_plan_approvals", "created_at < ?", (retention_cutoff,)
+            ),
+            "telegram_updates": cls._delete_in_batches(
+                connection,
+                "telegram_updates",
+                "received_at < ? AND sequence NOT IN ("
+                "SELECT sequence FROM telegram_updates ORDER BY sequence DESC LIMIT ?)",
                 (now - update_days * 86400, keep_recent_updates),
-            )
-            self._connection.execute(
-                "DELETE FROM scheduled_deletions WHERE delete_at < ? AND attempts >= 20",
+            ),
+            "scheduled_deletions": cls._delete_in_batches(
+                connection,
+                "scheduled_deletions",
+                "delete_at < ? AND attempts >= 20",
                 (now - 7 * 86400,),
-            )
-            retention_cutoff = now - event_days * 86400
-            self._connection.execute(
-                "DELETE FROM question_resolutions WHERE resolved_at < ?",
-                (retention_cutoff,),
-            )
-            self._connection.execute(
-                "DELETE FROM prompt_runs WHERE updated_at < ?",
-                (retention_cutoff,),
-            )
-            self._connection.execute(
-                "DELETE FROM plan_publications WHERE updated_at < ? AND ("
-                "status IN ('superseded', 'failed') OR EXISTS ("
+            ),
+            "question_resolutions": cls._delete_in_batches(
+                connection, "question_resolutions", "resolved_at < ?", (retention_cutoff,)
+            ),
+            "prompt_runs": cls._delete_in_batches(
+                connection, "prompt_runs", "updated_at < ?", (retention_cutoff,)
+            ),
+            "plan_publications": cls._delete_in_batches(
+                connection,
+                "plan_publications",
+                "updated_at < ? AND (status IN ('superseded', 'failed') OR EXISTS ("
                 "SELECT 1 FROM plan_publications AS newer "
                 "WHERE newer.space_id=plan_publications.space_id "
                 "AND newer.generation=plan_publications.generation "
@@ -2157,7 +2872,34 @@ class Store:
                 "AND spaces.generation=plan_publications.generation "
                 "AND spaces.lifecycle!='closed'))",
                 (retention_cutoff,),
-            )
+            ),
+            "outbound_intents": cls._delete_in_batches(
+                connection,
+                "outbound_intents",
+                "status IN ('delivered', 'uncertain', 'failed') AND updated_at < ?",
+                (retention_cutoff,),
+            ),
+        }
+        deleted["event_receipts"] += cls._delete_in_batches(
+            connection,
+            "event_receipts",
+            "rowid NOT IN (SELECT rowid FROM event_receipts "
+            "ORDER BY created_at DESC, rowid DESC LIMIT ?)",
+            (EVENT_RECEIPT_LIMIT,),
+        )
+        deleted["timeline"] += cls._delete_ranked_timeline_batches(connection)
+        deleted["outbound_intents"] += cls._delete_in_batches(
+            connection,
+            "outbound_intents",
+            "status IN ('delivered', 'uncertain', 'failed') AND rowid NOT IN ("
+            "SELECT rowid FROM outbound_intents "
+            "WHERE status IN ('delivered', 'uncertain', 'failed') "
+            "ORDER BY updated_at DESC, rowid DESC LIMIT ?)",
+            (OUTBOUND_TERMINAL_LIMIT,),
+        )
+        connection.execute("DROP TABLE maintenance_managed_threads")
+        connection.commit()
+        return deleted
 
     def telegram_update_seen(self, update_id: int, bot_role: str = CONTROL_BOT_ROLE) -> bool:
         with self._lock:

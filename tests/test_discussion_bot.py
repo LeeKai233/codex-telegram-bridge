@@ -39,8 +39,7 @@ class Messenger:
 
 
 class DirectMessenger:
-    async def call(self, operation: Any, *, priority: int = 10) -> Any:
-        del priority
+    async def call(self, operation: Any, **_kwargs: Any) -> Any:
         return await operation()
 
 
@@ -99,6 +98,58 @@ def put_pending(store: Store, request_key: str, request_id: str = "42") -> None:
         [{"id": "answer", "question": "Continue?"}],
         None,
     )
+
+
+@pytest.mark.asyncio
+async def test_installed_discussion_handlers_are_nonblocking_keyed_actors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _bridge, store, controller, _control, _discussion = make_runtime(tmp_path)
+    controller._application = SimpleNamespace()  # noqa: SLF001
+    events: list[str] = []
+    first_started = asyncio.Event()
+    other_started = asyncio.Event()
+    release_first = asyncio.Event()
+    release_other = asyncio.Event()
+
+    monkeypatch.setattr(controller, "_space_for_message", lambda message: message.space)
+
+    async def work(update: Any, _context: Any) -> None:
+        events.append(f"{update.label}-start")
+        if update.label == "a1":
+            first_started.set()
+            await release_first.wait()
+        elif update.label == "b1":
+            other_started.set()
+            await release_other.wait()
+        events.append(f"{update.label}-end")
+
+    handler = controller._defer_handler(work)  # noqa: SLF001
+
+    def candidate(label: str, space_id: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            label=label,
+            effective_message=SimpleNamespace(
+                space={"space_id": space_id, "generation": 1}
+            ),
+        )
+
+    try:
+        await asyncio.wait_for(handler(candidate("a1", "a"), SimpleNamespace()), 0.1)
+        await first_started.wait()
+        await asyncio.wait_for(handler(candidate("a2", "a"), SimpleNamespace()), 0.1)
+        await asyncio.wait_for(handler(candidate("b1", "b"), SimpleNamespace()), 0.1)
+        await other_started.wait()
+
+        assert events == ["a1-start", "b1-start"]
+        release_other.set()
+        release_first.set()
+        await controller._workloads.join()  # noqa: SLF001
+
+        assert events.index("a2-start") > events.index("a1-end")
+    finally:
+        await controller.stop()
+        store.close()
 
 
 @pytest.mark.asyncio
@@ -166,13 +217,6 @@ async def test_bind_text_fallback_handles_command_without_telegram_entity(
         for handler in application.handlers[0]
         if isinstance(handler, CommandHandler) and "bind" in handler.commands
     )
-    fallback = next(
-        handler
-        for handler in application.handlers[0]
-        if isinstance(handler, MessageHandler)
-        and handler.callback == controller._bind_text_fallback
-    )
-    assert application.handlers[0].index(bind_handler) < application.handlers[0].index(fallback)
     message = Message(
         message_id=8,
         date=datetime.now(UTC),
@@ -182,6 +226,13 @@ async def test_bind_text_fallback_handles_command_without_telegram_entity(
         entities=[],
     )
     update = Update(99, message=message)
+    fallback = next(
+        handler
+        for handler in application.handlers[0]
+        if isinstance(handler, MessageHandler)
+        and handler.check_update(update)
+    )
+    assert application.handlers[0].index(bind_handler) < application.handlers[0].index(fallback)
 
     assert bind_handler.check_update(update) is None
     assert fallback.check_update(update)
@@ -193,6 +244,7 @@ async def test_bind_text_fallback_handles_command_without_telegram_entity(
     monkeypatch.setattr(controller, "bind", bind)
     context = SimpleNamespace()
     await fallback.callback(update, context)
+    await controller._workloads.join()  # noqa: SLF001
     assert calls == [(update, context)]
 
     other_update = Update(
@@ -207,6 +259,7 @@ async def test_bind_text_fallback_handles_command_without_telegram_entity(
         ),
     )
     await fallback.callback(other_update, context)
+    await controller._workloads.join()  # noqa: SLF001
     assert calls == [(update, context)]
     store.close()
 
@@ -362,19 +415,32 @@ async def test_bind_permission_errors_use_custom_bot_labels(tmp_path: Path) -> N
     async def get_discussion_member(_chat_id: int, _user_id: int) -> object:
         return discussion_member
 
+    async def direct_query(operation: Any) -> object:
+        return await operation()
+
+    async def control_endpoint_get_me(**_kwargs: Any) -> object:
+        return await get_control_me()
+
+    async def discussion_endpoint_get_me(**_kwargs: Any) -> object:
+        return await get_discussion_me()
+
     controller.control = SimpleNamespace(
         bot=SimpleNamespace(
             get_chat=get_channel,
             get_me=get_control_me,
             get_chat_member=get_control_member,
-        )
+        ),
+        query=direct_query,
+        get_me=control_endpoint_get_me,
     )
     controller.discussion = SimpleNamespace(
         bot=SimpleNamespace(
             get_chat=get_group,
             get_me=get_discussion_me,
             get_chat_member=get_discussion_member,
-        )
+        ),
+        query=direct_query,
+        get_me=discussion_endpoint_get_me,
     )
     update = SimpleNamespace(
         effective_chat=SimpleNamespace(id=-1001),
@@ -544,7 +610,9 @@ async def test_telegram_answer_uses_the_same_question_cleanup_hook(
     store.record_question_message("request-key", DISCUSSION_ROLE, -1001, 21)
     responses: list[tuple[int | str, dict[str, Any]]] = []
 
-    async def respond(request_id: int | str, result: dict[str, Any]) -> None:
+    async def respond(
+        request_id: int | str, result: dict[str, Any], **_kwargs: Any
+    ) -> None:
         responses.append((request_id, result))
 
     monkeypatch.setattr(bridge.client, "respond", respond)

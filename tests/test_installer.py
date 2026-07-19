@@ -13,7 +13,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "install.sh"
 UNIT_MARKER = "# X-CodexTelegramBridge-Installer: managed"
-UNIT_VERSION = "# X-CodexTelegramBridge-Installer-Version: v0.2.5"
+UNIT_VERSION = "# X-CodexTelegramBridge-Installer-Version: v0.2.6"
 
 
 def run_installer_shell(
@@ -410,6 +410,14 @@ grep -Fxq \
     )
 
     assert result.returncode == 0, result.stderr
+
+
+def test_bridge_unit_throttles_restart_loops() -> None:
+    unit = (ROOT / "systemd/codex-telegram-bridge.service").read_text(encoding="utf-8")
+
+    assert "StartLimitIntervalSec=300" in unit
+    assert "StartLimitBurst=5" in unit
+    assert "RestartSec=30s" in unit
 
 
 def test_non_wsl_host_contract_fails_without_mutation(tmp_path: Path) -> None:

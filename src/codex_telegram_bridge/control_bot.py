@@ -50,6 +50,7 @@ from .telegram_common import (
     raw_arguments,
 )
 from .views import render_help, render_sessions_page, render_status_comment
+from .workloads import KeyedWorkScheduler
 
 LOGGER = logging.getLogger(__name__)
 
@@ -97,8 +98,11 @@ class ControlBotController:
         self.deletions = deletions
         self._perf_runs: dict[int, _PerfRun] = {}
         self._new_timeouts: dict[str, asyncio.Task[None]] = {}
+        self._application: Application | None = None
+        self._workloads = KeyedWorkScheduler("control-work", max_pending=128, max_running=2)
 
     def install(self, application: Application) -> None:
+        self._application = application
         application.add_handler(TypeHandler(Update, self._guard), group=-100)
         for command, callback in (
             ("pair", self.pair),
@@ -108,21 +112,40 @@ class ControlBotController:
             ("new", self.new),
             ("perf", self.perf),
         ):
-            application.add_handler(CommandHandler(command, callback))
+            application.add_handler(CommandHandler(command, self._defer_handler(callback)))
         application.add_handler(
-            MessageHandler(filters.TEXT & ~filters.COMMAND, self.observe_message)
+            MessageHandler(
+                filters.TEXT & ~filters.COMMAND,
+                self._defer_handler(self.observe_message),
+            )
         )
         application.add_handler(CallbackQueryHandler(self.callback, pattern=r"^cb:"))
         application.add_error_handler(self.error)
 
+    def _defer_handler(self, callback: Any) -> Any:
+        async def deferred(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+            chat = update.effective_chat
+            key = f"chat:{chat.id}" if chat is not None else "control"
+
+            async def run() -> None:
+                with contextlib.suppress(ApplicationHandlerStop):
+                    await callback(update, context)
+
+            if self._workloads.submit(key, run):
+                return
+            if chat is not None:
+                await self.endpoint.send_text(chat.id, "请求队列已满，请稍后重试。")
+
+        return deferred
+
     async def set_commands(self) -> None:
-        await self.endpoint.bot.set_my_commands(
+        await self.endpoint.set_my_commands(
             [BotCommand("pair", "完成 owner 配对"), BotCommand("help", "显示帮助")],
             scope=BotCommandScopeAllPrivateChats(),
         )
         owner = self.store.get_owner()
         if owner:
-            await self.endpoint.bot.set_my_commands(
+            await self.endpoint.set_my_commands(
                 [BotCommand(command, description) for command, description in _PRIVATE_COMMANDS],
                 scope=BotCommandScopeChat(chat_id=owner.chat_id),
             )
@@ -163,7 +186,6 @@ class ControlBotController:
             return
         self.store.set_owner(Owner(user.id, chat.id, user.username))
         self.store.set_meta("telegram_runtime_chat_id", chat.id)
-        await self.endpoint.send_text(chat.id, "🤝", plain="🤝", priority=0)
         await self.endpoint.send_text(chat.id, "配对成功。Session 写操作在评论串内使用 TOTP 认证。")
         await self.set_commands()
 
@@ -425,21 +447,56 @@ class ControlBotController:
         if not query or not user or not chat:
             return
         data = str(query.data or "")
-        consumed = self.store.consume_callback(
+        pending = self.store.peek_callback(
             data[3:], user.id, bot_role=CONTROL_ROLE, chat_id=chat.id
         ) if data.startswith("cb:") else None
-        if not consumed:
+        if not pending:
+            await self.endpoint.answer_callback(
+                query, "按钮已使用或过期，请重新执行命令。", show_alert=True
+            )
+            return
+        action, payload = pending
+        if action == "sessions_current":
+            await self.endpoint.answer_callback(query)
+            return
+        if not self._workloads.can_submit():
+            await self.endpoint.answer_callback(query, "请求队列已满，请稍后重试。", show_alert=True)
+            return
+        consumed = self.store.consume_callback(
+            data[3:], user.id, bot_role=CONTROL_ROLE, chat_id=chat.id
+        )
+        if consumed is None:
             await self.endpoint.answer_callback(
                 query, "按钮已使用或过期，请重新执行命令。", show_alert=True
             )
             return
         action, payload = consumed
-        if action == "sessions_current":
-            await self.endpoint.answer_callback(query)
-            return
         await self.endpoint.answer_callback(query)
         callback_message = getattr(query, "message", None)
         callback_message_id = getattr(callback_message, "message_id", None)
+        submitted = self._workloads.submit(
+            f"chat:{chat.id}",
+            lambda: self._run_callback_action(
+                update,
+                chat.id,
+                action,
+                payload,
+                int(callback_message_id) if callback_message_id is not None else None,
+            ),
+        )
+        if not submitted:
+            await self.endpoint.send_text(chat.id, "请求队列已满，请重新执行命令。")
+        elif self._application is None:
+            await self._workloads.join()
+
+    async def _run_callback_action(
+        self,
+        update: Update,
+        chat_id: int,
+        action: str,
+        payload: dict[str, Any],
+        callback_message_id: int | None,
+    ) -> None:
         try:
             if action == "sessions_page":
                 await self._show_sessions(
@@ -449,17 +506,17 @@ class ControlBotController:
                     edit=True,
                 )
             elif action == "session_detail":
-                await self._session_detail(chat.id, str(payload["thread_id"]))
+                await self._session_detail(chat_id, str(payload["thread_id"]))
             elif action == "follow_space":
-                await self._follow(chat.id, str(payload["thread_id"]))
+                await self._follow(chat_id, str(payload["thread_id"]))
             elif action == "new_flow":
                 await self._handle_new_callback(
-                    chat.id,
+                    chat_id,
                     payload,
                     message_id=int(callback_message_id) if callback_message_id is not None else None,
                 )
         except (KeyError, ValueError, RuntimeError, OSError, TelegramError) as exc:
-            await self.endpoint.send_text(chat.id, escape(str(exc)))
+            await self.endpoint.send_text(chat_id, escape(str(exc)))
 
     async def observe_message(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -966,6 +1023,7 @@ class ControlBotController:
                 task.result()
 
     async def stop(self) -> None:
+        await self._workloads.stop()
         for chat_id in list(self._perf_runs):
             await self._cancel_perf(chat_id, delete=False)
         tasks = list(self._new_timeouts.values())

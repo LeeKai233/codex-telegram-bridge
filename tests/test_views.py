@@ -14,6 +14,7 @@ from codex_telegram_bridge.models import (
     ThreadState,
 )
 from codex_telegram_bridge.views import (
+    ANIMATION_FRAMES,
     CHANNEL_POST_BUDGET,
     SESSIONS_MESSAGE_BUDGET,
     STATUS_COMMENT_BUDGET,
@@ -27,6 +28,10 @@ from codex_telegram_bridge.views import (
     render_sessions_page,
     render_status_comment,
 )
+
+
+def test_animation_frames_use_the_eight_moon_phases() -> None:
+    assert ANIMATION_FRAMES == ("🌑", "🌒", "🌓", "🌔", "🌕", "🌖", "🌗", "🌘")
 
 
 @dataclass
@@ -230,18 +235,18 @@ def test_status_comment_shows_animated_mode_and_main_and_subagent_profiles() -> 
 
     rendered = render_status_comment(state, space=space, animation_frame=1)
 
-    assert rendered.markdown.startswith("⠙ *🧭 Plan mode*")
+    assert rendered.markdown.startswith("🌒 *🧭 Plan mode*")
     assert "*🧠 Main*  `gpt-5.6-sol` · Effort `xhigh`" in rendered.markdown
     assert "`gpt-5.6-luna/max`" in rendered.markdown
-    assert rendered.plain.startswith("⠙ 🧭 Plan mode")
+    assert rendered.plain.startswith("🌒 🧭 Plan mode")
 
     channel = render_channel_post(state, space=space, animation_frame=1)
-    assert channel.markdown.startswith("⠙ *🧭 Plan mode*")
+    assert channel.markdown.startswith("🌒 *🧭 Plan mode*")
     assert "*🧠 Main*  `gpt-5.6-sol` · Effort `xhigh`" in channel.markdown
 
     space.current_mode = "default"
     normal = render_channel_post(state, space=space, animation_frame=2)
-    assert normal.markdown.startswith("⠹ *⚙️ Normal mode*")
+    assert normal.markdown.startswith("🌓 *⚙️ Normal mode*")
     assert "*🧠 Main*  `gpt-5.6-luna` · Effort `max`" in normal.markdown
 
 

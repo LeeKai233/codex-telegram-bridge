@@ -5,14 +5,13 @@ import contextlib
 import logging
 from collections.abc import Callable
 
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ParseMode
-from telegram.error import BadRequest
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
+from .delivery import DeliveryIntent, DeliveryKey, TelegramDeliveryEngine, delivery_fingerprint
 from .markdown import render_dashboard, render_dashboard_plain
 from .models import ThreadState
-from .outbound import OutboundMessenger
 from .store import Store
+from .telegram_common import CONTROL_ROLE, TelegramEndpoint
 
 LOGGER = logging.getLogger(__name__)
 
@@ -20,18 +19,18 @@ LOGGER = logging.getLogger(__name__)
 class DashboardManager:
     def __init__(
         self,
-        bot: Bot,
+        endpoint: TelegramEndpoint,
         store: Store,
-        messenger: OutboundMessenger,
+        delivery: TelegramDeliveryEngine,
         owner_chat_id: Callable[[], int | None],
         *,
         debounce_seconds: float = 2.0,
         heartbeat_seconds: int = 60,
         retry_seconds: float = 5.0,
     ) -> None:
-        self.bot = bot
+        self.endpoint = endpoint
         self.store = store
-        self.messenger = messenger
+        self.delivery = delivery
         self.owner_chat_id = owner_chat_id
         self.debounce_seconds = debounce_seconds
         self.heartbeat_seconds = heartbeat_seconds
@@ -41,7 +40,6 @@ class DashboardManager:
         self._wake_events: dict[str, asyncio.Event] = {}
         self._inflight: set[str] = set()
         self._locks: dict[str, asyncio.Lock] = {}
-        self._last_rendered: dict[str, str] = {}
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._stopping = False
 
@@ -131,43 +129,37 @@ class DashboardManager:
             return False
         lock = self._locks.setdefault(state.thread_id, asyncio.Lock())
         async with lock:
-            rendered = render_dashboard(state)
-            if self._last_rendered.get(state.thread_id) == rendered:
-                return True
+            terminal = str((state.goal or {}).get("status") or "") == "complete"
+            render_time = state.updated_at if terminal and state.updated_at else None
+            rendered = render_dashboard(state, now=render_time)
+            plain = render_dashboard_plain(state, now=render_time)
             message_id = self.store.subscriptions().get(state.thread_id)
             keyboard = self._keyboard(state)
             try:
                 if message_id:
-                    await self.messenger.call(
-                        lambda: self.bot.edit_message_text(
-                            chat_id=chat_id,
-                            message_id=message_id,
-                            text=rendered,
-                            parse_mode=ParseMode.MARKDOWN_V2,
+                    key = DeliveryKey(CONTROL_ROLE, chat_id, int(message_id))
+                    outcome = await self.delivery.submit(
+                        DeliveryIntent(
+                            key=key,
+                            markdown=rendered,
+                            plain=plain,
                             reply_markup=keyboard,
-                            disable_web_page_preview=True,
-                        ),
-                        priority=20,
+                            fingerprint=delivery_fingerprint(rendered, plain, keyboard),
+                            priority=5 if terminal else 10,
+                            terminal=terminal,
+                            context=f"subscription:{state.thread_id}",
+                        )
                     )
+                    return outcome.status != "transient_failure"
                 else:
-                    message = await self.messenger.call(
-                        lambda: self.bot.send_message(
-                            chat_id=chat_id,
-                            text=rendered,
-                            parse_mode=ParseMode.MARKDOWN_V2,
-                            reply_markup=keyboard,
-                            disable_web_page_preview=True,
-                        ),
+                    message = await self.endpoint.send_text(
+                        chat_id,
+                        rendered,
+                        plain=plain,
+                        reply_markup=keyboard,
                         priority=20,
                     )
                     self.store.set_dashboard_message(state.thread_id, int(message.message_id))
-            except BadRequest as exc:
-                lowered = str(exc).casefold()
-                if "message is not modified" in lowered:
-                    self._last_rendered[state.thread_id] = rendered
-                    return True
-                if not await self._recover_plain(state, chat_id, message_id, keyboard):
-                    return False
             except Exception as exc:
                 LOGGER.warning(
                     "Dashboard update failed for %s (%s)",
@@ -175,42 +167,7 @@ class DashboardManager:
                     type(exc).__name__,
                 )
                 return False
-            self._last_rendered[state.thread_id] = rendered
             return True
-
-    async def _recover_plain(
-        self,
-        state: ThreadState,
-        chat_id: int,
-        message_id: int | None,
-        keyboard: InlineKeyboardMarkup,
-    ) -> bool:
-        plain = render_dashboard_plain(state)
-        try:
-            if message_id:
-                await self.messenger.call(
-                    lambda: self.bot.edit_message_text(
-                        chat_id=chat_id, message_id=message_id, text=plain, reply_markup=keyboard
-                    ),
-                    priority=10,
-                )
-                return True
-        except Exception:
-            pass
-        try:
-            message = await self.messenger.call(
-                lambda: self.bot.send_message(chat_id=chat_id, text=plain, reply_markup=keyboard),
-                priority=10,
-            )
-        except Exception as exc:
-            LOGGER.warning(
-                "Plain dashboard recovery failed for %s (%s)",
-                state.thread_id,
-                type(exc).__name__,
-            )
-            return False
-        self.store.set_dashboard_message(state.thread_id, int(message.message_id))
-        return True
 
     @staticmethod
     def _keyboard(state: ThreadState) -> InlineKeyboardMarkup:
@@ -230,5 +187,5 @@ class DashboardManager:
             await asyncio.sleep(self.heartbeat_seconds)
             for thread_id in self.store.subscriptions():
                 state = self.store.get_thread(thread_id)
-                if state:
+                if state and str((state.goal or {}).get("status") or "") != "complete":
                     await self.schedule(state, immediate=True)

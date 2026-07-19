@@ -21,6 +21,7 @@ from .approval import (
 from .codex import CodexClient, CodexRpcError, file_input, text_input
 from .config import Config
 from .dashboard import DashboardManager
+from .delivery import TelegramDeliveryEngine
 from .files import FileCandidate, PathPolicy, cleanup_inbox
 from .metrics import MetricsSampler
 from .models import ModelOption, ModelProfile, SessionSpace, ThreadState, plan_revision_key
@@ -28,6 +29,7 @@ from .outbound import OutboundMessenger
 from .projector import EventProjector
 from .resolver import CodexResolver, DirectoryIndex
 from .store import Store
+from .telegram_common import CONTROL_ROLE, TelegramEndpoint
 from .tmux import TmuxManager
 
 LOGGER = logging.getLogger(__name__)
@@ -42,6 +44,7 @@ PromptCompletedHandler = Callable[[Json], Awaitable[None]]
 TuiPlanApprovedHandler = Callable[[str, str], Awaitable[None]]
 
 _FINAL_TURN_STATUSES = {"completed", "failed", "interrupted"}
+_SUBAGENT_PROFILE_RETRY_DELAYS = (1.0, 5.0, 30.0, 120.0)
 # The Codex TUI emits this fixed input after "Yes, implement this plan" is selected.
 TUI_PLAN_APPROVAL_PROMPT = "Implement the plan."
 
@@ -116,11 +119,31 @@ async def _noop_tui_plan_approved(thread_id: str, turn_id: str) -> None:
 
 
 class Bridge:
-    def __init__(self, config: Config, store: Store, bot: Bot, messenger: OutboundMessenger) -> None:
+    def __init__(
+        self,
+        config: Config,
+        store: Store,
+        bot: Bot,
+        messenger: OutboundMessenger,
+        *,
+        control_endpoint: TelegramEndpoint | None = None,
+        delivery: TelegramDeliveryEngine | None = None,
+        manage_messenger: bool = True,
+    ) -> None:
         self.config = config
         self.store = store
         self.bot = bot
         self.messenger = messenger
+        self.control_endpoint = control_endpoint or TelegramEndpoint(
+            CONTROL_ROLE,
+            bot,
+            messenger,
+        )
+        self.delivery = delivery or TelegramDeliveryEngine(
+            {CONTROL_ROLE: self.control_endpoint}
+        )
+        self._owns_delivery = delivery is None
+        self._manage_messenger = manage_messenger
         self.on_question: QuestionHandler = _noop_question
         self.on_command_approval: CommandApprovalHandler = _noop_command_approval
         self.on_notice: NoticeHandler = _noop_notice
@@ -130,14 +153,18 @@ class Bridge:
         self.on_prompt_completed: PromptCompletedHandler = _noop_prompt_completed
         self.on_tui_plan_approved: TuiPlanApprovedHandler = _noop_tui_plan_approved
         self.dashboard = DashboardManager(
-            bot,
+            self.control_endpoint,
             store,
-            messenger,
+            self.delivery,
             owner_chat_id=lambda: owner.chat_id if (owner := store.get_owner()) else None,
             debounce_seconds=config.dashboard_debounce_seconds,
             heartbeat_seconds=config.heartbeat_seconds,
         )
-        self.projector = EventProjector(store, self._on_state_change)
+        self.projector = EventProjector(
+            store,
+            self._on_state_change,
+            is_managed=self._notification_is_managed,
+        )
         self.client = CodexClient(
             config.codex_socket,
             on_notification=self._on_notification,
@@ -152,20 +179,30 @@ class Bridge:
         self._queue_locks: dict[str, asyncio.Lock] = {}
         self._queue_retry_tasks: dict[str, asyncio.Task[None]] = {}
         self._subagent_profile_tasks: dict[str, asyncio.Task[None]] = {}
+        self._interest_cache: set[str] = set()
+        self._interest_roots_snapshot: frozenset[str] | None = None
+        self._provisional_interest: dict[str, int] = {}
+        self._owned_thread_starts: dict[str, tuple[str, set[str]]] = {}
         self._space_locks: dict[str, asyncio.Lock] = {}
         self._pending_requests: dict[str, tuple[int | str, int]] = {}
         self._resolved_request_ids: dict[tuple[int, str], None] = {}
         self._notified_plan_items: dict[tuple[str, str, str], None] = {}
         self._terminal_turns: dict[tuple[str, str], tuple[str, str]] = {}
         self._maintenance_task: asyncio.Task[None] | None = None
+        self._resync_started_at: int | None = None
+        self._resync_finished_at: int | None = None
+        self._resync_failures = 0
+        self._resync_last_error: str | None = None
         self._started = False
 
     async def start(self) -> None:
         if self._started:
             return
         self._started = True
-        self._cleanup_local_state()
-        self.messenger.start()
+        if self._manage_messenger:
+            self.messenger.start()
+        if self._owns_delivery:
+            self.delivery.start()
         self.metrics.start()
         self.dashboard.start()
         await self.directory_index.refresh()
@@ -197,9 +234,12 @@ class Bridge:
         if profile_tasks:
             await asyncio.gather(*profile_tasks, return_exceptions=True)
         await self.dashboard.stop()
+        if self._owns_delivery:
+            await self.delivery.stop()
         await self.metrics.stop()
         await self.client.stop()
-        await self.messenger.stop()
+        if self._manage_messenger:
+            await self.messenger.stop()
 
     def _cleanup_local_state(self) -> None:
         protected = self.store.queued_file_paths() | self.store.pending_callback_file_paths()
@@ -212,11 +252,14 @@ class Bridge:
 
     async def _maintenance_loop(self) -> None:
         while True:
-            await asyncio.sleep(3600)
             try:
                 await asyncio.to_thread(self._cleanup_local_state)
             except Exception as exc:
-                LOGGER.warning("Local maintenance failed (%s)", type(exc).__name__)
+                LOGGER.warning(
+                    "event=bridge_maintenance_failed error_type=%s",
+                    type(exc).__name__,
+                )
+            await asyncio.sleep(3600)
 
     async def _on_codex_connection(self, connected: bool, generation: int, reason: str | None) -> None:
         if connected:
@@ -228,10 +271,8 @@ class Bridge:
                 await self.on_notice("Codex app-server 已断开，正在重连", None)
 
     async def resync(self) -> None:
-        threads = await self.client.list_threads(limit=200)
-        for payload in threads:
-            if isinstance(payload, dict) and payload.get("id"):
-                self.projector.apply_thread(payload)
+        self._resync_started_at = int(time.time())
+        self._resync_last_error = None
         legacy_subscriptions = set(self.store.subscriptions())
         space_subscriptions = self._space_subscription_thread_ids()
         for thread_id in sorted(legacy_subscriptions | space_subscriptions):
@@ -244,33 +285,151 @@ class Bridge:
                 if state.status == "idle":
                     active_spaces = self._active_spaces_for_thread(thread_id)
                     for space in active_spaces:
-                        asyncio.create_task(
-                            self.dispatch_space_queue(
-                                str(space["space_id"]), generation=int(space["generation"])
-                            )
+                        self._request_queue_retry(
+                            thread_id,
+                            delay=0.0,
+                            space_id=str(space["space_id"]),
+                            generation=int(space["generation"]),
                         )
                     if thread_id in legacy_subscriptions:
-                        asyncio.create_task(self.dispatch_queue(thread_id))
-            except CodexRpcError, RuntimeError:
+                        self._request_queue_retry(thread_id, delay=0.0)
+            except (CodexRpcError, RuntimeError, TimeoutError) as exc:
+                self._resync_failures += 1
+                self._resync_last_error = type(exc).__name__
                 LOGGER.exception("Failed to resync thread %s", thread_id)
         await self._hydrate_missing_subagent_profiles()
+        self._resync_finished_at = int(time.time())
+
+    def health_snapshot(self) -> dict[str, Any]:
+        return {
+            "codex": self.client.health_snapshot(),
+            "queue_retry_tasks": len(self._queue_retry_tasks),
+            "subagent_profile_tasks": len(self._subagent_profile_tasks),
+            "managed_threads": len(self._managed_thread_ids()),
+            "resync": {
+                "started_at": self._resync_started_at,
+                "finished_at": self._resync_finished_at,
+                "failures": self._resync_failures,
+                "last_error_type": self._resync_last_error,
+            },
+        }
 
     async def _hydrate_missing_subagent_profiles(self) -> None:
         seen: set[str] = set()
-        for parent in self.store.list_threads():
+        for parent_id in self._managed_thread_ids():
+            parent = self.store.get_thread(parent_id)
+            if parent is None:
+                continue
             for task in parent.tasks:
                 child_id = str(task.agent_thread_id or task.task_id or "")
                 if not child_id or child_id in seen:
                     continue
                 seen.add(child_id)
+                if task.status == "notFound":
+                    continue
                 child = self.store.get_thread(child_id)
                 if child is not None and child.model and child.reasoning_effort:
                     continue
-                await self._refresh_subagent_profile(
+                self._ensure_subagent_profile_refresh(
                     child_id,
                     parent.thread_id,
                     task.agent_path,
                 )
+
+    def _interest_roots(self) -> set[str]:
+        return set(self.store.subscriptions()) | self._space_subscription_thread_ids()
+
+    def _managed_thread_ids(self) -> set[str]:
+        roots = frozenset(self._interest_roots())
+        if self._interest_roots_snapshot != roots:
+            states = {state.thread_id: state for state in self.store.list_threads()}
+            managed = set(roots)
+            pending = list(roots)
+            while pending:
+                parent = states.get(pending.pop())
+                if parent is None:
+                    continue
+                for task in parent.tasks:
+                    child_id = str(task.agent_thread_id or task.task_id or "")
+                    if not child_id or child_id in managed:
+                        continue
+                    managed.add(child_id)
+                    pending.append(child_id)
+            self._interest_cache = managed
+            self._interest_roots_snapshot = roots
+        return self._interest_cache | set(self._provisional_interest)
+
+    def _invalidate_interest_cache(self) -> None:
+        self._interest_roots_snapshot = None
+
+    def _add_provisional_interest(self, thread_id: str) -> None:
+        if thread_id:
+            self._provisional_interest[thread_id] = self._provisional_interest.get(thread_id, 0) + 1
+
+    def _remove_provisional_interest(self, thread_id: str) -> None:
+        count = self._provisional_interest.get(thread_id, 0)
+        if count <= 1:
+            self._provisional_interest.pop(thread_id, None)
+        else:
+            self._provisional_interest[thread_id] = count - 1
+
+    @staticmethod
+    def _normalized_cwd(value: object) -> str:
+        if not value:
+            return ""
+        return str(Path(str(value)).resolve(strict=False))
+
+    def _begin_owned_thread_start(self, cwd: Path) -> str:
+        token = uuid.uuid4().hex
+        self._owned_thread_starts[token] = (self._normalized_cwd(cwd), set())
+        return token
+
+    def _claim_owned_thread(self, token: str, thread_id: str) -> None:
+        entry = self._owned_thread_starts.get(token)
+        if entry is None or not thread_id or thread_id in entry[1]:
+            return
+        entry[1].add(thread_id)
+        self._add_provisional_interest(thread_id)
+
+    def _claim_owned_thread_start(self, method: str, params: Json) -> str | None:
+        if method != "thread/started":
+            return None
+        thread = params.get("thread")
+        if not isinstance(thread, dict):
+            return None
+        thread_id = str(thread.get("id") or "")
+        cwd = self._normalized_cwd(thread.get("cwd"))
+        if not thread_id or not cwd:
+            return None
+        matched = False
+        for token, (expected_cwd, _) in tuple(self._owned_thread_starts.items()):
+            if cwd == expected_cwd:
+                self._claim_owned_thread(token, thread_id)
+                matched = True
+        return thread_id if matched else None
+
+    def _finish_owned_thread_start(self, token: str) -> None:
+        entry = self._owned_thread_starts.pop(token, None)
+        if entry is None:
+            return
+        for thread_id in entry[1]:
+            self._remove_provisional_interest(thread_id)
+
+    @staticmethod
+    def _notification_thread_id(params: Json) -> str:
+        if params.get("threadId"):
+            return str(params["threadId"])
+        thread = params.get("thread")
+        if isinstance(thread, dict) and thread.get("id"):
+            return str(thread["id"])
+        return ""
+
+    def _notification_is_managed(self, method: str, params: Json) -> bool:
+        thread_id = self._notification_thread_id(params)
+        if thread_id and thread_id in self._managed_thread_ids():
+            return True
+        claimed = self._claim_owned_thread_start(method, params)
+        return bool(claimed and claimed == thread_id)
 
     def _space_subscription_thread_ids(self) -> set[str]:
         return {
@@ -378,8 +537,13 @@ class Bridge:
         raise ValueError(f"session 选择不唯一: {selector}")
 
     async def watch(self, thread_id: str) -> ThreadState:
-        state = await self.subscribe_space_thread(thread_id)
-        self.store.subscribe(thread_id)
+        self._add_provisional_interest(thread_id)
+        try:
+            state = await self.subscribe_space_thread(thread_id)
+            self.store.subscribe(thread_id)
+            self._invalidate_interest_cache()
+        finally:
+            self._remove_provisional_interest(thread_id)
         await self.dashboard.schedule(state, immediate=True)
         return state
 
@@ -414,12 +578,18 @@ class Bridge:
 
     async def new_session(self, cwd: Path, prompt: str, client_message_id: str) -> ThreadState:
         cwd = self.path_policy.validate_directory(cwd)
-        payload = await self.client.start_thread(cwd)
-        state = self.projector.apply_thread(payload)
-        state.title = prompt[:80] or state.title
-        self.store.subscribe(state.thread_id)
-        state.subscribed = True
-        self.store.save_thread(state)
+        start_token = self._begin_owned_thread_start(cwd)
+        try:
+            payload = await self.client.start_thread(cwd)
+            self._claim_owned_thread(start_token, str(payload.get("id") or ""))
+            state = self.projector.apply_thread(payload)
+            state.title = prompt[:80] or state.title
+            self.store.subscribe(state.thread_id)
+            self._invalidate_interest_cache()
+            state.subscribed = True
+            self.store.save_thread(state)
+        finally:
+            self._finish_owned_thread_start(start_token)
         await self.tmux.ensure_window(state.thread_id, state.title, cwd)
         await self.client.start_turn(
             state.thread_id,
@@ -465,14 +635,20 @@ class Bridge:
                 cwd = self.path_policy.validate_directory(Path(state.cwd or space.pending_cwd))
             else:
                 cwd = self.path_policy.validate_directory(Path(space.pending_cwd))
-                payload = await self.client.start_thread(cwd)
-                state = self.projector.apply_thread(payload)
-                state.title = space.pending_prompt[:80] or state.title
-                self.store.save_thread(state)
-                space.thread_id = state.thread_id
-                space.lifecycle = "repair_required"
-                space.last_error = "activation in progress"
-                self.store.save_session_space(space)
+                start_token = self._begin_owned_thread_start(cwd)
+                try:
+                    payload = await self.client.start_thread(cwd)
+                    self._claim_owned_thread(start_token, str(payload.get("id") or ""))
+                    state = self.projector.apply_thread(payload)
+                    state.title = space.pending_prompt[:80] or state.title
+                    self.store.save_thread(state)
+                    space.thread_id = state.thread_id
+                    space.lifecycle = "repair_required"
+                    space.last_error = "activation in progress"
+                    self.store.save_session_space(space)
+                    self._invalidate_interest_cache()
+                finally:
+                    self._finish_owned_thread_start(start_token)
                 created_now = True
 
             await self.tmux.ensure_window(state.thread_id, state.title, cwd)
@@ -1226,7 +1402,7 @@ class Bridge:
         if generation != self.client.generation:
             raise RuntimeError("Codex 连接已经重建，原问题已失效")
         result = {"answers": {key: {"answers": values} for key, values in answers.items()}}
-        await self.client.respond(request_id, result)
+        await self.client.respond(request_id, result, generation=generation)
         await self._notify_question_resolved(request_key)
         self._pending_requests.pop(request_key, None)
         self.store.delete_pending_input(request_key)
@@ -1286,7 +1462,7 @@ class Bridge:
         if not isinstance(request_id, int | str):
             request_id = str(raw_request_id)
         try:
-            await self.client.respond(request_id, {"decision": mapped})
+            await self.client.respond(request_id, {"decision": mapped}, generation=generation)
         except Exception:
             if generation != self.client.generation:
                 await self._retire_command_approval(request_key)
@@ -1320,7 +1496,16 @@ class Bridge:
                 self._pending_requests.pop(key, None)
                 self.store.delete_pending_input(key)
             return
+        if not self._notification_is_managed(method, params):
+            LOGGER.debug(
+                "event=codex_notification_ignored method=%s thread_id=%s",
+                method,
+                self._notification_thread_id(params)[:8] or "missing",
+            )
+            return
         await self.projector.ingest(method, params)
+        if method in {"item/started", "item/completed", "turn/completed"}:
+            self._invalidate_interest_cache()
         if method == "item/started":
             item = params.get("item") or {}
             thread_id = str(params.get("threadId") or "")
@@ -1392,6 +1577,18 @@ class Bridge:
         child = self.store.get_thread(child_id)
         if child is not None and child.model and child.reasoning_effort:
             return
+        self._ensure_subagent_profile_refresh(
+            child_id,
+            parent_id,
+            str(item.get("agentPath") or ""),
+        )
+
+    def _ensure_subagent_profile_refresh(
+        self,
+        child_id: str,
+        parent_id: str,
+        agent_path: str,
+    ) -> None:
         running = self._subagent_profile_tasks.get(child_id)
         if running is not None and not running.done():
             return
@@ -1399,7 +1596,7 @@ class Bridge:
             self._refresh_subagent_profile(
                 child_id,
                 parent_id,
-                str(item.get("agentPath") or ""),
+                agent_path,
             ),
             name=f"codex-subagent-profile-{child_id[:8]}",
         )
@@ -1413,10 +1610,53 @@ class Bridge:
         )
 
     async def _refresh_subagent_profile(self, child_id: str, parent_id: str, agent_path: str) -> None:
-        try:
-            payload = await self.client.resume_thread(child_id)
-        except CodexRpcError, RuntimeError, TimeoutError:
-            LOGGER.exception("Failed to load subagent profile for %s", child_id[:8])
+        payload: Json | None = None
+        attempts = len(_SUBAGENT_PROFILE_RETRY_DELAYS) + 1
+        for attempt in range(attempts):
+            if attempt:
+                await asyncio.sleep(_SUBAGENT_PROFILE_RETRY_DELAYS[attempt - 1])
+            try:
+                payload = await self.client.resume_thread(child_id)
+                break
+            except CodexRpcError as exc:
+                message = str(exc.error.get("message") or exc).casefold()
+                if "no rollout found" in message or "not found" in message:
+                    parent = self.store.get_thread(parent_id)
+                    if parent is not None:
+                        now = int(time.time())
+                        for task in parent.tasks:
+                            if child_id not in {task.agent_thread_id, task.task_id}:
+                                continue
+                            task.status = "notFound"
+                            task.finished_at = task.finished_at or now
+                            task.updated_at = now
+                            self.store.save_thread(parent)
+                            self._invalidate_interest_cache()
+                            await self._notify_state_change(parent, "subagent/notFound")
+                            break
+                    LOGGER.info(
+                        "event=subagent_profile_terminal thread_id=%s reason=not_found",
+                        child_id[:8],
+                    )
+                    return
+                if attempt + 1 == attempts:
+                    LOGGER.warning(
+                        "event=subagent_profile_failed thread_id=%s attempts=%s error=%s",
+                        child_id[:8],
+                        attempts,
+                        type(exc).__name__,
+                    )
+                    return
+            except (RuntimeError, TimeoutError) as exc:
+                if attempt + 1 == attempts:
+                    LOGGER.warning(
+                        "event=subagent_profile_failed thread_id=%s attempts=%s error=%s",
+                        child_id[:8],
+                        attempts,
+                        type(exc).__name__,
+                    )
+                    return
+        if payload is None:
             return
         payload.setdefault("parentThreadId", parent_id)
         if agent_path:
@@ -1434,11 +1674,14 @@ class Bridge:
             spaces = self._active_spaces_for_thread(state.thread_id)
             if spaces:
                 for space in spaces:
-                    asyncio.create_task(
-                        self.dispatch_space_queue(str(space["space_id"]), generation=int(space["generation"]))
+                    self._request_queue_retry(
+                        state.thread_id,
+                        delay=0.0,
+                        space_id=str(space["space_id"]),
+                        generation=int(space["generation"]),
                     )
             else:
-                asyncio.create_task(self.dispatch_queue(state.thread_id))
+                self._request_queue_retry(state.thread_id, delay=0.0)
 
     async def _notify_state_change(self, state: ThreadState, reason: str) -> None:
         try:
@@ -1506,7 +1749,25 @@ class Bridge:
         if tombstone in self._resolved_request_ids:
             self._resolved_request_ids.pop(tombstone, None)
             return
-        thread_id = str(params.get("threadId") or "") or None
+        approval_params = (
+            normalize_command_approval_params(method, params)
+            if method in {"item/commandExecution/requestApproval", "execCommandApproval"}
+            else params
+        )
+        thread_id = self._notification_thread_id(approval_params) or None
+        if thread_id is None or thread_id not in self._managed_thread_ids():
+            LOGGER.info(
+                "event=codex_server_request_rejected method=%s thread_id=%s reason=unmanaged",
+                method,
+                str(thread_id or "")[:8] or "missing",
+            )
+            await self.client.respond_error(
+                request_id,
+                -32600,
+                "Interactive requests are disabled for sessions not managed by this bridge",
+                generation=generation,
+            )
+            return
         if method == "item/tool/requestUserInput":
             questions = [value for value in params.get("questions") or [] if isinstance(value, dict)]
             if any(bool(question.get("isSecret")) for question in questions):
@@ -1529,7 +1790,6 @@ class Bridge:
             await self.on_question(request_key, params)
             return
         if method in {"item/commandExecution/requestApproval", "execCommandApproval"}:
-            approval_params = normalize_command_approval_params(method, params)
             thread_id = str(approval_params.get("threadId") or "") or None
             available_decisions = command_approval_decisions(method, approval_params)
             request_key = f"approval:{uuid.uuid4().hex[:16]}"

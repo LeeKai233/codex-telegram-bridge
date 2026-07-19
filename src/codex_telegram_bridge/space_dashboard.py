@@ -13,6 +13,13 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import TelegramError
 
 from .config import Config
+from .delivery import (
+    DeliveryIntent,
+    DeliveryKey,
+    DeliveryOutcome,
+    TelegramDeliveryEngine,
+    delivery_fingerprint,
+)
 from .models import ThreadState
 from .security import SecurityManager
 from .store import Store
@@ -72,16 +79,19 @@ class SpaceDashboardManager:
         security: SecurityManager,
         control: TelegramEndpoint,
         discussion: TelegramEndpoint,
+        delivery: TelegramDeliveryEngine,
     ) -> None:
         self.config = config
         self.store = store
         self.security = security
         self.control = control
         self.discussion = discussion
+        self.delivery = delivery
         self._dirty: set[str] = set()
         self._immediate: set[str] = set()
         self._tasks: dict[str, asyncio.Task[None]] = {}
-        self._animation_indices: dict[str, int] = {}
+        self._animation_indices: dict[DeliveryKey, int] = {}
+        self._delivery_tickets: dict[DeliveryKey, asyncio.Future[DeliveryOutcome]] = {}
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._stopping = False
 
@@ -92,7 +102,10 @@ class SpaceDashboardManager:
                 self._heartbeat_loop(), name="telegram-space-heartbeat"
             )
         for space in self.store.list_spaces():
-            if space.get("lifecycle") in {"pending", "active"}:
+            if any(
+                space.get(name)
+                for name in ("channel_post_id", "status_message_id")
+            ):
                 await self.schedule_space(str(space["space_id"]), immediate=True)
 
     async def stop(self) -> None:
@@ -108,6 +121,7 @@ class SpaceDashboardManager:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        self._delivery_tickets.clear()
 
     async def on_thread_change(self, state: ThreadState, reason: str) -> None:
         for space in self.store.list_spaces():
@@ -118,6 +132,9 @@ class SpaceDashboardManager:
             await self.schedule_space(str(space["space_id"]), immediate=reason in _IMMEDIATE_REASONS)
 
     async def schedule_space(self, space_id: str, *, immediate: bool = False) -> None:
+        self._schedule_space(space_id, immediate=immediate)
+
+    def _schedule_space(self, space_id: str, *, immediate: bool) -> None:
         self._dirty.add(space_id)
         if immediate:
             self._immediate.add(space_id)
@@ -164,78 +181,120 @@ class SpaceDashboardManager:
         if not space:
             return
         state = self._state_for_space(space)
-        animation_index = self._animation_indices.get(space_id, 0)
-        channel_rendered, status_rendered = self._render(
-            space,
-            state,
-            animation_frame=animation_index,
-        )
-        status_keyboard = self._status_keyboard(space)
-
-        edits: list[Any] = []
+        canonical_channel, canonical_status = self._render(space, state, animation_frame=None)
+        terminal = self._is_terminal(space, state)
+        status_keyboard = self._status_keyboard(space, terminal=terminal)
         if space.get("channel_chat_id") and space.get("channel_post_id"):
-            edits.append(
-                self._edit_dashboard_target(
-                    self.control,
-                    channel_rendered.markdown,
-                    bot_role=CONTROL_ROLE,
-                    space_id=space_id,
-                    chat_id=int(space["channel_chat_id"]),
-                    message_id=int(space["channel_post_id"]),
-                    plain=channel_rendered.plain,
-                )
+            key = DeliveryKey(
+                CONTROL_ROLE,
+                int(space["channel_chat_id"]),
+                int(space["channel_post_id"]),
+            )
+            frame = self._frame_for(key, terminal=terminal)
+            channel_rendered, _ = self._render(space, state, animation_frame=frame)
+            self._submit_target(
+                key,
+                channel_rendered,
+                canonical_channel,
+                space_id=space_id,
+                terminal=terminal,
             )
         if space.get("discussion_chat_id") and space.get("status_message_id"):
-            edits.append(
-                self._edit_dashboard_target(
-                    self.discussion,
-                    status_rendered.markdown,
-                    bot_role=DISCUSSION_ROLE,
-                    space_id=space_id,
-                    chat_id=int(space["discussion_chat_id"]),
-                    message_id=int(space["status_message_id"]),
-                    plain=status_rendered.plain,
-                    reply_markup=status_keyboard,
-                )
+            key = DeliveryKey(
+                DISCUSSION_ROLE,
+                int(space["discussion_chat_id"]),
+                int(space["status_message_id"]),
             )
-        if edits:
-            await asyncio.gather(*edits)
-            self._animation_indices[space_id] = (animation_index + 1) % len(ANIMATION_FRAMES)
+            frame = self._frame_for(key, terminal=terminal)
+            _, status_rendered = self._render(space, state, animation_frame=frame)
+            self._submit_target(
+                key,
+                status_rendered,
+                canonical_status,
+                space_id=space_id,
+                terminal=terminal,
+                reply_markup=status_keyboard,
+            )
 
-    @staticmethod
-    async def _edit_dashboard_target(
-        endpoint: TelegramEndpoint,
-        markdown: str,
+    def _submit_target(
+        self,
+        key: DeliveryKey,
+        rendered: RenderedMessage,
+        canonical: RenderedMessage,
         *,
-        bot_role: str,
         space_id: str,
-        chat_id: int,
-        message_id: int,
-        plain: str,
+        terminal: bool,
         reply_markup: InlineKeyboardMarkup | None = None,
     ) -> None:
+        ticket = self.delivery.submit(
+            DeliveryIntent(
+                key=key,
+                markdown=rendered.markdown,
+                plain=rendered.plain,
+                reply_markup=reply_markup,
+                fingerprint=delivery_fingerprint(
+                    canonical.markdown,
+                    canonical.plain,
+                    reply_markup,
+                ),
+                priority=5 if terminal else 10,
+                terminal=terminal,
+                context=f"space:{space_id}",
+            )
+        )
+        if self._delivery_tickets.get(key) is ticket:
+            return
+        self._delivery_tickets[key] = ticket
+        ticket.add_done_callback(
+            lambda completed, target=key, target_space=space_id: self._delivery_finished(
+                target,
+                target_space,
+                completed,
+            )
+        )
+
+    def _delivery_finished(
+        self,
+        key: DeliveryKey,
+        space_id: str,
+        ticket: asyncio.Future[DeliveryOutcome],
+    ) -> None:
+        if self._delivery_tickets.get(key) is not ticket:
+            return
+        self._delivery_tickets.pop(key, None)
+        if ticket.cancelled():
+            return
         try:
-            options: dict[str, Any] = {"plain": plain}
-            if reply_markup is not None:
-                options["reply_markup"] = reply_markup
-            await endpoint.edit_text(
-                chat_id,
-                message_id,
-                markdown,
-                **options,
-            )
-        except Exception as exc:
+            outcome = ticket.result()
+        except Exception:
+            return
+        if outcome.status == "delivered" and outcome.performed:
+            self._animation_indices[key] = (
+                self._animation_indices.get(key, 0) + 1
+            ) % len(ANIMATION_FRAMES)
+        elif outcome.status == "transient_failure" and not self._stopping:
             LOGGER.warning(
-                "event=space_dashboard_target_failed space_id=%s bot_role=%s "
-                "chat_id=%s message_id=%s error_type=%s error=%s",
+                "event=space_dashboard_delivery_retry space_id=%s bot_role=%s "
+                "chat_id=%s message_id=%s attempts=%s",
                 space_id,
-                bot_role,
-                chat_id,
-                message_id,
-                type(exc).__name__,
-                _safe_error_text(exc),
+                key.bot_role,
+                key.chat_id,
+                key.message_id,
+                outcome.attempts,
             )
-            raise
+            self._schedule_space(space_id, immediate=False)
+
+    def _frame_for(self, key: DeliveryKey, *, terminal: bool) -> int:
+        if terminal:
+            return ANIMATION_FRAMES.index("🌕")
+        return self._animation_indices.get(key, 0)
+
+    @staticmethod
+    def _is_terminal(space: dict[str, Any], state: ThreadState | dict[str, Any]) -> bool:
+        if str(space.get("lifecycle") or "") == "closed":
+            return True
+        goal = state.goal if isinstance(state, ThreadState) else state.get("goal")
+        return isinstance(goal, dict) and str(goal.get("status") or "") == "complete"
 
     def _state_for_space(self, space: dict[str, Any]) -> ThreadState | dict[str, Any]:
         thread_id = str(space.get("thread_id") or "")
@@ -267,19 +326,28 @@ class SpaceDashboardManager:
             return closed, closed
         remaining = self.security.space_unlock_remaining(str(space["space_id"]))
         auth_expires_at = int(time.time()) + remaining if remaining > 0 else None
-        channel = render_channel_post(
-            state,
-            space=space,
-            lifecycle=lifecycle,
-            heartbeat_seconds=self.config.heartbeat_seconds,
-            animation_frame=animation_frame,
-        )
+        render_now: int | None = None
+        if self._is_terminal(space, state):
+            updated = state.updated_at if isinstance(state, ThreadState) else state.get("updated_at")
+            render_now = int(updated or space.get("updated_at") or time.time())
+            auth_expires_at = None
+        channel_options: dict[str, Any] = {
+            "space": space,
+            "lifecycle": lifecycle,
+            "heartbeat_seconds": self.config.heartbeat_seconds,
+            "animation_frame": animation_frame,
+        }
+        if "now" in inspect.signature(render_channel_post).parameters:
+            channel_options["now"] = render_now
+        channel = render_channel_post(state, **channel_options)
         status_options: dict[str, Any] = {
             "space": space,
             "lifecycle": lifecycle,
             "auth_expires_at": auth_expires_at,
             "heartbeat_seconds": self.config.heartbeat_seconds,
         }
+        if "now" in inspect.signature(render_status_comment).parameters:
+            status_options["now"] = render_now
         if "animation_frame" in inspect.signature(render_status_comment).parameters:
             status_options["animation_frame"] = animation_frame
         status = render_status_comment(state, **status_options)
@@ -292,9 +360,8 @@ class SpaceDashboardManager:
         space: dict[str, Any],
     ) -> InlineKeyboardButton:
         owner = self.store.get_owner()
-        nonce = secrets.token_urlsafe(12)
-        self.store.put_callback(
-            nonce,
+        nonce = self.store.ensure_callback(
+            secrets.token_urlsafe(12),
             action,
             {"space_id": space["space_id"], "generation": space["generation"]},
             owner.user_id if owner else 0,
@@ -306,11 +373,16 @@ class SpaceDashboardManager:
         )
         return InlineKeyboardButton(label, callback_data=f"cb:{nonce}")
 
-    def _status_keyboard(self, space: dict[str, Any]) -> InlineKeyboardMarkup | None:
+    def _status_keyboard(
+        self,
+        space: dict[str, Any],
+        *,
+        terminal: bool = False,
+    ) -> InlineKeyboardMarkup | None:
         post_id = space.get("channel_post_id")
         channel_id = space.get("channel_chat_id")
         rows: list[list[InlineKeyboardButton]] = []
-        if space.get("lifecycle") in {"pending", "active", "repair_required"}:
+        if not terminal and space.get("lifecycle") in {"pending", "active", "repair_required"}:
             rows.append(
                 [
                     self._callback_button("刷新", "space_refresh", space),
@@ -328,4 +400,6 @@ class SpaceDashboardManager:
             await asyncio.sleep(self.config.heartbeat_seconds)
             for space in self.store.list_spaces():
                 if space.get("lifecycle") in {"pending", "active"}:
-                    await self.schedule_space(str(space["space_id"]), immediate=True)
+                    state = self._state_for_space(space)
+                    if not self._is_terminal(space, state):
+                        await self.schedule_space(str(space["space_id"]), immediate=True)

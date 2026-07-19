@@ -10,6 +10,7 @@ from .models import LifecycleActivity, PlanStep, TaskState, ThreadState
 from .store import Store
 
 ChangeHandler = Callable[[ThreadState, str], Awaitable[None]]
+ManagedEventPredicate = Callable[[str, dict[str, Any]], bool]
 
 
 async def _noop_change(state: ThreadState, reason: str) -> None:
@@ -48,9 +49,17 @@ _CHILD_THREAD_TASK_STATUS = {
 
 
 class EventProjector:
-    def __init__(self, store: Store, on_change: ChangeHandler = _noop_change) -> None:
+    def __init__(
+        self,
+        store: Store,
+        on_change: ChangeHandler = _noop_change,
+        is_managed: ManagedEventPredicate | None = None,
+    ) -> None:
         self.store = store
         self.on_change = on_change
+        self.is_managed = is_managed or (
+            lambda _method, params: store.is_managed_thread(self._thread_id(params))
+        )
         self._last_repeatable_event: tuple[str, str] | None = None
 
     def apply_thread(self, payload: dict[str, Any]) -> ThreadState:
@@ -135,11 +144,63 @@ class EventProjector:
         return state
 
     def apply_goal(self, state: ThreadState, goal: object) -> ThreadState:
-        state.goal = dict(goal) if isinstance(goal, dict) else None
+        incoming = dict(goal) if isinstance(goal, dict) else None
+        if incoming is not None and self._goal_update_is_stale(state.goal, incoming):
+            return state
+        state.goal = incoming
         if state.goal and str(state.goal.get("status") or "") == "complete":
             self._finalize_active_tasks(state)
         self.store.save_thread(state)
         return state
+
+    def _apply_goal_notification(
+        self,
+        state: ThreadState,
+        params: dict[str, Any],
+    ) -> tuple[bool, bool]:
+        incoming = dict(params.get("goal") or {})
+        if self._goal_update_is_stale(state.goal, incoming):
+            return False, False
+        current = dict(state.goal or {})
+        before_visible = self._goal_visible_key(current)
+        before_tasks = [(task.task_id, task.status) for task in state.tasks]
+        state.goal = incoming
+        if str(incoming.get("status") or "") == "complete":
+            self._finalize_active_tasks(state)
+        after_tasks = [(task.task_id, task.status) for task in state.tasks]
+        persisted = current != incoming or before_tasks != after_tasks
+        visible = before_visible != self._goal_visible_key(incoming) or before_tasks != after_tasks
+        if visible:
+            state.latest_activity = f"Goal: {incoming.get('status', 'updated')}"
+            self._record_activity(
+                state,
+                "thread/goal/updated",
+                state.latest_activity,
+                str(incoming.get("status") or "updated"),
+            )
+        return persisted, visible
+
+    @staticmethod
+    def _goal_visible_key(goal: dict[str, Any]) -> tuple[str, str]:
+        return (
+            str(goal.get("status") or ""),
+            str(goal.get("objective") or ""),
+        )
+
+    @staticmethod
+    def _goal_update_is_stale(current: dict[str, Any] | None, incoming: dict[str, Any]) -> bool:
+        if not current:
+            return False
+        current_updated = int(current.get("updatedAt") or 0)
+        incoming_updated = int(incoming.get("updatedAt") or 0)
+        if current_updated and incoming_updated and incoming_updated < current_updated:
+            return True
+        return bool(
+            current_updated
+            and incoming_updated == current_updated
+            and str(current.get("status") or "") == "complete"
+            and str(incoming.get("status") or "") != "complete"
+        )
 
     @staticmethod
     def _apply_subagent_source(state: ThreadState, source: object) -> None:
@@ -309,6 +370,8 @@ class EventProjector:
 
     async def ingest(self, method: str, params: dict[str, Any]) -> None:
         thread_id = self._thread_id(params)
+        if not thread_id or not self.is_managed(method, params):
+            return
         if method not in {"thread/tokenUsage/updated"}:
             digest = _canonical_hash(method, params)
             if method in _REPEATABLE_NOTIFICATIONS:
@@ -320,10 +383,8 @@ class EventProjector:
             else:
                 self._last_repeatable_event = None
                 event_key = digest
-            if not self.store.record_event(event_key, thread_id, method, params):
+            if not self.store.record_event(event_key, thread_id, method, params, managed=True):
                 return
-        if not thread_id:
-            return
         if method == "thread/started":
             state = self.apply_thread(dict(params.get("thread") or {}))
             await self.on_change(state, method)
@@ -331,14 +392,19 @@ class EventProjector:
         if method == "thread/settings/updated":
             self._sync_space_settings(thread_id, params)
         state = self.store.get_thread(thread_id) or ThreadState(thread_id=thread_id)
-        changed = self._apply(state, method, params)
+        notify = True
+        if method == "thread/goal/updated":
+            changed, notify = self._apply_goal_notification(state, params)
+        else:
+            changed = self._apply(state, method, params)
         if not changed:
             return
         state.queue_count = self.store.queue_count(thread_id)
         state.updated_at = int(time.time())
         self.store.save_thread(state)
         self._sync_parent_agent_metadata(state)
-        await self.on_change(state, method)
+        if notify:
+            await self.on_change(state, method)
 
     def _sync_space_settings(self, thread_id: str, params: dict[str, Any]) -> None:
         thread_settings = params.get("threadSettings")
@@ -410,15 +476,6 @@ class EventProjector:
             state.status = "notLoaded"
             state.latest_activity = method.split("/")[-1]
             self._record_activity(state, method, state.latest_activity, state.status)
-            return True
-        if method == "thread/goal/updated":
-            state.goal = dict(params.get("goal") or {})
-            if str(state.goal.get("status") or "") == "complete":
-                self._finalize_active_tasks(state)
-            state.latest_activity = f"Goal: {state.goal.get('status', 'updated')}"
-            self._record_activity(
-                state, method, state.latest_activity, str(state.goal.get("status") or "updated")
-            )
             return True
         if method == "thread/goal/cleared":
             state.goal = None

@@ -16,7 +16,7 @@ CHANNEL_POST_BUDGET = 1000
 STATUS_COMMENT_BUDGET = 3900
 SHORT_MESSAGE_BUDGET = 2000
 SESSION_PAGE_SIZE = 5
-ANIMATION_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+ANIMATION_FRAMES = ("🌑", "🌒", "🌓", "🌔", "🌕", "🌖", "🌗", "🌘")
 
 _DETAIL_LABELS = ("①", "②", "③", "④", "⑤")
 

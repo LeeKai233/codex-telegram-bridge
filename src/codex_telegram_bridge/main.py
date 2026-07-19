@@ -9,15 +9,14 @@ import logging
 import os
 import signal
 import time
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from telegram import Bot
-
 from .config import Config, ensure_private_directory
+from .outbound import TelegramOutcomeUncertain
 from .store import Store
 
 LOGGER = logging.getLogger(__name__)
@@ -27,6 +26,7 @@ REDACTED_BOT_TOKEN = "[REDACTED_TELEGRAM_BOT_TOKEN]"
 POLLING_HEALTH_CHECK_SECONDS = 15.0
 POLLING_STALE_SECONDS = 90.0
 POLLING_RESTART_COOLDOWN_SECONDS = 30.0
+POLLING_RECOVERY_VERIFY_SECONDS = 45.0
 
 
 def _redact_log_value(value: Any, token: str) -> Any:
@@ -77,6 +77,10 @@ class AlreadyRunning(RuntimeError):
     pass
 
 
+class PollingRecoveryError(RuntimeError):
+    pass
+
+
 @contextmanager
 def instance_lock(path: Path) -> Any:
     ensure_private_directory(path.parent)
@@ -97,37 +101,34 @@ def instance_lock(path: Path) -> Any:
 
 
 class ConnectionPresence:
-    """Persist Telegram connectivity so unobservable disconnects can be reported later."""
+    """Emit each runtime lifecycle notice at most once across crashes and reconnects."""
 
     def __init__(
         self,
-        bot: Bot,
+        endpoint: Any,
         store: Store,
         disconnect_threshold_seconds: int,
         *,
-        probe_bots: Sequence[Bot] | None = None,
+        probe_bots: Sequence[Any] | None = None,
     ) -> None:
-        self.bot = bot
-        self.probe_bots = tuple(probe_bots or (bot,))
+        self.endpoint = endpoint
+        self.probe_bots = tuple(probe_bots or (endpoint,))
         self.store = store
         self.disconnect_threshold_seconds = max(1, disconnect_threshold_seconds)
         self._healthy = False
         self._failure_started: float | None = None
-        self._announced_chat_id: int | None = None
-        self._deferred_disconnect = bool(store.get_meta("telegram_disconnect_pending", False))
-        self._previous_runtime_active = bool(store.get_meta("telegram_runtime_active", False))
-        previous_chat_id = int(store.get_meta("telegram_runtime_chat_id", 0))
-        self._previous_runtime_chat_id = previous_chat_id or None
+        self._runtime_id: str | None = None
 
     async def runtime_started(self) -> None:
-        self.store.set_meta("telegram_runtime_active", True)
         owner = self.store.get_owner()
-        self.store.set_meta("telegram_runtime_chat_id", owner.chat_id if owner else 0)
+        lifecycle = self.store.begin_runtime_lifecycle(owner.chat_id if owner else None)
+        self._runtime_id = str(lifecycle["runtime_id"])
         await self._mark_healthy()
+        self.store.mark_runtime_ready(self._runtime_id)
 
     async def probe(self) -> None:
         try:
-            await asyncio.gather(*(bot.get_me() for bot in self.probe_bots))
+            await asyncio.gather(*(self._get_me(endpoint) for endpoint in self.probe_bots))
         except Exception:
             self._mark_failure()
             return
@@ -140,54 +141,72 @@ class ConnectionPresence:
             return
         if self._healthy and now - self._failure_started >= self.disconnect_threshold_seconds:
             self._healthy = False
-            self._deferred_disconnect = True
-            self.store.set_meta("telegram_disconnect_pending", True)
 
     async def _mark_healthy(self) -> None:
-        was_healthy = self._healthy
         self._healthy = True
         self._failure_started = None
+        if self._runtime_id is None:
+            return
         owner = self.store.get_owner()
         if owner is None:
             return
-        owner_changed = owner.chat_id != self._announced_chat_id
-        reconnected = not was_healthy and self._announced_chat_id is not None
-        unclean_for_owner = self._previous_runtime_active and self._previous_runtime_chat_id == owner.chat_id
-        deferred = self._deferred_disconnect or unclean_for_owner
-        if was_healthy and owner_changed and not deferred:
-            # The /pair handler sends its own handshake. Remember a newly paired owner
-            # without duplicating that message on the next health probe.
-            self._announced_chat_id = owner.chat_id
-            self.store.set_meta("telegram_runtime_chat_id", owner.chat_id)
+        self.store.bind_runtime_owner(self._runtime_id, owner.chat_id)
+        lifecycle = self.store.runtime_lifecycle()
+        if lifecycle is None or lifecycle.get("runtime_id") != self._runtime_id:
             return
-        if not owner_changed and not reconnected and not deferred:
-            return
-        try:
-            if deferred or reconnected:
-                await self.bot.send_message(chat_id=owner.chat_id, text=DISCONNECT_EMOJI)
-            await self.bot.send_message(chat_id=owner.chat_id, text=HANDSHAKE_EMOJI)
-        except Exception:
-            self._healthy = False
-            self._deferred_disconnect = True
-            self.store.set_meta("telegram_disconnect_pending", True)
-            return
-        self._announced_chat_id = owner.chat_id
-        self._deferred_disconnect = False
-        self._previous_runtime_active = False
-        self.store.set_meta("telegram_disconnect_pending", False)
-        self.store.set_meta("telegram_runtime_chat_id", owner.chat_id)
+        if lifecycle.get("startup_disconnect_state") == "pending":
+            await self._deliver_notice("startup_disconnect", owner.chat_id, DISCONNECT_EMOJI)
+        if lifecycle.get("handshake_state") == "pending":
+            await self._deliver_notice("handshake", owner.chat_id, HANDSHAKE_EMOJI)
 
     async def graceful_disconnect(self) -> None:
+        runtime_id = self._runtime_id
+        if runtime_id is None:
+            return
         owner = self.store.get_owner()
-        delivered = False
-        if owner is not None and self._healthy:
+        if owner is not None:
+            await self._deliver_notice("shutdown_disconnect", owner.chat_id, DISCONNECT_EMOJI)
+        self.store.finish_runtime_lifecycle(runtime_id)
+
+    async def _deliver_notice(self, notice: str, chat_id: int, emoji: str) -> None:
+        runtime_id = self._runtime_id
+        if runtime_id is None or not self.store.claim_runtime_notice(runtime_id, notice):
+            return
+        outcome = "delivered"
+        try:
+            await self._send_text(chat_id, emoji)
+        except TelegramOutcomeUncertain:
+            outcome = "uncertain"
+            LOGGER.warning("event=telegram_presence_uncertain notice=%s", notice)
+        except Exception as exc:
+            outcome = "failed"
+            LOGGER.warning(
+                "event=telegram_presence_failed notice=%s error_type=%s",
+                notice,
+                type(exc).__name__,
+            )
+        self.store.complete_runtime_notice(runtime_id, notice, outcome)
+
+    async def _send_text(self, chat_id: int, text: str) -> Any:
+        if hasattr(self.endpoint, "send_text"):
+            return await self.endpoint.send_text(
+                chat_id,
+                text,
+                plain=text,
+                priority=0,
+                lane="urgent",
+                semantics="non_idempotent",
+            )
+        return await self.endpoint.send_message(chat_id=chat_id, text=text)
+
+    @staticmethod
+    async def _get_me(endpoint: Any) -> Any:
+        if hasattr(endpoint, "get_me"):
             try:
-                await self.bot.send_message(chat_id=owner.chat_id, text=DISCONNECT_EMOJI)
-                delivered = True
-            except Exception:
-                LOGGER.warning("Could not deliver Telegram disconnect emoji; deferring it")
-        self.store.set_meta("telegram_runtime_active", False)
-        self.store.set_meta("telegram_disconnect_pending", bool(owner) and not delivered)
+                return await endpoint.get_me(lane="maintenance")
+            except TypeError:
+                return await endpoint.get_me()
+        raise RuntimeError("Telegram presence endpoint cannot probe getMe")
 
 
 async def _health_monitor(
@@ -203,7 +222,7 @@ async def _health_monitor(
 
 
 class PollingSupervisor:
-    """Restart only a stale Telegram updater while preserving application state."""
+    """Recover each stale polling transport without stopping healthy bridge services."""
 
     def __init__(
         self,
@@ -211,8 +230,10 @@ class PollingSupervisor:
         polling_health: Sequence[Any],
         allowed_updates: Sequence[str],
         *,
+        fatal_event: asyncio.Event | None = None,
         stale_after: float = POLLING_STALE_SECONDS,
         restart_cooldown: float = POLLING_RESTART_COOLDOWN_SECONDS,
+        recovery_verify_after: float = POLLING_RECOVERY_VERIFY_SECONDS,
     ) -> None:
         if polling_health and len(applications) != len(polling_health):
             raise ValueError("applications and polling_health must have the same length")
@@ -220,7 +241,13 @@ class PollingSupervisor:
         self.allowed_updates = list(allowed_updates)
         self.stale_after = stale_after
         self.restart_cooldown = restart_cooldown
+        self.recovery_verify_after = recovery_verify_after
+        self.fatal_event = fatal_event or asyncio.Event()
+        self.fatal_error: PollingRecoveryError | None = None
         self._cooldown_until: dict[str, float] = {}
+        self._recovery_pending: dict[str, tuple[int, float]] = {}
+        self.recovery_failures: dict[str, int] = {}
+        self.last_recovery_error: dict[str, str] = {}
 
     async def monitor(self, stop_event: asyncio.Event, *, interval: float) -> None:
         while not stop_event.is_set():
@@ -229,9 +256,34 @@ class PollingSupervisor:
             except TimeoutError:
                 await self.check_once()
 
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "recoveries_pending": len(self._recovery_pending),
+            "recovery_failures": dict(self.recovery_failures),
+            "last_recovery_error": dict(self.last_recovery_error),
+        }
+
     async def check_once(self) -> None:
         now = time.monotonic()
         for application, health in self.targets:
+            recovery = self._recovery_pending.get(health.role)
+            if recovery is not None:
+                success_count, deadline = recovery
+                if health.success_count > success_count:
+                    self._recovery_pending.pop(health.role, None)
+                    self._cooldown_until.pop(health.role, None)
+                    LOGGER.info(
+                        "event=telegram_polling_recovery_confirmed bot_role=%s",
+                        health.role,
+                    )
+                elif now >= deadline:
+                    self._schedule_retry(
+                        health,
+                        reason="verification_timeout",
+                        error_type="PollingRecoveryVerificationTimeout",
+                        now=now,
+                    )
+                continue
             if not health.stale_for(self.stale_after, now=now):
                 continue
             if now < self._cooldown_until.get(health.role, 0.0):
@@ -242,7 +294,11 @@ class PollingSupervisor:
     async def _restart(self, application: Any, health: Any) -> None:
         updater = getattr(application, "updater", None)
         if updater is None:
-            LOGGER.error("event=telegram_polling_restart_skipped bot_role=%s reason=no_updater", health.role)
+            self._schedule_retry(
+                health,
+                reason="no_updater",
+                error_type="MissingUpdater",
+            )
             return
         stale_since = health.last_success_at
         LOGGER.warning(
@@ -256,22 +312,68 @@ class PollingSupervisor:
         try:
             if getattr(updater, "running", True):
                 await updater.stop()
+            polling_request = health.polling_request
+            if polling_request is None:
+                raise RuntimeError("polling request is unavailable")
+            await polling_request.shutdown()
+            await polling_request.initialize()
+            LOGGER.info(
+                "event=telegram_polling_transport_recycled bot_role=%s",
+                health.role,
+            )
+            success_count = health.success_count
             await updater.start_polling(
                 allowed_updates=self.allowed_updates,
                 drop_pending_updates=False,
             )
         except Exception as exc:
             health.last_success_at = stale_since
-            health.mark_failure(type(exc).__name__)
             LOGGER.exception(
-                "event=telegram_polling_restart_failed bot_role=%s error_type=%s",
+                "event=telegram_polling_restart_failed bot_role=%s error_type=%s action=retry",
                 health.role,
                 type(exc).__name__,
+            )
+            self._schedule_retry(
+                health,
+                reason="restart_failed",
+                error_type=type(exc).__name__,
             )
             return
         health.mark_started()
         self._cooldown_until.pop(health.role, None)
-        LOGGER.info("event=telegram_polling_restarted bot_role=%s", health.role)
+        self._recovery_pending[health.role] = (
+            success_count,
+            time.monotonic() + self.recovery_verify_after,
+        )
+        LOGGER.info(
+            "event=telegram_polling_restarted bot_role=%s verification_seconds=%.1f",
+            health.role,
+            self.recovery_verify_after,
+        )
+
+    def _schedule_retry(
+        self,
+        health: Any,
+        *,
+        reason: str,
+        error_type: str = "none",
+        now: float | None = None,
+    ) -> None:
+        current = time.monotonic() if now is None else now
+        self._recovery_pending.pop(health.role, None)
+        self._cooldown_until[health.role] = current + self.restart_cooldown
+        health.last_success_at = min(health.last_success_at, current - self.stale_after)
+        health.mark_failure(error_type)
+        self.recovery_failures[health.role] = self.recovery_failures.get(health.role, 0) + 1
+        self.last_recovery_error[health.role] = f"{reason}:{error_type}"
+        LOGGER.error(
+            "event=telegram_polling_unrecoverable bot_role=%s reason=%s "
+            "error_type=%s action=retry retry_seconds=%.1f",
+            health.role,
+            reason,
+            error_type,
+            self.restart_cooldown,
+        )
 
 
 @dataclass(slots=True)
@@ -292,6 +394,79 @@ class Runtime:
         return (self.application, self.discussion_application)
 
 
+def _runtime_health_payload(
+    runtime: Runtime,
+    polling_supervisor: PollingSupervisor,
+    *,
+    service_state: str,
+) -> dict[str, Any]:
+    telegram_runtime = getattr(runtime, "telegram_runtime", None)
+    outbound: dict[str, Any] = {}
+    workloads: dict[str, Any] = {}
+    delivery: dict[str, Any] = {}
+    if telegram_runtime is not None:
+        for name in ("control_messenger", "discussion_messenger"):
+            component = getattr(telegram_runtime, name, None)
+            snapshot = getattr(component, "snapshot", None)
+            if callable(snapshot):
+                outbound[name.removesuffix("_messenger")] = snapshot()
+        component = getattr(telegram_runtime, "delivery", None)
+        snapshot = getattr(component, "snapshot", None)
+        if callable(snapshot):
+            delivery = snapshot()
+        for controller in getattr(telegram_runtime, "controllers", ()):
+            scheduler = getattr(controller, "_workloads", None)
+            snapshot = getattr(scheduler, "snapshot", None)
+            if callable(snapshot):
+                workloads[type(controller).__name__.removesuffix("Controller").casefold()] = (
+                    snapshot()
+                )
+    bridge_snapshot = getattr(runtime.bridge, "health_snapshot", None)
+    database_path = runtime.store.path
+    sizes = {
+        "database_bytes": database_path.stat().st_size if database_path.is_file() else 0,
+        "wal_bytes": Path(f"{database_path}-wal").stat().st_size
+        if Path(f"{database_path}-wal").is_file()
+        else 0,
+        "shm_bytes": Path(f"{database_path}-shm").stat().st_size
+        if Path(f"{database_path}-shm").is_file()
+        else 0,
+    }
+    return {
+        "sampled_at": int(time.time()),
+        "service_state": service_state,
+        "database": sizes,
+        "polling": [health.snapshot() for health in runtime.polling_health],
+        "polling_supervisor": polling_supervisor.snapshot(),
+        "outbound": outbound,
+        "delivery": delivery,
+        "workloads": workloads,
+        "bridge": bridge_snapshot() if callable(bridge_snapshot) else {},
+    }
+
+
+async def _health_snapshot_monitor(
+    runtime: Runtime,
+    polling_supervisor: PollingSupervisor,
+    stop_event: asyncio.Event,
+    *,
+    interval: float = 15.0,
+) -> None:
+    while not stop_event.is_set():
+        try:
+            await asyncio.to_thread(
+                runtime.store.write_health_snapshot,
+                _runtime_health_payload(runtime, polling_supervisor, service_state="running"),
+            )
+        except Exception as exc:
+            LOGGER.warning(
+                "event=health_snapshot_failed error_type=%s",
+                type(exc).__name__,
+            )
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(stop_event.wait(), timeout=interval)
+
+
 @dataclass(slots=True)
 class TelegramRuntimeServices:
     control_messenger: Any
@@ -300,8 +475,14 @@ class TelegramRuntimeServices:
     dashboards: Any
     controllers: tuple[Any, ...]
     coordinator: Any | None = None
+    delivery: Any | None = None
     _started: bool = False
     _quiesced: bool = False
+    _maintenance_tasks: dict[str, asyncio.Task[None]] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
 
     async def start(self) -> None:
         if self._started:
@@ -311,20 +492,76 @@ class TelegramRuntimeServices:
         self.control_messenger.start()
         self.discussion_messenger.start()
         try:
-            await self.deletions.start()
+            if self.delivery is not None:
+                self.delivery.start()
+            self._schedule_maintenance("deletions", self.deletions.start)
             for controller in self.controllers:
-                await controller.set_commands()
-            await self.dashboards.start()
+                name = type(controller).__name__.removesuffix("Controller").casefold()
+                self._schedule_maintenance(f"commands-{name}", controller.set_commands)
+            self._schedule_maintenance("dashboards", self.dashboards.start)
             if self.coordinator is not None:
-                await self.coordinator.start()
+                self._schedule_maintenance("coordinator", self.coordinator.start)
         except Exception:
             await self.stop()
             raise
+
+    def _schedule_maintenance(
+        self,
+        name: str,
+        operation: Callable[[], Awaitable[None]],
+    ) -> None:
+        current = self._maintenance_tasks.get(name)
+        if current is not None and not current.done():
+            return
+        task = asyncio.create_task(
+            self._run_maintenance(name, operation),
+            name=f"telegram-startup-{name}",
+        )
+        self._maintenance_tasks[name] = task
+        task.add_done_callback(
+            lambda completed, task_name=name: (
+                self._maintenance_tasks.pop(task_name, None)
+                if self._maintenance_tasks.get(task_name) is completed
+                else None
+            )
+        )
+
+    async def _run_maintenance(
+        self,
+        name: str,
+        operation: Callable[[], Awaitable[None]],
+    ) -> None:
+        delays = (1.0, 5.0, 30.0, 120.0, 300.0)
+        attempt = 0
+        while self._started and not self._quiesced:
+            try:
+                await operation()
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                delay = delays[min(attempt, len(delays) - 1)]
+                attempt += 1
+                LOGGER.warning(
+                    "event=telegram_startup_maintenance_failed task=%s attempt=%s "
+                    "error_type=%s retry_seconds=%.1f",
+                    name,
+                    attempt,
+                    type(exc).__name__,
+                    delay,
+                )
+                await asyncio.sleep(delay)
 
     async def quiesce(self) -> None:
         if not self._started or self._quiesced:
             return
         self._quiesced = True
+        tasks = list(self._maintenance_tasks.values())
+        self._maintenance_tasks.clear()
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         for controller in reversed(self.controllers):
             stop = getattr(controller, "stop", None)
             if stop is not None:
@@ -343,6 +580,9 @@ class TelegramRuntimeServices:
             await self.dashboards.stop()
         with contextlib.suppress(Exception):
             await self.deletions.stop()
+        if self.delivery is not None:
+            with contextlib.suppress(Exception):
+                await self.delivery.stop()
         with contextlib.suppress(Exception):
             await self.discussion_messenger.stop()
         with contextlib.suppress(Exception):
@@ -355,6 +595,7 @@ def _build_runtime(config: Config) -> Runtime:
     from .bridge import Bridge
     from .control_bot import ControlBotController
     from .deletions import MessageDeletionManager
+    from .delivery import TelegramDeliveryEngine
     from .discussion_bot import DiscussionBotController
     from .outbound import OutboundMessenger
     from .security import SecurityManager
@@ -377,19 +618,55 @@ def _build_runtime(config: Config) -> Runtime:
         raise RuntimeError("两个 Telegram Bot 必须使用不同 token")
     store = Store(config.database_path)
     try:
+        recovered_intents = store.recover_outbound_intents()
+        if recovered_intents:
+            LOGGER.warning(
+                "event=telegram_outbound_intents_recovered count=%s status=uncertain",
+                recovered_intents,
+            )
         control_polling_health = PollingHealth(CONTROL_ROLE)
         discussion_polling_health = PollingHealth(DISCUSSION_ROLE)
         control_application = build_application(control_token, control_polling_health)
         discussion_application = build_application(discussion_token, discussion_polling_health)
-        control_messenger = OutboundMessenger()
-        discussion_messenger = OutboundMessenger()
+        async def recycle_control_transport() -> None:
+            await control_application.bot.request.shutdown()
+            await control_application.bot.request.initialize()
+
+        async def recycle_discussion_transport() -> None:
+            await discussion_application.bot.request.shutdown()
+            await discussion_application.bot.request.initialize()
+
+        control_messenger = OutboundMessenger(
+            bot_role=CONTROL_ROLE,
+            journal=store,
+            recycle_transport=recycle_control_transport,
+        )
+        discussion_messenger = OutboundMessenger(
+            bot_role=DISCUSSION_ROLE,
+            journal=store,
+            recycle_transport=recycle_discussion_transport,
+        )
         control_endpoint = TelegramEndpoint(
             CONTROL_ROLE, control_application.bot, control_messenger
         )
         discussion_endpoint = TelegramEndpoint(
             DISCUSSION_ROLE, discussion_application.bot, discussion_messenger
         )
-        bridge = Bridge(config, store, control_application.bot, control_messenger)
+        delivery = TelegramDeliveryEngine(
+            {
+                CONTROL_ROLE: control_endpoint,
+                DISCUSSION_ROLE: discussion_endpoint,
+            }
+        )
+        bridge = Bridge(
+            config,
+            store,
+            control_application.bot,
+            control_messenger,
+            control_endpoint=control_endpoint,
+            delivery=delivery,
+            manage_messenger=False,
+        )
         security = SecurityManager(store, config.totp_secret_path, config.totp_unlock_seconds)
         dashboards = SpaceDashboardManager(
             config,
@@ -397,6 +674,7 @@ def _build_runtime(config: Config) -> Runtime:
             security,
             control_endpoint,
             discussion_endpoint,
+            delivery,
         )
         coordinator = SessionSpaceCoordinator(
             store,
@@ -442,12 +720,13 @@ def _build_runtime(config: Config) -> Runtime:
             dashboards,
             (control_controller, discussion_controller),
             coordinator=coordinator,
+            delivery=delivery,
         )
         presence = ConnectionPresence(
-            control_application.bot,
+            control_endpoint,
             store,
             config.disconnect_threshold_seconds,
-            probe_bots=(control_application.bot, discussion_application.bot),
+            probe_bots=(control_endpoint, discussion_endpoint),
         )
         return Runtime(
             control_application,
@@ -494,6 +773,8 @@ async def run_service(config: Config, stop_event: asyncio.Event | None = None) -
     presence_started = False
     health_task: asyncio.Task[None] | None = None
     polling_health_task: asyncio.Task[None] | None = None
+    health_snapshot_task: asyncio.Task[None] | None = None
+    stop_wait_task: asyncio.Task[bool] | None = None
     polling_supervisor = PollingSupervisor(
         applications,
         tuple(getattr(runtime, "polling_health", ())),
@@ -532,13 +813,40 @@ async def run_service(config: Config, stop_event: asyncio.Event | None = None) -
             polling_supervisor.monitor(stop_event, interval=POLLING_HEALTH_CHECK_SECONDS),
             name="telegram-polling-health",
         )
+        health_snapshot_task = asyncio.create_task(
+            _health_snapshot_monitor(runtime, polling_supervisor, stop_event),
+            name="bridge-health-snapshot",
+        )
         LOGGER.info("Codex Telegram Bridge is running")
-        await stop_event.wait()
+        stop_wait_task = asyncio.create_task(stop_event.wait(), name="bridge-stop-wait")
+        completed, _pending = await asyncio.wait(
+            (stop_wait_task, polling_health_task),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if stop_event.is_set():
+            pass
+        elif polling_health_task in completed:
+            supervisor_error = polling_health_task.exception()
+            if supervisor_error is None:
+                raise PollingRecoveryError("Telegram polling supervisor stopped unexpectedly")
+            raise PollingRecoveryError(
+                f"Telegram polling supervisor crashed: {type(supervisor_error).__name__}"
+            ) from supervisor_error
     finally:
+        stop_event.set()
+        wait_tasks = tuple(task for task in (stop_wait_task,) if task is not None)
+        for task in wait_tasks:
+            task.cancel()
+        for task in wait_tasks:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
         if polling_health_task is not None:
             polling_health_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await polling_health_task
+        if health_snapshot_task is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await health_snapshot_task
         if health_task is not None:
             health_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -572,6 +880,10 @@ async def run_service(config: Config, stop_event: asyncio.Event | None = None) -
         for signum in registered_signals:
             with contextlib.suppress(NotImplementedError, RuntimeError):
                 loop.remove_signal_handler(signum)
+        with contextlib.suppress(Exception):
+            runtime.store.write_health_snapshot(
+                _runtime_health_payload(runtime, polling_supervisor, service_state="stopped")
+            )
         runtime.store.close()
 
 

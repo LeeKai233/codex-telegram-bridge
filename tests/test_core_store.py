@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import sqlite3
 import stat
 import time
@@ -9,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+import codex_telegram_bridge.store as store_module
 from codex_telegram_bridge.models import (
     Owner,
     SessionSpace,
@@ -51,6 +53,71 @@ def test_owner_and_callback_claims_are_first_writer_wins(tmp_path: Path) -> None
     finally:
         first.close()
         second.close()
+
+
+def test_ensure_callback_reuses_live_scope_and_replaces_consumed_nonce(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    payload = {"space_id": "space-1", "generation": 1}
+
+    first = store.ensure_callback(
+        "first",
+        "space_refresh",
+        payload,
+        7,
+        4_000_000_000,
+        bot_role="discussion",
+        chat_id=-100123,
+        space_id="space-1",
+        generation=1,
+    )
+    reused = store.ensure_callback(
+        "second",
+        "space_refresh",
+        payload,
+        7,
+        4_000_000_100,
+        bot_role="discussion",
+        chat_id=-100123,
+        space_id="space-1",
+        generation=1,
+    )
+
+    assert first == reused == "first"
+    assert store.consume_callback(
+        "first",
+        7,
+        bot_role="discussion",
+        chat_id=-100123,
+        space_id="space-1",
+        generation=1,
+    ) == ("space_refresh", payload)
+
+    replacement = store.ensure_callback(
+        "third",
+        "space_refresh",
+        payload,
+        7,
+        4_000_000_200,
+        bot_role="discussion",
+        chat_id=-100123,
+        space_id="space-1",
+        generation=1,
+    )
+    next_generation = store.ensure_callback(
+        "fourth",
+        "space_refresh",
+        {"space_id": "space-1", "generation": 2},
+        7,
+        4_000_000_200,
+        bot_role="discussion",
+        chat_id=-100123,
+        space_id="space-1",
+        generation=2,
+    )
+
+    assert replacement == "third"
+    assert next_generation == "fourth"
+    store.close()
 
 
 def test_pair_code_is_consumed_atomically_and_locked_after_failures(tmp_path: Path) -> None:
@@ -417,6 +484,7 @@ def test_v7_plan_publication_migration_backfills_text_and_tui_state(
                     "content": [{"type": "text", "text": "Implement the plan."}],
                 },
             },
+            managed=True,
         )
         assert store.find_tui_plan_approval_turn(
             "thread-1", after=10, prompt="Implement the plan."
@@ -1320,4 +1388,310 @@ def test_startup_retirement_includes_unexpired_command_approvals(tmp_path: Path)
             (306, f"question:{request_key}")
         ]
     finally:
+        store.close()
+
+
+def _create_v9_event_database(path: Path) -> None:
+    now = int(time.time())
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE events (
+            event_key TEXT PRIMARY KEY,
+            thread_id TEXT,
+            kind TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+        CREATE INDEX idx_events_thread_created ON events(thread_id, created_at DESC);
+        CREATE TABLE subscriptions (
+            thread_id TEXT PRIMARY KEY,
+            dashboard_message_id INTEGER,
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at INTEGER NOT NULL
+        );
+        INSERT INTO subscriptions VALUES('managed-thread', NULL, 1, 1);
+        PRAGMA user_version=9;
+        """
+    )
+    connection.executemany(
+        "INSERT INTO events(event_key, thread_id, kind, payload_json, created_at) "
+        "VALUES(?, ?, ?, ?, ?)",
+        (
+            (
+                "managed-large",
+                "managed-thread",
+                "warning",
+                json.dumps({"threadId": "managed-thread", "message": "x" * 100_000}),
+                now,
+            ),
+            (
+                "managed-approval",
+                "managed-thread",
+                "item/started",
+                json.dumps(
+                    {
+                        "threadId": "managed-thread",
+                        "turnId": "turn-execute",
+                        "item": {
+                            "type": "userMessage",
+                            "clientId": None,
+                            "content": [{"type": "text", "text": "Implement the plan."}],
+                        },
+                    }
+                ),
+                now,
+            ),
+            (
+                "managed-large-nonapproval",
+                "managed-thread",
+                "item/started",
+                json.dumps(
+                    {
+                        "threadId": "managed-thread",
+                        "turnId": "turn-unrelated",
+                        "item": {
+                            "type": "userMessage",
+                            "clientId": None,
+                            "content": [{"type": "text", "text": "z" * 100_000}],
+                        },
+                    }
+                ),
+                now,
+            ),
+            (
+                "unmanaged-large",
+                "unmanaged-thread",
+                "warning",
+                json.dumps({"threadId": "unmanaged-thread", "message": "y" * 100_000}),
+                now,
+            ),
+        ),
+    )
+    connection.commit()
+    connection.close()
+
+
+def test_v10_migration_compacts_managed_events_and_preserves_tui_fact(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    _create_v9_event_database(path)
+
+    store = Store(path)
+    try:
+        assert store.schema_version == 10
+        assert store.last_backup_path is not None
+        assert store._connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        tables = {
+            str(row[0])
+            for row in store._connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        assert "events" not in tables
+        assert {
+            "event_receipts",
+            "timeline_events",
+            "tui_plan_approvals",
+        } <= tables
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM event_receipts"
+        ).fetchone()[0] == 3
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM timeline_events"
+        ).fetchone()[0] == 3
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM tui_plan_approvals"
+        ).fetchone()[0] == 1
+        assert store._connection.execute(
+            "SELECT MAX(length(payload_json)) FROM timeline_events"
+        ).fetchone()[0] < 1_000
+        assert store.find_tui_plan_approval_turn(
+            "managed-thread", after=0, prompt="Implement the plan."
+        ) == "turn-execute"
+        assert store.timeline("unmanaged-thread") == []
+    finally:
+        store.close()
+
+
+def test_v10_migration_failure_rolls_back_and_closes_connection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    _create_v9_event_database(path)
+
+    def fail(_store: Store) -> None:
+        raise RuntimeError("injected migration failure")
+
+    monkeypatch.setattr(Store, "_migrate_events_v10", fail)
+    with pytest.raises(RuntimeError, match="injected migration failure"):
+        Store(path)
+
+    connection = sqlite3.connect(path)
+    try:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert connection.execute(
+            "SELECT COUNT(*) FROM events"
+        ).fetchone()[0] == 4
+    finally:
+        connection.close()
+
+
+def test_live_event_storage_rejects_large_nonapproval_tui_message(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    try:
+        store.subscribe("managed-thread")
+        assert store.record_event(
+            "large-tui-message",
+            "managed-thread",
+            "item/started",
+            {
+                "threadId": "managed-thread",
+                "turnId": "turn-unrelated",
+                "item": {
+                    "type": "userMessage",
+                    "clientId": None,
+                    "content": [{"type": "text", "text": "x" * 100_000}],
+                },
+            },
+        )
+
+        assert store.find_tui_plan_approval_turn(
+            "managed-thread", after=0, prompt="Implement the plan."
+        ) is None
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM tui_plan_approvals"
+        ).fetchone()[0] == 0
+        assert store._connection.execute(
+            "SELECT MAX(length(payload_json)) FROM timeline_events"
+        ).fetchone()[0] < 1_000
+    finally:
+        store.close()
+
+
+def test_cleanup_enforces_receipt_and_per_thread_timeline_caps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(store_module, "EVENT_RECEIPT_LIMIT", 5)
+    monkeypatch.setattr(store_module, "TIMELINE_PER_THREAD_LIMIT", 3)
+    assert store_module.MAINTENANCE_BATCH_SIZE == 500
+    store = Store(tmp_path / "state.sqlite3")
+    try:
+        store.subscribe("managed-thread")
+        for index in range(8):
+            assert store.record_event(
+                f"event-{index}",
+                "managed-thread",
+                "warning",
+                {"threadId": "managed-thread", "message": str(index)},
+            )
+
+        deleted = store.cleanup()
+
+        assert deleted["event_receipts"] == 3
+        assert deleted["timeline"] == 5
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM event_receipts"
+        ).fetchone()[0] == 5
+        assert len(store.timeline("managed-thread", 20)) == 3
+    finally:
+        store.close()
+
+
+def test_cleanup_caps_terminal_outbound_intents_without_dropping_live_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(store_module, "OUTBOUND_TERMINAL_LIMIT", 3)
+    store = Store(tmp_path / "state.sqlite3")
+    try:
+        terminal_ids: list[str] = []
+        for index in range(5):
+            intent_id = store.create_outbound_intent(
+                bot_role="control",
+                operation=f"send-{index}",
+                lane="interactive",
+                chat_id=20,
+                payload_fingerprint=f"fingerprint-{index}",
+            )
+            store.update_outbound_intent(intent_id, status="delivered", attempts=1)
+            terminal_ids.append(intent_id)
+        pending_id = store.create_outbound_intent(
+            bot_role="control",
+            operation="pending",
+            lane="interactive",
+            chat_id=20,
+            payload_fingerprint="pending-fingerprint",
+        )
+
+        deleted = store.cleanup()
+
+        assert deleted["outbound_intents"] == 2
+        assert {row["intent_id"] for row in store.outbound_intents(limit=20)} == {
+            *terminal_ids[-3:],
+            pending_id,
+        }
+        assert store.outbound_intents(status="pending")[0]["intent_id"] == pending_id
+    finally:
+        store.close()
+
+
+def test_startup_recovery_marks_incomplete_outbound_intents_uncertain(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    try:
+        pending_id = store.create_outbound_intent(
+            bot_role="control",
+            operation="sendMessage",
+            lane="urgent",
+            chat_id=20,
+            payload_fingerprint="pending",
+        )
+        retrying_id = store.create_outbound_intent(
+            bot_role="discussion",
+            operation="sendMessage",
+            lane="interactive",
+            chat_id=20,
+            payload_fingerprint="retrying",
+        )
+        store.update_outbound_intent(retrying_id, status="retrying", attempts=1)
+
+        assert store.recover_outbound_intents() == 2
+
+        recovered = {row["intent_id"]: row for row in store.outbound_intents(limit=10)}
+        assert recovered[pending_id]["status"] == "uncertain"
+        assert recovered[retrying_id]["status"] == "uncertain"
+        assert {row["error_type"] for row in recovered.values()} == {"ProcessRestart"}
+        assert store.recover_outbound_intents() == 0
+    finally:
+        store.close()
+
+
+def test_cleanup_lock_contention_returns_after_one_second(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    store = Store(path)
+    blocker = sqlite3.connect(path)
+    blocker.execute("BEGIN IMMEDIATE")
+    started = time.monotonic()
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            store.cleanup()
+        assert time.monotonic() - started < 2.5
+    finally:
+        blocker.rollback()
+        blocker.close()
+        store.close()
+
+
+def test_health_snapshot_lock_contention_returns_after_one_second(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    store = Store(path)
+    blocker = sqlite3.connect(path)
+    blocker.execute("BEGIN IMMEDIATE")
+    started = time.monotonic()
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            store.write_health_snapshot({"service_state": "running"})
+        assert time.monotonic() - started < 2.5
+    finally:
+        blocker.rollback()
+        blocker.close()
         store.close()

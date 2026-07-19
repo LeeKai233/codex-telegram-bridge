@@ -18,6 +18,7 @@ from telegram.ext import ApplicationHandlerStop
 from codex_telegram_bridge.config import Config
 from codex_telegram_bridge.control_bot import ControlBotController
 from codex_telegram_bridge.deletions import MessageDeletionManager
+from codex_telegram_bridge.delivery import TelegramDeliveryEngine
 from codex_telegram_bridge.discussion_bot import DiscussionBotController
 from codex_telegram_bridge.files import FileCandidate
 from codex_telegram_bridge.metrics import MetricsSnapshot
@@ -763,15 +764,25 @@ async def test_space_dashboard_keeps_channel_native_comments_and_status_controls
         root_message_id=513,
         channel_post_id=113,
     )
+    delivery = TelegramDeliveryEngine(
+        {
+            CONTROL_ROLE: rig.control_endpoint,
+            DISCUSSION_ROLE: rig.discussion_endpoint,
+        }  # type: ignore[dict-item]
+    )
+    delivery.start()
     manager = SpaceDashboardManager(
         rig.config,
         rig.store,
         rig.security,  # type: ignore[arg-type]
         rig.control_endpoint,  # type: ignore[arg-type]
         rig.discussion_endpoint,  # type: ignore[arg-type]
+        delivery,
     )
 
     await manager._flush(str(space["space_id"]))
+    tickets = list(manager._delivery_tickets.values())
+    await asyncio.gather(*tickets)
 
     [channel_edit] = rig.control_endpoint.edited
     assert "reply_markup" not in channel_edit
@@ -782,6 +793,7 @@ async def test_space_dashboard_keeps_channel_native_comments_and_status_controls
         for button in row
     ]
     assert labels == ["刷新", "取消关注", "返回帖子"]
+    await delivery.stop(drain_timeout=0)
 
 
 @pytest.mark.asyncio
@@ -1542,6 +1554,55 @@ async def test_unobserved_absent_tui_prompt_keeps_plan_actions(
     assert publication["tui_prompt_seen_at"] is None
     assert rig.discussion_endpoint.deleted == []
     await rig.discussion.stop()
+
+
+@pytest.mark.asyncio
+async def test_plan_prompt_monitor_backs_off_and_stops_after_ten_minutes(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    add_active_space(
+        rig,
+        space_id="space-plan-monitor-deadline",
+        thread_id="thread-plan-monitor-deadline",
+        root_message_id=531,
+        channel_post_id=131,
+    )
+    await rig.discussion.plan_completed(
+        "thread-plan-monitor-deadline",
+        "turn-plan",
+        "item-plan",
+        "Keep this plan actionable after the monitor expires.",
+    )
+    publication = rig.store.latest_plan_publication("space-plan-monitor-deadline", 1)
+    assert publication is not None
+    await rig.discussion._cancel_plan_prompt_monitor(publication)  # noqa: SLF001
+
+    clock = [0.0]
+    sleeps: list[float] = []
+
+    async def absent(_thread_id: str) -> None:
+        return None
+
+    async def advance(delay: float) -> None:
+        sleeps.append(delay)
+        clock[0] += delay
+
+    monkeypatch.setattr(rig.discussion, "_plan_prompt_visibility", absent)
+    monkeypatch.setattr(
+        "codex_telegram_bridge.discussion_bot.time.monotonic", lambda: clock[0]
+    )
+    monkeypatch.setattr("codex_telegram_bridge.discussion_bot.asyncio.sleep", advance)
+
+    await rig.discussion._watch_plan_prompt(  # noqa: SLF001
+        rig.store.get_space("space-plan-monitor-deadline"),
+        publication,
+    )
+
+    assert sleeps[:15] == [2.0] * 15
+    assert sleeps[15:] == [10.0] * 57
+    assert sum(sleeps) == 600.0
+    latest = rig.store.latest_plan_publication("space-plan-monitor-deadline", 1)
+    assert latest is not None and latest["status"] == "published"
 
 
 @pytest.mark.asyncio
@@ -2610,7 +2671,7 @@ async def test_plan_button_rechecks_revision_after_readiness_await(
     await callback_task
 
     assert rig.bridge.collaboration_calls == []
-    assert "已过期" in rig.discussion_endpoint.callback_answers[-1]["text"]
+    assert "已过期" in rig.discussion_endpoint.sent[-1]["markdown"]
     assert rig.store.peek_callback(
         old_nonce,
         OWNER_ID,

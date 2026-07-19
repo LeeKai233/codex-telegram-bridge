@@ -12,6 +12,7 @@ import re
 import secrets
 import shlex
 import shutil
+import sqlite3
 import stat
 import sys
 import tempfile
@@ -1002,20 +1003,106 @@ async def onboard(
     return await doctor(config, offline=False, output=output)
 
 
-def _status(config: Config, output: TextIO) -> int:
-    store = _with_store(config)
+def _read_status_database(path: Path) -> dict[str, object]:
+    sizes = {
+        "database_bytes": path.stat().st_size if path.is_file() else 0,
+        "wal_bytes": Path(f"{path}-wal").stat().st_size if Path(f"{path}-wal").is_file() else 0,
+        "shm_bytes": Path(f"{path}-shm").stat().st_size if Path(f"{path}-shm").is_file() else 0,
+    }
+    empty: dict[str, object] = {
+        **sizes,
+        "schema_version": 0,
+        "owner_paired": False,
+        "subscriptions": 0,
+        "binding": None,
+        "spaces": [],
+        "auth_epoch": 0,
+        "force_locked": True,
+        "pending_disconnect": False,
+        "runtime_active": False,
+        "health": None,
+    }
+    if not path.is_file():
+        return empty
+    uri = f"{path.resolve().as_uri()}?mode=ro"
+    connection = sqlite3.connect(uri, uri=True, timeout=1.0)
     try:
-        owner = store.get_owner()
-        subscriptions = store.subscriptions()
-        binding = store.get_telegram_binding()
-        spaces = store.list_spaces()
-        schema_version = store.schema_version
-        auth_epoch = store.auth_epoch()
-        force_locked = bool(store.get_meta("totp_force_locked", True))
-        pending_disconnect = bool(store.get_meta("telegram_disconnect_pending", False))
-        runtime_active = bool(store.get_meta("telegram_runtime_active", False))
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only=ON")
+        tables = {
+            str(row[0])
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+
+        def meta(name: str, default: object) -> object:
+            if "metadata" not in tables:
+                return default
+            row = connection.execute("SELECT value FROM metadata WHERE key=?", (name,)).fetchone()
+            return json.loads(str(row[0])) if row is not None else default
+
+        owner_paired = bool(
+            connection.execute("SELECT 1 FROM owner WHERE singleton=1").fetchone()
+        ) if "owner" in tables else False
+        subscriptions = int(
+            connection.execute("SELECT COUNT(*) FROM subscriptions WHERE active=1").fetchone()[0]
+        ) if "subscriptions" in tables else 0
+        binding: dict[str, object] | None = None
+        if "telegram_binding" in tables:
+            row = connection.execute(
+                "SELECT binding_json FROM telegram_binding WHERE singleton=1"
+            ).fetchone()
+            if row is not None:
+                value = json.loads(str(row[0]))
+                binding = value if isinstance(value, dict) else None
+        spaces: list[dict[str, object]] = []
+        if "session_spaces" in tables:
+            spaces = [
+                {"lifecycle": str(row[0]), "count": int(row[1])}
+                for row in connection.execute(
+                    "SELECT lifecycle, COUNT(*) FROM session_spaces GROUP BY lifecycle"
+                )
+            ]
+        health: dict[str, object] | None = None
+        if "health_snapshots" in tables:
+            row = connection.execute(
+                "SELECT snapshot_json, updated_at FROM health_snapshots WHERE singleton=1"
+            ).fetchone()
+            if row is not None:
+                value = json.loads(str(row[0]))
+                health = value if isinstance(value, dict) else {}
+                health["updated_at"] = int(row[1])
+        return {
+            **sizes,
+            "schema_version": int(connection.execute("PRAGMA user_version").fetchone()[0]),
+            "owner_paired": owner_paired,
+            "subscriptions": subscriptions,
+            "binding": binding,
+            "spaces": spaces,
+            "auth_epoch": int(meta("totp_auth_epoch", 0)),
+            "force_locked": bool(meta("totp_force_locked", True)),
+            "pending_disconnect": bool(meta("telegram_disconnect_pending", False)),
+            "runtime_active": bool(meta("telegram_runtime_active", False)),
+            "health": health,
+        }
     finally:
-        store.close()
+        connection.close()
+
+
+def _status(config: Config, output: TextIO, *, as_json: bool = False) -> int:
+    database = _read_status_database(config.database_path)
+    owner_paired = bool(database["owner_paired"])
+    binding = database["binding"]
+    spaces = {
+        str(row["lifecycle"]): int(row["count"])
+        for row in database["spaces"]  # type: ignore[union-attr]
+    }
+    health = database["health"]
+    health_age = (
+        max(0, int(time.time()) - int(health.get("updated_at") or 0))
+        if isinstance(health, dict)
+        else None
+    )
+    health_state = "missing" if health_age is None else ("fresh" if health_age <= 60 else "stale")
     control_token_status = (
         "configured/private" if _mode_is_private(config.bot_token_path) else "missing/insecure"
     )
@@ -1024,27 +1111,71 @@ def _status(config: Config, output: TextIO) -> int:
     )
     totp_status = "configured" if _mode_is_private(config.totp_secret_path) else "missing/insecure"
     socket_status = "ready" if _socket_is_private(config.codex_socket) else "unavailable/insecure"
+    payload = {
+        "credentials": {
+            "control_token": control_token_status,
+            "forum_token": forum_token_status,
+            "totp": totp_status,
+        },
+        "owner": {"paired": owner_paired},
+        "channel_binding": {"ready": not _binding_issues(binding)},
+        "write_access": {"globally_locked": bool(database["force_locked"])},
+        "watched_sessions": int(database["subscriptions"]),
+        "session_spaces": {
+            name: spaces.get(name, 0)
+            for name in ("pending", "active", "closed", "repair_required")
+        },
+        "auth_epoch": int(database["auth_epoch"]),
+        "database": {
+            "schema_version": int(database["schema_version"]),
+            "bytes": int(database["database_bytes"]),
+            "wal_bytes": int(database["wal_bytes"]),
+            "shm_bytes": int(database["shm_bytes"]),
+        },
+        "runtime": {
+            "active_marker": bool(database["runtime_active"]),
+            "pending_disconnect": bool(database["pending_disconnect"]),
+            "health_state": health_state,
+            "health_age_seconds": health_age,
+            "health": health,
+        },
+        "codex_socket": socket_status,
+    }
+    if as_json:
+        output.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+        return 0
     output.write(f"control token: {control_token_status}\n")
     output.write(f"forum token: {forum_token_status}\n")
-    output.write(f"owner: {'paired' if owner else 'unpaired'}\n")
+    output.write(f"owner: {'paired' if owner_paired else 'unpaired'}\n")
     output.write(f"channel binding: {'ready' if not _binding_issues(binding) else 'missing/invalid'}\n")
     output.write(f"totp: {totp_status}\n")
     output.write(
-        f"write access gate: {'globally locked' if force_locked else 'space leases are process-local'}\n"
+        "write access gate: "
+        f"{'globally locked' if database['force_locked'] else 'space leases are process-local'}\n"
     )
-    output.write(f"watched sessions: {len(subscriptions)}\n")
-    lifecycles = {name: sum(space.get("lifecycle") == name for space in spaces) for name in (
-        "pending", "active", "closed", "repair_required"
-    )}
+    output.write(f"watched sessions: {database['subscriptions']}\n")
     output.write(
         "session spaces: "
-        + " · ".join(f"{name}={count}" for name, count in lifecycles.items())
+        + " · ".join(
+            f"{name}={spaces.get(name, 0)}"
+            for name in ("pending", "active", "closed", "repair_required")
+        )
         + "\n"
     )
-    output.write(f"auth epoch: {auth_epoch}\n")
-    output.write(f"database schema: v{schema_version}\n")
-    output.write(f"last runtime marker: {'active/unclean' if runtime_active else 'cleanly stopped'}\n")
-    output.write(f"deferred disconnect emoji: {'pending' if pending_disconnect else 'none'}\n")
+    output.write(f"auth epoch: {database['auth_epoch']}\n")
+    output.write(f"database schema: v{database['schema_version']}\n")
+    output.write(
+        f"database bytes: {database['database_bytes']} + wal {database['wal_bytes']}\n"
+    )
+    output.write(
+        "last runtime marker: "
+        f"{'active/unclean' if database['runtime_active'] else 'cleanly stopped'}\n"
+    )
+    output.write(
+        "deferred disconnect emoji: "
+        f"{'pending' if database['pending_disconnect'] else 'none'}\n"
+    )
+    output.write(f"health snapshot: {health_state}\n")
     output.write(f"codex socket: {socket_status}\n")
     return 0
 
@@ -1085,7 +1216,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     doctor = commands.add_parser("doctor", help="检查凭据、权限、Codex socket 与依赖")
     doctor.add_argument("--offline", action="store_true", help="不调用 Telegram getMe")
-    commands.add_parser("status", help="显示本机桥接状态（不显示秘密）")
+    status = commands.add_parser("status", help="显示本机桥接状态（不显示秘密）")
+    status.add_argument("--json", action="store_true", help="输出机器可读 JSON")
     return parser
 
 
@@ -1125,7 +1257,7 @@ def run(args: argparse.Namespace, *, output: TextIO = sys.stdout) -> int:
     if args.command == "doctor":
         return asyncio.run(_doctor(config, offline=args.offline, output=output))
     if args.command == "status":
-        return _status(config, output)
+        return _status(config, output, as_json=args.json)
 
     store = _with_store(config)
     try:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import stat
 from concurrent.futures import ThreadPoolExecutor
 from io import StringIO
@@ -26,7 +27,7 @@ from codex_telegram_bridge.cli import (
 from codex_telegram_bridge.config import Config
 from codex_telegram_bridge.models import Owner
 from codex_telegram_bridge.security import Enrollment, SecurityManager
-from codex_telegram_bridge.store import Store
+from codex_telegram_bridge.store import SCHEMA_VERSION, Store
 
 TOKEN = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcd1234"
 FORUM_TOKEN = "987654321:ZYXWVUTSRQPONMLKJIHGFEDCBA_1234567"
@@ -343,6 +344,60 @@ def test_status_reports_dual_credentials_and_binding_without_secrets(tmp_path: P
     assert "channel binding: ready" in rendered
     assert TOKEN not in rendered
     assert FORUM_TOKEN not in rendered
+
+
+def test_status_json_reports_persisted_health_without_secrets(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    store = Store(config.database_path)
+    store.write_health_snapshot(
+        {
+            "service_state": "running",
+            "polling": [{"role": "control", "seconds_since_success": 1.5}],
+            "outbound": {"control": {"queues": {"interactive": 0}}},
+            "delivery": {"pending": 0},
+            "bridge": {
+                "codex": {"generation": 3, "notification_queued": 0},
+                "resync": {"failures": 0},
+            },
+        }
+    )
+    store.close()
+    output = StringIO()
+
+    assert _status(config, output, as_json=True) == 0
+
+    payload = json.loads(output.getvalue())
+    assert payload["database"]["schema_version"] == SCHEMA_VERSION
+    assert payload["database"]["bytes"] > 0
+    assert payload["runtime"]["health_state"] == "fresh"
+    assert payload["runtime"]["health"]["polling"][0]["role"] == "control"
+    assert payload["runtime"]["health"]["bridge"]["codex"]["generation"] == 3
+    assert TOKEN not in output.getvalue()
+    assert FORUM_TOKEN not in output.getvalue()
+
+
+def test_status_does_not_create_or_migrate_database(tmp_path: Path) -> None:
+    missing_config = make_config(tmp_path / "missing")
+    assert _status(missing_config, StringIO(), as_json=True) == 0
+    assert not missing_config.database_path.exists()
+
+    config = make_config(tmp_path / "legacy")
+    config.state_dir.mkdir(parents=True)
+    connection = sqlite3.connect(config.database_path)
+    connection.execute("PRAGMA user_version=9")
+    connection.commit()
+    connection.close()
+
+    output = StringIO()
+    assert _status(config, output, as_json=True) == 0
+    connection = sqlite3.connect(config.database_path)
+    try:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table'"
+        ).fetchone()[0] == 0
+    finally:
+        connection.close()
 
 
 @pytest.mark.asyncio

@@ -77,9 +77,12 @@ async def test_start_protects_files_referenced_by_queued_prompts(
     )
     bridge = Bridge(config, store, object(), Messenger())  # type: ignore[arg-type]
     protected: set[Path] = set()
+    cleaned = asyncio.Event()
+    loop = asyncio.get_running_loop()
 
     def cleanup(_inbox: Path, _days: int, *, protected_paths: set[Path]) -> int:
         protected.update(protected_paths)
+        loop.call_soon_threadsafe(cleaned.set)
         return 0
 
     async def no_op(*_args: Any, **_kwargs: Any) -> None:
@@ -93,8 +96,37 @@ async def test_start_protects_files_referenced_by_queued_prompts(
     monkeypatch.setattr(bridge.dashboard, "start", lambda: None)
 
     await bridge.start()
+    await asyncio.wait_for(cleaned.wait(), timeout=1)
 
     assert protected == {upload.resolve()}
+    await bridge.stop()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_start_does_not_wait_for_local_maintenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, store = make_bridge(tmp_path)
+    release = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def blocked_cleanup() -> None:
+        future = asyncio.run_coroutine_threadsafe(release.wait(), loop)
+        future.result(timeout=2)
+
+    async def no_op(*_args: Any, **_kwargs: Any) -> None:
+        pass
+
+    monkeypatch.setattr(bridge, "_cleanup_local_state", blocked_cleanup)
+    monkeypatch.setattr(bridge.directory_index, "refresh", no_op)
+    monkeypatch.setattr(bridge.client, "start", lambda: None)
+    monkeypatch.setattr(bridge.client, "wait_connected", no_op)
+    monkeypatch.setattr(bridge.metrics, "start", lambda: None)
+    monkeypatch.setattr(bridge.dashboard, "start", lambda: None)
+
+    await asyncio.wait_for(bridge.start(), timeout=0.2)
+    release.set()
     await bridge.stop()
     store.close()
 
@@ -341,13 +373,15 @@ async def test_activate_pending_session_does_not_create_legacy_subscription(
 
     async def start_thread(cwd: Path) -> dict[str, Any]:
         assert cwd == tmp_path
-        return {
+        payload = {
             "id": "thread-new",
             "cwd": str(cwd),
             "createdAt": 100,
             "updatedAt": 100,
             "status": {"type": "idle"},
         }
+        await bridge._on_notification("thread/started", {"thread": payload})
+        return payload
 
     async def ensure_window(thread_id: str, title: str, cwd: Path) -> str:
         assert (thread_id, title, cwd) == (
@@ -383,11 +417,15 @@ async def test_activate_pending_session_does_not_create_legacy_subscription(
     space = store.get_session_space("space-pending")
     assert state.thread_id == "thread-new"
     assert turns == [("thread-new", "telegram-initial")]
-    assert changes == [("thread-new", "session/activated")]
+    assert changes == [
+        ("thread-new", "thread/started"),
+        ("thread-new", "session/activated"),
+    ]
     assert store.subscriptions() == {}
     assert space is not None
     assert (space.lifecycle, space.thread_id) == ("active", "thread-new")
     assert (space.pending_cwd, space.pending_prompt) == ("", "")
+    assert [event["kind"] for event in store.timeline("thread-new")] == ["thread/started"]
     store.close()
 
 
@@ -624,13 +662,16 @@ async def test_command_approval_persists_and_responds_with_protocol_decision(
     wire_decision: str,
 ) -> None:
     bridge, store = make_bridge(tmp_path)
+    store.subscribe("thread-approval")
     request_keys: list[str] = []
     responses: list[tuple[int | str, dict[str, Any]]] = []
 
     async def forward(request_key: str, _params: dict[str, Any]) -> None:
         request_keys.append(request_key)
 
-    async def respond(request_id: int | str, result: dict[str, Any]) -> None:
+    async def respond(
+        request_id: int | str, result: dict[str, Any], **_kwargs: Any
+    ) -> None:
         responses.append((request_id, result))
 
     bridge.on_command_approval = forward
@@ -665,6 +706,7 @@ async def test_command_approval_persists_and_responds_with_protocol_decision(
 @pytest.mark.asyncio
 async def test_command_approval_validates_and_preserves_available_decisions(tmp_path: Path) -> None:
     bridge, store = make_bridge(tmp_path)
+    store.subscribe("thread-approval")
     request_keys: list[str] = []
     responses: list[tuple[int | str, dict[str, Any]]] = []
     amendment = {
@@ -676,7 +718,9 @@ async def test_command_approval_validates_and_preserves_available_decisions(tmp_
     async def forward(request_key: str, _params: dict[str, Any]) -> None:
         request_keys.append(request_key)
 
-    async def respond(request_id: int | str, result: dict[str, Any]) -> None:
+    async def respond(
+        request_id: int | str, result: dict[str, Any], **_kwargs: Any
+    ) -> None:
         responses.append((request_id, result))
 
     bridge.on_command_approval = forward
@@ -715,13 +759,16 @@ async def test_command_approval_validates_and_preserves_available_decisions(tmp_
 @pytest.mark.asyncio
 async def test_legacy_command_approval_normalizes_conversation_and_call_ids(tmp_path: Path) -> None:
     bridge, store = make_bridge(tmp_path)
+    store.subscribe("legacy-conversation")
     forwarded: list[tuple[str, dict[str, Any]]] = []
     responses: list[tuple[int | str, dict[str, Any]]] = []
 
     async def forward(request_key: str, params: dict[str, Any]) -> None:
         forwarded.append((request_key, params))
 
-    async def respond(request_id: int | str, result: dict[str, Any]) -> None:
+    async def respond(
+        request_id: int | str, result: dict[str, Any], **_kwargs: Any
+    ) -> None:
         responses.append((request_id, result))
 
     bridge.on_command_approval = forward
@@ -756,6 +803,7 @@ async def test_legacy_command_approval_normalizes_conversation_and_call_ids(tmp_
 @pytest.mark.asyncio
 async def test_command_approval_retires_after_transport_generation_changes(tmp_path: Path) -> None:
     bridge, store = make_bridge(tmp_path)
+    store.subscribe("thread-reconnect")
     request_keys: list[str] = []
     resolved: list[str] = []
 
@@ -765,7 +813,9 @@ async def test_command_approval_retires_after_transport_generation_changes(tmp_p
     async def question_resolved(request_key: str) -> None:
         resolved.append(request_key)
 
-    async def fail_after_reconnect(_request_id: int | str, _result: dict[str, Any]) -> None:
+    async def fail_after_reconnect(
+        _request_id: int | str, _result: dict[str, Any], **_kwargs: Any
+    ) -> None:
         bridge.client.generation += 1
         raise OSError("connection replaced")
 
@@ -878,6 +928,135 @@ async def test_resync_uses_active_space_as_subscription_without_legacy_dashboard
     state = store.get_thread("thread-space")
     assert state is not None and state.subscribed
     assert store.subscriptions() == {}
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_resync_never_loads_global_thread_list_and_isolates_root_timeouts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, store = make_bridge(tmp_path)
+    store.subscribe("a-timeout")
+    store.subscribe("b-healthy")
+    resumed: list[str] = []
+
+    async def list_threads(**_kwargs: Any) -> list[dict[str, Any]]:
+        raise AssertionError("global thread inventory must not be projected during resync")
+
+    async def resume_thread(thread_id: str) -> dict[str, Any]:
+        resumed.append(thread_id)
+        if thread_id == "a-timeout":
+            raise TimeoutError("busy root")
+        return {
+            "id": thread_id,
+            "cwd": str(tmp_path),
+            "status": {"type": "active"},
+        }
+
+    async def get_goal(_thread_id: str) -> None:
+        return None
+
+    async def schedule(_state: ThreadState, *, immediate: bool = False) -> None:
+        assert immediate
+
+    monkeypatch.setattr(bridge.client, "list_threads", list_threads)
+    monkeypatch.setattr(bridge.client, "resume_thread", resume_thread)
+    monkeypatch.setattr(bridge.client, "get_goal", get_goal)
+    monkeypatch.setattr(bridge.dashboard, "schedule", schedule)
+
+    await bridge.resync()
+
+    assert resumed == ["a-timeout", "b-healthy"]
+    assert store.get_thread("b-healthy") is not None
+    assert store.get_thread("a-timeout") is None
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_unmanaged_codex_traffic_is_rejected_before_projection_or_telegram(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, store = make_bridge(tmp_path)
+    projected: list[str] = []
+    questions: list[str] = []
+    rejected: list[tuple[int | str, int, int | None]] = []
+
+    async def ingest(method: str, _params: dict[str, Any]) -> None:
+        projected.append(method)
+
+    async def question(request_key: str, _params: dict[str, Any]) -> None:
+        questions.append(request_key)
+
+    async def respond_error(
+        request_id: int | str,
+        code: int,
+        _message: str,
+        *,
+        generation: int | None = None,
+    ) -> None:
+        rejected.append((request_id, code, generation))
+
+    monkeypatch.setattr(bridge.projector, "ingest", ingest)
+    monkeypatch.setattr(bridge.client, "respond_error", respond_error)
+    bridge.on_question = question
+
+    await bridge._on_notification(
+        "item/completed",
+        {
+            "threadId": "foreign-thread",
+            "turnId": "foreign-turn",
+            "item": {"id": "answer", "type": "agentMessage", "text": "private"},
+        },
+    )
+    await bridge._on_server_request(
+        91,
+        "item/tool/requestUserInput",
+        {
+            "threadId": "foreign-thread",
+            "turnId": "foreign-turn",
+            "questions": [],
+        },
+        7,
+    )
+
+    assert projected == []
+    assert questions == []
+    assert rejected == [(91, -32600, 7)]
+    assert store.get_thread("foreign-thread") is None
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_persisted_subagent_descendant_remains_in_managed_interest_graph(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, store = make_bridge(tmp_path)
+    store.save_thread(
+        ThreadState(
+            thread_id="managed-parent",
+            tasks=[
+                TaskState(
+                    task_id="managed-child",
+                    agent_thread_id="managed-child",
+                    title="child",
+                )
+            ],
+        )
+    )
+    store.subscribe("managed-parent")
+    projected: list[str] = []
+
+    async def ingest(_method: str, params: dict[str, Any]) -> None:
+        projected.append(str(params.get("threadId") or ""))
+
+    monkeypatch.setattr(bridge.projector, "ingest", ingest)
+
+    await bridge._on_notification(
+        "thread/status/changed",
+        {"threadId": "managed-child", "status": {"type": "active"}},
+    )
+
+    assert projected == ["managed-child"]
     store.close()
 
 
@@ -1129,7 +1308,9 @@ async def test_side_fork_events_and_input_requests_never_reach_bridge_hooks(
         del params
         questions.append(request_key)
 
-    async def respond_error(request_id: int | str, code: int, message: str) -> None:
+    async def respond_error(
+        request_id: int | str, code: int, message: str, **_kwargs: Any
+    ) -> None:
         del message
         rejected.append((request_id, code))
 
@@ -1296,6 +1477,7 @@ async def test_plan_completion_hook_uses_authoritative_item_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     bridge, store = make_bridge(tmp_path)
+    store.subscribe("thread-plan")
     received: list[tuple[str, str, str, str]] = []
 
     async def ingest(_method: str, _params: dict[str, Any]) -> None:
@@ -1348,6 +1530,7 @@ async def test_tui_plan_approval_hook_uses_live_item_started_order(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     bridge, store = make_bridge(tmp_path)
+    store.subscribe("thread-tui")
     received: list[tuple[str, str]] = []
 
     async def ingest(_method: str, _params: dict[str, Any]) -> None:
@@ -1414,6 +1597,7 @@ async def test_tui_plan_approval_hook_ignores_unrelated_items(
     text: str,
 ) -> None:
     bridge, store = make_bridge(tmp_path)
+    store.subscribe("thread-plan")
     received: list[tuple[str, str]] = []
 
     async def ingest(_method: str, _params: dict[str, Any]) -> None:
@@ -1578,6 +1762,7 @@ async def test_subagent_activity_hydrates_effective_child_profile(
 ) -> None:
     bridge, store = make_bridge(tmp_path)
     store.save_thread(ThreadState(thread_id="parent", status="active"))
+    store.subscribe("parent")
 
     async def resume_thread(thread_id: str) -> dict[str, Any]:
         assert thread_id == "child-luna"
@@ -1634,6 +1819,7 @@ async def test_restart_hydrates_profiles_for_persisted_subagent_tasks(
             ],
         )
     )
+    store.subscribe("parent")
 
     async def resume_thread(thread_id: str) -> dict[str, Any]:
         assert thread_id == "child-sol"
@@ -1647,10 +1833,137 @@ async def test_restart_hydrates_profiles_for_persisted_subagent_tasks(
 
     monkeypatch.setattr(bridge.client, "resume_thread", resume_thread)
     await bridge._hydrate_missing_subagent_profiles()
+    await bridge._subagent_profile_tasks["child-sol"]
 
     parent = store.get_thread("parent")
     assert parent is not None
     assert [(item.model, item.reasoning_effort) for item in parent.tasks] == [
         ("gpt-5.6-sol", "xhigh")
     ]
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_subagent_hydration_skips_persisted_not_found_tasks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, store = make_bridge(tmp_path)
+    store.save_thread(
+        ThreadState(
+            thread_id="parent",
+            tasks=[
+                TaskState(
+                    task_id="missing-child",
+                    agent_thread_id="missing-child",
+                    title="missing",
+                    status="notFound",
+                )
+            ],
+        )
+    )
+    store.subscribe("parent")
+    resumed: list[str] = []
+
+    async def resume_thread(thread_id: str) -> dict[str, Any]:
+        resumed.append(thread_id)
+        raise AssertionError("notFound child must not be resumed")
+
+    monkeypatch.setattr(bridge.client, "resume_thread", resume_thread)
+
+    await bridge._hydrate_missing_subagent_profiles()
+
+    assert resumed == []
+    assert bridge._subagent_profile_tasks == {}
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_no_rollout_found_marks_subagent_terminal_without_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, store = make_bridge(tmp_path)
+    store.save_thread(
+        ThreadState(
+            thread_id="parent",
+            tasks=[
+                TaskState(
+                    task_id="missing-child",
+                    agent_thread_id="missing-child",
+                    title="missing",
+                    status="inProgress",
+                )
+            ],
+        )
+    )
+    store.subscribe("parent")
+    attempts = 0
+
+    async def resume_thread(_thread_id: str) -> dict[str, Any]:
+        nonlocal attempts
+        attempts += 1
+        raise CodexRpcError("thread/resume", {"message": "no rollout found for thread"})
+
+    monkeypatch.setattr(bridge.client, "resume_thread", resume_thread)
+
+    await bridge._hydrate_missing_subagent_profiles()
+    await bridge._subagent_profile_tasks["missing-child"]
+    await bridge._hydrate_missing_subagent_profiles()
+
+    parent = store.get_thread("parent")
+    assert attempts == 1
+    assert parent is not None and parent.tasks[0].status == "notFound"
+    assert bridge._subagent_profile_tasks == {}
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_subagent_hydration_retries_transient_failures_in_one_coalesced_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, store = make_bridge(tmp_path)
+    store.save_thread(
+        ThreadState(
+            thread_id="parent",
+            tasks=[
+                TaskState(
+                    task_id="eventual-child",
+                    agent_thread_id="eventual-child",
+                    title="eventual",
+                    status="inProgress",
+                )
+            ],
+        )
+    )
+    store.subscribe("parent")
+    attempts = 0
+
+    async def resume_thread(thread_id: str) -> dict[str, Any]:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise TimeoutError("temporary app-server stall")
+        return {
+            "id": thread_id,
+            "parentThreadId": "parent",
+            "model": "gpt-5.6-luna",
+            "reasoningEffort": "max",
+            "status": {"type": "active"},
+        }
+
+    monkeypatch.setattr(bridge.client, "resume_thread", resume_thread)
+    monkeypatch.setattr(bridge_module, "_SUBAGENT_PROFILE_RETRY_DELAYS", (0.0, 0.0, 0.0, 0.0))
+
+    await bridge._hydrate_missing_subagent_profiles()
+    task = bridge._subagent_profile_tasks["eventual-child"]
+    await bridge._hydrate_missing_subagent_profiles()
+    assert bridge._subagent_profile_tasks["eventual-child"] is task
+    await task
+
+    parent = store.get_thread("parent")
+    assert attempts == 3
+    assert parent is not None
+    assert (parent.tasks[0].model, parent.tasks[0].reasoning_effort) == (
+        "gpt-5.6-luna",
+        "max",
+    )
     store.close()

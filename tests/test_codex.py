@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 import codex_telegram_bridge.codex as codex_module
-from codex_telegram_bridge.codex import CodexClient, CodexRpcError
+from codex_telegram_bridge.codex import CodexClient, CodexDisconnected, CodexRpcError
 
 
 @pytest.mark.asyncio
@@ -879,6 +879,74 @@ async def test_disconnect_drains_server_requests_before_connection_callback(
 
 
 @pytest.mark.asyncio
+async def test_server_request_during_initialize_uses_new_connection_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response_sent = asyncio.Event()
+    sent: list[dict[str, Any]] = []
+
+    class InitializingWebSocket:
+        emitted = False
+
+        def __aiter__(self) -> InitializingWebSocket:
+            return self
+
+        async def __anext__(self) -> str:
+            if not self.emitted:
+                self.emitted = True
+                return '{"id":77,"method":"item/tool/requestUserInput","params":{}}'
+            await response_sent.wait()
+            raise StopAsyncIteration
+
+        async def send(self, raw: str) -> None:
+            sent.append(json.loads(raw))
+            response_sent.set()
+
+        async def close(self, *, code: int, reason: str) -> None:
+            del code, reason
+
+    websocket = InitializingWebSocket()
+
+    async def connect(**_kwargs: Any) -> InitializingWebSocket:
+        return websocket
+
+    async def on_server_request(
+        request_id: int | str,
+        _method: str,
+        _params: dict[str, Any],
+        generation: int,
+    ) -> None:
+        await client.respond_error(
+            request_id,
+            -32000,
+            "initializing",
+            generation=generation,
+        )
+
+    client = CodexClient(
+        Path("/tmp/not-used.sock"),
+        on_server_request=on_server_request,
+    )
+
+    async def initialize() -> None:
+        await asyncio.wait_for(response_sent.wait(), timeout=1)
+        client._stopping.set()
+
+    client._initialize = initialize  # type: ignore[method-assign]
+    monkeypatch.setattr(codex_module, "unix_connect", connect)
+
+    await asyncio.wait_for(client._run(), timeout=1)
+
+    assert client.generation == 1
+    assert sent == [
+        {
+            "id": 77,
+            "error": {"code": -32000, "message": "initializing"},
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_ephemeral_thread_started_before_rpc_response_is_never_forwarded() -> None:
     notifications: list[str] = []
     server_requests: list[str] = []
@@ -900,7 +968,12 @@ async def test_ephemeral_thread_started_before_rpc_response_is_never_forwarded()
         on_server_request=on_server_request,
     )
 
-    async def respond_error(request_id: int | str, code: int, message: str) -> None:
+    async def respond_error(
+        request_id: int | str,
+        code: int,
+        message: str,
+        **_kwargs: Any,
+    ) -> None:
         rejected.append((request_id, code, message))
 
     client.respond_error = respond_error  # type: ignore[method-assign]
@@ -941,3 +1014,255 @@ async def test_ephemeral_thread_started_before_rpc_response_is_never_forwarded()
     assert rejected == [
         (41, -32600, "Interactive requests are disabled for isolated side questions")
     ]
+
+
+@pytest.mark.asyncio
+async def test_reader_resolves_rpc_while_prior_notification_is_blocked() -> None:
+    notification_started = asyncio.Event()
+    release_notification = asyncio.Event()
+    notifications: list[str] = []
+
+    async def on_notification(method: str, _params: dict[str, Any]) -> None:
+        notifications.append(method)
+        if len(notifications) == 1:
+            notification_started.set()
+            await release_notification.wait()
+
+    class WebSocket:
+        def __init__(self) -> None:
+            self.frames: asyncio.Queue[str | None] = asyncio.Queue()
+
+        def __aiter__(self) -> WebSocket:
+            return self
+
+        async def __anext__(self) -> str:
+            frame = await self.frames.get()
+            if frame is None:
+                raise StopAsyncIteration
+            return frame
+
+        async def send(self, raw: str) -> None:
+            request_id = json.loads(raw)["id"]
+            await self.frames.put('{"method":"thread/status/changed","params":{}}')
+            await self.frames.put(json.dumps({"id": request_id, "result": {"ok": True}}))
+            await self.frames.put('{"method":"thread/name/updated","params":{}}')
+
+    client = CodexClient(Path("/tmp/not-used.sock"), on_notification=on_notification)
+    websocket = WebSocket()
+    token = object()
+    client._websocket = websocket  # type: ignore[assignment]
+    client._connection_token = token
+    reader = asyncio.create_task(
+        client._reader(websocket, connection_token=token, generation=1)  # type: ignore[arg-type]
+    )
+
+    result = await asyncio.wait_for(
+        client._request_on_connection("test/read", {}, timeout=1),
+        timeout=1,
+    )
+
+    assert result == {"ok": True}
+    await asyncio.wait_for(notification_started.wait(), timeout=1)
+    assert notifications == ["thread/status/changed"]
+    release_notification.set()
+    await websocket.frames.put(None)
+    await asyncio.wait_for(reader, timeout=1)
+    assert notifications == ["thread/status/changed", "thread/name/updated"]
+
+
+@pytest.mark.asyncio
+async def test_notification_queue_overflow_is_a_controlled_disconnect() -> None:
+    class WebSocket:
+        def __init__(self) -> None:
+            self.frames = iter(
+                [
+                    '{"method":"one","params":{}}',
+                    '{"method":"two","params":{}}',
+                ]
+            )
+
+        def __aiter__(self) -> WebSocket:
+            return self
+
+        async def __anext__(self) -> str:
+            try:
+                return next(self.frames)
+            except StopIteration:
+                raise StopAsyncIteration from None
+
+    client = CodexClient(Path("/tmp/not-used.sock"), notification_capacity=1)
+    queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=1)
+
+    with pytest.raises(CodexDisconnected, match="notification queue exceeded"):
+        await client._reader(  # type: ignore[arg-type]
+            WebSocket(),
+            connection_token=object(),
+            generation=1,
+            notification_queue=queue,
+        )
+
+    assert queue.qsize() == 1
+
+
+@pytest.mark.asyncio
+async def test_pending_rpc_admission_is_bounded_and_released() -> None:
+    class WebSocket:
+        async def send(self, _raw: str) -> None:
+            return None
+
+    client = CodexClient(
+        Path("/tmp/not-used.sock"),
+        pending_rpc_limit=1,
+        admission_timeout=0.01,
+    )
+    websocket = WebSocket()
+    client._websocket = websocket  # type: ignore[assignment]
+    client._connection_token = object()
+    first = asyncio.create_task(client._request_on_connection("first", {}, timeout=5))
+    while len(client._pending) != 1:
+        await asyncio.sleep(0)
+
+    with pytest.raises(TimeoutError, match="admission queue is full"):
+        await client._request_on_connection("blocked", {}, timeout=1)
+
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    third = asyncio.create_task(client._request_on_connection("third", {}, timeout=1))
+    while len(client._pending) != 1:
+        await asyncio.sleep(0)
+    [pending] = client._pending.values()
+    pending.future.set_result({"result": {"accepted": True}})
+    assert await third == {"accepted": True}
+    assert client.health_snapshot()["pending_rpc"] == 0
+
+
+@pytest.mark.asyncio
+async def test_send_timeout_cleans_pending_and_releases_admission() -> None:
+    class WebSocket:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def send(self, _raw: str) -> None:
+            await asyncio.Future()
+
+        async def close(self, *, code: int, reason: str) -> None:
+            del code, reason
+            self.closed = True
+
+    client = CodexClient(
+        Path("/tmp/not-used.sock"),
+        pending_rpc_limit=1,
+        send_timeout=0.01,
+    )
+    websocket = WebSocket()
+    client._websocket = websocket  # type: ignore[assignment]
+    client._connection_token = object()
+
+    with pytest.raises(CodexDisconnected, match="send timed out"):
+        await client._request_on_connection("slow", {}, timeout=1)
+
+    assert websocket.closed
+    assert client._pending == {}
+    assert client._pending_slots._value == 1
+
+
+@pytest.mark.asyncio
+async def test_late_response_from_old_connection_cannot_resolve_new_pending() -> None:
+    class SendingWebSocket:
+        async def send(self, _raw: str) -> None:
+            return None
+
+    class ResponseWebSocket:
+        def __init__(self, request_id: int) -> None:
+            self.frame = json.dumps({"id": request_id, "result": {"source": "frame"}})
+            self.sent = False
+
+        def __aiter__(self) -> ResponseWebSocket:
+            return self
+
+        async def __anext__(self) -> str:
+            if self.sent:
+                raise StopAsyncIteration
+            self.sent = True
+            return self.frame
+
+    client = CodexClient(Path("/tmp/not-used.sock"))
+    current_websocket = SendingWebSocket()
+    current_token = object()
+    client._websocket = current_websocket  # type: ignore[assignment]
+    client._connection_token = current_token
+    request = asyncio.create_task(client._request_on_connection("current", {}, timeout=1))
+    while not client._pending:
+        await asyncio.sleep(0)
+    [request_id] = client._pending
+
+    await client._reader(  # type: ignore[arg-type]
+        ResponseWebSocket(request_id),
+        connection_token=object(),
+        generation=1,
+        notification_queue=asyncio.Queue(maxsize=1),
+    )
+    assert not request.done()
+
+    await client._reader(  # type: ignore[arg-type]
+        ResponseWebSocket(request_id),
+        connection_token=current_token,
+        generation=2,
+        notification_queue=asyncio.Queue(maxsize=1),
+    )
+    assert await request == {"source": "frame"}
+
+
+@pytest.mark.asyncio
+async def test_server_requests_are_bounded_and_serial_per_thread() -> None:
+    started: list[tuple[int | str, str]] = []
+    active_threads: set[str] = set()
+    duplicate_thread_overlap = False
+    release = asyncio.Event()
+
+    async def on_server_request(
+        request_id: int | str,
+        _method: str,
+        params: dict[str, Any],
+        _generation: int,
+    ) -> None:
+        nonlocal duplicate_thread_overlap
+        thread_id = str(params["threadId"])
+        if thread_id in active_threads:
+            duplicate_thread_overlap = True
+        active_threads.add(thread_id)
+        started.append((request_id, thread_id))
+        await release.wait()
+        active_threads.remove(thread_id)
+
+    client = CodexClient(
+        Path("/tmp/not-used.sock"),
+        on_server_request=on_server_request,
+        server_request_capacity=128,
+        server_request_concurrency=8,
+    )
+    token = object()
+    client._connection_token = token
+    for request_id in range(10):
+        thread_id = "same" if request_id < 2 else f"thread-{request_id}"
+        client._enqueue_server_request(
+            request_id,
+            "request",
+            {"threadId": thread_id},
+            1,
+            token,
+        )
+    while len(started) < 8:
+        await asyncio.sleep(0)
+
+    assert len(client._server_request_tasks) == 8
+    assert len(client._server_request_queue) == 2
+    assert [thread for _, thread in started].count("same") == 1
+    assert duplicate_thread_overlap is False
+
+    release.set()
+    while client._server_request_tasks or client._server_request_queue:
+        await asyncio.sleep(0)
+    assert len(started) == 10
+    assert duplicate_thread_overlap is False

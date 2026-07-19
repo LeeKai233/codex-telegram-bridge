@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly INSTALLER_VERSION="0.2.5"
+readonly INSTALLER_VERSION="0.2.6"
 readonly UV_VERSION="0.11.28"
 readonly PROJECT="codex-telegram-bridge"
 readonly REPOSITORY="LeeKai233/codex-telegram-bridge"
@@ -848,13 +848,15 @@ Description=Codex Telegram Bridge
 Documentation=https://github.com/$REPOSITORY
 Wants=network-online.target
 After=$after
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
 WorkingDirectory=%h
 ExecStart=/usr/bin/env CODEX_HOME=%h/.codex %h/.local/bin/codex-telegram-bridge
 Restart=on-failure
-RestartSec=5s
+RestartSec=30s
 TimeoutStopSec=45s
 KillSignal=SIGTERM
 KillMode=process

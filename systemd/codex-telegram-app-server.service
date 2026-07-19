@@ -1,5 +1,5 @@
 # X-CodexTelegramBridge-Installer: managed
-# X-CodexTelegramBridge-Installer-Version: v0.2.5
+# X-CodexTelegramBridge-Installer-Version: v0.2.6
 [Unit]
 Description=Codex App Server for Telegram Bridge
 Documentation=https://github.com/LeeKai233/codex-telegram-bridge

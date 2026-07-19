@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -16,9 +17,13 @@ from codex_telegram_bridge.main import (
     HANDSHAKE_EMOJI,
     AlreadyRunning,
     ConnectionPresence,
+    PollingRecoveryError,
+    PollingSupervisor,
     TelegramRuntimeServices,
     _build_runtime,
+    _health_snapshot_monitor,
     _install_token_redaction,
+    _runtime_health_payload,
     instance_lock,
     main,
     run_service,
@@ -249,6 +254,33 @@ async def test_unclean_runtime_marker_is_reported_before_reconnect(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_successful_disconnect_notice_is_not_replayed_when_handshake_fails(
+    tmp_path: Path,
+) -> None:
+    class HandshakeFailingBot(FakeBot):
+        async def send_message(self, *, chat_id: int, text: str, **_kwargs: Any) -> object:
+            if text == HANDSHAKE_EMOJI:
+                raise RuntimeError("handshake unavailable")
+            return await super().send_message(chat_id=chat_id, text=text)
+
+    store = make_store(tmp_path)
+    store.set_meta("telegram_runtime_active", True)
+    store.set_meta("telegram_runtime_chat_id", 20)
+    bot = HandshakeFailingBot()
+    presence = ConnectionPresence(bot, store, disconnect_threshold_seconds=1)
+
+    await presence.runtime_started()
+    await presence.probe()
+
+    assert bot.messages == [(20, DISCONNECT_EMOJI)]
+    lifecycle = store.runtime_lifecycle()
+    assert lifecycle is not None
+    assert lifecycle["startup_disconnect_state"] == "delivered"
+    assert lifecycle["handshake_state"] == "failed"
+    store.close()
+
+
+@pytest.mark.asyncio
 async def test_pair_handler_handshake_is_not_duplicated_by_health_probe(tmp_path: Path) -> None:
     store = Store(tmp_path / "state" / "state.sqlite3")
     bot = FakeBot()
@@ -258,13 +290,13 @@ async def test_pair_handler_handshake_is_not_duplicated_by_health_probe(tmp_path
 
     await presence.probe()
 
-    assert bot.messages == []
+    assert bot.messages == [(20, HANDSHAKE_EMOJI)]
     assert store.get_meta("telegram_runtime_chat_id") == 20
     store.close()
 
 
 @pytest.mark.asyncio
-async def test_network_outage_is_deferred_until_probe_recovers(tmp_path: Path) -> None:
+async def test_network_recovery_does_not_replay_presence_emojis(tmp_path: Path) -> None:
     store = make_store(tmp_path)
     bot = FakeBot()
     presence = ConnectionPresence(bot, store, disconnect_threshold_seconds=1)
@@ -274,12 +306,12 @@ async def test_network_outage_is_deferred_until_probe_recovers(tmp_path: Path) -
     bot.fail = True
     presence._failure_started = time.monotonic() - 2
     await presence.probe()
-    assert store.get_meta("telegram_disconnect_pending") is True
+    assert store.get_meta("telegram_disconnect_pending") is False
     assert bot.messages == []
 
     bot.fail = False
     await presence.probe()
-    assert bot.messages == [(20, DISCONNECT_EMOJI), (20, HANDSHAKE_EMOJI)]
+    assert bot.messages == []
     assert store.get_meta("telegram_disconnect_pending") is False
     store.close()
 
@@ -315,6 +347,10 @@ async def test_telegram_runtime_starts_and_stops_coordinator_with_dependencies()
         async def stop(self) -> None:
             events.append("controller.stop")
 
+    class DeliveryService(Service):
+        def start(self) -> None:
+            events.append("delivery.start")
+
     runtime = TelegramRuntimeServices(
         Messenger("control"),
         Messenger("discussion"),
@@ -322,15 +358,19 @@ async def test_telegram_runtime_starts_and_stops_coordinator_with_dependencies()
         Service("dashboards"),
         (Controller(),),
         coordinator=Service("coordinator"),
+        delivery=DeliveryService("delivery"),
     )
 
     await runtime.start()
+    startup_tasks = tuple(runtime._maintenance_tasks.values())
+    await asyncio.gather(*startup_tasks)
     await runtime.quiesce()
     await runtime.stop()
 
     assert events == [
         "control.start",
         "discussion.start",
+        "delivery.start",
         "deletions.start",
         "commands",
         "dashboards.start",
@@ -339,9 +379,55 @@ async def test_telegram_runtime_starts_and_stops_coordinator_with_dependencies()
         "coordinator.stop",
         "dashboards.stop",
         "deletions.stop",
+        "delivery.stop",
         "discussion.stop",
         "control.stop",
     ]
+
+
+@pytest.mark.asyncio
+async def test_telegram_runtime_start_does_not_wait_for_slow_maintenance() -> None:
+    entered = asyncio.Event()
+
+    class Messenger:
+        def start(self) -> None:
+            pass
+
+        async def stop(self) -> None:
+            pass
+
+    class Service:
+        async def start(self) -> None:
+            entered.set()
+            await asyncio.Event().wait()
+
+        async def stop(self) -> None:
+            pass
+
+    class Controller:
+        async def set_commands(self) -> None:
+            entered.set()
+            await asyncio.Event().wait()
+
+        async def stop(self) -> None:
+            pass
+
+    runtime = TelegramRuntimeServices(
+        Messenger(),
+        Messenger(),
+        Service(),
+        Service(),
+        (Controller(),),
+        coordinator=Service(),
+    )
+
+    await asyncio.wait_for(runtime.start(), timeout=0.1)
+    await asyncio.wait_for(entered.wait(), timeout=0.1)
+
+    assert runtime._started
+    assert runtime._maintenance_tasks
+    await runtime.stop()
+    assert runtime._maintenance_tasks == {}
 
 
 @pytest.mark.asyncio
@@ -415,6 +501,7 @@ async def test_manual_lifecycle_order_and_explicit_allowed_updates(
             "presence": Presence(),
             "store": store,
             "allowed_updates": ["message", "callback_query"],
+            "polling_health": (),
             "telegram_runtime": TelegramRuntime(),
         },
     )()
@@ -445,6 +532,198 @@ async def test_manual_lifecycle_order_and_explicit_allowed_updates(
         "app.shutdown",
         "post_shutdown",
     ]
+    reopened = Store(store.path)
+    try:
+        snapshot = reopened.health_snapshot()
+        assert snapshot is not None
+        assert snapshot["service_state"] == "stopped"
+    finally:
+        reopened.close()
+
+
+def test_runtime_health_payload_aggregates_polling_delivery_and_codex_queues(
+    tmp_path: Path,
+) -> None:
+    class SnapshotComponent:
+        def __init__(self, value: dict[str, Any]) -> None:
+            self.value = value
+
+        def snapshot(self) -> dict[str, Any]:
+            return self.value
+
+    class ControlController:
+        _workloads = SnapshotComponent({"queued": 3, "active": 1})
+
+    class Bridge:
+        @staticmethod
+        def health_snapshot() -> dict[str, Any]:
+            return {"codex": {"rpc_queued": 2, "notification_queued": 4}}
+
+    store = make_store(tmp_path)
+    runtime = type(
+        "FakeRuntime",
+        (),
+        {
+            "bridge": Bridge(),
+            "store": store,
+            "polling_health": (SnapshotComponent({"role": "control", "failures": 0}),),
+            "telegram_runtime": type(
+                "FakeTelegramRuntime",
+                (),
+                {
+                    "control_messenger": SnapshotComponent({"queues": {"interactive": 1}}),
+                    "discussion_messenger": SnapshotComponent({"queues": {"interactive": 0}}),
+                    "delivery": SnapshotComponent({"pending": 2, "workers": 2}),
+                    "controllers": (ControlController(),),
+                },
+            )(),
+        },
+    )()
+    supervisor = PollingSupervisor((), (), [])
+    try:
+        payload = _runtime_health_payload(runtime, supervisor, service_state="running")
+
+        assert payload["polling"] == [{"role": "control", "failures": 0}]
+        assert payload["outbound"]["control"]["queues"]["interactive"] == 1
+        assert payload["delivery"] == {"pending": 2, "workers": 2}
+        assert payload["workloads"]["control"] == {"queued": 3, "active": 1}
+        assert payload["bridge"]["codex"] == {
+            "rpc_queued": 2,
+            "notification_queued": 4,
+        }
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_health_snapshot_write_failure_is_isolated_from_polling(
+    tmp_path: Path,
+) -> None:
+    stop_event = asyncio.Event()
+    loop_thread_id = threading.get_ident()
+
+    class FailingStore:
+        path = tmp_path / "state.sqlite3"
+        writes = 0
+        writer_thread_id: int | None = None
+        written = threading.Event()
+
+        def write_health_snapshot(self, _snapshot: dict[str, Any]) -> None:
+            self.writes += 1
+            self.writer_thread_id = threading.get_ident()
+            self.written.set()
+            raise RuntimeError("snapshot unavailable")
+
+    store = FailingStore()
+    runtime = type(
+        "FakeRuntime",
+        (),
+        {
+            "bridge": object(),
+            "store": store,
+            "polling_health": (),
+            "telegram_runtime": None,
+        },
+    )()
+    supervisor = PollingSupervisor((), (), [])
+
+    task = asyncio.create_task(
+        _health_snapshot_monitor(runtime, supervisor, stop_event, interval=0.001)
+    )
+    assert await asyncio.to_thread(store.written.wait, 1.0)
+    stop_event.set()
+    await asyncio.wait_for(task, timeout=1.0)
+
+    assert store.writes == 1
+    assert store.writer_thread_id != loop_thread_id
+    assert supervisor.fatal_error is None
+
+
+@pytest.mark.asyncio
+async def test_run_service_drains_health_write_before_final_stopped_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first_write_started = threading.Event()
+    release_first_write = threading.Event()
+    states: list[str] = []
+
+    class Store:
+        path = tmp_path / "state.sqlite3"
+
+        def write_health_snapshot(self, snapshot: dict[str, Any]) -> None:
+            state = str(snapshot["service_state"])
+            if state == "running":
+                first_write_started.set()
+                release_first_write.wait(timeout=2.0)
+            states.append(state)
+
+        def close(self) -> None:
+            pass
+
+    class Updater:
+        async def start_polling(self, **_kwargs: Any) -> None:
+            pass
+
+        async def stop(self) -> None:
+            pass
+
+    class Application:
+        updater = Updater()
+        post_init = None
+        post_stop = None
+        post_shutdown = None
+
+        async def initialize(self) -> None:
+            pass
+
+        async def start(self) -> None:
+            pass
+
+        async def stop(self) -> None:
+            pass
+
+        async def shutdown(self) -> None:
+            pass
+
+    class Bridge:
+        async def start(self) -> None:
+            pass
+
+        async def stop(self) -> None:
+            pass
+
+    class Presence:
+        async def runtime_started(self) -> None:
+            pass
+
+        async def graceful_disconnect(self) -> None:
+            pass
+
+    runtime = type(
+        "FakeRuntime",
+        (),
+        {
+            "application": Application(),
+            "bridge": Bridge(),
+            "presence": Presence(),
+            "store": Store(),
+            "allowed_updates": ["message"],
+            "polling_health": (),
+            "telegram_runtime": None,
+        },
+    )()
+    monkeypatch.setattr("codex_telegram_bridge.main._build_runtime", lambda _config: runtime)
+    stop_event = asyncio.Event()
+    service = asyncio.create_task(run_service(make_config(tmp_path), stop_event))
+    assert await asyncio.to_thread(first_write_started.wait, 1.0)
+
+    stop_event.set()
+    await asyncio.sleep(0.05)
+    assert not service.done()
+    release_first_write.set()
+    await asyncio.wait_for(service, timeout=2.0)
+
+    assert states == ["running", "stopped"]
 
 
 @pytest.mark.asyncio
@@ -552,4 +831,110 @@ async def test_dual_applications_drain_before_runtime_dependencies_stop(
         "telegram.stop",
         "discussion.shutdown",
         "control.shutdown",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("supervisor_mode", ("return", "crash"))
+async def test_polling_supervisor_termination_cleans_up_before_service_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    supervisor_mode: str,
+) -> None:
+    events: list[str] = []
+
+    class Updater:
+        async def start_polling(self, **_kwargs: Any) -> None:
+            events.append("polling.start")
+
+        async def stop(self) -> None:
+            events.append("polling.stop")
+
+    class Application:
+        updater = Updater()
+        post_init = None
+        post_stop = None
+        post_shutdown = None
+
+        async def initialize(self) -> None:
+            events.append("app.initialize")
+
+        async def start(self) -> None:
+            events.append("app.start")
+
+        async def stop(self) -> None:
+            events.append("app.stop")
+
+        async def shutdown(self) -> None:
+            events.append("app.shutdown")
+
+    class Bridge:
+        async def start(self) -> None:
+            events.append("bridge.start")
+
+        async def stop(self) -> None:
+            events.append("bridge.stop")
+
+    class Presence:
+        async def runtime_started(self) -> None:
+            events.append("presence.start")
+
+        async def probe(self) -> None:
+            events.append("presence.probe")
+
+        async def graceful_disconnect(self) -> None:
+            events.append("presence.stop")
+
+    class TerminatingSupervisor:
+        def __init__(
+            self,
+            _applications: Any,
+            _health: Any,
+            _allowed_updates: Any,
+        ) -> None:
+            pass
+
+        async def monitor(self, _stop_event: asyncio.Event, *, interval: float) -> None:
+            assert interval > 0
+            events.append(f"polling.{supervisor_mode}")
+            if supervisor_mode == "return":
+                return
+            raise RuntimeError("supervisor crashed")
+
+    store = make_store(tmp_path)
+    runtime = type(
+        "FakeRuntime",
+        (),
+        {
+            "application": Application(),
+            "bridge": Bridge(),
+            "presence": Presence(),
+            "store": store,
+            "allowed_updates": ["message"],
+            "telegram_runtime": None,
+        },
+    )()
+    monkeypatch.setattr("codex_telegram_bridge.main._build_runtime", lambda _config: runtime)
+    monkeypatch.setattr("codex_telegram_bridge.main.PollingSupervisor", TerminatingSupervisor)
+
+    expected_error = (
+        "polling supervisor stopped unexpectedly"
+        if supervisor_mode == "return"
+        else "polling supervisor crashed: RuntimeError"
+    )
+    with pytest.raises(PollingRecoveryError, match=expected_error):
+        await run_service(make_config(tmp_path), asyncio.Event())
+
+    assert events == [
+        "app.initialize",
+        "polling.start",
+        "bridge.start",
+        "app.start",
+        "presence.start",
+        f"polling.{supervisor_mode}",
+        "polling.stop",
+        "app.stop",
+        "presence.stop",
+        "bridge.stop",
+        "app.shutdown",
     ]

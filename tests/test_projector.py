@@ -16,6 +16,29 @@ from codex_telegram_bridge.projector import EventProjector
 from codex_telegram_bridge.store import Store
 
 
+def managed_projector(store: Store, on_change=None):  # type: ignore[no-untyped-def]
+    options = {"is_managed": lambda _method, _params: True}
+    return EventProjector(store, **options) if on_change is None else EventProjector(
+        store, on_change, **options
+    )
+
+
+@pytest.mark.asyncio
+async def test_projector_rejects_global_and_unmanaged_events_by_default(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    projector = EventProjector(store)
+
+    await projector.ingest("account/rateLimits/updated", {"limit": 1})
+    await projector.ingest(
+        "thread/status/changed",
+        {"threadId": "unmanaged", "status": {"type": "idle"}},
+    )
+
+    assert store.get_thread("unmanaged") is None
+    assert store.timeline("unmanaged") == []
+    store.close()
+
+
 @pytest.mark.asyncio
 async def test_repeated_status_transition_is_processed_after_an_intervening_event(tmp_path: Path) -> None:
     store = Store(tmp_path / "state.sqlite3")
@@ -24,7 +47,7 @@ async def test_repeated_status_transition_is_processed_after_an_intervening_even
     async def changed(state, reason: str) -> None:  # type: ignore[no-untyped-def]
         changes.append((state.status, reason))
 
-    projector = EventProjector(store, changed)
+    projector = managed_projector(store, changed)
     idle = {"threadId": "thread-1", "status": {"type": "idle"}}
 
     await projector.ingest("thread/status/changed", idle)
@@ -60,7 +83,7 @@ async def test_retryable_error_clears_on_healthy_status_but_remains_in_timeline(
     tmp_path: Path,
 ) -> None:
     store = Store(tmp_path / "state.sqlite3")
-    projector = EventProjector(store)
+    projector = managed_projector(store)
 
     await projector.ingest(
         "error",
@@ -96,7 +119,7 @@ async def test_retryable_error_clears_on_healthy_status_but_remains_in_timeline(
 
 def test_retryable_error_requires_strictly_newer_healthy_snapshot(tmp_path: Path) -> None:
     store = Store(tmp_path / "state.sqlite3")
-    projector = EventProjector(store)
+    projector = managed_projector(store)
     retrying = ThreadState(
         thread_id="thread-snapshot",
         status="systemError",
@@ -137,7 +160,7 @@ def test_retryable_error_requires_strictly_newer_healthy_snapshot(tmp_path: Path
 @pytest.mark.asyncio
 async def test_failed_turn_ends_retry_state_but_keeps_terminal_error(tmp_path: Path) -> None:
     store = Store(tmp_path / "state.sqlite3")
-    projector = EventProjector(store)
+    projector = managed_projector(store)
     await projector.ingest(
         "error",
         {
@@ -210,7 +233,7 @@ async def test_thread_settings_notification_updates_space_mode_and_profile(tmp_p
             normal_effort="max",
         )
     )
-    projector = EventProjector(store, changed)
+    projector = managed_projector(store, changed)
 
     await projector.ingest(
         "thread/settings/updated",
@@ -247,7 +270,7 @@ def test_apply_thread_projects_server_timestamps_and_turn_durations(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = Store(tmp_path / "state.sqlite3")
-    projector = EventProjector(store)
+    projector = managed_projector(store)
     monkeypatch.setattr(projector_module.time, "time", lambda: 150)
 
     state = projector.apply_thread(
@@ -289,7 +312,7 @@ def test_apply_thread_projects_server_timestamps_and_turn_durations(
 @pytest.mark.asyncio
 async def test_collaboration_items_project_semantic_tasks_and_recent_activity(tmp_path: Path) -> None:
     store = Store(tmp_path / "state.sqlite3")
-    projector = EventProjector(store)
+    projector = managed_projector(store)
     projector.apply_thread({"id": "thread-tasks", "status": {"type": "active"}})
 
     await projector.ingest(
@@ -340,7 +363,7 @@ async def test_child_thread_status_reconciles_historical_subagent_activity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = Store(tmp_path / "state.sqlite3")
-    projector = EventProjector(store)
+    projector = managed_projector(store)
     monkeypatch.setattr(projector_module.time, "time", lambda: 500)
     parent_payload = {
         "id": "parent",
@@ -441,7 +464,7 @@ def test_complete_goal_finalizes_unresolved_tasks_without_rewriting_plan(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = Store(tmp_path / "state.sqlite3")
-    projector = EventProjector(store)
+    projector = managed_projector(store)
     monkeypatch.setattr(projector_module.time, "time", lambda: 500)
     state = ThreadState(
         thread_id="parent",
@@ -460,9 +483,93 @@ def test_complete_goal_finalizes_unresolved_tasks_without_rewriting_plan(
     store.close()
 
 
+@pytest.mark.asyncio
+async def test_goal_progress_persists_without_republishing_dashboard(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    changes: list[tuple[str, str]] = []
+
+    async def changed(state: ThreadState, reason: str) -> None:
+        changes.append((str((state.goal or {}).get("status") or ""), reason))
+
+    projector = managed_projector(store, changed)
+    await projector.ingest(
+        "thread/goal/updated",
+        {
+            "threadId": "thread-goal-progress",
+            "goal": {
+                "status": "active",
+                "objective": "Finish",
+                "tokensUsed": 10,
+                "timeUsedSeconds": 1,
+                "updatedAt": 100,
+            },
+        },
+    )
+    await projector.ingest(
+        "thread/goal/updated",
+        {
+            "threadId": "thread-goal-progress",
+            "goal": {
+                "status": "active",
+                "objective": "Finish",
+                "tokensUsed": 20,
+                "timeUsedSeconds": 2,
+                "updatedAt": 101,
+            },
+        },
+    )
+
+    state = store.get_thread("thread-goal-progress")
+    assert state is not None
+    assert state.goal is not None and state.goal["tokensUsed"] == 20
+    assert changes == [("active", "thread/goal/updated")]
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_equal_timestamp_goal_update_cannot_regress_complete_state(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    changes: list[str] = []
+
+    async def changed(state: ThreadState, _reason: str) -> None:
+        changes.append(str((state.goal or {}).get("status") or ""))
+
+    projector = managed_projector(store, changed)
+    for status, updated_at in (("active", 100), ("complete", 101), ("active", 101)):
+        await projector.ingest(
+            "thread/goal/updated",
+            {
+                "threadId": "thread-goal-order",
+                "goal": {
+                    "status": status,
+                    "objective": "Finish",
+                    "updatedAt": updated_at,
+                },
+            },
+        )
+
+    complete = store.get_thread("thread-goal-order")
+    assert complete is not None and complete.goal is not None
+    assert complete.goal["status"] == "complete"
+    assert changes == ["active", "complete"]
+
+    await projector.ingest(
+        "thread/goal/updated",
+        {
+            "threadId": "thread-goal-order",
+            "goal": {"status": "active", "objective": "Resume", "updatedAt": 102},
+        },
+    )
+    resumed = store.get_thread("thread-goal-order")
+    assert resumed is not None and resumed.goal is not None
+    assert resumed.goal["status"] == "active"
+    assert changes == ["active", "complete", "active"]
+    store.close()
+
+
 def test_complete_goal_preserves_authoritative_active_child(tmp_path: Path) -> None:
     store = Store(tmp_path / "state.sqlite3")
-    projector = EventProjector(store)
+    projector = managed_projector(store)
     parent = ThreadState(
         thread_id="parent",
         tasks=[TaskState(task_id="active-child", title="Live agent", status="inProgress")],
@@ -489,7 +596,7 @@ def test_complete_goal_preserves_authoritative_active_child(tmp_path: Path) -> N
 
 def test_stale_child_snapshot_cannot_reopen_terminal_task(tmp_path: Path) -> None:
     store = Store(tmp_path / "state.sqlite3")
-    projector = EventProjector(store)
+    projector = managed_projector(store)
     parent = ThreadState(
         thread_id="parent",
         tasks=[
@@ -549,7 +656,7 @@ async def test_subagent_protocol_metadata_is_linked_without_exposing_activity_pa
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = Store(tmp_path / "state.sqlite3")
-    projector = EventProjector(store)
+    projector = managed_projector(store)
     monkeypatch.setattr(projector_module.time, "time", lambda: 500)
     projector.apply_thread({"id": "parent", "status": {"type": "active"}})
     child = projector.apply_thread(
@@ -657,7 +764,7 @@ async def test_mixed_subagent_profiles_are_not_overwritten_by_group_activity(
     tmp_path: Path,
 ) -> None:
     store = Store(tmp_path / "state.sqlite3")
-    projector = EventProjector(store)
+    projector = managed_projector(store)
     projector.apply_thread({"id": "parent", "status": {"type": "active"}})
     projector.apply_thread(
         {

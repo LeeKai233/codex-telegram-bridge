@@ -70,6 +70,7 @@ from .views import (
     render_ask_waiting,
     render_help,
 )
+from .workloads import KeyedWorkScheduler
 
 LOGGER = logging.getLogger(__name__)
 
@@ -78,7 +79,10 @@ _LOCKED_COMMAND_ALLOWLIST = {"/totp", "/help", "/lock"}
 _PLAN_ACTION_SECONDS = 24 * 60 * 60
 _INTERACTION_SECONDS = 5 * 60
 _PROMPT_WAIT_SECONDS = 30
-_PLAN_PROMPT_POLL_SECONDS = 0.5
+_PLAN_PROMPT_POLL_SECONDS = 2.0
+_PLAN_PROMPT_FAST_WINDOW_SECONDS = 30.0
+_PLAN_PROMPT_SLOW_POLL_SECONDS = 10.0
+_PLAN_PROMPT_MONITOR_SECONDS = 10 * 60.0
 _PLAN_DECISION_GRACE_SECONDS = 2.0
 _BOT_URL_TOKEN = re.compile(r"(https://api\.telegram\.org/bot)[^/\s]+", re.IGNORECASE)
 _BOT_TOKEN = re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{16,}\b")
@@ -154,12 +158,16 @@ class DiscussionBotController:
         self._plan_prompt_tasks: dict[str, asyncio.Task[None]] = {}
         self._plan_recovery_done = False
         self._plan_recovery_task: asyncio.Task[None] | None = None
+        self._workloads = KeyedWorkScheduler("discussion-work", max_pending=256, max_running=8)
 
     def install(self, application: Application) -> None:
         self._application = application
         application.add_handler(TypeHandler(Update, self._guard), group=-100)
         application.add_handler(MessageHandler(filters.ALL, self.observe_message), group=-50)
-        application.add_handler(MessageHandler(filters.TEXT, self.reply_to_intent), group=-25)
+        application.add_handler(
+            MessageHandler(filters.TEXT, self._defer_handler(self.reply_to_intent)),
+            group=-25,
+        )
         for command, callback in (
             ("bind", self.bind),
             ("help", self.help),
@@ -178,15 +186,21 @@ class DiscussionBotController:
             ("unwatch", self.unwatch),
             ("answer", self.answer),
         ):
-            application.add_handler(CommandHandler(command, callback))
+            application.add_handler(CommandHandler(command, self._defer_handler(callback)))
         application.add_handler(
             MessageHandler(
                 filters.TEXT & filters.Regex(r"(?i)^/bind(?:@[a-z0-9_]+)?(?:\s|$)"),
-                self._bind_text_fallback,
+                self._defer_handler(self._bind_text_fallback),
             )
         )
         application.add_handler(CallbackQueryHandler(self.callback, pattern=r"^cb:"))
-        application.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, self.upload), group=1)
+        application.add_handler(
+            MessageHandler(
+                filters.Document.ALL | filters.PHOTO,
+                self._defer_handler(self.upload),
+            ),
+            group=1,
+        )
         application.add_error_handler(self.error)
         self.bridge.on_question = self.forward_question
         self.bridge.on_command_approval = self.forward_command_approval
@@ -196,7 +210,33 @@ class DiscussionBotController:
         self.bridge.on_prompt_completed = self.prompt_completed
         self.bridge.on_tui_plan_approved = self.plan_turn_started
 
+    def _defer_handler(self, callback: Any) -> Any:
+        async def deferred(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+            message = update.effective_message
+            space = self._space_for_message(message) if message is not None else None
+            if space is not None:
+                key = f"space:{space['space_id']}:{space['generation']}"
+            else:
+                chat = self._chat_for_update(update)
+                key = f"chat:{chat.id}" if chat is not None else "discussion"
+
+            async def run() -> None:
+                with contextlib.suppress(ApplicationHandlerStop):
+                    await callback(update, context)
+
+            if self._workloads.submit(key, run):
+                return
+            if space is not None:
+                await self._send_space(space, "请求队列已满，请稍后重试。")
+            else:
+                chat = self._chat_for_update(update)
+                if chat is not None:
+                    await self._send_unscoped(chat.id, "请求队列已满，请稍后重试。")
+
+        return deferred
+
     async def stop(self) -> None:
+        await self._workloads.stop()
         plan_prompt_tasks = list(self._plan_prompt_tasks.values())
         self._plan_prompt_tasks.clear()
         for task in plan_prompt_tasks:
@@ -233,14 +273,14 @@ class DiscussionBotController:
                 await asyncio.shield(self.deletions.flush())
 
     async def set_commands(self) -> None:
-        await self.discussion.bot.set_my_commands(
+        await self.discussion.set_my_commands(
             [BotCommand("bind", "绑定频道讨论组"), BotCommand("help", "显示帮助")],
             scope=BotCommandScopeAllGroupChats(),
         )
         binding = self.store.get_telegram_binding()
         owner = self.store.get_owner()
         if binding and owner:
-            await self.discussion.bot.set_my_commands(
+            await self.discussion.set_my_commands(
                 [BotCommand(command, description) for command, description in _SESSION_COMMANDS],
                 scope=BotCommandScopeChatMember(
                     chat_id=int(binding["discussion_chat_id"]), user_id=owner.user_id
@@ -390,7 +430,7 @@ class DiscussionBotController:
         if not code:
             await self._send_unscoped(chat.id, "用法：`/bind <本机 bind code>`")
             return
-        group = await self.discussion.bot.get_chat(chat.id)
+        group = await self.discussion.query(lambda: self.discussion.bot.get_chat(chat.id))
         channel_id = getattr(group, "linked_chat_id", None)
         if group.type != ChatType.SUPERGROUP or not channel_id:
             raise RuntimeError("当前群不是已关联频道的讨论超级群")
@@ -398,17 +438,22 @@ class DiscussionBotController:
             raise RuntimeError("讨论组启用了 Forum Topics，请先关闭 Topics")
         if getattr(group, "username", None):
             raise RuntimeError("讨论组必须保持私有")
-        channel = await self.control.bot.get_chat(int(channel_id))
+        channel = await self.control.query(lambda: self.control.bot.get_chat(int(channel_id)))
         if channel.type != ChatType.CHANNEL or getattr(channel, "username", None):
             raise RuntimeError("关联频道必须保持私有")
         if int(getattr(channel, "linked_chat_id", 0) or 0) != chat.id:
             raise RuntimeError("频道与讨论组的 linked_chat_id 不是双向一致")
         control_me, discussion_me = await asyncio.gather(
-            self.control.bot.get_me(), self.discussion.bot.get_me()
+            self.control.get_me(lane="interactive"),
+            self.discussion.get_me(lane="interactive"),
         )
         control_member, discussion_member = await asyncio.gather(
-            self.control.bot.get_chat_member(int(channel_id), control_me.id),
-            self.discussion.bot.get_chat_member(chat.id, discussion_me.id),
+            self.control.query(
+                lambda: self.control.bot.get_chat_member(int(channel_id), control_me.id)
+            ),
+            self.discussion.query(
+                lambda: self.discussion.bot.get_chat_member(chat.id, discussion_me.id)
+            ),
         )
         if control_member.status != ChatMemberStatus.ADMINISTRATOR:
             raise RuntimeError(f"{self.config.control_bot_label} 不是频道管理员")
@@ -423,7 +468,9 @@ class DiscussionBotController:
         owner = self.store.get_owner()
         if not owner:
             raise RuntimeError(f"请先在 {self.config.control_bot_label} 私聊完成 owner 配对")
-        owner_member = await self.discussion.bot.get_chat_member(chat.id, owner.user_id)
+        owner_member = await self.discussion.query(
+            lambda: self.discussion.bot.get_chat_member(chat.id, owner.user_id)
+        )
         if bool(getattr(owner_member, "is_anonymous", False)):
             raise RuntimeError("owner 的匿名管理员模式必须关闭")
         if not self.store.consume_bind_code(code):
@@ -1676,11 +1723,14 @@ class DiscussionBotController:
         if action in {"plan_execute", "plan_continue"}:
             try:
                 self._ensure_latest_plan(space, payload)
-                await self._ensure_plan_ready(space)
-                self._ensure_latest_plan(space, payload)
             except RuntimeError as exc:
                 await self.discussion.answer_callback(query, str(exc), show_alert=True)
                 return
+        if not self._workloads.can_submit():
+            await self.discussion.answer_callback(
+                query, "请求队列已满，请稍后重试。", show_alert=True
+            )
+            return
         consumed = self.store.consume_callback(
             data[3:],
             user.id,
@@ -1703,8 +1753,9 @@ class DiscussionBotController:
         await self.discussion.answer_callback(query)
         callback_message = getattr(query, "message", None)
         callback_message_id = getattr(callback_message, "message_id", None)
-        try:
-            await self._dispatch_callback(
+        submitted = self._workloads.submit(
+            f"space:{space['space_id']}:{space['generation']}",
+            lambda: self._run_callback_action(
                 action,
                 payload,
                 space,
@@ -1712,6 +1763,35 @@ class DiscussionBotController:
                     int(callback_message_id) if callback_message_id is not None else None
                 ),
                 callback_chat_id=int(chat.id),
+            ),
+        )
+        if not submitted:
+            await self._send_space(space, "请求队列已满，请重新执行命令。")
+        elif self._application is None:
+            await self._workloads.join()
+
+    async def _run_callback_action(
+        self,
+        action: str,
+        payload: dict[str, Any],
+        space: dict[str, Any],
+        *,
+        callback_message_id: int | None,
+        callback_chat_id: int,
+    ) -> None:
+        try:
+            if action in {"plan_execute", "plan_continue"}:
+                self._ensure_latest_plan(space, payload)
+                await self._ensure_plan_ready(space)
+                self._ensure_latest_plan(space, payload)
+            await self._dispatch_callback(
+                action,
+                payload,
+                space,
+                callback_message_id=(
+                    int(callback_message_id) if callback_message_id is not None else None
+                ),
+                callback_chat_id=callback_chat_id,
             )
         except (KeyError, ValueError, RuntimeError, OSError, TelegramError, PathPolicyError) as exc:
             LOGGER.warning(
@@ -2082,6 +2162,8 @@ class DiscussionBotController:
         revision_key = str(publication.get("revision_key") or "")
         thread_id = str(publication["thread_id"])
         seen = publication.get("tui_prompt_seen_at") is not None
+        started = time.monotonic()
+        deadline = started + _PLAN_PROMPT_MONITOR_SECONDS
         while True:
             latest = self.store.latest_plan_publication(space_id, generation)
             if (
@@ -2091,6 +2173,19 @@ class DiscussionBotController:
                 or str(latest.get("status") or "") != "published"
             ):
                 return
+            now = time.monotonic()
+            if now >= deadline:
+                LOGGER.info(
+                    "event=plan_prompt_monitor_expired space_id=%s item_id=%s",
+                    space_id[:12],
+                    item_id[:8],
+                )
+                return
+            poll_seconds = (
+                _PLAN_PROMPT_POLL_SECONDS
+                if now - started < _PLAN_PROMPT_FAST_WINDOW_SECONDS
+                else _PLAN_PROMPT_SLOW_POLL_SECONDS
+            )
             visible = await self._plan_prompt_visibility(thread_id)
             if visible is True:
                 if not seen:
@@ -2102,13 +2197,17 @@ class DiscussionBotController:
                     ):
                         return
                     seen = True
-                await asyncio.sleep(_PLAN_PROMPT_POLL_SECONDS)
+                await asyncio.sleep(min(poll_seconds, max(0.0, deadline - time.monotonic())))
                 continue
             if visible is None or not seen:
-                await asyncio.sleep(_PLAN_PROMPT_POLL_SECONDS)
+                await asyncio.sleep(min(poll_seconds, max(0.0, deadline - time.monotonic())))
                 continue
 
-            await asyncio.sleep(_PLAN_DECISION_GRACE_SECONDS)
+            await asyncio.sleep(
+                min(_PLAN_DECISION_GRACE_SECONDS, max(0.0, deadline - time.monotonic()))
+            )
+            if time.monotonic() >= deadline:
+                return
             latest = self.store.latest_plan_publication(space_id, generation)
             if latest is None or str(latest.get("status") or "") != "published":
                 return

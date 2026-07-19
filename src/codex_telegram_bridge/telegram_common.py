@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import logging
 import re
 import time
@@ -24,7 +25,7 @@ from telegram.ext import AIORateLimiter, Application
 from telegram.request import HTTPXRequest
 
 from .markdown import MAX_MESSAGE_LENGTH
-from .outbound import OutboundMessenger
+from .outbound import OperationSemantics, OutboundLane, OutboundMessenger
 
 LOGGER = logging.getLogger(__name__)
 
@@ -35,6 +36,14 @@ POLLING_CONNECTION_POOL_SIZE = 2
 POLLING_READ_TIMEOUT_SECONDS = 30.0
 POLLING_CONNECT_TIMEOUT_SECONDS = 10.0
 POLLING_POOL_TIMEOUT_SECONDS = 10.0
+OUTBOUND_CONNECTION_POOL_SIZE = 8
+OUTBOUND_READ_TIMEOUT_SECONDS = 15.0
+OUTBOUND_WRITE_TIMEOUT_SECONDS = 15.0
+OUTBOUND_CONNECT_TIMEOUT_SECONDS = 10.0
+OUTBOUND_POOL_TIMEOUT_SECONDS = 5.0
+OUTBOUND_MEDIA_WRITE_TIMEOUT_SECONDS = 60.0
+
+
 def balanced_button_rows(
     buttons: Sequence[InlineKeyboardButton], *, columns: int = 3
 ) -> list[list[InlineKeyboardButton]]:
@@ -59,6 +68,8 @@ class PollingHealth:
     last_error_type: str | None = None
     failure_count: int = 0
     consecutive_failures: int = 0
+    success_count: int = 0
+    polling_request: PollingHealthRequest | None = field(default=None, init=False, repr=False)
 
     def mark_started(self) -> None:
         self.last_success_at = time.monotonic()
@@ -66,6 +77,7 @@ class PollingHealth:
     def mark_success(self) -> None:
         self.last_success_at = time.monotonic()
         self.consecutive_failures = 0
+        self.success_count += 1
 
     def mark_failure(self, error_type: str) -> None:
         self.last_error_type = error_type
@@ -76,6 +88,17 @@ class PollingHealth:
         current = time.monotonic() if now is None else now
         return current - self.last_success_at >= seconds
 
+    def snapshot(self, *, now: float | None = None) -> dict[str, object]:
+        current = time.monotonic() if now is None else now
+        return {
+            "role": self.role,
+            "seconds_since_success": max(0.0, current - self.last_success_at),
+            "last_error_type": self.last_error_type,
+            "failure_count": self.failure_count,
+            "consecutive_failures": self.consecutive_failures,
+            "success_count": self.success_count,
+        }
+
 
 class PollingHealthRequest(HTTPXRequest):
     """Record successful getUpdates responses without touching outbound requests."""
@@ -85,6 +108,7 @@ class PollingHealthRequest(HTTPXRequest):
     def __init__(self, health: PollingHealth, **kwargs: Any) -> None:
         self.health = health
         super().__init__(**kwargs)
+        health.polling_request = self
 
     async def do_request(self, *args: Any, **kwargs: Any) -> tuple[int, bytes]:
         try:
@@ -105,7 +129,23 @@ def build_application(token: str, polling_health: PollingHealth | None = None) -
         Application.builder()
         .token(token)
         .concurrent_updates(False)
-        .rate_limiter(AIORateLimiter())
+        .request(
+            HTTPXRequest(
+                connection_pool_size=OUTBOUND_CONNECTION_POOL_SIZE,
+                read_timeout=OUTBOUND_READ_TIMEOUT_SECONDS,
+                write_timeout=OUTBOUND_WRITE_TIMEOUT_SECONDS,
+                connect_timeout=OUTBOUND_CONNECT_TIMEOUT_SECONDS,
+                pool_timeout=OUTBOUND_POOL_TIMEOUT_SECONDS,
+                media_write_timeout=OUTBOUND_MEDIA_WRITE_TIMEOUT_SECONDS,
+            )
+        )
+        .rate_limiter(
+            AIORateLimiter(
+                group_max_rate=15,
+                group_time_period=60,
+                max_retries=0,
+            )
+        )
     )
     if polling_health is not None:
         builder = builder.get_updates_request(
@@ -164,6 +204,8 @@ class TelegramEndpoint:
         reply_markup: InlineKeyboardMarkup | ForceReply | None = None,
         reply_parameters: ReplyParameters | None = None,
         priority: int = 10,
+        lane: OutboundLane = "interactive",
+        semantics: OperationSemantics = "non_idempotent",
     ) -> Any:
         markdown = markdown[:MAX_MESSAGE_LENGTH]
         fallback = (plain or plain_from_markdown(markdown))[:MAX_MESSAGE_LENGTH]
@@ -181,6 +223,15 @@ class TelegramEndpoint:
                     **kwargs,
                 ),
                 priority=priority,
+                lane=lane,
+                semantics=semantics,
+                audit={
+                    "operation": "sendMessage",
+                    "chat_id": chat_id,
+                    "payload_fingerprint": hashlib.sha256(
+                        markdown.encode("utf-8")
+                    ).hexdigest(),
+                },
             )
         except BadRequest:
             LOGGER.warning(
@@ -190,6 +241,15 @@ class TelegramEndpoint:
             return await self.messenger.call(
                 lambda: self.bot.send_message(text=fallback, **kwargs),
                 priority=priority,
+                lane=lane,
+                semantics=semantics,
+                audit={
+                    "operation": "sendMessage",
+                    "chat_id": chat_id,
+                    "payload_fingerprint": hashlib.sha256(
+                        fallback.encode("utf-8")
+                    ).hexdigest(),
+                },
             )
 
     async def edit_text(
@@ -202,6 +262,7 @@ class TelegramEndpoint:
         parse_mode: str | None = ParseMode.MARKDOWN_V2,
         reply_markup: InlineKeyboardMarkup | None = None,
         priority: int = 10,
+        lane: OutboundLane = "live",
     ) -> Any:
         markdown = markdown[:MAX_MESSAGE_LENGTH]
         fallback = (plain or plain_from_markdown(markdown))[:MAX_MESSAGE_LENGTH]
@@ -219,6 +280,8 @@ class TelegramEndpoint:
                     **kwargs,
                 ),
                 priority=priority,
+                lane=lane,
+                semantics="idempotent",
             )
         except BadRequest as exc:
             if "message is not modified" in str(exc).casefold():
@@ -230,14 +293,25 @@ class TelegramEndpoint:
             return await self.messenger.call(
                 lambda: self.bot.edit_message_text(text=fallback, **kwargs),
                 priority=priority,
+                lane=lane,
+                semantics="idempotent",
             )
 
-    async def delete_message(self, chat_id: int, message_id: int, *, priority: int = 0) -> bool:
+    async def delete_message(
+        self,
+        chat_id: int,
+        message_id: int,
+        *,
+        priority: int = 20,
+        lane: OutboundLane = "maintenance",
+    ) -> bool:
         try:
             return bool(
                 await self.messenger.call(
                     lambda: self.bot.delete_message(chat_id=chat_id, message_id=message_id),
                     priority=priority,
+                    lane=lane,
+                    semantics="idempotent",
                 )
             )
         except TelegramError as exc:
@@ -251,6 +325,7 @@ class TelegramEndpoint:
         *,
         reply_markup: InlineKeyboardMarkup | None = None,
         priority: int = 10,
+        lane: OutboundLane = "live",
     ) -> Any:
         try:
             return await self.messenger.call(
@@ -260,6 +335,8 @@ class TelegramEndpoint:
                     reply_markup=reply_markup,
                 ),
                 priority=priority,
+                lane=lane,
+                semantics="idempotent",
             )
         except BadRequest as exc:
             if "message is not modified" in str(exc).casefold():
@@ -275,6 +352,7 @@ class TelegramEndpoint:
         caption: str,
         reply_parameters: ReplyParameters | None = None,
         priority: int = 5,
+        lane: OutboundLane = "interactive",
     ) -> Any:
         return await self.messenger.call(
             lambda: self.bot.send_document(
@@ -285,6 +363,37 @@ class TelegramEndpoint:
                 reply_parameters=reply_parameters,
             ),
             priority=priority,
+            lane=lane,
+            semantics="non_idempotent",
+            audit={
+                "operation": "sendDocument",
+                "chat_id": chat_id,
+                "payload_fingerprint": hashlib.sha256(
+                    f"{Path(filename).name}\0{caption}".encode()
+                ).hexdigest(),
+            },
+        )
+
+    async def get_me(self, *, lane: OutboundLane = "maintenance") -> Any:
+        return await self.messenger.call(
+            self.bot.get_me,
+            lane=lane,
+            semantics="query",
+        )
+
+    async def query(
+        self,
+        operation: Any,
+        *,
+        lane: OutboundLane = "interactive",
+    ) -> Any:
+        return await self.messenger.call(operation, lane=lane, semantics="query")
+
+    async def set_my_commands(self, commands: Sequence[Any], **kwargs: Any) -> Any:
+        return await self.messenger.call(
+            lambda: self.bot.set_my_commands(commands, **kwargs),
+            lane="maintenance",
+            semantics="idempotent",
         )
 
     async def answer_callback(

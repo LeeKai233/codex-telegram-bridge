@@ -318,6 +318,48 @@ async def click_last_button(
 
 
 @pytest.mark.asyncio
+async def test_installed_control_handlers_are_nonblocking_keyed_actors(tmp_path: Path) -> None:
+    controller, _store, _endpoint, _bridge, _coordinator, _deletions = build_controller(tmp_path)
+    controller._application = SimpleNamespace()  # noqa: SLF001
+    events: list[str] = []
+    first_started = asyncio.Event()
+    other_started = asyncio.Event()
+    release_first = asyncio.Event()
+    release_other = asyncio.Event()
+
+    async def work(update: Any, _context: Any) -> None:
+        events.append(f"{update.label}-start")
+        if update.label == "a1":
+            first_started.set()
+            await release_first.wait()
+        elif update.label == "b1":
+            other_started.set()
+            await release_other.wait()
+        events.append(f"{update.label}-end")
+
+    handler = controller._defer_handler(work)  # noqa: SLF001
+
+    def candidate(label: str, chat_id: int) -> SimpleNamespace:
+        return SimpleNamespace(label=label, effective_chat=SimpleNamespace(id=chat_id))
+
+    try:
+        await asyncio.wait_for(handler(candidate("a1", 70), SimpleNamespace()), 0.1)
+        await first_started.wait()
+        await asyncio.wait_for(handler(candidate("a2", 70), SimpleNamespace()), 0.1)
+        await asyncio.wait_for(handler(candidate("b1", 71), SimpleNamespace()), 0.1)
+        await other_started.wait()
+
+        assert events == ["a1-start", "b1-start"]
+        release_other.set()
+        release_first.set()
+        await controller._workloads.join()  # noqa: SLF001
+
+        assert events.index("a2-start") > events.index("a1-end")
+    finally:
+        await controller.stop()
+
+
+@pytest.mark.asyncio
 async def test_new_interactive_flow_captures_project_and_prompt(tmp_path: Path) -> None:
     controller, store, endpoint, _bridge, coordinator, _deletions = build_controller(tmp_path)
     try:
