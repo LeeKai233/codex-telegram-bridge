@@ -32,8 +32,8 @@ release tag before release immutability is enabled.
 
    ```bash
    release_dir="$(mktemp -d)"
-   cp install.sh dist/codex_telegram_bridge-0.2.6-py3-none-any.whl \
-      dist/codex_telegram_bridge-0.2.6.tar.gz "$release_dir/"
+   cp install.sh dist/codex_telegram_bridge-0.2.7-py3-none-any.whl \
+      dist/codex_telegram_bridge-0.2.7.tar.gz "$release_dir/"
    (cd "$release_dir" && sha256sum install.sh *.whl *.tar.gz >SHA256SUMS)
    ```
 
@@ -42,11 +42,11 @@ release tag before release immutability is enabled.
 
    ```bash
    release_sha="$(git rev-parse HEAD)"
-   gh release create v0.2.6 --repo LeeKai233/codex-telegram-bridge \
-      --draft --target "$release_sha" --title "v0.2.6" \
+   gh release create v0.2.7 --repo LeeKai233/codex-telegram-bridge \
+      --draft --target "$release_sha" --title "v0.2.7" \
       "$release_dir/install.sh" "$release_dir/SHA256SUMS" \
-      "$release_dir/codex_telegram_bridge-0.2.6-py3-none-any.whl" \
-      "$release_dir/codex_telegram_bridge-0.2.6.tar.gz"
+      "$release_dir/codex_telegram_bridge-0.2.7-py3-none-any.whl" \
+      "$release_dir/codex_telegram_bridge-0.2.7.tar.gz"
    ```
 
 4. Review the draft assets and notes, then publish once. Confirm the release is marked immutable,
@@ -61,10 +61,10 @@ asset before testing the pinned tag:
 ```bash
 release_dir="$(mktemp -d)"
 cd "$release_dir"
-base="https://github.com/LeeKai233/codex-telegram-bridge/releases/download/v0.2.6"
+base="https://github.com/LeeKai233/codex-telegram-bridge/releases/download/v0.2.7"
 for asset in install.sh SHA256SUMS \
-  codex_telegram_bridge-0.2.6-py3-none-any.whl \
-  codex_telegram_bridge-0.2.6.tar.gz; do
+  codex_telegram_bridge-0.2.7-py3-none-any.whl \
+  codex_telegram_bridge-0.2.7.tar.gz; do
   curl --proto "=https" --tlsv1.2 -fL --retry 3 --retry-all-errors \
     -o "$asset" "$base/$asset"
 done
@@ -72,7 +72,7 @@ sha256sum -c SHA256SUMS
 bash install.sh --version
 UV_TOOL_DIR="$release_dir/tools" UV_TOOL_BIN_DIR="$release_dir/bin" \
   uv tool install --python 3.14 \
-  git+https://github.com/LeeKai233/codex-telegram-bridge@v0.2.6
+  git+https://github.com/LeeKai233/codex-telegram-bridge@v0.2.7
 "$release_dir/bin/codex-tg" --help
 "$release_dir/bin/codex-telegram-bridge" --help
 ```

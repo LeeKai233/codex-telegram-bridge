@@ -13,7 +13,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "install.sh"
 UNIT_MARKER = "# X-CodexTelegramBridge-Installer: managed"
-UNIT_VERSION = "# X-CodexTelegramBridge-Installer-Version: v0.2.6"
+UNIT_VERSION = "# X-CodexTelegramBridge-Installer-Version: v0.2.7"
 
 
 def run_installer_shell(

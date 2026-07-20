@@ -32,7 +32,7 @@ def bootstrap_command() -> str:
     return next(
         line
         for line in README.read_text(encoding="utf-8").splitlines()
-        if line.startswith("bash -c '") and "releases/download/v0.2.6/install.sh" in line
+        if line.startswith("bash -c '") and "releases/download/v0.2.7/install.sh" in line
     )
 
 
@@ -59,7 +59,7 @@ def test_release_version_is_consistent_across_public_artifacts() -> None:
     installer_match = re.search(r'^readonly INSTALLER_VERSION="([^"]+)"$', installer, re.MULTILINE)
     package_match = re.search(r'^__version__ = "([^"]+)"$', package_init, re.MULTILINE)
 
-    assert version == "0.2.6"
+    assert version == "0.2.7"
     assert installer_match is not None and installer_match.group(1) == version
     assert package_match is not None and package_match.group(1) == version
     assert f"releases/download/v{version}/install.sh" in readme
