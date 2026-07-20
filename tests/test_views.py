@@ -116,7 +116,7 @@ def test_channel_post_contains_compact_live_summary() -> None:
     assert "🟢 执行中 · 总执行 `00:18:42`" in rendered.markdown
     assert "🎯 Goal 🟢 `active`" in rendered.markdown
     assert "🧭 Plan `1/3` `###-------`" in rendered.markdown
-    assert "🧩 Tasks `2/3` · Active `1` · Queue `2`" in rendered.markdown
+    assert "🧩 Tasks `2/3` · Active `1` · Failed `0` · Interrupted `0` · Queue `2`" in rendered.markdown
     assert "心跳 `≤60s`" in rendered.markdown
     assert len(rendered.markdown) <= CHANNEL_POST_BUDGET
     assert "*" not in rendered.plain
@@ -368,4 +368,23 @@ def test_empty_structured_tasks_fall_back_to_agent_counts() -> None:
         agents_failed=1,
     )
     rendered = render_channel_post(state, now=1_700_000_000)
-    assert "🧩 Tasks `3/6` · Active `2` · Queue `0`" in rendered.markdown
+    assert "🧩 Tasks `4/6` · Active `2` · Failed `1` · Interrupted `0` · Queue `0`" in rendered.markdown
+
+
+def test_channel_task_counter_includes_all_terminal_statuses() -> None:
+    state = ThreadState(
+        thread_id="thread-mixed-tasks",
+        status="active",
+        tasks=[
+            TaskState(task_id="completed", title="Completed", status="completed"),
+            TaskState(task_id="failed", title="Failed", status="failed"),
+            TaskState(task_id="interrupted", title="Interrupted", status="interrupted"),
+            TaskState(task_id="active", title="Active", status="inProgress"),
+            TaskState(task_id="shutdown", title="Shutdown", status="shutdown"),
+            TaskState(task_id="missing", title="Missing", status="notFound"),
+        ],
+    )
+
+    rendered = render_channel_post(state, now=1_700_000_000)
+
+    assert "🧩 Tasks `5/6` · Active `1` · Failed `2` · Interrupted `1` · Queue `0`" in rendered.markdown

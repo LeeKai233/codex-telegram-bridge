@@ -117,39 +117,113 @@ async def test_retryable_error_clears_on_healthy_status_but_remains_in_timeline(
     store.close()
 
 
-def test_retryable_error_requires_strictly_newer_healthy_snapshot(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_terminal_error_supersedes_older_retrying_activity(tmp_path: Path) -> None:
     store = Store(tmp_path / "state.sqlite3")
     projector = managed_projector(store)
-    retrying = ThreadState(
-        thread_id="thread-snapshot",
-        status="systemError",
-        updated_at=100,
-        last_error="Reconnecting",
-        last_error_recoverable=True,
-        recent_activity=[
-            LifecycleActivity(kind="error", text="Reconnecting", status="retrying", timestamp=100)
-        ],
-    )
-    store.save_thread(retrying)
 
-    for updated_at in (0, 99, 100):
-        payload = {
-            "id": "thread-snapshot",
-            "status": {"type": "idle"},
-        }
-        if updated_at:
-            payload["updatedAt"] = updated_at
-        state = projector.apply_thread(payload)
-        assert state.last_error == "Reconnecting"
+    await projector.ingest(
+        "error",
+        {
+            "threadId": "thread-terminal-error",
+            "willRetry": True,
+            "error": {"message": "Temporary transport failure"},
+        },
+    )
+    await projector.ingest(
+        "error",
+        {
+            "threadId": "thread-terminal-error",
+            "willRetry": False,
+            "error": {"message": "Reconnecting"},
+        },
+    )
+    await projector.ingest(
+        "thread/status/changed",
+        {"threadId": "thread-terminal-error", "status": {"type": "idle"}},
+    )
+
+    state = store.get_thread("thread-terminal-error")
+    assert state is not None
+    assert state.last_error == "Reconnecting"
+    assert state.last_error_recoverable is False
+    assert state.latest_activity == "Session idle"
+    store.close()
+
+
+@pytest.mark.parametrize(
+    ("case", "updated_at", "expected_error", "expected_status"),
+    [
+        ("missing-timestamp", None, "", "idle"),
+        ("older-snapshot", 99, "Reconnecting", "systemError"),
+        ("same-timestamp", 100, "", "idle"),
+    ],
+)
+def test_healthy_snapshot_recovery_respects_timestamp_case(
+    tmp_path: Path,
+    case: str,
+    updated_at: int | None,
+    expected_error: str,
+    expected_status: str,
+) -> None:
+    store = Store(tmp_path / f"state-{case}.sqlite3")
+    projector = managed_projector(store)
+    store.save_thread(
+        ThreadState(
+            thread_id="thread-snapshot",
+            status="systemError",
+            updated_at=100,
+            last_error="Reconnecting",
+            last_error_recoverable=True,
+            recent_activity=[
+                LifecycleActivity(
+                    kind="error", text="Reconnecting", status="retrying", timestamp=100
+                )
+            ],
+        )
+    )
+
+    payload: dict[str, object] = {
+        "id": "thread-snapshot",
+        "status": {"type": "idle"},
+    }
+    if updated_at is not None:
+        payload["updatedAt"] = updated_at
+    state = projector.apply_thread(payload)
+
+    assert state.last_error == expected_error
+    assert state.status == expected_status
+    if expected_error:
+        assert state.latest_activity == ""
         assert state.last_error_recoverable is True
+        assert any(activity.status == "retrying" for activity in state.recent_activity)
+    else:
+        assert state.last_error_recoverable is False
+        assert state.latest_activity == "连接已恢复"
+        assert all(activity.status != "retrying" for activity in state.recent_activity)
+    store.close()
+
+
+def test_reconnecting_text_is_recoverable_even_without_flag(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    projector = managed_projector(store)
+    store.save_thread(
+        ThreadState(
+            thread_id="thread-reconnecting-text",
+            status="systemError",
+            last_error="Reconnecting",
+            recent_activity=[
+                LifecycleActivity(
+                    kind="error", text="Reconnecting", status="retrying", timestamp=100
+                )
+            ],
+        )
+    )
 
     recovered = projector.apply_thread(
-        {
-            "id": "thread-snapshot",
-            "updatedAt": 101,
-            "status": {"type": "idle"},
-        }
+        {"id": "thread-reconnecting-text", "status": {"type": "idle"}}
     )
+
     assert recovered.last_error == ""
     assert recovered.last_error_recoverable is False
     assert recovered.latest_activity == "连接已恢复"
@@ -242,6 +316,10 @@ async def test_thread_settings_notification_updates_space_mode_and_profile(tmp_p
             "threadSettings": {
                 "model": "gpt-5.6-sol",
                 "effort": "xhigh",
+                "activePermissionProfile": {"id": "workspace-safe", "extends": "default"},
+                "approvalPolicy": "on-request",
+                "approvalsReviewer": "user",
+                "sandboxPolicy": {"type": "workspaceWrite", "networkAccess": False},
                 "collaborationMode": {
                     "mode": "plan",
                     "settings": {
@@ -262,7 +340,43 @@ async def test_thread_settings_notification_updates_space_mode_and_profile(tmp_p
         "xhigh",
     )
     assert state is not None and state.latest_activity == "Session settings updated"
+    assert (state.permissions, state.approval_policy, state.approvals_reviewer) == (
+        "workspace-safe",
+        "on-request",
+        "user",
+    )
+    assert state.sandbox_policy == {"type": "workspaceWrite", "networkAccess": False}
     assert changes == ["thread/settings/updated"]
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_child_status_change_notifies_parent_dashboard(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    changes: list[tuple[str, str]] = []
+
+    async def changed(state: ThreadState, reason: str) -> None:
+        changes.append((state.thread_id, reason))
+
+    store.save_thread(
+        ThreadState(
+            thread_id="parent",
+            tasks=[TaskState(task_id="child", title="Child", status="pending")],
+        )
+    )
+    store.save_thread(
+        ThreadState(thread_id="child", parent_thread_id="parent", status="idle")
+    )
+    projector = managed_projector(store, changed)
+
+    await projector.ingest(
+        "thread/status/changed",
+        {"threadId": "child", "status": {"type": "active"}},
+    )
+
+    assert changes == [("child", "thread/status/changed"), ("parent", "subagent/updated")]
+    parent = store.get_thread("parent")
+    assert parent is not None and parent.tasks[0].status == "inProgress"
     store.close()
 
 

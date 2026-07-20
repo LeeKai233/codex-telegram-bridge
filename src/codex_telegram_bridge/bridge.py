@@ -59,6 +59,34 @@ def _workspace_write_policy() -> Json:
     }
 
 
+def _writable_turn_security(state: ThreadState) -> Json:
+    kwargs: Json = {
+        "approval_policy": state.approval_policy
+        if state.approval_policy is not None
+        else "on-request"
+    }
+    if state.permissions:
+        kwargs["permissions"] = state.permissions
+    else:
+        kwargs["sandbox_policy"] = state.sandbox_policy or _workspace_write_policy()
+    if state.approvals_reviewer:
+        kwargs["approvals_reviewer"] = state.approvals_reviewer
+    return kwargs
+
+
+def _thread_settings_security(state: ThreadState) -> Json:
+    kwargs: Json = {}
+    if state.permissions:
+        kwargs["permissions"] = state.permissions
+    elif state.sandbox_policy is not None:
+        kwargs["sandbox_policy"] = state.sandbox_policy
+    if state.approval_policy is not None:
+        kwargs["approval_policy"] = state.approval_policy
+    if state.approvals_reviewer:
+        kwargs["approvals_reviewer"] = state.approvals_reviewer
+    return kwargs
+
+
 def _turn_error_kind(error: object) -> str:
     if not isinstance(error, dict):
         return ""
@@ -438,6 +466,10 @@ class Bridge:
             if space.get("thread_id") and space.get("lifecycle") != "closed"
         }
 
+    async def _notify_projector_parent_changes(self, reason: str) -> None:
+        for parent in self.projector.take_parent_changes():
+            await self._on_state_change(parent, reason)
+
     def _active_spaces_for_thread(self, thread_id: str) -> list[Json]:
         return [
             space
@@ -451,6 +483,7 @@ class Bridge:
         self._backfill_space_profiles(thread_id, payload)
         state = self.projector.apply_thread(payload)
         state = self.projector.apply_goal(state, await self.client.get_goal(thread_id))
+        await self._notify_projector_parent_changes("subagent/resync")
         state.subscribed = True
         self.store.save_thread(state)
         return state
@@ -516,6 +549,7 @@ class Bridge:
         for payload in await self.client.list_threads(limit=limit, search_term=search_term):
             if isinstance(payload, dict) and payload.get("id"):
                 state = self.projector.apply_thread(payload)
+                await self._notify_projector_parent_changes("subagent/snapshot")
                 if not state.is_subagent and not state.ephemeral:
                     states.append(state)
         return states
@@ -572,6 +606,7 @@ class Bridge:
         payload = await self.client.read_thread(thread_id, include_turns=True)
         state = self.projector.apply_thread(payload)
         state = self.projector.apply_goal(state, await self.client.get_goal(thread_id))
+        await self._notify_projector_parent_changes("subagent/refresh")
         self.store.save_thread(state)
         await self.dashboard.schedule(state, immediate=True)
         return state
@@ -583,6 +618,7 @@ class Bridge:
             payload = await self.client.start_thread(cwd)
             self._claim_owned_thread(start_token, str(payload.get("id") or ""))
             state = self.projector.apply_thread(payload)
+            await self._notify_projector_parent_changes("subagent/snapshot")
             state.title = prompt[:80] or state.title
             self.store.subscribe(state.thread_id)
             self._invalidate_interest_cache()
@@ -596,8 +632,7 @@ class Bridge:
             [text_input(prompt)],
             client_message_id=client_message_id,
             cwd=cwd,
-            sandbox_policy=_workspace_write_policy(),
-            approval_policy="on-request",
+            **_writable_turn_security(state),
         )
         await self.dashboard.schedule(state, immediate=True)
         return state
@@ -640,6 +675,7 @@ class Bridge:
                     payload = await self.client.start_thread(cwd)
                     self._claim_owned_thread(start_token, str(payload.get("id") or ""))
                     state = self.projector.apply_thread(payload)
+                    await self._notify_projector_parent_changes("subagent/snapshot")
                     state.title = space.pending_prompt[:80] or state.title
                     self.store.save_thread(state)
                     space.thread_id = state.thread_id
@@ -668,8 +704,7 @@ class Bridge:
                         [text_input(space.pending_prompt)],
                         client_message_id=client_message_id,
                         cwd=cwd,
-                        sandbox_policy=_workspace_write_policy(),
-                        approval_policy="on-request",
+                        **_writable_turn_security(state),
                         collaboration_mode=collaboration_mode,
                     )
                 except Exception as exc:
@@ -733,9 +768,13 @@ class Bridge:
                 model=profile.model,
                 effort=profile.effort,
             )
+            settings_kwargs: Json = {"collaboration_mode": collaboration_mode}
+            state = self.store.get_thread(space.thread_id or "")
+            if state is not None:
+                settings_kwargs.update(_thread_settings_security(state))
             await self.client.update_thread_settings(
                 space.thread_id or "",
-                collaboration_mode=collaboration_mode,
+                **settings_kwargs,
             )
             current = self._require_active_space(space_id)
             if current.generation != space.generation or current.thread_id != space.thread_id:
@@ -823,6 +862,7 @@ class Bridge:
             thread_id = space.thread_id or ""
             payload = await self.client.resume_thread(space.thread_id or "")
             state = self.projector.apply_thread(payload)
+            await self._notify_projector_parent_changes("subagent/resync")
             if state.thread_id != thread_id:
                 raise RuntimeError("Codex resumed a different session")
             if state.is_subagent or state.ephemeral:
@@ -862,8 +902,7 @@ class Bridge:
                 [text_input(prompt)],
                 client_message_id=client_message_id,
                 cwd=cwd,
-                sandbox_policy=_workspace_write_policy(),
-                approval_policy="on-request",
+                **_writable_turn_security(state),
                 collaboration_mode=collaboration_mode,
             )
             if not (turn or {}).get("id"):
@@ -989,6 +1028,7 @@ class Bridge:
                 raise RuntimeError("Session space generation is stale")
         payload = await self.client.resume_thread(thread_id)
         state = self.projector.apply_thread(payload)
+        await self._notify_projector_parent_changes("subagent/resync")
         if not state.cwd:
             raise ValueError("Session does not report a working directory")
         cwd = self.path_policy.validate_directory(Path(state.cwd))
@@ -1035,8 +1075,7 @@ class Bridge:
             values,
             client_message_id=client_message_id,
             cwd=cwd,
-            sandbox_policy=_workspace_write_policy(),
-            approval_policy="on-request",
+            **_writable_turn_security(state),
         )
         turn_id = str((turn or {}).get("id") or "")
         if space_id is not None and generation is not None:
@@ -1126,8 +1165,7 @@ class Bridge:
                     inputs,
                     client_message_id=client_message_id,
                     cwd=cwd,
-                    sandbox_policy=_workspace_write_policy(),
-                    approval_policy="on-request",
+                    **_writable_turn_security(state),
                 )
                 turn_id = str((turn or {}).get("id") or "")
                 if space_id is not None and generation is not None:
@@ -1662,9 +1700,7 @@ class Bridge:
         if agent_path:
             payload.setdefault("agentPath", agent_path)
         self.projector.apply_thread(payload)
-        parent = self.store.get_thread(parent_id)
-        if parent is not None:
-            await self._notify_state_change(parent, "subagent/profile")
+        await self._notify_projector_parent_changes("subagent/profile")
 
     async def _on_state_change(self, state: ThreadState, reason: str) -> None:
         immediate = reason in {"error", "turn/completed", "thread/goal/updated", "thread/status/changed"}

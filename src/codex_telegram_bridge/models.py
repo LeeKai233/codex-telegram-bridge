@@ -119,6 +119,10 @@ class ThreadState:
     session_id: str = ""
     model: str = ""
     reasoning_effort: str = ""
+    permissions: str | None = None
+    approval_policy: str | dict[str, Any] | None = None
+    approvals_reviewer: str | None = None
+    sandbox_policy: dict[str, Any] | None = None
     parent_thread_id: str | None = None
     agent_nickname: str = ""
     agent_role: str = ""

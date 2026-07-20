@@ -570,6 +570,112 @@ async def test_change_space_model_updates_current_mode_for_subsequent_turns(
 
 
 @pytest.mark.asyncio
+async def test_change_space_model_preserves_permission_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, store = make_bridge(tmp_path)
+    store.save_session_space(
+        SessionSpace(
+            space_id="space-security",
+            lifecycle="active",
+            thread_id="thread-security",
+            normal_model="old",
+            normal_effort="high",
+        )
+    )
+    store.save_thread(
+        ThreadState(
+            thread_id="thread-security",
+            cwd=str(tmp_path),
+            status="active",
+            permissions="workspace-safe",
+            approval_policy="on-request",
+            approvals_reviewer="auto_review",
+            sandbox_policy={"type": "workspaceWrite", "networkAccess": False},
+        )
+    )
+    updates: list[dict[str, Any]] = []
+
+    async def resolve_profile(_model: str, _effort: str) -> ModelProfile:
+        return ModelProfile("gpt-5.6-luna", "max")
+
+    async def resolve_mode(
+        mode: str, *, model: str | None = None, effort: str | None = None
+    ) -> dict[str, Any]:
+        return {
+            "mode": mode,
+            "settings": {"model": model, "reasoning_effort": effort},
+        }
+
+    async def update_settings(_thread_id: str, **kwargs: Any) -> None:
+        updates.append(kwargs)
+
+    monkeypatch.setattr(bridge, "resolve_model_profile", resolve_profile)
+    monkeypatch.setattr(bridge.client, "resolve_collaboration_mode", resolve_mode)
+    monkeypatch.setattr(bridge.client, "update_thread_settings", update_settings)
+
+    await bridge.change_space_model("space-security", "luna", "max")
+
+    assert updates == [
+        {
+            "collaboration_mode": {
+                "mode": "default",
+                "settings": {
+                    "model": "gpt-5.6-luna",
+                    "reasoning_effort": "max",
+                },
+            },
+            "permissions": "workspace-safe",
+            "approval_policy": "on-request",
+            "approvals_reviewer": "auto_review",
+        }
+    ]
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_send_prompt_reuses_persisted_permission_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, store = make_bridge(tmp_path)
+    thread_id = "thread-security-turn"
+    store.save_thread(
+        ThreadState(
+            thread_id=thread_id,
+            cwd=str(tmp_path),
+            status="idle",
+            permissions="workspace-safe",
+            approval_policy="on-request",
+            approvals_reviewer="user",
+        )
+    )
+    captured: list[dict[str, Any]] = []
+
+    async def resume_thread(_thread_id: str) -> dict[str, Any]:
+        return {"id": thread_id, "cwd": str(tmp_path), "status": {"type": "idle"}}
+
+    async def start_turn(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+        captured.append(kwargs)
+        return {"id": "turn-security"}
+
+    monkeypatch.setattr(bridge.client, "resume_thread", resume_thread)
+    monkeypatch.setattr(bridge.client, "start_turn", start_turn)
+
+    assert await bridge.send_prompt(thread_id, "use the inherited profile") == "started"
+
+    assert captured == [
+        {
+            "client_message_id": captured[0]["client_message_id"],
+            "cwd": tmp_path,
+            "permissions": "workspace-safe",
+            "approval_policy": "on-request",
+            "approvals_reviewer": "user",
+        }
+    ]
+    store.close()
+
+
+@pytest.mark.asyncio
 async def test_space_prompt_queue_is_scoped_to_current_generation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

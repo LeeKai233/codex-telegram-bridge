@@ -61,12 +61,17 @@ class EventProjector:
             lambda _method, params: store.is_managed_thread(self._thread_id(params))
         )
         self._last_repeatable_event: tuple[str, str] | None = None
+        self._parent_changes: dict[str, ThreadState] = {}
+
+    def take_parent_changes(self) -> list[ThreadState]:
+        changes = list(self._parent_changes.values())
+        self._parent_changes.clear()
+        return changes
 
     def apply_thread(self, payload: dict[str, Any]) -> ThreadState:
         thread_id = str(payload.get("id") or "")
         persisted = self.store.get_thread(thread_id)
         state = persisted or ThreadState(thread_id=thread_id)
-        persisted_updated_at = state.updated_at
         incoming_updated_at = int(payload.get("updatedAt") or 0)
         stale_payload = bool(
             persisted is not None
@@ -93,22 +98,19 @@ class EventProjector:
         state.created_at = int(payload.get("createdAt") or state.created_at)
         if not stale_payload:
             state.updated_at = incoming_updated_at or state.updated_at
+            self._apply_security_settings(state, payload)
             status = payload.get("status") or {}
             if isinstance(status, dict):
                 state.status = str(status.get("type") or state.status)
                 state.active_flags = [str(value) for value in status.get("activeFlags") or []]
-                if (
-                    incoming_updated_at > persisted_updated_at
-                    and state.status in {"active", "idle"}
-                    and self._clear_recoverable_error(state)
-                ):
+                if state.status in {"active", "idle"} and self._clear_recoverable_error(state):
                     state.latest_activity = "连接已恢复"
                     self._record_activity(
                         state,
                         "thread/resynced",
                         state.latest_activity,
                         "recovered",
-                        timestamp=incoming_updated_at,
+                        timestamp=incoming_updated_at or int(time.time()),
                     )
         turns = (
             []
@@ -151,6 +153,7 @@ class EventProjector:
         if state.goal and str(state.goal.get("status") or "") == "complete":
             self._finalize_active_tasks(state)
         self.store.save_thread(state)
+        self._sync_parent_agent_metadata(state)
         return state
 
     def _apply_goal_notification(
@@ -230,12 +233,46 @@ class EventProjector:
             spawned.get("agentRole") or spawned.get("agent_role") or state.agent_role
         )
 
-    def _sync_parent_agent_metadata(self, state: ThreadState) -> None:
+    @staticmethod
+    def _apply_security_settings(state: ThreadState, values: dict[str, Any]) -> None:
+        if "activePermissionProfile" in values:
+            profile = values.get("activePermissionProfile")
+            profile_id = profile.get("id") if isinstance(profile, dict) else None
+            if profile_id:
+                state.permissions = str(profile_id).strip()
+            elif "permissions" in values:
+                permissions = values.get("permissions")
+                state.permissions = str(permissions).strip() if permissions else None
+            else:
+                state.permissions = None
+        elif "permissions" in values:
+            permissions = values.get("permissions")
+            state.permissions = str(permissions).strip() if permissions else None
+
+        if "approvalPolicy" in values:
+            policy = values.get("approvalPolicy")
+            if policy is None or isinstance(policy, (str, dict)):
+                state.approval_policy = policy
+        if "approvalsReviewer" in values:
+            reviewer = values.get("approvalsReviewer")
+            state.approvals_reviewer = str(reviewer).strip() if reviewer else None
+        if "sandboxPolicy" in values:
+            policy = values.get("sandboxPolicy")
+            if isinstance(policy, dict):
+                state.sandbox_policy = dict(policy)
+            elif "sandbox" not in values:
+                state.sandbox_policy = None
+        if "sandbox" in values and not isinstance(values.get("sandboxPolicy"), dict):
+            policy = values.get("sandbox")
+            if isinstance(policy, dict):
+                state.sandbox_policy = dict(policy)
+
+    def _sync_parent_agent_metadata(self, state: ThreadState) -> ThreadState | None:
         if not state.parent_thread_id:
-            return
+            return None
         parent = self.store.get_thread(state.parent_thread_id)
         if parent is None:
-            return
+            return None
         changed = False
         for task in parent.tasks:
             if task.agent_thread_id != state.thread_id and task.task_id != state.thread_id:
@@ -272,6 +309,9 @@ class EventProjector:
         if changed:
             self._refresh_agent_counts(parent)
             self.store.save_thread(parent)
+            self._parent_changes[parent.thread_id] = parent
+            return parent
+        return None
 
     def _reconcile_tasks_from_children(self, state: ThreadState) -> bool:
         changed = False
@@ -388,6 +428,7 @@ class EventProjector:
         if method == "thread/started":
             state = self.apply_thread(dict(params.get("thread") or {}))
             await self.on_change(state, method)
+            await self._notify_parent_changes("subagent/updated")
             return
         if method == "thread/settings/updated":
             self._sync_space_settings(thread_id, params)
@@ -405,6 +446,11 @@ class EventProjector:
         self._sync_parent_agent_metadata(state)
         if notify:
             await self.on_change(state, method)
+        await self._notify_parent_changes("subagent/updated")
+
+    async def _notify_parent_changes(self, reason: str) -> None:
+        for parent in self.take_parent_changes():
+            await self.on_change(parent, reason)
 
     def _sync_space_settings(self, thread_id: str, params: dict[str, Any]) -> None:
         thread_settings = params.get("threadSettings")
@@ -469,6 +515,9 @@ class EventProjector:
             )
             return True
         if method == "thread/settings/updated":
+            settings = params.get("threadSettings")
+            if isinstance(settings, dict):
+                self._apply_security_settings(state, settings)
             state.latest_activity = "Session settings updated"
             self._record_activity(state, method, state.latest_activity, "updated")
             return True
@@ -555,15 +604,45 @@ class EventProjector:
 
     @staticmethod
     def _clear_recoverable_error(state: ThreadState) -> bool:
-        if not state.last_error_recoverable:
+        latest_error = next(
+            (
+                activity
+                for activity in reversed(state.recent_activity)
+                if activity.kind == "error"
+            ),
+            None,
+        )
+        has_retrying_activity = latest_error is not None and latest_error.status == "retrying"
+        terminal_error_supersedes = latest_error is not None and latest_error.status not in {
+            "",
+            "retrying",
+        }
+        recoverable = (
+            not terminal_error_supersedes
+            and (
+                state.last_error_recoverable
+                or "reconnecting" in state.last_error.casefold()
+                or has_retrying_activity
+            )
+        )
+        if not recoverable:
             return False
         state.last_error = ""
-        EventProjector._finish_recoverable_error(state)
+        state.last_error_recoverable = False
+        state.recent_activity = [
+            activity
+            for activity in state.recent_activity
+            if not (activity.kind == "error" and activity.status == "retrying")
+        ]
         return True
 
     @staticmethod
     def _finish_recoverable_error(state: ThreadState) -> bool:
-        if not state.last_error_recoverable:
+        has_retrying_activity = any(
+            activity.kind == "error" and activity.status == "retrying"
+            for activity in state.recent_activity
+        )
+        if not state.last_error_recoverable and not has_retrying_activity:
             return False
         state.last_error_recoverable = False
         state.recent_activity = [

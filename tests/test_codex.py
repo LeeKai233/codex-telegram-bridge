@@ -24,6 +24,10 @@ async def test_resume_thread_merges_latest_turn_metadata() -> None:
             "model": "gpt-5.6-luna",
             "reasoningEffort": "max",
             "cwd": "/tmp/project",
+            "activePermissionProfile": {"id": "workspace-safe", "extends": "default"},
+            "approvalPolicy": "on-request",
+            "approvalsReviewer": "user",
+            "sandbox": {"type": "workspaceWrite", "networkAccess": False},
             "initialTurnsPage": {
                 "data": [{"id": "turn-2", "status": "inProgress", "items": [], "itemsView": "notLoaded"}]
             },
@@ -37,6 +41,13 @@ async def test_resume_thread_merges_latest_turn_metadata() -> None:
     assert thread["model"] == "gpt-5.6-luna"
     assert thread["reasoningEffort"] == "max"
     assert thread["cwd"] == "/tmp/project"
+    assert thread["activePermissionProfile"] == {
+        "id": "workspace-safe",
+        "extends": "default",
+    }
+    assert thread["approvalPolicy"] == "on-request"
+    assert thread["approvalsReviewer"] == "user"
+    assert thread["sandbox"] == {"type": "workspaceWrite", "networkAccess": False}
     assert calls == [
         (
             "thread/resume",
@@ -97,6 +108,32 @@ async def test_start_thread_keeps_read_only_fork_without_approvals(tmp_path: Pat
     assert calls[0][1]["approvalPolicy"] == "never"
 
 
+@pytest.mark.asyncio
+async def test_start_thread_merges_top_level_security_settings(tmp_path: Path) -> None:
+    client = CodexClient(Path("/tmp/not-used.sock"))
+
+    async def request(
+        method: str, params: dict[str, Any], timeout: float = 30.0
+    ) -> dict[str, Any]:
+        del method, params, timeout
+        return {
+            "thread": {"id": "thread-security"},
+            "activePermissionProfile": {"id": "named-profile"},
+            "approvalPolicy": "on-request",
+            "approvalsReviewer": "auto_review",
+            "sandbox": {"type": "workspaceWrite", "networkAccess": False},
+        }
+
+    client.request = request  # type: ignore[method-assign]
+
+    thread = await client.start_thread(tmp_path)
+
+    assert thread["activePermissionProfile"] == {"id": "named-profile"}
+    assert thread["approvalPolicy"] == "on-request"
+    assert thread["approvalsReviewer"] == "auto_review"
+    assert thread["sandbox"]["type"] == "workspaceWrite"
+
+
 def test_ask_fork_question_defaults_to_five_minutes() -> None:
     timeout = inspect.signature(CodexClient.ask_fork_question).parameters["timeout"].default
 
@@ -131,6 +168,34 @@ async def test_start_turn_passes_security_overrides(tmp_path: Path) -> None:
     assert params["approvalPolicy"] == "never"
     assert params["model"] == "gpt-5.6-luna"
     assert params["effort"] == "max"
+
+
+@pytest.mark.asyncio
+async def test_start_turn_passes_named_permissions_and_reviewer() -> None:
+    client = CodexClient(Path("/tmp/not-used.sock"))
+    calls: list[dict[str, Any]] = []
+
+    async def request(
+        _method: str, params: dict[str, Any], timeout: float = 30.0
+    ) -> dict[str, Any]:
+        del timeout
+        calls.append(params)
+        return {"turn": {"id": "turn-permissions"}}
+
+    client.request = request  # type: ignore[method-assign]
+
+    await client.start_turn(
+        "thread-1",
+        [{"type": "text", "text": "hello"}],
+        permissions="workspace-safe",
+        approval_policy={"sandbox_approval": True},
+        approvals_reviewer="auto_review",
+    )
+
+    assert calls[0]["permissions"] == "workspace-safe"
+    assert calls[0]["approvalPolicy"] == {"sandbox_approval": True}
+    assert calls[0]["approvalsReviewer"] == "auto_review"
+    assert "sandboxPolicy" not in calls[0]
 
 
 @pytest.mark.asyncio
@@ -329,6 +394,53 @@ async def test_update_thread_settings_sends_explicit_collaboration_profile() -> 
             30,
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_update_thread_settings_sends_security_profile() -> None:
+    client = CodexClient(Path("/tmp/not-used.sock"))
+    calls: list[tuple[str, dict[str, Any], float]] = []
+
+    async def request(
+        method: str, params: dict[str, Any], timeout: float = 30.0
+    ) -> dict[str, Any]:
+        calls.append((method, params, timeout))
+        return {}
+
+    client.request = request  # type: ignore[method-assign]
+    policy = {"sandbox_approval": True}
+
+    await client.update_thread_settings(
+        "thread-1",
+        permissions="workspace-safe",
+        approval_policy=policy,
+        approvals_reviewer="user",
+    )
+
+    assert calls == [
+        (
+            "thread/settings/update",
+            {
+                "threadId": "thread-1",
+                "permissions": "workspace-safe",
+                "approvalPolicy": policy,
+                "approvalsReviewer": "user",
+            },
+            30,
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_update_thread_settings_rejects_conflicting_security_profiles() -> None:
+    client = CodexClient(Path("/tmp/not-used.sock"))
+
+    with pytest.raises(ValueError, match="cannot be combined"):
+        await client.update_thread_settings(
+            "thread-1",
+            permissions="workspace-safe",
+            sandbox_policy={"type": "workspaceWrite"},
+        )
 
 
 @pytest.mark.asyncio
@@ -543,6 +655,10 @@ async def test_ephemeral_turn_without_base_thread_uses_notifications_instead_of_
         and params["sandbox"] == "read-only"
         for method, params in calls
     )
+    turn_params = next(params for method, params in calls if method == "turn/start")
+    assert turn_params["sandboxPolicy"] == {"type": "readOnly", "networkAccess": False}
+    assert turn_params["approvalPolicy"] == "never"
+    assert "permissions" not in turn_params
     assert client._ephemeral_thread_ids == set()
 
 

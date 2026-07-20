@@ -287,13 +287,17 @@ class ControlBotController:
         chat = update.effective_chat
         if not chat:
             return
-        spaces = self.store.list_spaces()
+        spaces = [
+            space
+            for space in self.store.list_spaces()
+            if str(space.get("lifecycle") or "pending") != "closed"
+        ][:30]
         if not spaces:
             await self.endpoint.send_text(chat.id, "当前没有 Session 帖子。")
             return
         lines = ["*🤖 Session 帖子*"]
-        rows: list[list[InlineKeyboardButton]] = []
-        for index, space in enumerate(spaces[:30], 1):
+        buttons: list[InlineKeyboardButton] = []
+        for index, space in enumerate(spaces, 1):
             lifecycle = str(space.get("lifecycle") or "pending")
             title = clip(str(space.get("title") or space.get("thread_id") or "Pending"), 80)
             lines.append(
@@ -305,11 +309,15 @@ class ControlBotController:
                     int(space["channel_chat_id"]), int(space["channel_post_id"])
                 )
             if link:
-                rows.append([InlineKeyboardButton(f"打开 {index}", url=link)])
+                buttons.append(InlineKeyboardButton(f"打开 {index}", url=link))
         await self.endpoint.send_text(
             chat.id,
             "\n".join(lines),
-            reply_markup=InlineKeyboardMarkup(rows) if rows else None,
+            reply_markup=(
+                InlineKeyboardMarkup(balanced_button_rows(buttons, columns=3))
+                if buttons
+                else None
+            ),
         )
 
     async def new(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

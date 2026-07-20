@@ -14,11 +14,16 @@ from codex_telegram_bridge.config import Config
 from codex_telegram_bridge.dashboard import DashboardManager
 from codex_telegram_bridge.delivery import (
     DeliveryIntent,
+    DeliveryKey,
     DeliveryOutcome,
     TelegramDeliveryEngine,
 )
 from codex_telegram_bridge.models import TaskState, ThreadState
-from codex_telegram_bridge.space_dashboard import _IMMEDIATE_REASONS, SpaceDashboardManager
+from codex_telegram_bridge.space_dashboard import (
+    _IMMEDIATE_REASONS,
+    SpaceDashboardManager,
+    _AnimationBatch,
+)
 from codex_telegram_bridge.store import Store
 from codex_telegram_bridge.views import RenderedMessage
 
@@ -39,24 +44,29 @@ class BotEndpoint:
 
 
 class RecordingDelivery:
-    def __init__(self) -> None:
+    def __init__(self, performed_by_role: dict[str, bool] | None = None) -> None:
         self.intents: list[DeliveryIntent] = []
+        self.outcomes: list[DeliveryOutcome] = []
         self.fingerprints: dict[object, str] = {}
+        self.performed_by_role = performed_by_role or {}
 
     def submit(self, intent: DeliveryIntent) -> asyncio.Future[DeliveryOutcome]:
         self.intents.append(intent)
-        performed = self.fingerprints.get(intent.key) != intent.fingerprint
+        performed = self.performed_by_role.get(
+            intent.key.bot_role,
+            self.fingerprints.get(intent.key) != intent.fingerprint,
+        )
         self.fingerprints[intent.key] = intent.fingerprint
         future = asyncio.get_running_loop().create_future()
-        future.set_result(
-            DeliveryOutcome(
-                key=intent.key,
-                revision=len(self.intents),
-                status="delivered",
-                attempts=1 if performed else 0,
-                performed=performed,
-            )
+        outcome = DeliveryOutcome(
+            key=intent.key,
+            revision=len(self.intents),
+            status="delivered",
+            attempts=1 if performed else 0,
+            performed=performed,
         )
+        self.outcomes.append(outcome)
+        future.set_result(outcome)
         return future
 
 
@@ -450,9 +460,18 @@ async def test_space_dashboard_passes_mode_profiles_tasks_and_advancing_animatio
     store.save_thread(state)
     await manager._flush("space-animation")
     await asyncio.sleep(0)
+    await manager._flush("space-animation")
+    await asyncio.sleep(0)
 
-    assert [frame for _space, _state, frame in received if frame is not None] == [0, 0, 1, 1]
-    assert [frame for _space, _state, frame in channel_received if frame is not None] == [0, 0, 1, 1]
+    assert [frame for _space, _state, frame in received if frame is not None] == [0, 0, 1, 1, 2, 2]
+    assert [frame for _space, _state, frame in channel_received if frame is not None] == [
+        0,
+        0,
+        1,
+        1,
+        2,
+        2,
+    ]
     assert received[0][0]["current_mode"] == "plan"
     assert received[0][0]["normal_model"] == "gpt-5.6-sol"
     assert received[0][0]["plan_effort"] == "max"
@@ -463,7 +482,71 @@ async def test_space_dashboard_passes_mode_profiles_tasks_and_advancing_animatio
         "discussion",
         "control",
         "discussion",
+        "control",
+        "discussion",
     ]
+    assert all(outcome.performed for outcome in delivery.outcomes)
+    assert delivery.intents[0].fingerprint != delivery.intents[2].fingerprint
+    assert delivery.intents[2].fingerprint != delivery.intents[4].fingerprint
+    store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("performed_by_role", "expected_frame"),
+    [
+        ({"control": False, "discussion": False}, 0),
+        ({"control": False, "discussion": True}, 1),
+    ],
+)
+async def test_animation_batch_requires_a_real_delivery_to_advance(
+    tmp_path: Path,
+    performed_by_role: dict[str, bool],
+    expected_frame: int,
+) -> None:
+    config = replace(
+        Config.default(),
+        config_dir=tmp_path / "config",
+        state_dir=tmp_path / "state",
+        allowed_root=tmp_path,
+    )
+    store = Store(config.database_path)
+    delivery = RecordingDelivery(performed_by_role)
+    manager = SpaceDashboardManager(
+        config,
+        store,
+        StaticSecurity(),  # type: ignore[arg-type]
+        RecordingEndpoint(),  # type: ignore[arg-type]
+        RecordingEndpoint(),  # type: ignore[arg-type]
+        delivery,  # type: ignore[arg-type]
+    )
+    space_id = "space-animation-batch"
+    keys = {
+        DeliveryKey("control", -100122, 39),
+        DeliveryKey("discussion", -100123, 41),
+    }
+    manager._animation_batches[space_id] = _AnimationBatch(
+        frame=0,
+        targets=keys,
+        advance=True,
+    )
+
+    for revision, key in enumerate(keys, 1):
+        ticket: asyncio.Future[DeliveryOutcome] = asyncio.get_running_loop().create_future()
+        manager._delivery_tickets[key] = ticket
+        ticket.set_result(
+            DeliveryOutcome(
+                key=key,
+                revision=revision,
+                status="delivered",
+                attempts=0 if not performed_by_role[key.bot_role] else 1,
+                performed=performed_by_role[key.bot_role],
+            )
+        )
+        manager._delivery_finished(key, space_id, ticket, 0)
+
+    assert manager._animation_indices.get(space_id, 0) == expected_frame
+    assert space_id not in manager._animation_batches
     store.close()
 
 

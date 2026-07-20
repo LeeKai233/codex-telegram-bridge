@@ -22,6 +22,25 @@ ServerRequestHandler = Callable[[int | str, str, Json, int], Awaitable[None]]
 ConnectionHandler = Callable[[bool, int, str | None], Awaitable[None]]
 
 
+def _merge_thread_response(result: Json) -> Json:
+    thread = dict(result.get("thread") or {})
+    for key in (
+        "activePermissionProfile",
+        "approvalPolicy",
+        "approvalsReviewer",
+        "permissions",
+        "sandbox",
+        "sandboxPolicy",
+    ):
+        if key in result:
+            thread[key] = result[key]
+    for key in ("model", "reasoningEffort", "cwd"):
+        value = result.get(key)
+        if isinstance(value, str) and value.strip():
+            thread[key] = value.strip() if key != "cwd" else value
+    return thread
+
+
 @dataclass(frozen=True, slots=True)
 class ThreadPage:
     data: list[Json]
@@ -873,22 +892,12 @@ class CodexClient:
             },
             timeout=60,
         )
-        thread = dict((result or {}).get("thread") or {})
+        thread = _merge_thread_response(dict(result or {}))
         initial_page = (result or {}).get("initialTurnsPage") or {}
         turns = initial_page.get("data") if isinstance(initial_page, dict) else None
         if isinstance(turns, list) and turns:
             # thread/resume excludes history, but steering still needs the active turn ID.
             thread["turns"] = [turns[0]]
-        if isinstance(result, dict):
-            model = result.get("model")
-            effort = result.get("reasoningEffort")
-            cwd = result.get("cwd")
-            if isinstance(model, str) and model.strip():
-                thread["model"] = model.strip()
-            if isinstance(effort, str) and effort.strip():
-                thread["reasoningEffort"] = effort.strip()
-            if isinstance(cwd, str) and cwd.strip():
-                thread["cwd"] = cwd
         return thread
 
     async def get_goal(self, thread_id: str) -> Json | None:
@@ -1043,6 +1052,10 @@ class CodexClient:
         model: str | None = None,
         effort: str | None = None,
         collaboration_mode: Json | None = None,
+        permissions: str | None = None,
+        sandbox_policy: Json | None = None,
+        approval_policy: str | Json | None = None,
+        approvals_reviewer: str | None = None,
     ) -> None:
         """Update sticky settings used by subsequent turns in a thread."""
         normalized_thread_id = thread_id.strip()
@@ -1050,6 +1063,8 @@ class CodexClient:
             raise ValueError("Thread ID must not be empty")
         if collaboration_mode is not None and (model is not None or effort is not None):
             raise ValueError("collaboration_mode cannot be combined with model or effort")
+        if permissions is not None and sandbox_policy is not None:
+            raise ValueError("permissions cannot be combined with sandbox_policy")
         params: Json = {"threadId": normalized_thread_id}
         if collaboration_mode is not None:
             mode = collaboration_mode.get("mode")
@@ -1074,8 +1089,20 @@ class CodexClient:
                 if not effort.strip():
                     raise ValueError("Effort must not be empty")
                 params["effort"] = effort.strip()
-            if len(params) == 1:
-                raise ValueError("At least one thread setting must be provided")
+        if permissions is not None:
+            if not permissions.strip():
+                raise ValueError("Permissions must not be empty")
+            params["permissions"] = permissions.strip()
+        if sandbox_policy is not None:
+            params["sandboxPolicy"] = sandbox_policy
+        if approval_policy is not None:
+            params["approvalPolicy"] = approval_policy
+        if approvals_reviewer is not None:
+            if not approvals_reviewer.strip():
+                raise ValueError("Approvals reviewer must not be empty")
+            params["approvalsReviewer"] = approvals_reviewer.strip()
+        if len(params) == 1:
+            raise ValueError("At least one thread setting must be provided")
         await self.request("thread/settings/update", params, timeout=30)
 
     async def start_thread(self, cwd: Path, *, ephemeral: bool = False, read_only: bool = False) -> Json:
@@ -1086,7 +1113,7 @@ class CodexClient:
             "approvalPolicy": "never" if read_only else "on-request",
         }
         result = await self.request("thread/start", params, timeout=60)
-        return dict((result or {}).get("thread") or {})
+        return _merge_thread_response(dict(result or {}))
 
     async def fork_thread(
         self,
@@ -1245,13 +1272,17 @@ class CodexClient:
         output_schema: Json | None = None,
         cwd: Path | None = None,
         sandbox_policy: Json | None = None,
-        approval_policy: str | None = None,
+        permissions: str | None = None,
+        approval_policy: str | Json | None = None,
+        approvals_reviewer: str | None = None,
         model: str | None = None,
         effort: str | None = None,
         collaboration_mode: Json | None = None,
     ) -> Json:
         if collaboration_mode is not None and (model is not None or effort is not None):
             raise ValueError("collaboration_mode cannot be combined with model or effort")
+        if permissions is not None and sandbox_policy is not None:
+            raise ValueError("permissions cannot be combined with sandbox_policy")
         params: Json = {"threadId": thread_id, "input": inputs}
         if client_message_id:
             params["clientUserMessageId"] = client_message_id
@@ -1261,8 +1292,12 @@ class CodexClient:
             params["cwd"] = str(cwd)
         if sandbox_policy is not None:
             params["sandboxPolicy"] = sandbox_policy
+        if permissions is not None:
+            params["permissions"] = permissions
         if approval_policy is not None:
             params["approvalPolicy"] = approval_policy
+        if approvals_reviewer is not None:
+            params["approvalsReviewer"] = approvals_reviewer
         if model is not None:
             params["model"] = model
         if effort is not None:

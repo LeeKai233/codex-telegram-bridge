@@ -7,6 +7,7 @@ import logging
 import re
 import secrets
 import time
+from dataclasses import dataclass, field
 from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -50,6 +51,15 @@ _BOT_URL_TOKEN = re.compile(r"(https://api\.telegram\.org/bot)[^/\s]+", re.IGNOR
 _BOT_TOKEN = re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{16,}\b")
 
 
+@dataclass(slots=True)
+class _AnimationBatch:
+    frame: int
+    targets: set[DeliveryKey]
+    advance: bool
+    acknowledged: set[DeliveryKey] = field(default_factory=set)
+    performed: bool = False
+
+
 def _safe_error_text(exc: BaseException) -> str:
     detail = " ".join(str(exc).split()) or type(exc).__name__
     detail = _BOT_URL_TOKEN.sub(r"\1<redacted>", detail)
@@ -90,7 +100,8 @@ class SpaceDashboardManager:
         self._dirty: set[str] = set()
         self._immediate: set[str] = set()
         self._tasks: dict[str, asyncio.Task[None]] = {}
-        self._animation_indices: dict[DeliveryKey, int] = {}
+        self._animation_indices: dict[str, int] = {}
+        self._animation_batches: dict[str, _AnimationBatch] = {}
         self._delivery_tickets: dict[DeliveryKey, asyncio.Future[DeliveryOutcome]] = {}
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._stopping = False
@@ -181,50 +192,55 @@ class SpaceDashboardManager:
         if not space:
             return
         state = self._state_for_space(space)
-        canonical_channel, canonical_status = self._render(space, state, animation_frame=None)
         terminal = self._is_terminal(space, state)
         status_keyboard = self._status_keyboard(space, terminal=terminal)
+        targets: list[
+            tuple[DeliveryKey, RenderedMessage, InlineKeyboardMarkup | None]
+        ] = []
+        frame = self._frame_for(space_id, terminal=terminal)
         if space.get("channel_chat_id") and space.get("channel_post_id"):
             key = DeliveryKey(
                 CONTROL_ROLE,
                 int(space["channel_chat_id"]),
                 int(space["channel_post_id"]),
             )
-            frame = self._frame_for(key, terminal=terminal)
             channel_rendered, _ = self._render(space, state, animation_frame=frame)
-            self._submit_target(
-                key,
-                channel_rendered,
-                canonical_channel,
-                space_id=space_id,
-                terminal=terminal,
-            )
+            targets.append((key, channel_rendered, None))
         if space.get("discussion_chat_id") and space.get("status_message_id"):
             key = DeliveryKey(
                 DISCUSSION_ROLE,
                 int(space["discussion_chat_id"]),
                 int(space["status_message_id"]),
             )
-            frame = self._frame_for(key, terminal=terminal)
             _, status_rendered = self._render(space, state, animation_frame=frame)
+            targets.append((key, status_rendered, status_keyboard))
+        if not targets:
+            self._animation_batches.pop(space_id, None)
+            return
+        self._animation_batches[space_id] = _AnimationBatch(
+            frame=frame,
+            targets={key for key, *_ in targets},
+            advance=not terminal,
+        )
+        for key, rendered, reply_markup in targets:
             self._submit_target(
                 key,
-                status_rendered,
-                canonical_status,
+                rendered,
                 space_id=space_id,
                 terminal=terminal,
-                reply_markup=status_keyboard,
+                reply_markup=reply_markup,
+                animation_frame=frame,
             )
 
     def _submit_target(
         self,
         key: DeliveryKey,
         rendered: RenderedMessage,
-        canonical: RenderedMessage,
         *,
         space_id: str,
         terminal: bool,
         reply_markup: InlineKeyboardMarkup | None = None,
+        animation_frame: int = 0,
     ) -> None:
         ticket = self.delivery.submit(
             DeliveryIntent(
@@ -233,8 +249,8 @@ class SpaceDashboardManager:
                 plain=rendered.plain,
                 reply_markup=reply_markup,
                 fingerprint=delivery_fingerprint(
-                    canonical.markdown,
-                    canonical.plain,
+                    rendered.markdown,
+                    rendered.plain,
                     reply_markup,
                 ),
                 priority=5 if terminal else 10,
@@ -245,19 +261,18 @@ class SpaceDashboardManager:
         if self._delivery_tickets.get(key) is ticket:
             return
         self._delivery_tickets[key] = ticket
-        ticket.add_done_callback(
-            lambda completed, target=key, target_space=space_id: self._delivery_finished(
-                target,
-                target_space,
-                completed,
-            )
-        )
+
+        def on_done(completed: asyncio.Future[DeliveryOutcome]) -> None:
+            self._delivery_finished(key, space_id, completed, animation_frame)
+
+        ticket.add_done_callback(on_done)
 
     def _delivery_finished(
         self,
         key: DeliveryKey,
         space_id: str,
         ticket: asyncio.Future[DeliveryOutcome],
+        animation_frame: int,
     ) -> None:
         if self._delivery_tickets.get(key) is not ticket:
             return
@@ -268,10 +283,17 @@ class SpaceDashboardManager:
             outcome = ticket.result()
         except Exception:
             return
-        if outcome.status == "delivered" and outcome.performed:
-            self._animation_indices[key] = (
-                self._animation_indices.get(key, 0) + 1
-            ) % len(ANIMATION_FRAMES)
+        if outcome.status == "delivered":
+            batch = self._animation_batches.get(space_id)
+            if batch is not None and batch.frame == animation_frame:
+                batch.performed = batch.performed or outcome.performed
+                batch.acknowledged.add(key)
+                if batch.targets <= batch.acknowledged:
+                    self._animation_batches.pop(space_id, None)
+                    if batch.advance and batch.performed:
+                        self._animation_indices[space_id] = (
+                            batch.frame + 1
+                        ) % len(ANIMATION_FRAMES)
         elif outcome.status == "transient_failure" and not self._stopping:
             LOGGER.warning(
                 "event=space_dashboard_delivery_retry space_id=%s bot_role=%s "
@@ -284,10 +306,10 @@ class SpaceDashboardManager:
             )
             self._schedule_space(space_id, immediate=False)
 
-    def _frame_for(self, key: DeliveryKey, *, terminal: bool) -> int:
+    def _frame_for(self, space_id: str, *, terminal: bool) -> int:
         if terminal:
             return ANIMATION_FRAMES.index("🌕")
-        return self._animation_indices.get(key, 0)
+        return self._animation_indices.get(space_id, 0)
 
     @staticmethod
     def _is_terminal(space: dict[str, Any], state: ThreadState | dict[str, Any]) -> bool:

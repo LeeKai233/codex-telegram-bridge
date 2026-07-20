@@ -215,18 +215,24 @@ def _plan_counts(state: object) -> tuple[int, int]:
     return sum(_step_value(step)[1] == "completed" for step in steps), len(steps)
 
 
-def _task_counts(state: object) -> tuple[int, int, int, int]:
+def _task_counts(state: object) -> tuple[int, int, int, int, int]:
     tasks = _value(state, "tasks")
     if tasks and isinstance(tasks, Sequence) and not isinstance(tasks, str | bytes):
         statuses = [str(_value(task, "status", default="pending") or "pending") for task in tasks]
-        completed = sum(status in {"completed", "shutdown"} for status in statuses)
+        completed_statuses = {"completed", "shutdown"}
+        failed_statuses = {"failed", "errored", "notFound"}
+        interrupted_statuses = {"interrupted"}
+        terminal_statuses = completed_statuses | failed_statuses | interrupted_statuses
+        completed = sum(status in completed_statuses for status in statuses)
         active = sum(status in {"active", "running", "inProgress", "pendingInit"} for status in statuses)
-        failed = sum(status in {"failed", "errored", "interrupted", "notFound"} for status in statuses)
-        return completed, len(statuses), active, failed
+        failed = sum(status in failed_statuses for status in statuses)
+        interrupted = sum(status in interrupted_statuses for status in statuses)
+        finished = sum(status in terminal_statuses for status in statuses)
+        return finished, len(statuses), active, failed, interrupted
     completed = int(_value(state, "agents_completed", default=0) or 0)
     active = int(_value(state, "agents_active", default=0) or 0)
     failed = int(_value(state, "agents_failed", default=0) or 0)
-    return completed, completed + active + failed, active, failed
+    return completed + failed, completed + active + failed, active, failed, 0
 
 
 def _agent_task_counts(state: object) -> tuple[int, int, int, int, int]:
@@ -373,7 +379,7 @@ def render_channel_post(
     icon, status = _status(state, lifecycle)
     goal_icon, goal_status, _ = _goal(state)
     completed, plan_total = _plan_counts(state)
-    tasks_completed, tasks_total, tasks_active, _ = _task_counts(state)
+    tasks_completed, tasks_total, tasks_active, tasks_failed, tasks_interrupted = _task_counts(state)
     duration = _duration(_total_duration(state, now, total_duration_seconds))
     queue = _queue_count(state, queue_count)
     title = clip(_title(state), 80)
@@ -405,7 +411,8 @@ def render_channel_post(
             f"🎯 Goal {goal_icon} {inline_code(goal_status)}",
             f"🧭 Plan {inline_code(f'{completed}/{plan_total}')} {inline_code(ascii_bar(progress))}",
             f"🧩 Tasks {inline_code(f'{tasks_completed}/{tasks_total}')} · Active "
-            f"{inline_code(tasks_active)} · Queue {inline_code(queue)}",
+            f"{inline_code(tasks_active)} · Failed {inline_code(tasks_failed)} · Interrupted "
+            f"{inline_code(tasks_interrupted)} · Queue {inline_code(queue)}",
             f"🕒 更新 {inline_code(time.strftime('%H:%M', time.localtime(now)))} · "
             f"心跳 {inline_code(f'≤{heartbeat_seconds}s')}",
             f"📁 {inline_code(cwd, 140)}",
@@ -422,7 +429,8 @@ def render_channel_post(
             ),
             f"🎯 Goal {goal_icon} {goal_status}",
             f"🧭 Plan {completed}/{plan_total} {ascii_bar(progress)}",
-            f"🧩 Tasks {tasks_completed}/{tasks_total} · Active {tasks_active} · Queue {queue}",
+            f"🧩 Tasks {tasks_completed}/{tasks_total} · Active {tasks_active} · "
+            f"Failed {tasks_failed} · Interrupted {tasks_interrupted} · Queue {queue}",
             f"🕒 更新 {time.strftime('%H:%M', time.localtime(now))} · 心跳 ≤{heartbeat_seconds}s",
             f"📁 {cwd}",
         ]
@@ -547,7 +555,7 @@ def _agent_lines(task: object, now: int) -> tuple[str, str]:
     started = _epoch(_value(task, "started_at", "updated_at")) or now
     finished = _epoch(_value(task, "finished_at"))
     elapsed = _duration(max(0, (finished or now) - started))
-    title = clip(str(_value(task, "title", default="Agent task") or "Agent task"), 100)
+    title = clip(str(_value(task, "title", default="Agent task") or "Agent task"), 64)
     metadata = [status, short_id]
     if role:
         metadata.append(clip(role, 32))
