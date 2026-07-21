@@ -1384,11 +1384,8 @@ class Bridge:
     async def resolve_files(self, thread_id: str, description: str) -> list[FileCandidate]:
         state = self.store.get_thread(thread_id) or await self.refresh(thread_id)
         return await self.resolver.resolve_files(
-            thread_id,
             Path(state.cwd),
             description,
-            model=self.config.ask_model,
-            effort=self.config.ask_reasoning_effort,
         )
 
     async def send_upload(

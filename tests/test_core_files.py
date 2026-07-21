@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import time
 from io import BytesIO
@@ -8,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import codex_telegram_bridge.resolver as resolver_module
 from codex_telegram_bridge.files import (
     PathPolicy,
     PathPolicyError,
@@ -16,7 +16,7 @@ from codex_telegram_bridge.files import (
     safe_filename,
     sha256_file,
 )
-from codex_telegram_bridge.resolver import CodexResolver, DirectoryIndex
+from codex_telegram_bridge.resolver import CodexResolver, DirectoryIndex, parse_file_query
 
 
 @pytest.mark.parametrize(
@@ -52,36 +52,147 @@ def test_sensitive_files_are_rejected(tmp_path: Path, relative: str) -> None:
         policy.validate_file(path)
 
 
+@pytest.mark.parametrize(
+    ("description", "extensions", "fragments"),
+    [
+        ("pdf", ("pdf",), ()),
+        (".pdf", ("pdf",), ()),
+        ("*.pdf", ("pdf",), ()),
+        ("ext:pdf main_ai", ("pdf",), ("main_ai",)),
+        ("pdf png main_ai", ("pdf", "png"), ("main_ai",)),
+        ('pdf "reports/2025"', ("pdf",), ("reports/2025",)),
+    ],
+)
+def test_parse_file_query(
+    description: str, extensions: tuple[str, ...], fragments: tuple[str, ...]
+) -> None:
+    query = parse_file_query(description)
+    assert query.extensions == extensions
+    assert query.fragments == fragments
+
+
 @pytest.mark.asyncio
-async def test_resolver_relative_file_paths_are_anchored_to_session_cwd(tmp_path: Path) -> None:
+async def test_resolver_uses_fd_for_recursive_literal_file_search(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     project = tmp_path / "project"
     project.mkdir()
-    report = project / "report.txt"
-    report.write_text("report", encoding="utf-8")
+    paths = [
+        project / "main_ai.pdf",
+        project / "main_ai.txt",
+        project / "reports" / "2025" / "deep_main_ai.PDF",
+        project / ".hidden.pdf",
+        project / ".env.pdf",
+        project / "too-large.pdf",
+    ]
+    for path in paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"x")
+    (project / "too-large.pdf").write_bytes(b"x" * 1001)
 
-    calls: list[dict[str, object]] = []
+    commands: list[tuple[tuple[str, ...], dict[str, object]]] = []
+
+    class Process:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            output = b"\0".join(os.fsencode(path) for path in paths) + b"\0"
+            return output, b""
+
+    async def create_process(*command: str, **kwargs: object) -> Process:
+        commands.append((command, kwargs))
+        return Process()
 
     class Client:
         async def run_ephemeral_turn(
-            self, _cwd: Path, _prompt: str, **kwargs: object
+            self, _cwd: Path, _prompt: str, **_kwargs: object
         ) -> str:
-            calls.append(kwargs)
-            return json.dumps({"paths": ["report.txt"]})
+            raise AssertionError("file resolution must not call the model")
 
+    monkeypatch.setattr(
+        resolver_module.shutil,
+        "which",
+        lambda name: "/usr/bin/fd" if name == "fd" else None,
+    )
+    monkeypatch.setattr(resolver_module.asyncio, "create_subprocess_exec", create_process)
     policy = PathPolicy(tmp_path, upload_limit=1000)
     resolver = CodexResolver(Client(), policy, DirectoryIndex(tmp_path))  # type: ignore[arg-type]
 
-    candidates = await resolver.resolve_files(
-        "thread",
-        project,
-        "the report",
-        model="gpt-5.6-luna",
-        effort="medium",
-    )
+    candidates = await resolver.resolve_files(project, "pdf main_ai")
 
-    assert [candidate.path for candidate in candidates] == [report.resolve()]
-    assert calls[0]["model"] == "gpt-5.6-luna"
-    assert calls[0]["effort"] == "medium"
+    assert [candidate.path for candidate in candidates] == [
+        (project / "main_ai.pdf").resolve(),
+        (project / "reports" / "2025" / "deep_main_ai.PDF").resolve(),
+    ]
+    command, kwargs = commands[0]
+    assert command[0] == "/usr/bin/fd"
+    assert "--max-depth" not in command
+    assert {"--hidden", "--no-ignore", "--fixed-strings", "--full-path"} <= set(command)
+    assert "--extension" in command and "pdf" in command
+    assert command[-1] == "main_ai"
+    assert kwargs["cwd"] == str(project.resolve())
+
+    candidates = await resolver.resolve_files(project, "pdf")
+    assert [candidate.path for candidate in candidates] == [
+        (project / ".hidden.pdf").resolve(),
+        (project / "main_ai.pdf").resolve(),
+        (project / "reports" / "2025" / "deep_main_ai.PDF").resolve(),
+    ]
+
+    candidates = await resolver.resolve_files(project, "main_ai")
+    assert [candidate.path for candidate in candidates] == [
+        (project / "main_ai.pdf").resolve(),
+        (project / "main_ai.txt").resolve(),
+        (project / "reports" / "2025" / "deep_main_ai.PDF").resolve(),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_resolver_treats_fd_no_match_as_empty(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    class Process:
+        returncode = 1
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b"", b""
+
+    async def create_process(*_command: str, **_kwargs: object) -> Process:
+        return Process()
+
+    monkeypatch.setattr(resolver_module.shutil, "which", lambda _name: "/usr/bin/fd")
+    monkeypatch.setattr(resolver_module.asyncio, "create_subprocess_exec", create_process)
+    policy = PathPolicy(tmp_path, upload_limit=1000)
+    resolver = CodexResolver(object(), policy, DirectoryIndex(tmp_path))  # type: ignore[arg-type]
+
+    assert await resolver.resolve_files(tmp_path, "missing") == []
+
+
+def test_resolver_finds_fd_outside_service_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fd_directory = tmp_path / "linuxbrew" / "bin"
+    fd_directory.mkdir(parents=True)
+    fd = fd_directory / "fd"
+    fd.write_text("#!/bin/sh\n", encoding="utf-8")
+    fd.chmod(0o700)
+
+    monkeypatch.setattr(resolver_module.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(
+        resolver_module, "_fd_fallback_directories", lambda: (fd_directory,)
+    )
+    policy = PathPolicy(tmp_path, upload_limit=1000)
+    resolver = CodexResolver(object(), policy, DirectoryIndex(tmp_path))  # type: ignore[arg-type]
+
+    assert resolver._fd_binary() == str(fd)
+
+
+def test_resolver_requires_fd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(resolver_module.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(resolver_module, "_fd_fallback_directories", lambda: (tmp_path,))
+    policy = PathPolicy(tmp_path, upload_limit=1000)
+    resolver = CodexResolver(object(), policy, DirectoryIndex(tmp_path))  # type: ignore[arg-type]
+
+    with pytest.raises(OSError, match="fd/fdfind"):
+        resolver._fd_binary()
 
 
 def test_path_outside_root_and_symlink_escape_are_rejected(tmp_path: Path) -> None:

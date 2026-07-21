@@ -2011,6 +2011,7 @@ async def test_getfile_edits_progress_into_scoped_file_choice(rig: Rig, tmp_path
     edit = rig.discussion_endpoint.edited[-1]
     assert "请选择要发送的文件" in edit["markdown"]
     button = edit["reply_markup"].inline_keyboard[0][0]
+    assert button.text == "①"
     callback = rig.store.peek_callback(
         str(button.callback_data)[3:],
         OWNER_ID,
@@ -2025,6 +2026,80 @@ async def test_getfile_edits_progress_into_scoped_file_choice(rig: Rig, tmp_path
     assert payload["path"] == str(report)
     assert payload["inode"] == metadata.st_ino
     assert payload["modified_ns"] == metadata.st_mtime_ns
+
+
+@pytest.mark.asyncio
+async def test_getfile_paginates_all_candidates_and_researches_on_next_page(
+    rig: Rig, tmp_path: Path
+) -> None:
+    space = add_active_space(
+        rig,
+        space_id="space-getfile-pages",
+        thread_id="thread-getfile-pages",
+        root_message_id=531,
+        channel_post_id=131,
+    )
+    candidates: list[FileCandidate] = []
+    for index in range(9):
+        path = tmp_path / f"report-{index}.pdf"
+        path.write_bytes(f"pdf-{index}".encode())
+        metadata = path.stat()
+        candidates.append(
+            FileCandidate(
+                path=path,
+                size=metadata.st_size,
+                modified_at=int(metadata.st_mtime),
+                device=metadata.st_dev,
+                inode=metadata.st_ino,
+                modified_ns=metadata.st_mtime_ns,
+            )
+        )
+    queries: list[str] = []
+
+    async def resolve_files(_thread_id: str, description: str) -> list[FileCandidate]:
+        queries.append(description)
+        return candidates
+
+    rig.bridge.resolve_files = resolve_files  # type: ignore[attr-defined]
+    rig.security.unlocked.add(str(space["space_id"]))
+    rig.discussion._require_active_unlocked = lambda _update: space  # type: ignore[method-assign]
+
+    await rig.discussion.getfile(
+        SimpleNamespace(
+            effective_message=SimpleNamespace(text="/getfile pdf", caption=None)
+        ),
+        SimpleNamespace(),
+    )
+
+    first_page = rig.discussion_endpoint.edited[-1]
+    assert "共 9 个，第 1/2 页" in first_page["markdown"]
+    assert [len(row) for row in first_page["reply_markup"].inline_keyboard] == [4, 4, 1]
+    assert [
+        button.text
+        for row in first_page["reply_markup"].inline_keyboard[:-1]
+        for button in row
+    ] == list("①②③④⑤⑥⑦⑧")
+    next_button = first_page["reply_markup"].inline_keyboard[-1][0]
+    assert next_button.text == "下一页"
+
+    callback_message = SimpleNamespace(message_id=int(first_page["message_id"]))
+    await rig.discussion.callback(
+        SimpleNamespace(
+            callback_query=SimpleNamespace(data=next_button.callback_data, message=callback_message),
+            effective_user=SimpleNamespace(id=OWNER_ID),
+            effective_chat=SimpleNamespace(id=DISCUSSION_CHAT_ID),
+            effective_message=callback_message,
+        ),
+        SimpleNamespace(),
+    )
+
+    assert queries == ["pdf", "pdf"]
+    second_page = rig.discussion_endpoint.edited[-1]
+    assert "共 9 个，第 2/2 页" in second_page["markdown"]
+    assert "9\\." in second_page["markdown"]
+    assert [len(row) for row in second_page["reply_markup"].inline_keyboard] == [1, 1]
+    assert second_page["reply_markup"].inline_keyboard[0][0].text == "①"
+    assert second_page["reply_markup"].inline_keyboard[-1][0].text == "上一页"
 
 
 @pytest.mark.asyncio

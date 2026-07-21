@@ -705,10 +705,6 @@ def render_status_comment(
         if hidden_agents:
             markdown_lines.append(escape(f"… 另有 {hidden_agents} 个已结束 Agent"))
             plain_lines.append(f"... 另有 {hidden_agents} 个已结束 Agent")
-    latest = str(_value(state, "latest_activity", "activity", default="") or "")
-    if latest:
-        markdown_lines.append(f"*⚡ 最新*  {escape(clip(latest, 360))}")
-        plain_lines.append(f"⚡ 最新 · {clip(latest, 360)}")
     error = str(_value(state, "last_error", "error", default="") or "")
     if error:
         markdown_lines.append(f"*❌ 错误*  {escape(clip(error, 360))}")

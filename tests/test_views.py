@@ -140,6 +140,8 @@ def test_full_status_comment_has_plan_tasks_auth_update_and_plain_fallback() -> 
     assert "🔓 TOTP 已认证 · 剩余 `30 min`" in rendered.markdown
     expires = time.strftime("%H:%M:%S", time.localtime(1_700_001_900))
     assert f"到期 `{expires}`" in rendered.markdown
+    assert "*⚡ 最新*" not in rendered.markdown
+    assert "⚡ 最新" not in rendered.plain
     assert "*🕘 近期事件*" in rendered.markdown
     assert "Plan created · completed" in rendered.markdown
     updated = time.strftime("%H:%M:%S", time.localtime(1_700_000_000))

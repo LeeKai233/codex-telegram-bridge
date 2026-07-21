@@ -1356,30 +1356,24 @@ async def test_ask_space_question_uses_isolated_client_without_mutating_primary_
 
 
 @pytest.mark.asyncio
-async def test_resolve_files_uses_configured_utility_profile(
+async def test_resolve_files_uses_session_cwd_without_model(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     bridge, store = make_bridge(tmp_path)
     store.save_thread(ThreadState(thread_id="thread-files", cwd=str(tmp_path), status="idle"))
-    calls: list[tuple[str, Path, str, str | None, str | None]] = []
+    calls: list[tuple[Path, str]] = []
 
     async def resolve_files(
-        thread_id: str,
         cwd: Path,
         description: str,
-        *,
-        model: str | None,
-        effort: str | None,
     ) -> list[Any]:
-        calls.append((thread_id, cwd, description, model, effort))
+        calls.append((cwd, description))
         return []
 
     monkeypatch.setattr(bridge.resolver, "resolve_files", resolve_files)
 
     assert await bridge.resolve_files("thread-files", "the report") == []
-    assert calls == [
-        ("thread-files", tmp_path.resolve(), "the report", "gpt-5.6-luna", "medium")
-    ]
+    assert calls == [(tmp_path.resolve(), "the report")]
     store.close()
 
 

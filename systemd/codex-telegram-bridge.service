@@ -1,16 +1,17 @@
 # X-CodexTelegramBridge-Installer: managed
-# X-CodexTelegramBridge-Installer-Version: v0.2.7
+# X-CodexTelegramBridge-Installer-Version: v0.2.8
 [Unit]
 Description=Codex Telegram Bridge
 Documentation=https://github.com/LeeKai233/codex-telegram-bridge
 Wants=network-online.target
 After=network-online.target codex-telegram-app-server.service
-StartLimitIntervalSec=300
-StartLimitBurst=5
+StartLimitIntervalSec=900
+StartLimitBurst=30
 
 [Service]
 Type=simple
 WorkingDirectory=%h
+ExecStartPre=/usr/bin/test -S %h/.codex/app-server-control/app-server-control.sock
 ExecStart=/usr/bin/env CODEX_HOME=%h/.codex %h/.local/bin/codex-telegram-bridge
 Restart=on-failure
 RestartSec=30s
@@ -19,6 +20,7 @@ KillSignal=SIGTERM
 KillMode=process
 Environment=PYTHONUNBUFFERED=1
 Environment=CODEX_HOME=%h/.codex
+Environment=PATH=%h/.local/bin:%h/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin
 EnvironmentFile=-%h/.config/codex-telegram-bridge/proxy.env
 UMask=0077
 

@@ -13,7 +13,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "install.sh"
 UNIT_MARKER = "# X-CodexTelegramBridge-Installer: managed"
-UNIT_VERSION = "# X-CodexTelegramBridge-Installer-Version: v0.2.7"
+UNIT_VERSION = "# X-CodexTelegramBridge-Installer-Version: v0.2.8"
 
 
 def run_installer_shell(
@@ -400,6 +400,7 @@ def test_generated_bridge_unit_matches_static_unit_and_forces_codex_home(
         """
 initialize_paths
 install -d -m 0700 "$USER_UNIT_DIR"
+unit_exists() { return 1; }
 write_bridge_unit
 cmp -s "$STATIC_UNIT" "$USER_UNIT_DIR/codex-telegram-bridge.service"
 grep -Fxq \
@@ -415,9 +416,84 @@ grep -Fxq \
 def test_bridge_unit_throttles_restart_loops() -> None:
     unit = (ROOT / "systemd/codex-telegram-bridge.service").read_text(encoding="utf-8")
 
-    assert "StartLimitIntervalSec=300" in unit
-    assert "StartLimitBurst=5" in unit
+    assert "StartLimitIntervalSec=900" in unit
+    assert "StartLimitBurst=30" in unit
     assert "RestartSec=30s" in unit
+    assert "ExecStartPre=/usr/bin/test -S %h/.codex/app-server-control/app-server-control.sock" in unit
+    assert (
+        "Environment=PATH=%h/.local/bin:%h/.linuxbrew/bin:"
+        "/home/linuxbrew/.linuxbrew/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+    ) in unit
+
+
+def test_bridge_unit_waits_for_managed_daemon_when_present(tmp_path: Path) -> None:
+    result = run_installer_shell(
+        tmp_path,
+        """
+initialize_paths
+install -d -m 0700 "$USER_UNIT_DIR"
+EXTERNAL_APP_SERVER=1
+unit_exists() { [[ "$1" == codex-managed-daemon-bootstrap.service ]]; }
+write_bridge_unit
+grep -Fxq 'Wants=network-online.target codex-managed-daemon-bootstrap.service' \
+    "$USER_UNIT_DIR/codex-telegram-bridge.service"
+grep -Fxq 'After=network-online.target codex-managed-daemon-bootstrap.service' \
+    "$USER_UNIT_DIR/codex-telegram-bridge.service"
+! grep -Fq 'codex-telegram-app-server.service' "$USER_UNIT_DIR/codex-telegram-bridge.service"
+""",
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_bridge_unit_keeps_installer_owned_app_server_dependency(tmp_path: Path) -> None:
+    result = run_installer_shell(
+        tmp_path,
+        """
+initialize_paths
+install -d -m 0700 "$USER_UNIT_DIR"
+EXTERNAL_APP_SERVER=0
+unit_exists() { [[ "$1" == codex-telegram-app-server.service ]]; }
+write_bridge_unit
+grep -Fxq 'Wants=network-online.target' \
+    "$USER_UNIT_DIR/codex-telegram-bridge.service"
+grep -Fxq 'After=network-online.target codex-telegram-app-server.service' \
+    "$USER_UNIT_DIR/codex-telegram-bridge.service"
+! grep -Fq 'codex-managed-daemon-bootstrap.service' \
+    "$USER_UNIT_DIR/codex-telegram-bridge.service"
+""",
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_managed_daemon_recovery_dropin_is_idempotent(tmp_path: Path) -> None:
+    result = run_installer_shell(
+        tmp_path,
+        """
+initialize_paths
+install -d -m 0700 "$USER_UNIT_DIR"
+write_managed_daemon_recovery_dropin
+first=$(sha256sum \
+    "$USER_UNIT_DIR/codex-managed-daemon-bootstrap.service.d/codex-telegram-bridge-recovery.conf")
+write_managed_daemon_recovery_dropin
+second=$(sha256sum \
+    "$USER_UNIT_DIR/codex-managed-daemon-bootstrap.service.d/codex-telegram-bridge-recovery.conf")
+[[ "$first" == "$second" ]]
+grep -Fxq 'StartLimitIntervalSec=900' \
+    "$USER_UNIT_DIR/codex-managed-daemon-bootstrap.service.d/codex-telegram-bridge-recovery.conf"
+grep -Fxq 'StartLimitBurst=30' \
+    "$USER_UNIT_DIR/codex-managed-daemon-bootstrap.service.d/codex-telegram-bridge-recovery.conf"
+grep -Fxq 'Restart=on-failure' \
+    "$USER_UNIT_DIR/codex-managed-daemon-bootstrap.service.d/codex-telegram-bridge-recovery.conf"
+grep -Fxq 'RestartSec=30s' \
+    "$USER_UNIT_DIR/codex-managed-daemon-bootstrap.service.d/codex-telegram-bridge-recovery.conf"
+! grep -Fq 'EnvironmentFile=' \
+    "$USER_UNIT_DIR/codex-managed-daemon-bootstrap.service.d/codex-telegram-bridge-recovery.conf"
+""",
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_non_wsl_host_contract_fails_without_mutation(tmp_path: Path) -> None:

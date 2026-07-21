@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly INSTALLER_VERSION="0.2.7"
+readonly INSTALLER_VERSION="0.2.8"
 readonly UV_VERSION="0.11.28"
 readonly PROJECT="codex-telegram-bridge"
 readonly REPOSITORY="LeeKai233/codex-telegram-bridge"
@@ -468,7 +468,7 @@ PY
 
 install_os_dependencies() {
     local package missing=()
-    for package in ca-certificates curl git tmux; do
+    for package in ca-certificates curl fd-find git tmux; do
         if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q 'install ok installed'; then
             missing+=("$package")
         fi
@@ -832,12 +832,45 @@ EOF
     mv "$temporary" "$destination"
 }
 
+write_managed_daemon_recovery_dropin() {
+    local dropin_dir="$USER_UNIT_DIR/codex-managed-daemon-bootstrap.service.d"
+    local destination="$dropin_dir/codex-telegram-bridge-recovery.conf"
+    local temporary
+    install -d -m 0700 "$dropin_dir"
+    if [[ -e "$destination" || -L "$destination" ]]; then
+        [[ -f "$destination" && ! -L "$destination" ]] || \
+            die "managed Codex daemon recovery drop-in is not a regular file"
+        if ! grep -Fxq "$UNIT_MARKER" "$destination"; then
+            die "unowned managed Codex daemon recovery drop-in already exists"
+        fi
+    fi
+    temporary="$(mktemp "$dropin_dir/.codex-telegram-bridge-recovery.XXXXXX")"
+    cat >"$temporary" <<EOF
+$UNIT_MARKER
+$UNIT_VERSION
+[Unit]
+StartLimitIntervalSec=900
+StartLimitBurst=30
+
+[Service]
+Restart=on-failure
+RestartSec=30s
+EOF
+    chmod 0644 "$temporary"
+    mv "$temporary" "$destination"
+}
+
 write_bridge_unit() {
     local destination="$USER_UNIT_DIR/codex-telegram-bridge.service"
+    local wants="network-online.target"
     local after="network-online.target"
     local temporary
     if ((EXTERNAL_APP_SERVER == 0)); then
         after="network-online.target codex-telegram-app-server.service"
+    fi
+    if unit_exists codex-managed-daemon-bootstrap.service; then
+        wants+=" codex-managed-daemon-bootstrap.service"
+        after+=" codex-managed-daemon-bootstrap.service"
     fi
     temporary="$(mktemp "$USER_UNIT_DIR/.codex-telegram-bridge.XXXXXX")"
     cat >"$temporary" <<EOF
@@ -846,14 +879,15 @@ $UNIT_VERSION
 [Unit]
 Description=Codex Telegram Bridge
 Documentation=https://github.com/$REPOSITORY
-Wants=network-online.target
+Wants=$wants
 After=$after
-StartLimitIntervalSec=300
-StartLimitBurst=5
+StartLimitIntervalSec=900
+StartLimitBurst=30
 
 [Service]
 Type=simple
 WorkingDirectory=%h
+ExecStartPre=/usr/bin/test -S %h/.codex/app-server-control/app-server-control.sock
 ExecStart=/usr/bin/env CODEX_HOME=%h/.codex %h/.local/bin/codex-telegram-bridge
 Restart=on-failure
 RestartSec=30s
@@ -862,6 +896,7 @@ KillSignal=SIGTERM
 KillMode=process
 Environment=PYTHONUNBUFFERED=1
 Environment=CODEX_HOME=%h/.codex
+Environment=PATH=%h/.local/bin:%h/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin
 EnvironmentFile=-%h/.config/codex-telegram-bridge/proxy.env
 UMask=0077
 
@@ -907,6 +942,9 @@ install_and_start_units() {
         write_app_server_unit
     else
         info "Reusing the existing private Codex App Server socket."
+    fi
+    if unit_exists codex-managed-daemon-bootstrap.service; then
+        write_managed_daemon_recovery_dropin
     fi
     write_bridge_unit
 

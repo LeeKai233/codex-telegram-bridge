@@ -84,6 +84,8 @@ _PLAN_PROMPT_FAST_WINDOW_SECONDS = 30.0
 _PLAN_PROMPT_SLOW_POLL_SECONDS = 10.0
 _PLAN_PROMPT_MONITOR_SECONDS = 10 * 60.0
 _PLAN_DECISION_GRACE_SECONDS = 2.0
+_GETFILE_PAGE_SIZE = 8
+_CIRCLED_FILE_BUTTON_LABELS = "①②③④⑤⑥⑦⑧"
 _BOT_URL_TOKEN = re.compile(r"(https://api\.telegram\.org/bot)[^/\s]+", re.IGNORECASE)
 _BOT_TOKEN = re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{16,}\b")
 
@@ -1511,35 +1513,12 @@ class DiscussionBotController:
                 "没有找到符合描述且允许发送的文件。",
             )
             return
-        lines = ["请选择要发送的文件："]
-        rows: list[list[InlineKeyboardButton]] = []
-        for index, candidate in enumerate(candidates[:8], 1):
-            lines.append(
-                f"{index}\\. {inline_code(compact_path(str(candidate.path)), 120)} · "
-                f"{inline_code(human_bytes(candidate.size))}"
-            )
-            rows.append(
-                [
-                    self._button(
-                        f"发送 {index}. {candidate.path.name[:32]}",
-                        "send_file",
-                        {
-                            "path": str(candidate.path),
-                            "size": candidate.size,
-                            "modified_at": candidate.modified_at,
-                            "device": candidate.device,
-                            "inode": candidate.inode,
-                            "modified_ns": candidate.modified_ns,
-                        },
-                        space,
-                    )
-                ]
-            )
-        await self._edit_or_resend_getfile(
+        await self._render_getfile_page(
             space,
             waiting_message_id,
-            "\n".join(lines),
-            reply_markup=InlineKeyboardMarkup(rows),
+            description,
+            candidates,
+            page=1,
         )
 
     async def _getfile_space_is_current(
@@ -1556,6 +1535,104 @@ class DiscussionBotController:
             int(space["discussion_chat_id"]), waiting_message_id
         )
         return False
+
+    async def _render_getfile_page(
+        self,
+        space: dict[str, Any],
+        message_id: int | None,
+        query: str,
+        candidates: list[FileCandidate],
+        *,
+        page: int,
+    ) -> None:
+        if not candidates:
+            markdown = "没有找到符合描述且允许发送的文件。"
+            if message_id is None:
+                await self._send_space(space, markdown)
+            else:
+                await self._edit_or_resend_getfile(space, message_id, markdown)
+            return
+
+        total_pages = (len(candidates) + _GETFILE_PAGE_SIZE - 1) // _GETFILE_PAGE_SIZE
+        page = min(max(1, page), total_pages)
+        start = (page - 1) * _GETFILE_PAGE_SIZE
+        visible = candidates[start : start + _GETFILE_PAGE_SIZE]
+        lines = [
+            f"请选择要发送的文件：共 {len(candidates)} 个，第 {page}/{total_pages} 页。"
+        ]
+        file_buttons: list[InlineKeyboardButton] = []
+        for local_index, candidate in enumerate(visible, 1):
+            index = start + local_index
+            lines.append(
+                f"{index}\\. {inline_code(compact_path(str(candidate.path)), 120)} · "
+                f"{inline_code(human_bytes(candidate.size))}"
+            )
+            file_buttons.append(
+                self._button(
+                    _CIRCLED_FILE_BUTTON_LABELS[local_index - 1],
+                    "send_file",
+                    {
+                        "path": str(candidate.path),
+                        "size": candidate.size,
+                        "modified_at": candidate.modified_at,
+                        "device": candidate.device,
+                        "inode": candidate.inode,
+                        "modified_ns": candidate.modified_ns,
+                    },
+                    space,
+                )
+            )
+
+        rows = balanced_button_rows(file_buttons, columns=4)
+
+        navigation: list[InlineKeyboardButton] = []
+        if page > 1:
+            navigation.append(
+                self._button(
+                    "上一页",
+                    "getfile_page",
+                    {"query": query, "page": page - 1},
+                    space,
+                )
+            )
+        if page < total_pages:
+            navigation.append(
+                self._button(
+                    "下一页",
+                    "getfile_page",
+                    {"query": query, "page": page + 1},
+                    space,
+                )
+            )
+        if navigation:
+            rows.append(navigation)
+
+        markdown = "\n".join(lines)
+        if message_id is None:
+            await self._send_space(
+                space,
+                markdown,
+                reply_markup=InlineKeyboardMarkup(rows),
+            )
+        else:
+            await self._edit_or_resend_getfile(
+                space,
+                message_id,
+                markdown,
+                reply_markup=InlineKeyboardMarkup(rows),
+            )
+
+    async def _getfile_page(
+        self,
+        space: dict[str, Any],
+        payload: dict[str, Any],
+        *,
+        message_id: int | None,
+    ) -> None:
+        query = str(payload["query"]).strip()
+        page = int(payload.get("page") or 1)
+        candidates = await self.bridge.resolve_files(str(space["thread_id"]), query)
+        await self._render_getfile_page(space, message_id, query, candidates, page=page)
 
     async def _edit_or_resend_getfile(
         self,
@@ -1866,6 +1943,9 @@ class DiscussionBotController:
         elif action == "send_file":
             self._ensure_unlocked(space)
             await self._send_file(space, payload)
+        elif action == "getfile_page":
+            self._ensure_unlocked(space)
+            await self._getfile_page(space, payload, message_id=callback_message_id)
         elif action == "send_upload":
             self._ensure_unlocked(space)
             await self._send_upload(space, payload)
