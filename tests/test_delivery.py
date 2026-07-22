@@ -92,6 +92,26 @@ async def test_delivery_engine_deduplicates_by_semantic_fingerprint() -> None:
 
 
 @pytest.mark.asyncio
+async def test_delivery_engine_reserves_interactive_lane_for_terminal_updates() -> None:
+    class LaneEndpoint:
+        def __init__(self) -> None:
+            self.lanes: list[str] = []
+
+        async def edit_text(self, *_args: Any, lane: str, **_kwargs: Any) -> None:
+            self.lanes.append(lane)
+
+    endpoint = LaneEndpoint()
+    engine = TelegramDeliveryEngine({"discussion": endpoint})  # type: ignore[dict-item]
+    engine.start()
+
+    await engine.submit(intent("working"))
+    await engine.submit(intent("finished", terminal=True))
+
+    assert endpoint.lanes == ["maintenance", "interactive"]
+    await engine.stop(drain_timeout=0)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("error", [RetryAfter(0), TimedOut()])
 async def test_delivery_engine_does_not_add_a_second_retry_layer(
     error: BaseException,

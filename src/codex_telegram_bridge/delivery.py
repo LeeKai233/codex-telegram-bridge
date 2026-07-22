@@ -282,6 +282,7 @@ class TelegramDeliveryEngine:
         options: dict[str, object] = {
             "plain": intent.plain,
             "priority": intent.priority,
+            "lane": "interactive" if intent.terminal else "maintenance",
         }
         if intent.reply_markup is not None:
             options["reply_markup"] = intent.reply_markup

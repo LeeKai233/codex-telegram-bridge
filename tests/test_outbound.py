@@ -469,6 +469,53 @@ async def test_interactive_lane_is_not_starved_by_maintenance_backlog() -> None:
 
 
 @pytest.mark.asyncio
+async def test_maintenance_chat_pacing_preserves_interactive_latency() -> None:
+    messenger = OutboundMessenger(
+        minimum_interval=0,
+        maintenance_chat_interval=0.05,
+    )
+    events: list[tuple[str, float]] = []
+
+    async def record(name: str) -> None:
+        events.append((name, time.monotonic()))
+
+    messenger.start()
+    await messenger.call(
+        lambda: record("maintenance-1"),
+        lane="maintenance",
+        traffic_class="maintenance",
+        chat_key="chat:20",
+    )
+    second = asyncio.create_task(
+        messenger.call(
+            lambda: record("maintenance-2"),
+            lane="maintenance",
+            traffic_class="maintenance",
+            chat_key="chat:20",
+        )
+    )
+    interactive = asyncio.create_task(
+        messenger.call(
+            lambda: record("interactive"),
+            lane="interactive",
+            traffic_class="interactive",
+            chat_key="chat:20",
+        )
+    )
+
+    await asyncio.wait_for(interactive, timeout=0.04)
+    await second
+    await messenger.stop()
+
+    assert [name for name, _timestamp in events] == [
+        "maintenance-1",
+        "interactive",
+        "maintenance-2",
+    ]
+    assert events[2][1] - events[0][1] >= 0.04
+
+
+@pytest.mark.asyncio
 async def test_default_scheduler_runs_each_traffic_class_at_its_own_concurrency() -> None:
     messenger = OutboundMessenger()
     release = asyncio.Event()

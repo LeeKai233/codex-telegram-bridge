@@ -39,6 +39,7 @@ _LEGACY_TRAFFIC_CLASSES: dict[OutboundLane, TrafficClass] = {
 }
 _KEYED_TRAFFIC_CLASSES = frozenset({"interactive"})
 OUTBOUND_STOP_GRACE_SECONDS = 1.0
+MAINTENANCE_CHAT_MINIMUM_INTERVAL_SECONDS = 6.0
 
 
 def _consume_task_result(task: asyncio.Task[None]) -> None:
@@ -121,6 +122,7 @@ class OutboundMessenger:
         journal: OutboundJournal | None = None,
         recycle_transport: Callable[[], Awaitable[None]] | None = None,
         max_queue_size: int = 1_000,
+        maintenance_chat_interval: float = MAINTENANCE_CHAT_MINIMUM_INTERVAL_SECONDS,
     ) -> None:
         # Keep the legacy observable value for callers that inspect it. A global
         # interval is only enabled when explicitly configured.
@@ -131,6 +133,7 @@ class OutboundMessenger:
         self.journal = journal
         self.recycle_transport = recycle_transport
         self.max_queue_size = max(1, int(max_queue_size))
+        self.maintenance_chat_interval = max(0.0, maintenance_chat_interval)
         self._queues: dict[TrafficClass, deque[_Job]] = {
             traffic_class: deque() for traffic_class in TRAFFIC_CLASS_CONCURRENCY
         }
@@ -141,6 +144,7 @@ class OutboundMessenger:
         self._wake = asyncio.Event()
         self._stopping = False
         self._last_request = 0.0
+        self._maintenance_request_at: dict[str, float] = {}
         self._interval_lock = asyncio.Lock()
         self._active_jobs: dict[asyncio.Task[Any], _Job] = {}
         self._active_keys: set[tuple[int, str]] = set()
@@ -395,6 +399,9 @@ class OutboundMessenger:
             self._active_keys.discard((job.generation, job.chat_key))
 
     async def _execute(self, job: _Job) -> None:
+        await self._pace_maintenance_chat(job)
+        if not self._job_is_current(job):
+            return
         if self._interval_enabled:
             async with self._interval_lock:
                 delay = self.minimum_interval - (time.monotonic() - self._last_request)
@@ -408,8 +415,18 @@ class OutboundMessenger:
         except (BadRequest, Forbidden) as exc:
             self._finish_error(job, exc)
         except RetryAfter as exc:
+            retry_delay = _retry_after_seconds(exc)
+            LOGGER.warning(
+                "event=telegram_outbound_retry_after bot_role=%s traffic_class=%s "
+                "chat_key=%s retry_seconds=%.1f attempt=%s",
+                self.bot_role,
+                job.traffic_class,
+                job.chat_key,
+                retry_delay,
+                job.attempts,
+            )
             if job.attempts <= self.retries:
-                self._requeue(job, _retry_after_seconds(exc))
+                self._requeue(job, retry_delay)
             else:
                 self._finish_error(job, exc)
         except NetworkError as exc:
@@ -426,6 +443,20 @@ class OutboundMessenger:
             self._metrics[job.traffic_class]["completed"] += 1
             self._journal(job, "delivered")
             job.future.set_result(result)
+
+    async def _pace_maintenance_chat(self, job: _Job) -> None:
+        if (
+            job.traffic_class != "maintenance"
+            or not job.chat_key.startswith("chat:")
+            or self.maintenance_chat_interval <= 0
+        ):
+            return
+        last_request = self._maintenance_request_at.get(job.chat_key, 0.0)
+        delay = self.maintenance_chat_interval - (time.monotonic() - last_request)
+        if delay > 0:
+            await asyncio.sleep(delay)
+        if self._job_is_current(job):
+            self._maintenance_request_at[job.chat_key] = time.monotonic()
 
     async def _run_transport_operation(
         self,
