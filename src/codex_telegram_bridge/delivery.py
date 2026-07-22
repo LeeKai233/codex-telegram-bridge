@@ -12,6 +12,7 @@ from typing import Literal
 from telegram import InlineKeyboardMarkup
 from telegram.error import BadRequest, Forbidden, TelegramError
 
+from .outbound import OutboundLane
 from .telegram_common import TelegramEndpoint
 
 LOGGER = logging.getLogger(__name__)
@@ -37,6 +38,7 @@ class DeliveryIntent:
     markdown: str
     plain: str
     fingerprint: str
+    lane: OutboundLane = "live"
     reply_markup: InlineKeyboardMarkup | None = None
     priority: int = 10
     terminal: bool = False
@@ -282,7 +284,7 @@ class TelegramDeliveryEngine:
         options: dict[str, object] = {
             "plain": intent.plain,
             "priority": intent.priority,
-            "lane": "interactive" if intent.terminal else "maintenance",
+            "lane": intent.lane,
         }
         if intent.reply_markup is not None:
             options["reply_markup"] = intent.reply_markup

@@ -700,3 +700,168 @@ async def test_callback_ack_bypasses_blocked_interactive_work_for_same_chat() ->
     release.set()
     await asyncio.gather(interactive_task, callback_task)
     await messenger.stop()
+
+
+@pytest.mark.asyncio
+async def test_idempotent_edit_coalesces_while_queued_and_reports_health() -> None:
+    messenger = OutboundMessenger(minimum_interval=0, group_chat_interval=0)
+    release = asyncio.Event()
+    both_started = asyncio.Event()
+    started = 0
+    performed: list[str] = []
+
+    async def blocker() -> None:
+        nonlocal started
+        started += 1
+        if started == 2:
+            both_started.set()
+        await release.wait()
+
+    async def record(value: str) -> None:
+        performed.append(value)
+
+    key = ("discussion", -10020, 41)
+    messenger.start()
+    blockers = [asyncio.create_task(messenger.call(blocker)) for _ in range(2)]
+    await both_started.wait()
+    old = asyncio.create_task(
+        messenger.call(lambda: record("old"), coalesce_key=key, chat_key="chat:-10020")
+    )
+    await asyncio.sleep(0.01)
+    latest = asyncio.create_task(
+        messenger.call(lambda: record("latest"), coalesce_key=key, chat_key="chat:-10020")
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await old
+
+    health = messenger.snapshot()
+    assert health["coalesced"] == 1
+    assert health["superseded"] == 1
+    assert health["oldest_queued_seconds"] > 0
+    assert health["traffic_classes"]["interactive"]["coalesced"] == 1
+    assert health["traffic_classes"]["interactive"]["superseded"] == 1
+
+    release.set()
+    await asyncio.gather(*blockers, latest)
+    await messenger.stop()
+
+    assert performed == ["latest"]
+
+
+@pytest.mark.asyncio
+async def test_idempotent_edit_coalesces_during_throttle_and_retry_waits() -> None:
+    messenger = OutboundMessenger(
+        minimum_interval=0,
+        retries=1,
+        maintenance_chat_interval=0.2,
+        group_chat_interval=0,
+    )
+    performed: list[str] = []
+    throttle_key = ("discussion", 20, 41)
+    retry_key = ("discussion", 20, 42)
+
+    async def retrying() -> None:
+        performed.append("retry-attempt")
+        raise RetryAfter(30)
+
+    async def record(value: str) -> None:
+        performed.append(value)
+
+    messenger.start()
+    await messenger.call(
+        lambda: asyncio.sleep(0),
+        lane="maintenance",
+        chat_key="chat:20",
+    )
+    throttled = asyncio.create_task(
+        messenger.call(
+            lambda: record("throttled-old"),
+            lane="maintenance",
+            chat_key="chat:20",
+            coalesce_key=throttle_key,
+        )
+    )
+    for _ in range(100):
+        if messenger.snapshot()["traffic_classes"]["maintenance"]["active"]:
+            break
+        await asyncio.sleep(0.001)
+    throttle_latest = asyncio.create_task(
+        messenger.call(
+            lambda: record("throttle-latest"),
+            lane="maintenance",
+            chat_key="chat:20",
+            coalesce_key=throttle_key,
+        )
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await throttled
+    await asyncio.wait_for(throttle_latest, timeout=1)
+
+    retrying_task = asyncio.create_task(
+        messenger.call(retrying, chat_key="chat:20", coalesce_key=retry_key)
+    )
+    for _ in range(100):
+        if messenger.snapshot()["traffic_classes"]["interactive"]["retries"]:
+            break
+        await asyncio.sleep(0.001)
+    retry_latest = asyncio.create_task(
+        messenger.call(
+            lambda: record("retry-latest"),
+            chat_key="chat:20",
+            coalesce_key=retry_key,
+        )
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await retrying_task
+    await asyncio.wait_for(retry_latest, timeout=1)
+    await messenger.stop()
+
+    assert "throttled-old" not in performed
+    assert performed.count("retry-attempt") == 1
+    assert performed[-1] == "retry-latest"
+
+
+@pytest.mark.asyncio
+async def test_coalescing_preserves_in_transport_and_non_idempotent_operations() -> None:
+    messenger = OutboundMessenger(minimum_interval=0, group_chat_interval=0)
+    transport_started = asyncio.Event()
+    release_transport = asyncio.Event()
+    performed: list[str] = []
+    key = ("discussion", 20, 41)
+
+    async def in_transport() -> None:
+        performed.append("transport-old")
+        transport_started.set()
+        await release_transport.wait()
+
+    async def record(value: str) -> None:
+        performed.append(value)
+
+    messenger.start()
+    old = asyncio.create_task(
+        messenger.call(in_transport, chat_key="chat:20", coalesce_key=key)
+    )
+    await transport_started.wait()
+    latest = asyncio.create_task(
+        messenger.call(lambda: record("transport-latest"), chat_key="chat:20", coalesce_key=key)
+    )
+    await asyncio.sleep(0)
+    assert not old.done()
+    assert messenger.snapshot()["superseded"] == 0
+    release_transport.set()
+    await asyncio.gather(old, latest)
+
+    non_idempotent = [
+        asyncio.create_task(
+            messenger.call(
+                lambda value=value: record(value),
+                semantics="non_idempotent",
+                coalesce_key=key,
+            )
+        )
+        for value in ("send-one", "send-two")
+    ]
+    await asyncio.gather(*non_idempotent)
+    await messenger.stop()
+
+    assert performed == ["transport-old", "transport-latest", "send-one", "send-two"]

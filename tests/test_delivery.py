@@ -12,6 +12,7 @@ from codex_telegram_bridge.delivery import (
     DeliveryKey,
     TelegramDeliveryEngine,
 )
+from codex_telegram_bridge.outbound import OutboundLane
 
 
 class RecordingEndpoint:
@@ -41,12 +42,14 @@ def intent(
     *,
     fingerprint: str | None = None,
     terminal: bool = False,
+    lane: OutboundLane = "live",
 ) -> DeliveryIntent:
     return DeliveryIntent(
         key=DeliveryKey("discussion", -100123, 390),
         markdown=text,
         plain=text,
         fingerprint=fingerprint or text,
+        lane=lane,
         priority=5 if terminal else 10,
         terminal=terminal,
         context="test",
@@ -92,7 +95,7 @@ async def test_delivery_engine_deduplicates_by_semantic_fingerprint() -> None:
 
 
 @pytest.mark.asyncio
-async def test_delivery_engine_reserves_interactive_lane_for_terminal_updates() -> None:
+async def test_delivery_engine_uses_each_intent_explicit_lane() -> None:
     class LaneEndpoint:
         def __init__(self) -> None:
             self.lanes: list[str] = []
@@ -104,8 +107,8 @@ async def test_delivery_engine_reserves_interactive_lane_for_terminal_updates() 
     engine = TelegramDeliveryEngine({"discussion": endpoint})  # type: ignore[dict-item]
     engine.start()
 
-    await engine.submit(intent("working"))
-    await engine.submit(intent("finished", terminal=True))
+    await engine.submit(intent("working", lane="maintenance"))
+    await engine.submit(intent("finished", terminal=True, lane="interactive"))
 
     assert endpoint.lanes == ["maintenance", "interactive"]
     await engine.stop(drain_timeout=0)
@@ -139,4 +142,18 @@ async def test_delivery_engine_stops_retrying_permanent_errors() -> None:
     assert outcome.status == "permanent_failure"
     assert outcome.attempts == 1
     assert len(endpoint.calls) == 1
+    await engine.stop(drain_timeout=0)
+
+
+@pytest.mark.asyncio
+async def test_delivery_worker_restarts_after_outbound_supersession() -> None:
+    endpoint = RecordingEndpoint([asyncio.CancelledError(), None])
+    engine = TelegramDeliveryEngine({"discussion": endpoint})  # type: ignore[dict-item]
+    engine.start()
+
+    outcome = await asyncio.wait_for(engine.submit(intent("latest")), timeout=1)
+
+    assert outcome.status == "delivered"
+    assert outcome.attempts == 2
+    assert len(endpoint.calls) == 2
     await engine.stop(drain_timeout=0)

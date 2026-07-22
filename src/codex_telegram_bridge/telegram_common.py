@@ -31,6 +31,7 @@ LOGGER = logging.getLogger(__name__)
 
 CONTROL_ROLE = "control"
 DISCUSSION_ROLE = "discussion"
+STATUS_ROLE = "status"
 ALLOWED_UPDATES = ["message", "callback_query"]
 POLLING_CONNECTION_POOL_SIZE = 2
 POLLING_READ_TIMEOUT_SECONDS = 30.0
@@ -300,6 +301,7 @@ class TelegramEndpoint:
                 traffic_class=_traffic_class_for_lane(lane),
                 chat_key=_chat_key(chat_id),
                 semantics="idempotent",
+                coalesce_key=(self.role, chat_id, message_id),
             )
         except BadRequest as exc:
             if "message is not modified" in str(exc).casefold():
@@ -315,6 +317,7 @@ class TelegramEndpoint:
                 traffic_class=_traffic_class_for_lane(lane),
                 chat_key=_chat_key(chat_id),
                 semantics="idempotent",
+                coalesce_key=(self.role, chat_id, message_id),
             )
 
     async def delete_message(
@@ -361,6 +364,7 @@ class TelegramEndpoint:
                 traffic_class=_traffic_class_for_lane(lane),
                 chat_key=_chat_key(chat_id),
                 semantics="idempotent",
+                coalesce_key=(self.role, chat_id, message_id),
             )
         except BadRequest as exc:
             if "message is not modified" in str(exc).casefold():

@@ -22,9 +22,10 @@ from .delivery import (
     delivery_fingerprint,
 )
 from .models import ThreadState
+from .outbound import LANE_WEIGHTS, OutboundLane
 from .security import SecurityManager
 from .store import Store
-from .telegram_common import CONTROL_ROLE, DISCUSSION_ROLE, TelegramEndpoint
+from .telegram_common import CONTROL_ROLE, DISCUSSION_ROLE, STATUS_ROLE, TelegramEndpoint
 from .views import (
     ANIMATION_FRAMES,
     RenderedMessage,
@@ -90,15 +91,19 @@ class SpaceDashboardManager:
         control: TelegramEndpoint,
         discussion: TelegramEndpoint,
         delivery: TelegramDeliveryEngine,
+        *,
+        status: TelegramEndpoint | None = None,
     ) -> None:
         self.config = config
         self.store = store
         self.security = security
         self.control = control
         self.discussion = discussion
+        self.status = status or discussion
         self.delivery = delivery
         self._dirty: set[str] = set()
         self._immediate: set[str] = set()
+        self._lanes: dict[str, OutboundLane] = {}
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._animation_indices: dict[str, int] = {}
         self._animation_batches: dict[str, _AnimationBatch] = {}
@@ -120,7 +125,11 @@ class SpaceDashboardManager:
                 space.get(name)
                 for name in ("channel_post_id", "status_message_id")
             ):
-                await self.schedule_space(str(space["space_id"]), immediate=True)
+                await self.schedule_space(
+                    str(space["space_id"]),
+                    immediate=True,
+                    lane="maintenance",
+                )
 
     async def stop(self) -> None:
         self._stopping = True
@@ -146,11 +155,26 @@ class SpaceDashboardManager:
                 continue
             await self.schedule_space(str(space["space_id"]), immediate=reason in _IMMEDIATE_REASONS)
 
-    async def schedule_space(self, space_id: str, *, immediate: bool = False) -> None:
-        self._schedule_space(space_id, immediate=immediate)
+    async def schedule_space(
+        self,
+        space_id: str,
+        *,
+        immediate: bool = False,
+        lane: OutboundLane = "live",
+    ) -> None:
+        self._schedule_space(space_id, immediate=immediate, lane=lane)
 
-    def _schedule_space(self, space_id: str, *, immediate: bool) -> None:
+    def _schedule_space(
+        self,
+        space_id: str,
+        *,
+        immediate: bool,
+        lane: OutboundLane = "live",
+    ) -> None:
         self._dirty.add(space_id)
+        current_lane = self._lanes.get(space_id)
+        if current_lane is None or LANE_WEIGHTS[lane] > LANE_WEIGHTS[current_lane]:
+            self._lanes[space_id] = lane
         if immediate:
             self._immediate.add(space_id)
         task = self._tasks.get(space_id)
@@ -167,8 +191,9 @@ class SpaceDashboardManager:
                 if not immediate:
                     await asyncio.sleep(self.config.dashboard_debounce_seconds)
                 self._dirty.discard(space_id)
+                lane = self._lanes.pop(space_id, "live")
                 try:
-                    await self._flush(space_id)
+                    await self._flush(space_id, lane=lane)
                 except TelegramError as exc:
                     LOGGER.warning(
                         "event=space_dashboard_update_failed space_id=%s error_type=%s error=%s",
@@ -191,7 +216,7 @@ class SpaceDashboardManager:
             if self._tasks.get(space_id) is asyncio.current_task():
                 self._tasks.pop(space_id, None)
 
-    async def _flush(self, space_id: str) -> None:
+    async def _flush(self, space_id: str, *, lane: OutboundLane = "live") -> None:
         space = self.store.get_space(space_id)
         if not space:
             return
@@ -213,7 +238,7 @@ class SpaceDashboardManager:
             targets.append((key, channel_rendered, None))
         if space.get("discussion_chat_id") and space.get("status_message_id"):
             key = DeliveryKey(
-                DISCUSSION_ROLE,
+                self._status_bot_role(space),
                 int(space["discussion_chat_id"]),
                 int(space["status_message_id"]),
             )
@@ -233,6 +258,7 @@ class SpaceDashboardManager:
                 rendered,
                 space_id=space_id,
                 terminal=terminal,
+                lane="interactive" if terminal else lane,
                 reply_markup=reply_markup,
                 animation_frame=frame,
             )
@@ -244,6 +270,7 @@ class SpaceDashboardManager:
         *,
         space_id: str,
         terminal: bool,
+        lane: OutboundLane,
         reply_markup: InlineKeyboardMarkup | None = None,
         animation_frame: int = 0,
     ) -> None:
@@ -266,6 +293,7 @@ class SpaceDashboardManager:
                 plain=rendered.plain,
                 reply_markup=reply_markup,
                 fingerprint=fingerprint,
+                lane=lane,
                 priority=5 if terminal else 10,
                 terminal=terminal,
                 context=f"space:{space_id}",
@@ -447,12 +475,17 @@ class SpaceDashboardManager:
             {"space_id": space["space_id"], "generation": space["generation"]},
             owner.user_id if owner else 0,
             int(time.time()) + self.config.callback_seconds,
-            bot_role=DISCUSSION_ROLE,
+            bot_role=self._status_bot_role(space),
             chat_id=int(space.get("discussion_chat_id") or 0),
             space_id=str(space["space_id"]),
             generation=int(space["generation"]),
         )
         return InlineKeyboardButton(label, callback_data=f"cb:{nonce}")
+
+    @staticmethod
+    def _status_bot_role(space: dict[str, Any]) -> str:
+        role = str(space.get("status_bot_role") or DISCUSSION_ROLE)
+        return role if role in {DISCUSSION_ROLE, STATUS_ROLE} else DISCUSSION_ROLE
 
     def _status_keyboard(
         self,
@@ -483,4 +516,8 @@ class SpaceDashboardManager:
                 if space.get("lifecycle") in {"pending", "active"}:
                     state = self._state_for_space(space)
                     if self._is_animated(space, state):
-                        await self.schedule_space(str(space["space_id"]), immediate=True)
+                        await self.schedule_space(
+                            str(space["space_id"]),
+                            immediate=True,
+                            lane="maintenance",
+                        )

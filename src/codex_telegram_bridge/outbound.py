@@ -7,8 +7,8 @@ import itertools
 import logging
 import time
 from collections import deque
-from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Iterable, Mapping
+from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
 from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TelegramError
@@ -18,6 +18,7 @@ LOGGER = logging.getLogger(__name__)
 OutboundLane = Literal["urgent", "interactive", "live", "maintenance"]
 TrafficClass = Literal["callback_ack", "interactive", "media", "maintenance"]
 OperationSemantics = Literal["query", "idempotent", "non_idempotent"]
+CoalesceKey = tuple[str, int, int]
 LANE_WEIGHTS: dict[OutboundLane, int] = {
     "urgent": 4,
     "interactive": 3,
@@ -89,9 +90,13 @@ class _Job:
     chat_key: str
     semantics: OperationSemantics
     due_at: float
+    enqueued_at: float
+    coalesce_key: CoalesceKey | None = None
     attempts: int = 0
     intent_id: str | None = None
     generation: int = 0
+    transport_started: bool = False
+    superseded: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 def lane_for_priority(priority: int) -> OutboundLane:
@@ -165,7 +170,14 @@ class OutboundMessenger:
         self._active_jobs: dict[asyncio.Task[Any], _Job] = {}
         self._active_keys: set[tuple[int, str]] = set()
         self._metrics: dict[TrafficClass, dict[str, int]] = {
-            traffic_class: {"completed": 0, "failed": 0, "uncertain": 0, "retries": 0}
+            traffic_class: {
+                "completed": 0,
+                "failed": 0,
+                "uncertain": 0,
+                "retries": 0,
+                "coalesced": 0,
+                "superseded": 0,
+            }
             for traffic_class in TRAFFIC_CLASS_CONCURRENCY
         }
         self._consecutive_transport_failures = 0
@@ -229,19 +241,27 @@ class OutboundMessenger:
         traffic_class: TrafficClass | None = None,
         chat_key: str | int | None = None,
         semantics: OperationSemantics = "idempotent",
+        coalesce_key: CoalesceKey | None = None,
         audit: Mapping[str, Any] | None = None,
     ) -> Any:
         if not self._task or self._task.done() or self._stopping:
             raise RuntimeError("Telegram outbound scheduler is not running")
-        if sum(len(queue) for queue in self._queues.values()) >= self.max_queue_size:
+        selected_lane = lane or lane_for_priority(priority)
+        selected_traffic_class = traffic_class or _LEGACY_TRAFFIC_CLASSES[selected_lane]
+        selected_coalesce_key = coalesce_key if semantics == "idempotent" else None
+        queued_count = sum(len(queue) for queue in self._queues.values())
+        replaceable_count = self._queued_coalesce_count(selected_coalesce_key)
+        if queued_count - replaceable_count >= self.max_queue_size:
             raise RuntimeError(
                 f"Telegram outbound queue reached its {self.max_queue_size}-item limit"
             )
-        selected_lane = lane or lane_for_priority(priority)
-        selected_traffic_class = traffic_class or _LEGACY_TRAFFIC_CLASSES[selected_lane]
+        superseded = self._supersede_waiting_edits(selected_coalesce_key)
+        if superseded:
+            self._metrics[selected_traffic_class]["coalesced"] += 1
         future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
         sequence = next(self._counter)
         selected_chat_key = str(chat_key) if chat_key is not None else f"job:{sequence}"
+        enqueued_at = time.monotonic()
         intent_id: str | None = None
         if semantics == "non_idempotent" and self.journal is not None:
             metadata = dict(audit or {})
@@ -261,7 +281,9 @@ class OutboundMessenger:
                 traffic_class=selected_traffic_class,
                 chat_key=selected_chat_key,
                 semantics=semantics,
-                due_at=time.monotonic(),
+                due_at=enqueued_at,
+                enqueued_at=enqueued_at,
+                coalesce_key=selected_coalesce_key,
                 intent_id=intent_id,
             )
         )
@@ -269,12 +291,16 @@ class OutboundMessenger:
         return await future
 
     def snapshot(self) -> dict[str, Any]:
+        now = time.monotonic()
         active_counts = {traffic_class: 0 for traffic_class in TRAFFIC_CLASS_CONCURRENCY}
         for job in self._active_jobs.values():
             active_counts[job.traffic_class] += 1
         traffic_classes = {
             traffic_class: {
                 "queued": len(self._queues[traffic_class]),
+                "oldest_queued_seconds": self._oldest_queued_seconds(
+                    self._queues[traffic_class], now=now
+                ),
                 "active": active_counts[traffic_class],
                 "concurrency": concurrency,
                 **self._metrics[traffic_class],
@@ -290,9 +316,61 @@ class OutboundMessenger:
             "traffic_classes": traffic_classes,
             "active": bool(self._active_jobs),
             "queue_capacity": self.max_queue_size,
+            "coalesced": sum(values["coalesced"] for values in self._metrics.values()),
+            "superseded": sum(values["superseded"] for values in self._metrics.values()),
+            "oldest_queued_seconds": self._oldest_queued_seconds(
+                (job for queue in self._queues.values() for job in queue),
+                now=now,
+            ),
             "consecutive_transport_failures": self._consecutive_transport_failures,
             "transport_recycles": self._recycle_count,
         }
+
+    def _supersede_waiting_edits(self, coalesce_key: CoalesceKey | None) -> int:
+        if coalesce_key is None:
+            return 0
+        superseded = 0
+        seen: set[int] = set()
+        for queue in self._queues.values():
+            for job in tuple(queue):
+                if job.coalesce_key != coalesce_key:
+                    continue
+                queue.remove(job)
+                seen.add(id(job))
+                superseded += int(self._cancel_superseded(job))
+        for job in tuple(self._active_jobs.values()):
+            if id(job) in seen or job.coalesce_key != coalesce_key:
+                continue
+            superseded += int(self._cancel_superseded(job))
+        if superseded:
+            self._wake.set()
+        return superseded
+
+    def _queued_coalesce_count(self, coalesce_key: CoalesceKey | None) -> int:
+        if coalesce_key is None:
+            return 0
+        return sum(
+            job.coalesce_key == coalesce_key and not job.future.done()
+            for queue in self._queues.values()
+            for job in queue
+        )
+
+    def _cancel_superseded(self, job: _Job) -> bool:
+        if job.transport_started or job.future.done():
+            return False
+        job.superseded.set()
+        job.future.cancel()
+        self._metrics[job.traffic_class]["superseded"] += 1
+        return True
+
+    @staticmethod
+    def _oldest_queued_seconds(
+        jobs: Iterable[_Job],
+        *,
+        now: float,
+    ) -> float:
+        enqueued = [job.enqueued_at for job in jobs]
+        return max(0.0, now - min(enqueued)) if enqueued else 0.0
 
     async def _supervise_workers(self, generation: int) -> None:
         workers = [
@@ -425,12 +503,16 @@ class OutboundMessenger:
             async with self._interval_lock:
                 delay = self.minimum_interval - (time.monotonic() - self._last_request)
                 if delay > 0:
-                    await asyncio.sleep(delay)
+                    await self._wait_for_supersession(job, delay)
                 if self._job_is_current(job):
                     self._last_request = time.monotonic()
         job.attempts += 1
         try:
-            result = await self._run_transport_operation(job.operation)
+            job.transport_started = True
+            try:
+                result = await self._run_transport_operation(job.operation)
+            finally:
+                job.transport_started = False
         except (BadRequest, Forbidden) as exc:
             self._finish_error(job, exc)
         except RetryAfter as exc:
@@ -473,7 +555,7 @@ class OutboundMessenger:
         last_request = self._maintenance_request_at.get(job.chat_key, 0.0)
         delay = self.maintenance_chat_interval - (time.monotonic() - last_request)
         if delay > 0:
-            await asyncio.sleep(delay)
+            await self._wait_for_supersession(job, delay)
         if self._job_is_current(job):
             self._maintenance_request_at[job.chat_key] = time.monotonic()
 
@@ -500,7 +582,17 @@ class OutboundMessenger:
                     self._group_request_at[job.chat_key] = dispatched_at
                     self._save_group_request_at(chat_id, dispatched_at)
                     return
-            await asyncio.sleep(min(self.group_chat_interval, max(0.01, delay)))
+            await self._wait_for_supersession(
+                job,
+                min(self.group_chat_interval, max(0.01, delay)),
+            )
+
+    @staticmethod
+    async def _wait_for_supersession(job: _Job, delay: float) -> None:
+        if delay <= 0 or job.superseded.is_set():
+            return
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(job.superseded.wait(), timeout=delay)
 
     def _group_rate_limit_key(self, chat_id: int) -> str:
         return f"telegram-group-rate:{self.bot_role}:{chat_id}"

@@ -882,10 +882,15 @@ async def test_space_dashboard_start_has_no_periodic_animation_writes(
         RecordingEndpoint(),  # type: ignore[arg-type]
         RecordingDelivery(),  # type: ignore[arg-type]
     )
-    scheduled: list[tuple[str, bool]] = []
+    scheduled: list[tuple[str, bool, str]] = []
 
-    async def schedule(space_id: str, *, immediate: bool = False) -> None:
-        scheduled.append((space_id, immediate))
+    async def schedule(
+        space_id: str,
+        *,
+        immediate: bool = False,
+        lane: str = "live",
+    ) -> None:
+        scheduled.append((space_id, immediate, lane))
 
     monkeypatch.setattr(manager, "schedule_space", schedule)
     await manager.start()
@@ -893,8 +898,70 @@ async def test_space_dashboard_start_has_no_periodic_animation_writes(
     await manager.stop()
 
     assert set(scheduled) == {
-        ("active-space", True),
-        ("pending-space", True),
+        ("active-space", True, "maintenance"),
+        ("pending-space", True, "maintenance"),
     }
-    assert ("closed-space", True) not in scheduled
+    assert ("closed-space", True, "maintenance") not in scheduled
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_space_dashboard_routes_status_role_and_refresh_lanes(tmp_path: Path) -> None:
+    config = replace(
+        Config.default(),
+        config_dir=tmp_path / "config",
+        state_dir=tmp_path / "state",
+        allowed_root=tmp_path,
+    )
+    store = Store(config.database_path)
+    space = {
+        "space_id": "space-status-role",
+        "generation": 1,
+        "lifecycle": "active",
+        "thread_id": "thread-status-role",
+        "discussion_chat_id": -100123,
+        "status_message_id": 41,
+        "status_bot_role": "status",
+    }
+    store.get_space = lambda _space_id: dict(space)  # type: ignore[method-assign]
+    store.save_thread(ThreadState(thread_id="thread-status-role", status="active"))
+    delivery = RecordingDelivery()
+    discussion = RecordingEndpoint()
+    status = RecordingEndpoint()
+    manager = SpaceDashboardManager(
+        config,
+        store,
+        StaticSecurity(),  # type: ignore[arg-type]
+        RecordingEndpoint(),  # type: ignore[arg-type]
+        discussion,  # type: ignore[arg-type]
+        delivery,  # type: ignore[arg-type]
+        status=status,  # type: ignore[arg-type]
+    )
+
+    await manager._flush("space-status-role", lane="maintenance")
+    await asyncio.sleep(0)
+
+    assert manager.status is status
+    assert [(item.key.bot_role, item.lane) for item in delivery.intents] == [
+        ("status", "maintenance")
+    ]
+    keyboard = delivery.intents[0].reply_markup
+    assert keyboard is not None
+    callback_data = keyboard.inline_keyboard[0][0].callback_data
+    assert callback_data is not None
+    nonce = callback_data.removeprefix("cb:")
+    callback = store.peek_callback(nonce, 0, bot_role="status")
+    assert callback is not None
+    assert store.peek_callback(nonce, 0, bot_role="discussion") is None
+
+    terminal = ThreadState(
+        thread_id="thread-status-role",
+        status="idle",
+        goal={"status": "complete", "objective": "Done"},
+    )
+    store.save_thread(terminal)
+    await manager._flush("space-status-role", lane="live")
+
+    assert delivery.intents[-1].lane == "interactive"
+    assert delivery.intents[-1].terminal is True
     store.close()
