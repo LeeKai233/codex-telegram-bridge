@@ -156,7 +156,9 @@ async def test_follow_existing_thread_subscribes_before_creating_channel_post(
         "gpt-5.6-sol",
         "xhigh",
     )
-    assert control.sent[0]["markdown"].startswith("🌑 *⚙️ Normal mode*")
+    assert control.sent[0]["markdown"].startswith(
+        "🌑 *⚙️ 期望 Normal mode · TUI 模式未确认*"
+    )
     assert "*🧠 Main*  `gpt-5.6-sol` · Effort `xhigh`" in control.sent[0]["markdown"]
     store.close()
 
