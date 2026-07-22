@@ -582,31 +582,36 @@ display_identity() {
 }
 
 configure_tokens() {
-    local control_path="$CONFIG_DIR/telegram_bot_token"
+    local legacy_control_path="$CONFIG_DIR/telegram_bot_token"
+    local control_path="$CONFIG_DIR/telegram_9527_bot_token"
     local discussion_path="$CONFIG_DIR/telegram_426_bot_token"
-    local identity_json
+    local status_path="$CONFIG_DIR/telegram_69_bot_token"
+    local identity_json status_identity path
 
     CONTROL_IDENTITY="Control Bot"
     DISCUSSION_IDENTITY="Discussion Bot"
-    if [[ -L "$control_path" || -L "$discussion_path" ]]; then
-        die "refusing symbolic-link Telegram credential files"
-    fi
-    if [[ -e "$control_path" && -e "$discussion_path" ]]; then
-        validate_existing_credential "$control_path"
-        validate_existing_credential "$discussion_path"
+    for path in "$legacy_control_path" "$control_path" "$discussion_path" "$status_path"; do
+        [[ ! -L "$path" ]] || die "refusing symbolic-link Telegram credential file: $path"
+        if [[ -e "$path" ]]; then
+            validate_existing_credential "$path"
+        fi
+    done
+    if [[ -e "$control_path" && -e "$discussion_path" && -e "$status_path" && ! -e "$legacy_control_path" ]]; then
         info "Existing Telegram credential files found; preserving them."
         return
     fi
-    if [[ -e "$control_path" || -L "$control_path" || -e "$discussion_path" || -L "$discussion_path" ]]; then
-        die "only one Telegram credential file exists; resolve the partial state manually before rerunning"
+    if [[ -e "$legacy_control_path" || -e "$control_path" || -e "$discussion_path" || -e "$status_path" ]]; then
+        info "Existing Telegram credentials found; validating them and filling only missing roles."
     fi
 
-    printf '\nEnter the two different Telegram BotFather tokens. Input is hidden.\n'
-    identity_json="$(env -u TELEGRAM_GPT_BOT_TOKEN -u TELEGRAM_426_BOT_TOKEN \
-        CODEX_HOME="$CODEX_HOME_DIR" "$CODEX_TG_BIN" configure-tokens --prompt --json)"
+    printf '\nEnter any missing Telegram BotFather tokens. Input is hidden.\n'
+    identity_json="$(env -u TELEGRAM_9527_BOT_TOKEN -u TELEGRAM_GPT_BOT_TOKEN \
+        -u TELEGRAM_426_BOT_TOKEN -u TELEGRAM_69_BOT_TOKEN CODEX_HOME="$CODEX_HOME_DIR" \
+        "$CODEX_TG_BIN" configure-tokens --prompt --fill-missing --json)"
     CONTROL_IDENTITY="$(display_identity "$(json_identity "$identity_json" control)")"
     DISCUSSION_IDENTITY="$(display_identity "$(json_identity "$identity_json" forum)")"
-    info "Telegram tokens validated for $CONTROL_IDENTITY and $DISCUSSION_IDENTITY."
+    status_identity="$(display_identity "$(json_identity "$identity_json" status)")"
+    info "Telegram tokens validated for $CONTROL_IDENTITY, $DISCUSSION_IDENTITY, and $status_identity."
 }
 
 validate_existing_credential() {

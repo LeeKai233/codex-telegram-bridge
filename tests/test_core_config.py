@@ -24,7 +24,7 @@ def make_config(tmp_path: Path, **overrides: object) -> Config:
 def test_bot_token_requires_private_regular_file(tmp_path: Path) -> None:
     config = make_config(tmp_path)
     config.config_dir.mkdir()
-    token = config.config_dir / "telegram_bot_token"
+    token = config.config_dir / "telegram_9527_bot_token"
     token.write_text("123456:secret\n", encoding="utf-8")
     token.chmod(0o600)
     assert config.read_bot_token() == "123456:secret"
@@ -50,12 +50,18 @@ def test_two_bot_tokens_are_private_and_role_addressable(tmp_path: Path) -> None
     config.config_dir.mkdir()
     config.bot_token_path.write_text("123456:control-secret-value\n", encoding="utf-8")
     config.forum_bot_token_path.write_text("654321:forum-secret-value\n", encoding="utf-8")
+    config.status_bot_token_path.write_text("696969:status-secret-value\n", encoding="utf-8")
     config.bot_token_path.chmod(0o600)
     config.forum_bot_token_path.chmod(0o600)
+    config.status_bot_token_path.chmod(0o600)
 
     assert config.read_token("9527") == "123456:control-secret-value"
     assert config.read_forum_bot_token() == "654321:forum-secret-value"
     assert config.token_path("426") == config.forum_bot_token_path
+    assert config.read_token("69") == "696969:status-secret-value"
+    assert config.token_path("status") == config.status_bot_token_path
+    assert config.bot_token_path.name == "telegram_9527_bot_token"
+    assert config.legacy_bot_token_path.name == "telegram_bot_token"
     with pytest.raises(ValueError, match="Unknown Telegram bot role"):
         config.token_path("unknown")
 

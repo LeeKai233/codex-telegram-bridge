@@ -29,8 +29,16 @@ from .config import Config, ensure_private_directory, open_private_directory
 from .security import Enrollment, SecurityManager
 from .store import Store
 
+CONTROL_TOKEN_VARIABLE = "TELEGRAM_9527_BOT_TOKEN"
 TOKEN_VARIABLE = "TELEGRAM_GPT_BOT_TOKEN"
 FORUM_TOKEN_VARIABLE = "TELEGRAM_426_BOT_TOKEN"
+STATUS_TOKEN_VARIABLE = "TELEGRAM_69_BOT_TOKEN"
+TOKEN_VARIABLES = (
+    CONTROL_TOKEN_VARIABLE,
+    TOKEN_VARIABLE,
+    FORUM_TOKEN_VARIABLE,
+    STATUS_TOKEN_VARIABLE,
+)
 _ASSIGNMENT = re.compile(rf"^[ \t]*(?:export[ \t]+)?{TOKEN_VARIABLE}[ \t]*=[ \t]*(?P<value>.*)$")
 _TOKEN_SHAPE = re.compile(r"^[0-9]{6,16}:[A-Za-z0-9_-]{20,}$")
 
@@ -88,7 +96,7 @@ def _assignment_value_for(line: str, variable: str) -> str | None:
 
 def _read_bashrc_tokens(
     path: Path,
-    variables: tuple[str, ...] = (TOKEN_VARIABLE, FORUM_TOKEN_VARIABLE),
+    variables: tuple[str, ...] = TOKEN_VARIABLES,
     *,
     require_all: bool = True,
 ) -> tuple[dict[str, str], str, str, int]:
@@ -470,7 +478,7 @@ def _install_token_files(
 ) -> None:
     paths = [path for path, _token in destinations.values()]
     if len(set(paths)) != len(paths):
-        raise CliError("两个 Bot token 不能写入同一个凭据文件")
+        raise CliError("多个 Bot token 不能写入同一个凭据文件")
     targets: list[_CredentialTarget] = []
     parent_descriptors: dict[Path, int] = {}
     lock_descriptors: list[int] = []
@@ -544,8 +552,8 @@ def _install_token_files(
     except BaseException as exc:
         if isinstance(exc, _AtomicWriteCommittedError):
             raise CliError(
-                f"{exc}；Bot token 私有凭据已保留。请检查磁盘/WSL 状态，"
-                "确认 .bashrc 已清理，并运行 `codex-tg doctor --offline` 检查凭据"
+                f"{exc}；Bot token 私有凭据已保留。请检查磁盘/WSL 状态与旧凭据源，"
+                "并运行 `codex-tg doctor --offline` 检查凭据"
             ) from None
         if any(target.committed_identity is not None for target in targets):
             try:
@@ -586,17 +594,31 @@ async def _validate_telegram_token(token: str) -> str:
 async def _validate_distinct_tokens(
     control: str,
     forum: str,
+    status: str | None = None,
     *,
     validator: Callable[[str], Awaitable[str]],
 ) -> dict[str, str]:
-    if not _TOKEN_SHAPE.fullmatch(control) or not _TOKEN_SHAPE.fullmatch(forum):
+    tokens = {"control": control, "forum": forum}
+    if status is not None:
+        tokens["status"] = status
+    if any(not _TOKEN_SHAPE.fullmatch(token) for token in tokens.values()):
         raise CliError("Bot token 格式无效；未写入任何凭据")
-    if hmac.compare_digest(control, forum):
-        raise CliError("两个 Bot 必须使用不同的 token；未写入任何凭据")
-    control_identity, forum_identity = await asyncio.gather(validator(control), validator(forum))
-    if hmac.compare_digest(control_identity.casefold(), forum_identity.casefold()):
-        raise CliError("两个 token 指向同一个 Bot；未写入任何凭据")
-    return {"control": control_identity, "forum": forum_identity}
+    token_values = list(tokens.values())
+    if any(
+        hmac.compare_digest(token, other)
+        for index, token in enumerate(token_values)
+        for other in token_values[index + 1 :]
+    ):
+        raise CliError("所有 Bot 必须使用不同的 token；未写入任何凭据")
+    identity_values = await asyncio.gather(*(validator(token) for token in token_values))
+    normalized_identities = [identity.casefold() for identity in identity_values]
+    if any(
+        hmac.compare_digest(identity, other)
+        for index, identity in enumerate(normalized_identities)
+        for other in normalized_identities[index + 1 :]
+    ):
+        raise CliError("多个 token 指向同一个 Bot；未写入任何凭据")
+    return dict(zip(tokens, identity_values, strict=True))
 
 
 def _rotation_requires_owner_reset(config: Config) -> bool:
@@ -609,6 +631,128 @@ def _rotation_requires_owner_reset(config: Config) -> bool:
         store.close()
 
 
+def _token_paths(config: Config) -> dict[str, Path]:
+    return {
+        "control": config.bot_token_path,
+        "forum": config.forum_bot_token_path,
+        "status": config.status_bot_token_path,
+    }
+
+
+def _existing_token_state(
+    config: Config,
+) -> tuple[dict[str, str], dict[str, _CredentialSnapshot], _CredentialSnapshot]:
+    snapshots = {role: _credential_snapshot(path) for role, path in _token_paths(config).items()}
+    legacy = _credential_snapshot(config.legacy_bot_token_path)
+    tokens = {
+        role: snapshot.content.strip()
+        for role, snapshot in snapshots.items()
+        if snapshot.existed
+    }
+    if legacy.existed:
+        legacy_token = legacy.content.strip()
+        canonical = tokens.get("control")
+        if canonical is not None and not hmac.compare_digest(canonical, legacy_token):
+            raise CliError(
+                "旧 telegram_bot_token 与 canonical telegram_9527_bot_token 内容冲突；"
+                "未修改任何凭据，请人工确认正确的 9527 Bot token"
+            )
+        tokens.setdefault("control", legacy_token)
+    return tokens, snapshots, legacy
+
+
+def _finalize_token_sources(
+    *,
+    legacy: _CredentialSnapshot | None = None,
+    bashrc: tuple[Path, str, str, int] | None = None,
+) -> None:
+    if legacy is None or not legacy.existed:
+        if bashrc is not None:
+            path, original, cleaned, mode = bashrc
+            _atomic_write_text(path, cleaned, mode, expected=original)
+        return
+
+    parent_descriptor = open_private_directory(legacy.path.parent)
+    backup_name = f".{legacy.path.name}.migrating-{secrets.token_hex(8)}"
+    moved = False
+    try:
+        current = _credential_snapshot_at(legacy.path, parent_descriptor)
+        if current != legacy:
+            raise CliError(f"旧凭据文件在配置期间发生变化，未删除：{legacy.path}")
+        os.rename(
+            legacy.path.name,
+            backup_name,
+            src_dir_fd=parent_descriptor,
+            dst_dir_fd=parent_descriptor,
+        )
+        moved = True
+        try:
+            os.fsync(parent_descriptor)
+        except OSError:
+            os.rename(
+                backup_name,
+                legacy.path.name,
+                src_dir_fd=parent_descriptor,
+                dst_dir_fd=parent_descriptor,
+            )
+            moved = False
+            with contextlib.suppress(OSError):
+                os.fsync(parent_descriptor)
+            raise CliError(f"无法持久化旧凭据迁移：{legacy.path}") from None
+
+        try:
+            if bashrc is not None:
+                path, original, cleaned, mode = bashrc
+                _atomic_write_text(path, cleaned, mode, expected=original)
+        except BaseException:
+            try:
+                os.rename(
+                    backup_name,
+                    legacy.path.name,
+                    src_dir_fd=parent_descriptor,
+                    dst_dir_fd=parent_descriptor,
+                )
+                moved = False
+                os.fsync(parent_descriptor)
+            except OSError:
+                raise CliError("旧凭据迁移失败且源文件恢复失败；请立即检查凭据目录") from None
+            raise
+
+        try:
+            os.unlink(backup_name, dir_fd=parent_descriptor)
+            moved = False
+        except OSError:
+            try:
+                os.rename(
+                    backup_name,
+                    legacy.path.name,
+                    src_dir_fd=parent_descriptor,
+                    dst_dir_fd=parent_descriptor,
+                )
+                moved = False
+                os.fsync(parent_descriptor)
+            except OSError:
+                raise CliError("旧凭据迁移失败且源文件恢复失败；请立即检查凭据目录") from None
+            raise CliError(f"无法删除已迁移的旧凭据文件：{legacy.path}") from None
+        try:
+            os.fsync(parent_descriptor)
+        except OSError:
+            raise _AtomicWriteCommittedError(
+                f"旧凭据已迁移，但无法 fsync 目录 {legacy.path.parent}"
+            ) from None
+    finally:
+        if moved:
+            with contextlib.suppress(OSError):
+                os.rename(
+                    backup_name,
+                    legacy.path.name,
+                    src_dir_fd=parent_descriptor,
+                    dst_dir_fd=parent_descriptor,
+                )
+                os.fsync(parent_descriptor)
+        os.close(parent_descriptor)
+
+
 async def migrate_bashrc_token(
     config: Config,
     bashrc: Path,
@@ -617,8 +761,9 @@ async def migrate_bashrc_token(
 ) -> str:
     token, original, cleaned, bashrc_mode = _read_bashrc_token(bashrc)
     identity = await validator(token)
-    snapshot = _credential_snapshot(config.bot_token_path)
-    changed = not snapshot.existed or not hmac.compare_digest(snapshot.content.strip(), token)
+    existing, _snapshots, legacy = _existing_token_state(config)
+    current = existing.get("control")
+    changed = current is None or not hmac.compare_digest(current, token)
     if changed and _rotation_requires_owner_reset(config):
         raise CliError(
             "检测到 Bot token 变更，但仍存在 Telegram 授权状态；"
@@ -627,7 +772,10 @@ async def migrate_bashrc_token(
     _install_token_files(
         {"control": (config.bot_token_path, token)},
         force=True,
-        finalize=lambda: _atomic_write_text(bashrc, cleaned, bashrc_mode, expected=original),
+        finalize=lambda: _finalize_token_sources(
+            legacy=legacy,
+            bashrc=(bashrc, original, cleaned, bashrc_mode),
+        ),
     )
     return identity
 
@@ -639,24 +787,41 @@ async def migrate_bashrc_tokens(
     validator: Callable[[str], Awaitable[str]] = _validate_telegram_token,
 ) -> dict[str, str]:
     tokens, original, cleaned, bashrc_mode = _read_bashrc_tokens(bashrc, require_all=False)
-    try:
-        control = tokens.get(TOKEN_VARIABLE) or config.read_token("control")
-        forum = tokens.get(FORUM_TOKEN_VARIABLE) or config.read_token("forum")
-    except RuntimeError as exc:
+    shell_control = tokens.get(CONTROL_TOKEN_VARIABLE)
+    legacy_shell_control = tokens.get(TOKEN_VARIABLE)
+    if (
+        shell_control is not None
+        and legacy_shell_control is not None
+        and not hmac.compare_digest(shell_control, legacy_shell_control)
+    ):
         raise CliError(
-            "两个 Bot token 必须分别存在于 .bashrc 直接赋值或私有凭据文件中"
-        ) from exc
-    identities = await _validate_distinct_tokens(control, forum, validator=validator)
+            f"{CONTROL_TOKEN_VARIABLE} 与旧 {TOKEN_VARIABLE} 内容冲突；未修改任何凭据"
+        )
+    existing, _snapshots, legacy = _existing_token_state(config)
+    values = {
+        "control": shell_control or legacy_shell_control or existing.get("control"),
+        "forum": tokens.get(FORUM_TOKEN_VARIABLE) or existing.get("forum"),
+        "status": tokens.get(STATUS_TOKEN_VARIABLE) or existing.get("status"),
+    }
+    missing = [role for role, value in values.items() if value is None]
+    if missing:
+        raise CliError(
+            "三个 Bot token 必须分别存在于 .bashrc 直接赋值或私有凭据文件中；"
+            f"缺少角色：{', '.join(missing)}"
+        )
+    control = str(values["control"])
+    forum = str(values["forum"])
+    status = str(values["status"])
+    identities = await _validate_distinct_tokens(control, forum, status, validator=validator)
 
     destinations = {
         "control": (config.bot_token_path, control),
         "forum": (config.forum_bot_token_path, forum),
+        "status": (config.status_bot_token_path, status),
     }
-    snapshots = [_credential_snapshot(path) for path, _token in destinations.values()]
     changed = any(
-        not snapshot.existed
-        or not hmac.compare_digest(snapshot.content.strip(), token)
-        for snapshot, token in zip(snapshots, (control, forum), strict=True)
+        role not in existing or not hmac.compare_digest(existing[role], token)
+        for role, token in (("control", control), ("forum", forum), ("status", status))
     )
     if changed and _rotation_requires_owner_reset(config):
         raise CliError(
@@ -666,7 +831,10 @@ async def migrate_bashrc_tokens(
     _install_token_files(
         destinations,
         force=True,
-        finalize=lambda: _atomic_write_text(bashrc, cleaned, bashrc_mode, expected=original),
+        finalize=lambda: _finalize_token_sources(
+            legacy=legacy,
+            bashrc=(bashrc, original, cleaned, bashrc_mode),
+        ),
     )
     return identities
 
@@ -675,35 +843,42 @@ async def configure_prompt_tokens(
     config: Config,
     *,
     force: bool = False,
+    fill_missing: bool = False,
     token_reader: Callable[[str], str] = getpass.getpass,
     validator: Callable[[str], Awaitable[str]] = _validate_telegram_token,
 ) -> dict[str, str]:
+    if force and fill_missing:
+        raise CliError("--force 与 --fill-missing 不能同时使用")
     try:
         ensure_private_directory(config.config_dir)
-        snapshots = [
-            _credential_snapshot(config.bot_token_path),
-            _credential_snapshot(config.forum_bot_token_path),
-        ]
-    except RuntimeError as exc:
+        existing, snapshots, legacy = _existing_token_state(config)
+    except (CliError, RuntimeError) as exc:
         raise CliError(f"无法安全准备 Telegram 凭据目录：{exc}") from None
-    if not force and any(snapshot.existed for snapshot in snapshots):
-        raise CliError("Bot token 凭据已存在；确认替换时请添加 --force")
+    if not force and not fill_missing and (existing or legacy.existed):
+        raise CliError("Bot token 凭据已存在；补齐升级请添加 --fill-missing，确认替换请添加 --force")
+
+    values = dict(existing) if fill_missing else {}
+    labels = {
+        "control": config.control_bot_label,
+        "forum": config.discussion_bot_label,
+        "status": "Status Bot",
+    }
     try:
-        control = token_reader(
-            f"输入 {config.control_bot_label} token（输入内容不会显示）："
-        ).strip()
-        forum = token_reader(
-            f"输入 {config.discussion_bot_label} token（输入内容不会显示）："
-        ).strip()
+        for role in ("control", "forum", "status"):
+            if role not in values:
+                values[role] = token_reader(
+                    f"输入 {labels[role]} token（输入内容不会显示）："
+                ).strip()
     except (EOFError, OSError):
         raise CliError("无法从终端安全读取 Bot token") from None
 
-    identities = await _validate_distinct_tokens(control, forum, validator=validator)
-    entered = (control, forum)
+    control = values["control"]
+    forum = values["forum"]
+    status = values["status"]
+    identities = await _validate_distinct_tokens(control, forum, status, validator=validator)
     changed = any(
-        not snapshot.existed
-        or not hmac.compare_digest(snapshot.content.strip(), token)
-        for snapshot, token in zip(snapshots, entered, strict=True)
+        role not in existing or not hmac.compare_digest(existing[role], token)
+        for role, token in (("control", control), ("forum", forum), ("status", status))
     )
     if force and changed and _rotation_requires_owner_reset(config):
         raise CliError(
@@ -711,13 +886,26 @@ async def configure_prompt_tokens(
             "请先运行 `codex-tg owner-reset`，再重新执行 token 配置，随后运行 "
             "`systemctl --user restart codex-telegram-bridge` 和 `codex-tg onboard`"
         )
-    _install_token_files(
+    paths = _token_paths(config)
+    destinations = (
         {
-            "control": (config.bot_token_path, control),
-            "forum": (config.forum_bot_token_path, forum),
-        },
-        force=force,
+            role: (paths[role], values[role])
+            for role, snapshot in snapshots.items()
+            if not snapshot.existed
+        }
+        if fill_missing
+        else {role: (paths[role], values[role]) for role in paths}
     )
+    if legacy.existed:
+        destinations["control"] = (paths["control"], control)
+    if destinations:
+        _install_token_files(
+            destinations,
+            force=force or legacy.existed,
+            finalize=(
+                (lambda: _finalize_token_sources(legacy=legacy)) if legacy.existed else None
+            ),
+        )
     return identities
 
 
@@ -782,7 +970,7 @@ def _bashrc_token_variables(path: Path) -> set[str]:
         return set()
     found: set[str] = set()
     for line in path.read_text(encoding="utf-8").splitlines():
-        for variable in (TOKEN_VARIABLE, FORUM_TOKEN_VARIABLE):
+        for variable in TOKEN_VARIABLES:
             assignment = re.compile(
                 rf"^[ \t]*(?:export[ \t]+)?{re.escape(variable)}[ \t]*="
             )
@@ -851,7 +1039,7 @@ async def _doctor(config: Config, *, offline: bool, output: TextIO) -> int:
     report("OK", f"Python {sys.version_info.major}.{sys.version_info.minor}")
 
     identities: dict[str, str] = {}
-    for role, path in (("control", config.bot_token_path), ("forum", config.forum_bot_token_path)):
+    for role, path in _token_paths(config).items():
         if _mode_is_private(path):
             report("OK", f"Telegram {role} token 文件存在且权限为私有")
             if not offline:
@@ -863,17 +1051,28 @@ async def _doctor(config: Config, *, offline: bool, output: TextIO) -> int:
                     report("OK", f"Telegram {role} getMe 验证成功")
         else:
             report("FAIL", f"Telegram {role} token 缺失、不是普通文件或权限过宽：{path}")
-    if not offline and len(identities) == 2 and identities["control"] == identities["forum"]:
-        report("FAIL", "control 与 forum token 指向同一个 Bot")
+    if not offline and len(identities) == 3:
+        normalized = {identity.casefold() for identity in identities.values()}
+        if len(normalized) != 3:
+            report("FAIL", "control、forum 与 status token 必须指向三个不同的 Bot")
+
+    if os.path.lexists(config.legacy_bot_token_path):
+        report(
+            "FAIL",
+            "仍存在旧 telegram_bot_token；请运行 "
+            "`codex-tg configure-tokens --prompt --fill-missing` 完成一次性迁移",
+        )
+    else:
+        report("OK", "旧 telegram_bot_token 已迁移或不存在")
 
     bashrc_variables = _bashrc_token_variables(Path.home() / ".bashrc")
     if bashrc_variables:
         report("FAIL", f"~/.bashrc 仍包含 Bot token 明文赋值：{', '.join(sorted(bashrc_variables))}")
     else:
-        report("OK", "~/.bashrc 中没有两个 Bot token 的明文赋值")
+        report("OK", "~/.bashrc 中没有 Bot token 的明文赋值")
 
     environment_tokens = [
-        variable for variable in (TOKEN_VARIABLE, FORUM_TOKEN_VARIABLE) if os.environ.get(variable)
+        variable for variable in TOKEN_VARIABLES if os.environ.get(variable)
     ]
     if environment_tokens:
         report(
@@ -1109,12 +1308,16 @@ def _status(config: Config, output: TextIO, *, as_json: bool = False) -> int:
     forum_token_status = (
         "configured/private" if _mode_is_private(config.forum_bot_token_path) else "missing/insecure"
     )
+    status_token_status = (
+        "configured/private" if _mode_is_private(config.status_bot_token_path) else "missing/insecure"
+    )
     totp_status = "configured" if _mode_is_private(config.totp_secret_path) else "missing/insecure"
     socket_status = "ready" if _socket_is_private(config.codex_socket) else "unavailable/insecure"
     payload = {
         "credentials": {
             "control_token": control_token_status,
             "forum_token": forum_token_status,
+            "status_token": status_token_status,
             "totp": totp_status,
         },
         "owner": {"paired": owner_paired},
@@ -1146,6 +1349,7 @@ def _status(config: Config, output: TextIO, *, as_json: bool = False) -> int:
         return 0
     output.write(f"control token: {control_token_status}\n")
     output.write(f"forum token: {forum_token_status}\n")
+    output.write(f"status token: {status_token_status}\n")
     output.write(f"owner: {'paired' if owner_paired else 'unpaired'}\n")
     output.write(f"channel binding: {'ready' if not _binding_issues(binding) else 'missing/invalid'}\n")
     output.write(f"totp: {totp_status}\n")
@@ -1194,12 +1398,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     configure_all = commands.add_parser(
         "configure-tokens",
-        help="交互录入或从 .bashrc 安全迁移两个 Bot token",
+        help="交互录入或从 .bashrc 安全迁移三个 Bot token",
     )
     configure_all.add_argument("--bashrc", type=Path, default=Path.home() / ".bashrc")
-    configure_all.add_argument("--prompt", action="store_true", help="从隐藏终端提示录入两个 token")
+    configure_all.add_argument("--prompt", action="store_true", help="从隐藏终端提示录入 token")
     configure_all.add_argument("--json", action="store_true", help="只输出验证后的 Bot 身份 JSON")
-    configure_all.add_argument("--force", action="store_true", help="允许 --prompt 替换已有凭据")
+    replace_mode = configure_all.add_mutually_exclusive_group()
+    replace_mode.add_argument("--force", action="store_true", help="允许 --prompt 替换已有凭据")
+    replace_mode.add_argument(
+        "--fill-missing",
+        action="store_true",
+        help="验证全部身份，只提示并写入缺失凭据，同时迁移旧 control 文件",
+    )
 
     commands.add_parser("pair-code", help="生成一次性 owner 配对码")
     commands.add_parser("bind-code", help="生成一次性频道/讨论组绑定码")
@@ -1228,8 +1438,16 @@ def run(args: argparse.Namespace, *, output: TextIO = sys.stdout) -> int:
         output.write(f"Bot @{identity} 验证成功；token 已迁移到私有凭据文件并从 .bashrc 删除。\n")
         return 0
     if args.command == "configure-tokens":
+        if args.fill_missing and not args.prompt:
+            raise CliError("--fill-missing 必须与 --prompt 一起使用")
         if args.prompt:
-            identities = asyncio.run(configure_prompt_tokens(config, force=args.force))
+            identities = asyncio.run(
+                configure_prompt_tokens(
+                    config,
+                    force=args.force,
+                    fill_missing=args.fill_missing,
+                )
+            )
         else:
             identities = asyncio.run(migrate_bashrc_tokens(config, args.bashrc.expanduser()))
         if args.json:
@@ -1237,8 +1455,9 @@ def run(args: argparse.Namespace, *, output: TextIO = sys.stdout) -> int:
         elif args.prompt:
             output.write(
                 f"{config.control_bot_label} @{identities['control']} 与 "
-                f"{config.discussion_bot_label} @{identities['forum']} 验证成功；"
-                "两个 token 已保存到私有凭据文件。\n"
+                f"{config.discussion_bot_label} @{identities['forum']}、"
+                f"Status Bot @{identities['status']} 验证成功；"
+                "三个 token 已保存到私有凭据文件。\n"
             )
             if args.force:
                 output.write(
@@ -1248,8 +1467,9 @@ def run(args: argparse.Namespace, *, output: TextIO = sys.stdout) -> int:
         else:
             output.write(
                 f"{config.control_bot_label} @{identities['control']} 与 "
-                f"{config.discussion_bot_label} @{identities['forum']} 验证成功；"
-                "两个 token 已迁移到私有凭据文件并从 .bashrc 删除。\n"
+                f"{config.discussion_bot_label} @{identities['forum']}、"
+                f"Status Bot @{identities['status']} 验证成功；"
+                "三个 token 已迁移到私有凭据文件并从 .bashrc 删除。\n"
             )
         return 0
     if args.command == "onboard":

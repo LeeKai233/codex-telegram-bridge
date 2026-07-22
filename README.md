@@ -1,7 +1,7 @@
 # Codex Telegram Bridge
 
 Codex Telegram Bridge connects Codex sessions running in WSL2 to a private Telegram channel and
-its linked discussion group. It uses two Telegram Bots and outbound long polling, so it does not
+its linked discussion group. It uses three Telegram Bots and outbound long polling, so it does not
 open a public webhook or network port.
 
 ```text
@@ -9,6 +9,7 @@ Control Bot private chat
   -> session post in your private channel
   -> Telegram's Leave a comment link
   -> fixed thread in the linked private discussion group
+  -> Status Bot maintains the live session dashboard
   -> Discussion Bot forwards messages to the matching Codex session
 ```
 
@@ -34,7 +35,7 @@ The v0.2.8 installer intentionally has a narrow host contract:
 - A normal non-root user with `sudo` access.
 - A real interactive terminal.
 - tmux. The installer adds it with apt when it is missing.
-- Two different Telegram Bots, one private channel, and one linked private supergroup.
+- Three different Telegram Bots, one private channel, and one linked private supergroup.
 
 WSL1, Linux without systemd, Docker, macOS, native Windows, and system-wide/root installs are not
 supported by this installer.
@@ -43,13 +44,14 @@ supported by this installer.
 
 Before installing:
 
-1. Create two Bots with [BotFather](https://t.me/BotFather) and keep both tokens ready.
+1. Create three Bots with [BotFather](https://t.me/BotFather) and keep all three tokens ready.
 2. Create a private channel and a private supergroup.
 3. Link the supergroup as the channel's discussion group.
 4. Disable Forum Topics in the discussion group.
 5. Add the Control Bot to the channel with only the permissions needed to post and edit messages.
 6. Add the Discussion Bot to the discussion group with at least permission to delete messages.
-7. Disable anonymous-admin mode for the Telegram account that will own the Bridge.
+7. Add the Status Bot to the discussion group so it can send and edit its own status messages.
+8. Disable anonymous-admin mode for the Telegram account that will own the Bridge.
 
 The `/bind` flow checks the linkage, Bot roles, and required permissions. It warns when a Bot has
 unnecessary administrator privileges.
@@ -59,7 +61,7 @@ unnecessary administrator privileges.
 Run the version-pinned installer from a WSL terminal:
 
 ```bash
-bash -c 'set -Eeuo pipefail; url="https://github.com/LeeKai233/codex-telegram-bridge/releases/download/v0.2.8/install.sh"; sha256="606b9d72c37440f744e3b9271647a67d46ef3a864a76582659269b7e9f66389d"; installer="$(mktemp)"; cleanup() { rm -f -- "$installer"; }; trap cleanup EXIT; curl --proto "=https" --tlsv1.2 -fsSL --retry 3 --retry-all-errors -o "$installer" "$url"; printf "%s  %s\n" "$sha256" "$installer" | sha256sum -c -; bash "$installer"'
+bash -c 'set -Eeuo pipefail; url="https://github.com/LeeKai233/codex-telegram-bridge/releases/download/v0.2.8/install.sh"; sha256="e3d29d711eebc0b9de355a4a2e82d5cb3c7165b4665d49d392f4196704d48d08"; installer="$(mktemp)"; cleanup() { rm -f -- "$installer"; }; trap cleanup EXIT; curl --proto "=https" --tlsv1.2 -fsSL --retry 3 --retry-all-errors -o "$installer" "$url"; printf "%s  %s\n" "$sha256" "$installer" | sha256sum -c -; bash "$installer"'
 ```
 
 The installer:
@@ -72,9 +74,10 @@ The installer:
 5. Installs the latest official standalone Codex release into `~/.local/bin` and verifies the
    required `app-server --listen unix://` and `--remote unix://` capabilities.
 6. Pauses while you configure and authenticate Codex in another WSL terminal.
-7. Reads both Bot tokens with hidden terminal prompts, validates them with Telegram `getMe`, and
+7. Reads all three Bot tokens with hidden terminal prompts, validates them with Telegram `getMe`, and
    stores them in private `0600` files. Tokens are never command-line arguments or installer logs.
-8. Lets you choose user-facing names for the two Bots, defaulting to their Telegram usernames.
+8. Lets you choose user-facing names for the Control and Discussion Bots, defaulting to their
+   Telegram usernames.
 9. Installs and starts two systemd user services, then guides TOTP, `/pair`, and `/bind` onboarding.
 
 The installer enables user lingering so both services return after WSL/systemd restarts. It does
@@ -106,9 +109,12 @@ stops. The Bridge service is never allowed to overwrite an unowned service with 
 Re-running the installer updates the installed tools and installer-owned units, but refuses to
 downgrade units written by a newer installer and preserves
 existing `config.toml`, Bot tokens, TOTP secret, SQLite state, proxy file, custom Bot names, and
-Telegram bindings. A partial credential state with only one token file is rejected for manual
-review instead of overwriting the remaining credential. If both credentials exist but
-`config.toml` does not, the recovered configuration prompts with the generic `Control Bot` and
+Telegram bindings. Missing Bot roles are added with `configure-tokens --prompt --fill-missing`;
+existing credentials are validated but never replaced. The legacy `telegram_bot_token` is migrated
+once to `telegram_9527_bot_token` only after all three Bot identities validate, while
+`telegram_426_bot_token` is preserved and `telegram_69_bot_token` is added for the Status Bot. If
+the canonical credentials exist but `config.toml` does not, the recovered configuration prompts
+with the generic `Control Bot` and
 `Discussion Bot` label defaults because it does not replace the credentials just to rediscover
 their usernames.
 
@@ -118,7 +124,7 @@ may customize labels and behavior, but overrides for `config_dir`, `state_dir`, 
 `codex_socket`, or `codex_binary` must match those standard paths. Unsupported path overrides are
 rejected before Bot tokens are requested.
 
-To rotate either Bot token after pairing, revoke the old Telegram authority first:
+To rotate any Bot token after pairing, revoke the old Telegram authority first:
 
 ```bash
 codex-tg owner-reset
@@ -286,17 +292,18 @@ mode `0700`; tokens, TOTP, and SQLite files use mode `0600`. Database schema upg
 online SQLite backup first.
 
 Credential writes use a private transaction lock, descriptor-relative atomic commits, inode/content
-verification, and rollback. Two concurrent first-time configurations cannot mix or overwrite each
-other's Bot tokens.
+verification, and rollback. Concurrent first-time configurations cannot mix or overwrite each
+other's three Bot tokens.
 
 `allowed_root` limits Bridge file and working-directory operations. It is not a confidentiality
 sandbox for Codex itself.
 
 ## Security model
 
-- Both Bots use outbound Telegram HTTPS long polling; there is no webhook listener.
+- All three Bots use outbound Telegram HTTPS long polling; there is no webhook listener.
 - The Control Bot accepts one private-chat owner. The Discussion Bot accepts that owner only in the
   validated private discussion group and mapped channel comment threads.
+- The Status Bot owns live dashboard messages and does not accept the prompt/control command surface.
 - TOTP leases are per session and process-local; a restart locks all session writes again.
 - Sensitive Codex questions are not forwarded to Telegram. Command execution approvals for
   non-full-access workspace turns are forwarded to the owner in the Session discussion and can

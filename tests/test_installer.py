@@ -537,7 +537,8 @@ configure_tokens
     )
 
     assert result.returncode == 1
-    assert "only one Telegram credential file exists" in result.stderr
+    assert "validating them and filling only missing roles" in result.stdout
+    assert "only one Telegram credential file exists" not in result.stderr
 
 
 def test_external_private_socket_can_be_reused_explicitly(tmp_path: Path) -> None:
@@ -585,12 +586,14 @@ def test_token_command_argv_environment_and_output_do_not_contain_secrets(tmp_pa
         "#!/bin/sh\n"
         "printf 'argv=%s\\n' \"$*\" >\"$CAPTURE\"\n"
         "env | sort >>\"$CAPTURE\"\n"
-        "printf '{\"control\":\"control_bot\",\"forum\":\"forum_bot\"}\\n'\n",
+        "printf '{\"control\":\"control_bot\",\"forum\":\"forum_bot\","
+        "\"status\":\"status_bot\"}\\n'\n",
         encoding="utf-8",
     )
     fake_cli.chmod(0o700)
     control_secret = "123456789:CONTROL_SECRET_VALUE"
     forum_secret = "987654321:FORUM_SECRET_VALUE"
+    status_secret = "696969696:STATUS_SECRET_VALUE"
     result = run_installer_shell(
         tmp_path,
         """
@@ -605,6 +608,7 @@ configure_tokens
             "FAKE_CLI": str(fake_cli),
             "TELEGRAM_GPT_BOT_TOKEN": control_secret,
             "TELEGRAM_426_BOT_TOKEN": forum_secret,
+            "TELEGRAM_69_BOT_TOKEN": status_secret,
         },
     )
 
@@ -613,5 +617,6 @@ configure_tokens
     assert result.returncode == 0, result.stderr
     assert control_secret not in combined
     assert forum_secret not in combined
-    assert "configure-tokens --prompt --json" in captured
+    assert status_secret not in combined
+    assert "configure-tokens --prompt --fill-missing --json" in captured
     assert stat.S_IMODE(fake_cli.stat().st_mode) == 0o700

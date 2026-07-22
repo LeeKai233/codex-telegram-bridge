@@ -31,8 +31,18 @@ from codex_telegram_bridge.store import SCHEMA_VERSION, Store
 
 TOKEN = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcd1234"
 FORUM_TOKEN = "987654321:ZYXWVUTSRQPONMLKJIHGFEDCBA_1234567"
+STATUS_TOKEN = "696969696:ABCDEFGHIJKLMNOPQRSTUVWXYZ_status_bot_"
 NEW_TOKEN = "333333333:ABCDEFGHIJKLMNOPQRSTUVWXYZ_new_control"
 NEW_FORUM_TOKEN = "444444444:ABCDEFGHIJKLMNOPQRSTUVWXYZ_new_forum__"
+NEW_STATUS_TOKEN = "555555555:ABCDEFGHIJKLMNOPQRSTUVWXYZ_new_status_"
+
+
+def token_identity(value: str) -> str:
+    return {
+        TOKEN: "control_bot",
+        FORUM_TOKEN: "forum_bot",
+        STATUS_TOKEN: "status_bot",
+    }.get(value, f"bot_{value.partition(':')[0]}")
 
 
 def make_config(root: Path) -> Config:
@@ -214,6 +224,7 @@ async def test_bashrc_directory_fsync_failure_keeps_committed_credentials(
     original = (
         f"export TELEGRAM_GPT_BOT_TOKEN={TOKEN}\n"
         f"export TELEGRAM_426_BOT_TOKEN={FORUM_TOKEN}\n"
+        f"export TELEGRAM_69_BOT_TOKEN={STATUS_TOKEN}\n"
         "export EDITOR=vim\n"
     )
     bashrc.write_text(original, encoding="utf-8")
@@ -227,7 +238,7 @@ async def test_bashrc_directory_fsync_failure_keeps_committed_credentials(
     )
 
     async def validator(value: str) -> str:
-        return "control_bot" if value == TOKEN else "forum_bot"
+        return token_identity(value)
 
     with pytest.raises(CliError, match="凭据已保留") as captured:
         await migrate_bashrc_tokens(config, bashrc, validator=validator)
@@ -236,6 +247,7 @@ async def test_bashrc_directory_fsync_failure_keeps_committed_credentials(
     assert "codex-tg doctor --offline" in str(captured.value)
     assert config.read_token("control") == TOKEN
     assert config.read_token("forum") == FORUM_TOKEN
+    assert config.read_token("status") == STATUS_TOKEN
     assert bashrc.read_text(encoding="utf-8") == "export EDITOR=vim\n"
     assert stat.S_IMODE(bashrc.stat().st_mode) == 0o640
     assert TOKEN not in str(captured.value)
@@ -250,21 +262,28 @@ async def test_configure_tokens_reuses_private_control_and_migrates_forum(tmp_pa
     config.bot_token_path.chmod(0o600)
     bashrc = tmp_path / ".bashrc"
     bashrc.write_text(
-        f"export TELEGRAM_426_BOT_TOKEN='{FORUM_TOKEN}'\nexport EDITOR=vim\n",
+        f"export TELEGRAM_426_BOT_TOKEN='{FORUM_TOKEN}'\n"
+        f"export TELEGRAM_69_BOT_TOKEN='{STATUS_TOKEN}'\n"
+        "export EDITOR=vim\n",
         encoding="utf-8",
     )
     validated: list[str] = []
 
     async def validator(value: str) -> str:
         validated.append(value)
-        return "control_bot" if value == TOKEN else "forum_bot"
+        return token_identity(value)
 
     identities = await migrate_bashrc_tokens(config, bashrc, validator=validator)
 
-    assert set(validated) == {TOKEN, FORUM_TOKEN}
-    assert identities == {"control": "control_bot", "forum": "forum_bot"}
+    assert set(validated) == {TOKEN, FORUM_TOKEN, STATUS_TOKEN}
+    assert identities == {
+        "control": "control_bot",
+        "forum": "forum_bot",
+        "status": "status_bot",
+    }
     assert config.read_token("control") == TOKEN
     assert config.read_token("forum") == FORUM_TOKEN
+    assert config.read_token("status") == STATUS_TOKEN
     assert bashrc.read_text(encoding="utf-8") == "export EDITOR=vim\n"
 
 
@@ -273,7 +292,9 @@ async def test_configure_tokens_rejects_one_token_for_both_bots(tmp_path: Path) 
     config = make_config(tmp_path)
     bashrc = tmp_path / ".bashrc"
     bashrc.write_text(
-        f"TELEGRAM_GPT_BOT_TOKEN={TOKEN}\nTELEGRAM_426_BOT_TOKEN={TOKEN}\n",
+        f"TELEGRAM_GPT_BOT_TOKEN={TOKEN}\n"
+        f"TELEGRAM_426_BOT_TOKEN={TOKEN}\n"
+        f"TELEGRAM_69_BOT_TOKEN={STATUS_TOKEN}\n",
         encoding="utf-8",
     )
     with pytest.raises(CliError, match="不同的 token"):
@@ -288,8 +309,10 @@ async def test_bashrc_migration_cannot_bypass_token_rotation_reset(tmp_path: Pat
     config.config_dir.mkdir()
     config.bot_token_path.write_text(TOKEN + "\n", encoding="utf-8")
     config.forum_bot_token_path.write_text(FORUM_TOKEN + "\n", encoding="utf-8")
+    config.status_bot_token_path.write_text(STATUS_TOKEN + "\n", encoding="utf-8")
     config.bot_token_path.chmod(0o600)
     config.forum_bot_token_path.chmod(0o600)
+    config.status_bot_token_path.chmod(0o600)
     store = Store(config.database_path)
     store.set_owner(Owner(7, 8, "owner"))
     store.close()
@@ -297,6 +320,7 @@ async def test_bashrc_migration_cannot_bypass_token_rotation_reset(tmp_path: Pat
     original = (
         f"TELEGRAM_GPT_BOT_TOKEN={NEW_TOKEN}\n"
         f"TELEGRAM_426_BOT_TOKEN={NEW_FORUM_TOKEN}\n"
+        f"TELEGRAM_69_BOT_TOKEN={NEW_STATUS_TOKEN}\n"
     )
     bashrc.write_text(original, encoding="utf-8")
 
@@ -309,6 +333,7 @@ async def test_bashrc_migration_cannot_bypass_token_rotation_reset(tmp_path: Pat
     assert bashrc.read_text(encoding="utf-8") == original
     assert config.read_token("control") == TOKEN
     assert config.read_token("forum") == FORUM_TOKEN
+    assert config.read_token("status") == STATUS_TOKEN
 
 
 def test_parser_exposes_dual_token_and_binding_commands() -> None:
@@ -322,8 +347,10 @@ def test_status_reports_dual_credentials_and_binding_without_secrets(tmp_path: P
     config.config_dir.mkdir()
     config.bot_token_path.write_text(TOKEN + "\n", encoding="utf-8")
     config.forum_bot_token_path.write_text(FORUM_TOKEN + "\n", encoding="utf-8")
+    config.status_bot_token_path.write_text(STATUS_TOKEN + "\n", encoding="utf-8")
     config.bot_token_path.chmod(0o600)
     config.forum_bot_token_path.chmod(0o600)
+    config.status_bot_token_path.chmod(0o600)
     store = Store(config.database_path)
     store.set_telegram_binding(
         {
@@ -341,9 +368,11 @@ def test_status_reports_dual_credentials_and_binding_without_secrets(tmp_path: P
     rendered = output.getvalue()
     assert "control token: configured/private" in rendered
     assert "forum token: configured/private" in rendered
+    assert "status token: configured/private" in rendered
     assert "channel binding: ready" in rendered
     assert TOKEN not in rendered
     assert FORUM_TOKEN not in rendered
+    assert STATUS_TOKEN not in rendered
 
 
 def test_status_json_reports_persisted_health_without_secrets(tmp_path: Path) -> None:
@@ -372,6 +401,7 @@ def test_status_json_reports_persisted_health_without_secrets(tmp_path: Path) ->
     assert payload["runtime"]["health_state"] == "fresh"
     assert payload["runtime"]["health"]["polling"][0]["role"] == "control"
     assert payload["runtime"]["health"]["bridge"]["codex"]["generation"] == 3
+    assert payload["credentials"]["status_token"] == "missing/insecure"
     assert TOKEN not in output.getvalue()
     assert FORUM_TOKEN not in output.getvalue()
 
@@ -403,7 +433,7 @@ def test_status_does_not_create_or_migrate_database(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_prompt_configures_distinct_tokens_with_private_permissions(tmp_path: Path) -> None:
     config = make_config(tmp_path)
-    entered = iter([TOKEN, FORUM_TOKEN])
+    entered = iter([TOKEN, FORUM_TOKEN, STATUS_TOKEN])
     prompts: list[str] = []
 
     def token_reader(prompt: str) -> str:
@@ -411,7 +441,7 @@ async def test_prompt_configures_distinct_tokens_with_private_permissions(tmp_pa
         return next(entered)
 
     async def validator(value: str) -> str:
-        return "control_bot" if value == TOKEN else "forum_bot"
+        return token_identity(value)
 
     identities = await configure_prompt_tokens(
         config,
@@ -419,13 +449,109 @@ async def test_prompt_configures_distinct_tokens_with_private_permissions(tmp_pa
         validator=validator,
     )
 
-    assert identities == {"control": "control_bot", "forum": "forum_bot"}
-    assert len(prompts) == 2
+    assert identities == {
+        "control": "control_bot",
+        "forum": "forum_bot",
+        "status": "status_bot",
+    }
+    assert len(prompts) == 3
     assert all("不会显示" in prompt for prompt in prompts)
     assert config.read_token("control") == TOKEN
     assert config.read_token("forum") == FORUM_TOKEN
+    assert config.read_token("status") == STATUS_TOKEN
     assert stat.S_IMODE(config.bot_token_path.stat().st_mode) == 0o600
     assert stat.S_IMODE(config.forum_bot_token_path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(config.status_bot_token_path.stat().st_mode) == 0o600
+
+
+@pytest.mark.asyncio
+async def test_fill_missing_migrates_legacy_control_and_adds_status(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    config.config_dir.mkdir()
+    config.legacy_bot_token_path.write_text(TOKEN + "\n", encoding="utf-8")
+    config.forum_bot_token_path.write_text(FORUM_TOKEN + "\n", encoding="utf-8")
+    config.legacy_bot_token_path.chmod(0o600)
+    config.forum_bot_token_path.chmod(0o600)
+    prompts: list[str] = []
+
+    def token_reader(prompt: str) -> str:
+        prompts.append(prompt)
+        return STATUS_TOKEN
+
+    async def validator(value: str) -> str:
+        return token_identity(value)
+
+    identities = await configure_prompt_tokens(
+        config,
+        fill_missing=True,
+        token_reader=token_reader,
+        validator=validator,
+    )
+
+    assert identities == {
+        "control": "control_bot",
+        "forum": "forum_bot",
+        "status": "status_bot",
+    }
+    assert len(prompts) == 1 and "Status Bot" in prompts[0]
+    assert not config.legacy_bot_token_path.exists()
+    assert config.read_token("control") == TOKEN
+    assert config.read_token("forum") == FORUM_TOKEN
+    assert config.read_token("status") == STATUS_TOKEN
+
+
+@pytest.mark.asyncio
+async def test_fill_missing_rejects_conflicting_legacy_control_without_prompt(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    config.config_dir.mkdir()
+    config.bot_token_path.write_text(TOKEN + "\n", encoding="utf-8")
+    config.legacy_bot_token_path.write_text(NEW_TOKEN + "\n", encoding="utf-8")
+    config.bot_token_path.chmod(0o600)
+    config.legacy_bot_token_path.chmod(0o600)
+    prompts = 0
+
+    def token_reader(_prompt: str) -> str:
+        nonlocal prompts
+        prompts += 1
+        return STATUS_TOKEN
+
+    with pytest.raises(CliError, match="内容冲突") as captured:
+        await configure_prompt_tokens(config, fill_missing=True, token_reader=token_reader)
+
+    assert prompts == 0
+    assert config.bot_token_path.read_text(encoding="utf-8") == TOKEN + "\n"
+    assert config.legacy_bot_token_path.read_text(encoding="utf-8") == NEW_TOKEN + "\n"
+    assert TOKEN not in str(captured.value)
+    assert NEW_TOKEN not in str(captured.value)
+
+
+@pytest.mark.asyncio
+async def test_fill_missing_validation_failure_keeps_legacy_and_missing_targets(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    config.config_dir.mkdir()
+    config.legacy_bot_token_path.write_text(TOKEN + "\n", encoding="utf-8")
+    config.forum_bot_token_path.write_text(FORUM_TOKEN + "\n", encoding="utf-8")
+    config.legacy_bot_token_path.chmod(0o600)
+    config.forum_bot_token_path.chmod(0o600)
+
+    async def validator(value: str) -> str:
+        if value == STATUS_TOKEN:
+            raise CliError("validation failed")
+        return token_identity(value)
+
+    with pytest.raises(CliError, match="validation failed"):
+        await configure_prompt_tokens(
+            config,
+            fill_missing=True,
+            token_reader=lambda _prompt: STATUS_TOKEN,
+            validator=validator,
+        )
+
+    assert config.legacy_bot_token_path.read_text(encoding="utf-8") == TOKEN + "\n"
+    assert not config.bot_token_path.exists()
+    assert not config.status_bot_token_path.exists()
 
 
 @pytest.mark.asyncio
@@ -463,8 +589,10 @@ async def test_prompt_requires_force_and_rejects_same_bot_identity(tmp_path: Pat
     config.config_dir.mkdir()
     config.bot_token_path.write_text(TOKEN + "\n", encoding="utf-8")
     config.forum_bot_token_path.write_text(FORUM_TOKEN + "\n", encoding="utf-8")
+    config.status_bot_token_path.write_text(STATUS_TOKEN + "\n", encoding="utf-8")
     config.bot_token_path.chmod(0o600)
     config.forum_bot_token_path.chmod(0o600)
+    config.status_bot_token_path.chmod(0o600)
 
     async def distinct_validator(value: str) -> str:
         return "new_control" if value == FORUM_TOKEN else "new_forum"
@@ -482,7 +610,7 @@ async def test_prompt_requires_force_and_rejects_same_bot_identity(tmp_path: Pat
     async def same_identity_validator(_value: str) -> str:
         return "same_bot"
 
-    entered = iter([TOKEN, FORUM_TOKEN])
+    entered = iter([TOKEN, FORUM_TOKEN, STATUS_TOKEN])
     with pytest.raises(CliError, match="同一个 Bot") as captured:
         await configure_prompt_tokens(
             make_config(tmp_path / "other"),
@@ -501,10 +629,13 @@ async def test_prompt_rolls_back_both_credentials_when_commit_fails(
     config.config_dir.mkdir()
     old_control = "111111111:ABCDEFGHIJKLMNOPQRSTUVWXYZ_old_control"
     old_forum = "222222222:ABCDEFGHIJKLMNOPQRSTUVWXYZ_old_forum__"
+    old_status = "666666666:ABCDEFGHIJKLMNOPQRSTUVWXYZ_old_status_"
     config.bot_token_path.write_text(old_control + "\n", encoding="utf-8")
     config.forum_bot_token_path.write_text(old_forum + "\n", encoding="utf-8")
+    config.status_bot_token_path.write_text(old_status + "\n", encoding="utf-8")
     config.bot_token_path.chmod(0o600)
     config.forum_bot_token_path.chmod(0o600)
+    config.status_bot_token_path.chmod(0o600)
     real_replace = os.replace
     replacement_count = 0
 
@@ -523,9 +654,9 @@ async def test_prompt_rolls_back_both_credentials_when_commit_fails(
     monkeypatch.setattr("codex_telegram_bridge.cli.os.replace", fail_second_replace)
 
     async def validator(value: str) -> str:
-        return "control_bot" if value == TOKEN else "forum_bot"
+        return token_identity(value)
 
-    entered = iter([TOKEN, FORUM_TOKEN])
+    entered = iter([TOKEN, FORUM_TOKEN, STATUS_TOKEN])
     with pytest.raises(CliError, match="原有凭据已恢复") as captured:
         await configure_prompt_tokens(
             config,
@@ -536,6 +667,7 @@ async def test_prompt_rolls_back_both_credentials_when_commit_fails(
 
     assert config.read_token("control") == old_control
     assert config.read_token("forum") == old_forum
+    assert config.read_token("status") == old_status
     assert TOKEN not in str(captured.value)
     assert FORUM_TOKEN not in str(captured.value)
 
@@ -548,10 +680,13 @@ async def test_prompt_interrupt_after_first_commit_restores_both_credentials(
     config.config_dir.mkdir()
     old_control = "111111111:ABCDEFGHIJKLMNOPQRSTUVWXYZ_old_control"
     old_forum = "222222222:ABCDEFGHIJKLMNOPQRSTUVWXYZ_old_forum__"
+    old_status = "666666666:ABCDEFGHIJKLMNOPQRSTUVWXYZ_old_status_"
     config.bot_token_path.write_text(old_control + "\n", encoding="utf-8")
     config.forum_bot_token_path.write_text(old_forum + "\n", encoding="utf-8")
+    config.status_bot_token_path.write_text(old_status + "\n", encoding="utf-8")
     config.bot_token_path.chmod(0o600)
     config.forum_bot_token_path.chmod(0o600)
+    config.status_bot_token_path.chmod(0o600)
     real_fsync = os.fsync
     fsync_count = 0
 
@@ -565,9 +700,9 @@ async def test_prompt_interrupt_after_first_commit_restores_both_credentials(
     monkeypatch.setattr("codex_telegram_bridge.cli.os.fsync", interrupt_after_first_replace)
 
     async def validator(value: str) -> str:
-        return "control_bot" if value == TOKEN else "forum_bot"
+        return token_identity(value)
 
-    entered = iter([TOKEN, FORUM_TOKEN])
+    entered = iter([TOKEN, FORUM_TOKEN, STATUS_TOKEN])
     with pytest.raises(KeyboardInterrupt):
         await configure_prompt_tokens(
             config,
@@ -578,6 +713,7 @@ async def test_prompt_interrupt_after_first_commit_restores_both_credentials(
 
     assert config.read_token("control") == old_control
     assert config.read_token("forum") == old_forum
+    assert config.read_token("status") == old_status
 
 
 @pytest.mark.asyncio
@@ -609,9 +745,9 @@ async def test_prompt_never_chmods_or_reads_substituted_symlink_target(
     monkeypatch.setattr("codex_telegram_bridge.cli.os.link", link_then_substitute_symlink)
 
     async def validator(value: str) -> str:
-        return "control_bot" if value == TOKEN else "forum_bot"
+        return token_identity(value)
 
-    entered = iter([TOKEN, FORUM_TOKEN])
+    entered = iter([TOKEN, FORUM_TOKEN, STATUS_TOKEN])
     with pytest.raises(CliError, match="回滚未完整完成") as captured:
         await configure_prompt_tokens(
             config,
@@ -651,9 +787,9 @@ async def test_prompt_detects_parent_directory_swap_and_does_not_write_replaceme
     monkeypatch.setattr("codex_telegram_bridge.cli.os.link", link_then_swap_parent)
 
     async def validator(value: str) -> str:
-        return "control_bot" if value == TOKEN else "forum_bot"
+        return token_identity(value)
 
-    entered = iter([TOKEN, FORUM_TOKEN])
+    entered = iter([TOKEN, FORUM_TOKEN, STATUS_TOKEN])
     with pytest.raises(CliError, match="回滚未完整完成") as captured:
         await configure_prompt_tokens(
             config,
@@ -673,8 +809,10 @@ async def test_changed_tokens_require_owner_reset_before_rotation(tmp_path: Path
     config.config_dir.mkdir()
     config.bot_token_path.write_text(TOKEN + "\n", encoding="utf-8")
     config.forum_bot_token_path.write_text(FORUM_TOKEN + "\n", encoding="utf-8")
+    config.status_bot_token_path.write_text(STATUS_TOKEN + "\n", encoding="utf-8")
     config.bot_token_path.chmod(0o600)
     config.forum_bot_token_path.chmod(0o600)
+    config.status_bot_token_path.chmod(0o600)
     store = Store(config.database_path)
     store.set_owner(Owner(7, 8, "owner"))
     store.close()
@@ -682,7 +820,7 @@ async def test_changed_tokens_require_owner_reset_before_rotation(tmp_path: Path
     async def validator(value: str) -> str:
         return f"bot_{value.partition(':')[0]}"
 
-    entered = iter([NEW_TOKEN, NEW_FORUM_TOKEN])
+    entered = iter([NEW_TOKEN, NEW_FORUM_TOKEN, NEW_STATUS_TOKEN])
     with pytest.raises(CliError, match="owner-reset") as captured:
         await configure_prompt_tokens(
             config,
@@ -776,8 +914,10 @@ async def test_rotation_succeeds_after_owner_reset_and_same_token_force_is_nonde
     config.config_dir.mkdir()
     config.bot_token_path.write_text(TOKEN + "\n", encoding="utf-8")
     config.forum_bot_token_path.write_text(FORUM_TOKEN + "\n", encoding="utf-8")
+    config.status_bot_token_path.write_text(STATUS_TOKEN + "\n", encoding="utf-8")
     config.bot_token_path.chmod(0o600)
     config.forum_bot_token_path.chmod(0o600)
+    config.status_bot_token_path.chmod(0o600)
     store = Store(config.database_path)
     store.set_owner(Owner(7, 8, "owner"))
     store.set_telegram_binding(
@@ -794,7 +934,7 @@ async def test_rotation_succeeds_after_owner_reset_and_same_token_force_is_nonde
     async def validator(value: str) -> str:
         return f"bot_{value.partition(':')[0]}"
 
-    same = iter([TOKEN, FORUM_TOKEN])
+    same = iter([TOKEN, FORUM_TOKEN, STATUS_TOKEN])
     await configure_prompt_tokens(
         config,
         force=True,
@@ -807,7 +947,7 @@ async def test_rotation_succeeds_after_owner_reset_and_same_token_force_is_nonde
     store.reset_owner()
     store.close()
 
-    changed = iter([NEW_TOKEN, NEW_FORUM_TOKEN])
+    changed = iter([NEW_TOKEN, NEW_FORUM_TOKEN, NEW_STATUS_TOKEN])
     await configure_prompt_tokens(
         config,
         force=True,
@@ -816,6 +956,7 @@ async def test_rotation_succeeds_after_owner_reset_and_same_token_force_is_nonde
     )
     assert config.read_token("control") == NEW_TOKEN
     assert config.read_token("forum") == NEW_FORUM_TOKEN
+    assert config.read_token("status") == NEW_STATUS_TOKEN
     store = Store(config.database_path)
     try:
         assert store.get_owner() is None
@@ -829,10 +970,13 @@ def test_configure_tokens_json_outputs_identities_only(
 ) -> None:
     config = make_config(tmp_path)
 
-    async def fake_prompt(_config: Config, *, force: bool) -> dict[str, str]:
+    async def fake_prompt(
+        _config: Config, *, force: bool, fill_missing: bool
+    ) -> dict[str, str]:
         assert _config is config
         assert force is True
-        return {"control": "control_bot", "forum": "讨论_bot"}
+        assert fill_missing is False
+        return {"control": "control_bot", "forum": "讨论_bot", "status": "status_bot"}
 
     monkeypatch.setattr("codex_telegram_bridge.cli._config_from_args", lambda _args: config)
     monkeypatch.setattr("codex_telegram_bridge.cli.configure_prompt_tokens", fake_prompt)
@@ -840,8 +984,12 @@ def test_configure_tokens_json_outputs_identities_only(
     output = StringIO()
 
     assert run(args, output=output) == 0
-    assert json.loads(output.getvalue()) == {"control": "control_bot", "forum": "讨论_bot"}
-    assert set(json.loads(output.getvalue())) == {"control", "forum"}
+    assert json.loads(output.getvalue()) == {
+        "control": "control_bot",
+        "forum": "讨论_bot",
+        "status": "status_bot",
+    }
+    assert set(json.loads(output.getvalue())) == {"control", "forum", "status"}
     assert TOKEN not in output.getvalue()
     assert FORUM_TOKEN not in output.getvalue()
 
@@ -854,6 +1002,9 @@ def test_parser_exposes_prompt_json_force_and_onboard_timeout() -> None:
     assert configured.prompt is True
     assert configured.json is True
     assert configured.force is True
+    assert configured.fill_missing is False
+    fill_missing = parser.parse_args(["configure-tokens", "--prompt", "--fill-missing"])
+    assert fill_missing.fill_missing is True
     assert onboard_args.command == "onboard"
     assert onboard_args.timeout == 42
 

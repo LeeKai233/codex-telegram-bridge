@@ -259,9 +259,13 @@ class Config:
     def bot_token_path(self) -> Path:
         credentials = os.environ.get("CREDENTIALS_DIRECTORY")
         if credentials:
-            candidate = Path(credentials) / "telegram_bot_token"
+            candidate = Path(credentials) / "telegram_9527_bot_token"
             if candidate.is_file():
                 return candidate
+        return self.config_dir / "telegram_9527_bot_token"
+
+    @property
+    def legacy_bot_token_path(self) -> Path:
         return self.config_dir / "telegram_bot_token"
 
     @property
@@ -277,12 +281,23 @@ class Config:
     def discussion_bot_token_path(self) -> Path:
         return self.forum_bot_token_path
 
+    @property
+    def status_bot_token_path(self) -> Path:
+        credentials = os.environ.get("CREDENTIALS_DIRECTORY")
+        if credentials:
+            candidate = Path(credentials) / "telegram_69_bot_token"
+            if candidate.is_file():
+                return candidate
+        return self.config_dir / "telegram_69_bot_token"
+
     def token_path(self, bot_role: str = "control") -> Path:
         normalized = bot_role.strip().casefold()
         if normalized in {"control", "controller", "primary", "9527"}:
             return self.bot_token_path
         if normalized in {"forum", "discussion", "comment", "426"}:
             return self.forum_bot_token_path
+        if normalized in {"status", "dashboard", "69"}:
+            return self.status_bot_token_path
         raise ValueError(f"Unknown Telegram bot role: {bot_role}")
 
     @property
