@@ -16,6 +16,7 @@ from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, Tele
 LOGGER = logging.getLogger(__name__)
 
 OutboundLane = Literal["urgent", "interactive", "live", "maintenance"]
+TrafficClass = Literal["callback_ack", "interactive", "media", "maintenance"]
 OperationSemantics = Literal["query", "idempotent", "non_idempotent"]
 LANE_WEIGHTS: dict[OutboundLane, int] = {
     "urgent": 4,
@@ -24,6 +25,19 @@ LANE_WEIGHTS: dict[OutboundLane, int] = {
     "maintenance": 1,
 }
 _LANE_CYCLE = tuple(lane for lane, weight in LANE_WEIGHTS.items() for _ in range(weight))
+TRAFFIC_CLASS_CONCURRENCY: dict[TrafficClass, int] = {
+    "callback_ack": 4,
+    "interactive": 2,
+    "media": 1,
+    "maintenance": 1,
+}
+_LEGACY_TRAFFIC_CLASSES: dict[OutboundLane, TrafficClass] = {
+    "urgent": "interactive",
+    "interactive": "interactive",
+    "live": "interactive",
+    "maintenance": "maintenance",
+}
+_KEYED_TRAFFIC_CLASSES = frozenset({"interactive"})
 OUTBOUND_STOP_GRACE_SECONDS = 1.0
 
 
@@ -63,6 +77,8 @@ class _Job:
     operation: Callable[[], Awaitable[Any]]
     future: asyncio.Future[Any]
     lane: OutboundLane
+    traffic_class: TrafficClass
+    chat_key: str
     semantics: OperationSemantics
     due_at: float
     attempts: int = 0
@@ -94,11 +110,11 @@ def _known_unsent(exc: NetworkError) -> bool:
 
 
 class OutboundMessenger:
-    """Weighted Bot API scheduler and the sole authority for transport retries."""
+    """Class-isolated Bot API scheduler and transport retry authority."""
 
     def __init__(
         self,
-        minimum_interval: float = 1.05,
+        minimum_interval: float | None = None,
         retries: int = 3,
         *,
         bot_role: str = "control",
@@ -106,25 +122,37 @@ class OutboundMessenger:
         recycle_transport: Callable[[], Awaitable[None]] | None = None,
         max_queue_size: int = 1_000,
     ) -> None:
-        self.minimum_interval = minimum_interval
+        # Keep the legacy observable value for callers that inspect it. A global
+        # interval is only enabled when explicitly configured.
+        self.minimum_interval = 1.05 if minimum_interval is None else max(0.0, minimum_interval)
+        self._interval_enabled = minimum_interval is not None and minimum_interval > 0
         self.retries = max(0, retries)
         self.bot_role = bot_role
         self.journal = journal
         self.recycle_transport = recycle_transport
         self.max_queue_size = max(1, int(max_queue_size))
-        self._queues: dict[OutboundLane, deque[_Job]] = {
-            lane: deque() for lane in LANE_WEIGHTS
+        self._queues: dict[TrafficClass, deque[_Job]] = {
+            traffic_class: deque() for traffic_class in TRAFFIC_CLASS_CONCURRENCY
         }
         self._counter = itertools.count()
         self._task: asyncio.Task[None] | None = None
+        self._worker_tasks: set[asyncio.Task[None]] = set()
         self._generation = 0
         self._wake = asyncio.Event()
         self._stopping = False
         self._last_request = 0.0
-        self._lane_cursor = 0
-        self._active_job: _Job | None = None
+        self._interval_lock = asyncio.Lock()
+        self._active_jobs: dict[asyncio.Task[Any], _Job] = {}
+        self._active_keys: set[tuple[int, str]] = set()
+        self._metrics: dict[TrafficClass, dict[str, int]] = {
+            traffic_class: {"completed": 0, "failed": 0, "uncertain": 0, "retries": 0}
+            for traffic_class in TRAFFIC_CLASS_CONCURRENCY
+        }
         self._consecutive_transport_failures = 0
         self._recycle_count = 0
+        self._transport_condition = asyncio.Condition()
+        self._active_transport_requests = 0
+        self._recycling_transport = False
 
     def start(self) -> None:
         if self._task and not self._task.done():
@@ -132,19 +160,19 @@ class OutboundMessenger:
         self._stopping = False
         self._generation += 1
         generation = self._generation
+        self._last_request = 0.0
         self._task = asyncio.create_task(
-            self._worker(generation), name=f"telegram-{self.bot_role}-outbound"
+            self._supervise_workers(generation), name=f"telegram-{self.bot_role}-outbound"
         )
 
     async def stop(self) -> None:
         self._stopping = True
         self._generation += 1
         self._wake.set()
-        active_job = self._active_job
         error = RuntimeError("Telegram bridge is stopping")
-        if active_job and not active_job.future.done():
-            active_job.future.set_exception(error)
-        self._active_job = None
+        for job in tuple(self._active_jobs.values()):
+            if not job.future.done():
+                job.future.set_exception(error)
         for queue in self._queues.values():
             while queue:
                 job = queue.popleft()
@@ -152,12 +180,17 @@ class OutboundMessenger:
                     job.future.set_exception(error)
         task = self._task
         self._task = None
+        workers = tuple(self._worker_tasks)
+        self._worker_tasks.clear()
         if task is None:
+            self._active_keys.clear()
             return
-        task.cancel()
+        for worker in workers:
+            worker.cancel()
         done, _pending = await asyncio.wait((task,), timeout=OUTBOUND_STOP_GRACE_SECONDS)
         if task in done:
             _consume_task_result(task)
+            self._active_keys.clear()
             return
         LOGGER.warning(
             "event=telegram_outbound_stop_timeout bot_role=%s timeout_seconds=%.1f",
@@ -165,6 +198,7 @@ class OutboundMessenger:
             OUTBOUND_STOP_GRACE_SECONDS,
         )
         task.add_done_callback(_consume_task_result)
+        self._active_keys.clear()
 
     async def call(
         self,
@@ -172,6 +206,8 @@ class OutboundMessenger:
         *,
         priority: int = 10,
         lane: OutboundLane | None = None,
+        traffic_class: TrafficClass | None = None,
+        chat_key: str | int | None = None,
         semantics: OperationSemantics = "idempotent",
         audit: Mapping[str, Any] | None = None,
     ) -> Any:
@@ -182,23 +218,28 @@ class OutboundMessenger:
                 f"Telegram outbound queue reached its {self.max_queue_size}-item limit"
             )
         selected_lane = lane or lane_for_priority(priority)
+        selected_traffic_class = traffic_class or _LEGACY_TRAFFIC_CLASSES[selected_lane]
         future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+        sequence = next(self._counter)
+        selected_chat_key = str(chat_key) if chat_key is not None else f"job:{sequence}"
         intent_id: str | None = None
         if semantics == "non_idempotent" and self.journal is not None:
             metadata = dict(audit or {})
             intent_id = self.journal.create_outbound_intent(
                 bot_role=self.bot_role,
                 operation=str(metadata.get("operation") or "unknown"),
-                lane=selected_lane,
+                lane=selected_traffic_class,
                 chat_id=(int(metadata["chat_id"]) if metadata.get("chat_id") is not None else None),
                 payload_fingerprint=str(metadata.get("payload_fingerprint") or ""),
             )
-        self._queues[selected_lane].append(
+        self._queues[selected_traffic_class].append(
             _Job(
-                sequence=next(self._counter),
+                sequence=sequence,
                 operation=operation,
                 future=future,
                 lane=selected_lane,
+                traffic_class=selected_traffic_class,
+                chat_key=selected_chat_key,
                 semantics=semantics,
                 due_at=time.monotonic(),
                 intent_id=intent_id,
@@ -208,26 +249,64 @@ class OutboundMessenger:
         return await future
 
     def snapshot(self) -> dict[str, Any]:
+        active_counts = {traffic_class: 0 for traffic_class in TRAFFIC_CLASS_CONCURRENCY}
+        for job in self._active_jobs.values():
+            active_counts[job.traffic_class] += 1
+        traffic_classes = {
+            traffic_class: {
+                "queued": len(self._queues[traffic_class]),
+                "active": active_counts[traffic_class],
+                "concurrency": concurrency,
+                **self._metrics[traffic_class],
+            }
+            for traffic_class, concurrency in TRAFFIC_CLASS_CONCURRENCY.items()
+        }
         return {
             "bot_role": self.bot_role,
-            "queues": {lane: len(queue) for lane, queue in self._queues.items()},
-            "active": self._active_job is not None,
+            "queues": {
+                traffic_class: values["queued"]
+                for traffic_class, values in traffic_classes.items()
+            },
+            "traffic_classes": traffic_classes,
+            "active": bool(self._active_jobs),
             "queue_capacity": self.max_queue_size,
             "consecutive_transport_failures": self._consecutive_transport_failures,
             "transport_recycles": self._recycle_count,
         }
 
-    async def _worker(self, generation: int) -> None:
+    async def _supervise_workers(self, generation: int) -> None:
+        workers = [
+            asyncio.create_task(
+                self._worker(generation, traffic_class, slot),
+                name=f"telegram-{self.bot_role}-{traffic_class}-{slot + 1}",
+            )
+            for traffic_class, concurrency in TRAFFIC_CLASS_CONCURRENCY.items()
+            for slot in range(concurrency)
+        ]
+        if generation == self._generation:
+            self._worker_tasks = set(workers)
+        await asyncio.gather(*workers, return_exceptions=True)
+
+    async def _worker(
+        self,
+        generation: int,
+        traffic_class: TrafficClass,
+        slot: int,
+    ) -> None:
+        del slot
         while generation == self._generation and not self._stopping:
-            job = await self._next_job()
+            job = await self._next_job(generation, traffic_class)
+            job.generation = generation
             if generation != self._generation or self._stopping:
                 if not job.future.done():
                     job.future.set_exception(RuntimeError("Telegram bridge is stopping"))
                 return
             if job.future.cancelled():
+                self._release_key(job)
                 continue
-            job.generation = generation
-            self._active_job = job
+            worker = asyncio.current_task()
+            assert worker is not None
+            self._active_jobs[worker] = job
             try:
                 try:
                     await self._execute(job)
@@ -242,19 +321,22 @@ class OutboundMessenger:
                     if not job.future.done():
                         job.future.set_exception(exc)
             finally:
-                if self._active_job is job:
-                    self._active_job = None
+                if self._active_jobs.get(worker) is job:
+                    self._active_jobs.pop(worker, None)
+                self._release_key(job)
+                self._wake.set()
 
-    async def _next_job(self) -> _Job:
+    async def _next_job(
+        self,
+        generation: int,
+        traffic_class: TrafficClass,
+    ) -> _Job:
         while True:
             now = time.monotonic()
-            job = self._take_due(now)
+            job = self._take_due(generation, traffic_class, now)
             if job is not None:
                 return job
-            due_at = min(
-                (job.due_at for queue in self._queues.values() for job in queue),
-                default=None,
-            )
+            due_at = self._next_due_at(generation, traffic_class)
             self._wake.clear()
             if due_at is None:
                 await self._wake.wait()
@@ -263,24 +345,66 @@ class OutboundMessenger:
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._wake.wait(), timeout=timeout)
 
-    def _take_due(self, now: float) -> _Job | None:
-        for _ in range(len(_LANE_CYCLE)):
-            lane = _LANE_CYCLE[self._lane_cursor]
-            self._lane_cursor = (self._lane_cursor + 1) % len(_LANE_CYCLE)
-            queue = self._queues[lane]
-            for index, candidate in enumerate(queue):
-                if candidate.due_at <= now:
-                    del queue[index]
-                    return candidate
+    def _take_due(
+        self,
+        generation: int,
+        traffic_class: TrafficClass,
+        now: float,
+    ) -> _Job | None:
+        queue = self._queues[traffic_class]
+        for index, candidate in enumerate(queue):
+            if candidate.due_at > now:
+                continue
+            if traffic_class in _KEYED_TRAFFIC_CLASSES:
+                key = (generation, candidate.chat_key)
+                if key in self._active_keys:
+                    continue
+                if any(
+                    queued.chat_key == candidate.chat_key
+                    and queued.sequence < candidate.sequence
+                    for queued in queue
+                ):
+                    continue
+                self._active_keys.add(key)
+            del queue[index]
+            return candidate
         return None
 
+    def _next_due_at(
+        self,
+        generation: int,
+        traffic_class: TrafficClass,
+    ) -> float | None:
+        queue = self._queues[traffic_class]
+        due: list[float] = []
+        for candidate in queue:
+            if traffic_class in _KEYED_TRAFFIC_CLASSES:
+                if (generation, candidate.chat_key) in self._active_keys:
+                    continue
+                if any(
+                    queued.chat_key == candidate.chat_key
+                    and queued.sequence < candidate.sequence
+                    for queued in queue
+                ):
+                    continue
+            due.append(candidate.due_at)
+        return min(due, default=None)
+
+    def _release_key(self, job: _Job) -> None:
+        if job.traffic_class in _KEYED_TRAFFIC_CLASSES:
+            self._active_keys.discard((job.generation, job.chat_key))
+
     async def _execute(self, job: _Job) -> None:
-        delay = self.minimum_interval - (time.monotonic() - self._last_request)
-        if delay > 0:
-            await asyncio.sleep(delay)
+        if self._interval_enabled:
+            async with self._interval_lock:
+                delay = self.minimum_interval - (time.monotonic() - self._last_request)
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                if self._job_is_current(job):
+                    self._last_request = time.monotonic()
         job.attempts += 1
         try:
-            result = await job.operation()
+            result = await self._run_transport_operation(job.operation)
         except (BadRequest, Forbidden) as exc:
             self._finish_error(job, exc)
         except RetryAfter as exc:
@@ -296,14 +420,27 @@ class OutboundMessenger:
             LOGGER.error("Unexpected Telegram outbound error (%s)", type(exc).__name__)
             self._finish_error(job, exc)
         else:
-            if self._job_is_current(job):
-                self._consecutive_transport_failures = 0
+            if not self._job_is_current(job):
+                return
+            self._consecutive_transport_failures = 0
+            self._metrics[job.traffic_class]["completed"] += 1
             self._journal(job, "delivered")
-            if not job.future.done():
-                job.future.set_result(result)
+            job.future.set_result(result)
+
+    async def _run_transport_operation(
+        self,
+        operation: Callable[[], Awaitable[Any]],
+    ) -> Any:
+        async with self._transport_condition:
+            while self._recycling_transport:
+                await self._transport_condition.wait()
+            self._active_transport_requests += 1
+        try:
+            return await operation()
         finally:
-            if job.generation == self._generation and not self._stopping:
-                self._last_request = time.monotonic()
+            async with self._transport_condition:
+                self._active_transport_requests -= 1
+                self._transport_condition.notify_all()
 
     async def _handle_network_error(self, job: _Job, exc: NetworkError) -> None:
         if not self._job_is_current(job):
@@ -318,6 +455,7 @@ class OutboundMessenger:
             )
             uncertain.__cause__ = exc
             self._journal(job, "uncertain", type(exc).__name__)
+            self._metrics[job.traffic_class]["uncertain"] += 1
             if not job.future.done():
                 job.future.set_exception(uncertain)
             return
@@ -333,7 +471,14 @@ class OutboundMessenger:
             or self.recycle_transport is None
         ):
             return
+        async with self._transport_condition:
+            if self._recycling_transport:
+                return
+            self._recycling_transport = True
         try:
+            async with self._transport_condition:
+                while self._active_transport_requests:
+                    await self._transport_condition.wait()
             await self.recycle_transport()
         except Exception as exc:
             if self._job_is_current(job):
@@ -349,6 +494,9 @@ class OutboundMessenger:
         finally:
             if self._job_is_current(job):
                 self._consecutive_transport_failures = 0
+            async with self._transport_condition:
+                self._recycling_transport = False
+                self._transport_condition.notify_all()
 
     @staticmethod
     def _retry_delay(attempt: int) -> float:
@@ -358,7 +506,8 @@ class OutboundMessenger:
         if not self._job_is_current(job):
             return
         job.due_at = time.monotonic() + max(0.0, delay)
-        self._queues[job.lane].append(job)
+        self._queues[job.traffic_class].append(job)
+        self._metrics[job.traffic_class]["retries"] += 1
         self._journal(job, "retrying")
         self._wake.set()
 
@@ -370,9 +519,11 @@ class OutboundMessenger:
         )
 
     def _finish_error(self, job: _Job, exc: Exception) -> None:
+        if not self._job_is_current(job):
+            return
+        self._metrics[job.traffic_class]["failed"] += 1
         self._journal(job, "failed", type(exc).__name__)
-        if not job.future.done():
-            job.future.set_exception(exc)
+        job.future.set_exception(exc)
 
     def _journal(self, job: _Job, status: str, error_type: str | None = None) -> None:
         if job.intent_id is None or self.journal is None:

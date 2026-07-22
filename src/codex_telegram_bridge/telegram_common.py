@@ -25,7 +25,7 @@ from telegram.ext import AIORateLimiter, Application
 from telegram.request import HTTPXRequest
 
 from .markdown import MAX_MESSAGE_LENGTH
-from .outbound import OperationSemantics, OutboundLane, OutboundMessenger
+from .outbound import OperationSemantics, OutboundLane, OutboundMessenger, TrafficClass
 
 LOGGER = logging.getLogger(__name__)
 
@@ -42,6 +42,18 @@ OUTBOUND_WRITE_TIMEOUT_SECONDS = 15.0
 OUTBOUND_CONNECT_TIMEOUT_SECONDS = 10.0
 OUTBOUND_POOL_TIMEOUT_SECONDS = 5.0
 OUTBOUND_MEDIA_WRITE_TIMEOUT_SECONDS = 60.0
+
+
+def _traffic_class_for_lane(lane: OutboundLane, *, media: bool = False) -> TrafficClass:
+    if media:
+        return "media"
+    if lane == "maintenance":
+        return "maintenance"
+    return "interactive"
+
+
+def _chat_key(chat_id: int) -> str:
+    return f"chat:{chat_id}"
 
 
 def balanced_button_rows(
@@ -224,6 +236,8 @@ class TelegramEndpoint:
                 ),
                 priority=priority,
                 lane=lane,
+                traffic_class=_traffic_class_for_lane(lane),
+                chat_key=_chat_key(chat_id),
                 semantics=semantics,
                 audit={
                     "operation": "sendMessage",
@@ -242,6 +256,8 @@ class TelegramEndpoint:
                 lambda: self.bot.send_message(text=fallback, **kwargs),
                 priority=priority,
                 lane=lane,
+                traffic_class=_traffic_class_for_lane(lane),
+                chat_key=_chat_key(chat_id),
                 semantics=semantics,
                 audit={
                     "operation": "sendMessage",
@@ -281,6 +297,8 @@ class TelegramEndpoint:
                 ),
                 priority=priority,
                 lane=lane,
+                traffic_class=_traffic_class_for_lane(lane),
+                chat_key=_chat_key(chat_id),
                 semantics="idempotent",
             )
         except BadRequest as exc:
@@ -294,6 +312,8 @@ class TelegramEndpoint:
                 lambda: self.bot.edit_message_text(text=fallback, **kwargs),
                 priority=priority,
                 lane=lane,
+                traffic_class=_traffic_class_for_lane(lane),
+                chat_key=_chat_key(chat_id),
                 semantics="idempotent",
             )
 
@@ -311,6 +331,8 @@ class TelegramEndpoint:
                     lambda: self.bot.delete_message(chat_id=chat_id, message_id=message_id),
                     priority=priority,
                     lane=lane,
+                    traffic_class=_traffic_class_for_lane(lane),
+                    chat_key=_chat_key(chat_id),
                     semantics="idempotent",
                 )
             )
@@ -336,6 +358,8 @@ class TelegramEndpoint:
                 ),
                 priority=priority,
                 lane=lane,
+                traffic_class=_traffic_class_for_lane(lane),
+                chat_key=_chat_key(chat_id),
                 semantics="idempotent",
             )
         except BadRequest as exc:
@@ -364,6 +388,8 @@ class TelegramEndpoint:
             ),
             priority=priority,
             lane=lane,
+            traffic_class=_traffic_class_for_lane(lane, media=True),
+            chat_key=_chat_key(chat_id),
             semantics="non_idempotent",
             audit={
                 "operation": "sendDocument",
@@ -378,6 +404,8 @@ class TelegramEndpoint:
         return await self.messenger.call(
             self.bot.get_me,
             lane=lane,
+            traffic_class=_traffic_class_for_lane(lane),
+            chat_key="bot:get_me",
             semantics="query",
         )
 
@@ -386,13 +414,22 @@ class TelegramEndpoint:
         operation: Any,
         *,
         lane: OutboundLane = "interactive",
+        chat_key: str | int | None = None,
     ) -> Any:
-        return await self.messenger.call(operation, lane=lane, semantics="query")
+        return await self.messenger.call(
+            operation,
+            lane=lane,
+            traffic_class=_traffic_class_for_lane(lane),
+            chat_key=chat_key if chat_key is not None else "bot:query",
+            semantics="query",
+        )
 
     async def set_my_commands(self, commands: Sequence[Any], **kwargs: Any) -> Any:
         return await self.messenger.call(
             lambda: self.bot.set_my_commands(commands, **kwargs),
             lane="maintenance",
+            traffic_class="maintenance",
+            chat_key=f"bot:commands:{kwargs.get('scope', 'default')}",
             semantics="idempotent",
         )
 
@@ -403,8 +440,23 @@ class TelegramEndpoint:
         *,
         show_alert: bool = False,
     ) -> None:
+        message = getattr(query, "message", None)
+        chat = getattr(message, "chat", None)
+        chat_id = getattr(chat, "id", None)
+        callback_id = getattr(query, "id", None)
+        callback_key = (
+            f"callback:{callback_id}"
+            if callback_id is not None
+            else _chat_key(int(chat_id))
+            if chat_id is not None
+            else f"callback:{id(query)}"
+        )
         with contextlib.suppress(TelegramError):
             await self.messenger.call(
                 lambda: query.answer(text=text, show_alert=show_alert),
                 priority=0,
+                lane="urgent",
+                traffic_class="callback_ack",
+                chat_key=callback_key,
+                semantics="idempotent",
             )

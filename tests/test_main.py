@@ -595,6 +595,57 @@ def test_runtime_health_payload_aggregates_polling_delivery_and_codex_queues(
         store.close()
 
 
+def test_runtime_health_payload_exposes_outbound_traffic_class_metrics(tmp_path: Path) -> None:
+    class SnapshotComponent:
+        def __init__(self, value: dict[str, Any]) -> None:
+            self.value = value
+
+        def snapshot(self) -> dict[str, Any]:
+            return self.value
+
+    traffic_classes = {
+        "callback_ack": {"queued": 1, "active": 2, "concurrency": 4},
+        "interactive": {"queued": 3, "active": 2, "concurrency": 2},
+        "media": {"queued": 0, "active": 1, "concurrency": 1},
+        "maintenance": {"queued": 2, "active": 0, "concurrency": 1},
+    }
+    store = make_store(tmp_path)
+    runtime = type(
+        "FakeRuntime",
+        (),
+        {
+            "bridge": object(),
+            "store": store,
+            "polling_health": (),
+            "telegram_runtime": type(
+                "FakeTelegramRuntime",
+                (),
+                {
+                    "control_messenger": SnapshotComponent(
+                        {"traffic_classes": traffic_classes}
+                    ),
+                    "discussion_messenger": SnapshotComponent(
+                        {"traffic_classes": traffic_classes}
+                    ),
+                    "delivery": None,
+                    "controllers": (),
+                },
+            )(),
+        },
+    )()
+    try:
+        payload = _runtime_health_payload(
+            runtime,
+            PollingSupervisor((), (), []),
+            service_state="running",
+        )
+
+        assert payload["outbound"]["control"]["traffic_classes"] == traffic_classes
+        assert payload["outbound"]["discussion"]["traffic_classes"] == traffic_classes
+    finally:
+        store.close()
+
+
 @pytest.mark.asyncio
 async def test_health_snapshot_write_failure_is_isolated_from_polling(
     tmp_path: Path,

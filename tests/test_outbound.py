@@ -466,3 +466,151 @@ async def test_interactive_lane_is_not_starved_by_maintenance_backlog() -> None:
     await messenger.stop()
 
     assert order.index("interactive") <= 2
+
+
+@pytest.mark.asyncio
+async def test_default_scheduler_runs_each_traffic_class_at_its_own_concurrency() -> None:
+    messenger = OutboundMessenger()
+    release = asyncio.Event()
+    all_started = asyncio.Event()
+    started = 0
+
+    async def blocked() -> None:
+        nonlocal started
+        started += 1
+        if started == 8:
+            all_started.set()
+        await release.wait()
+
+    messenger.start()
+    tasks = [
+        *(
+            asyncio.create_task(
+                messenger.call(
+                    blocked,
+                    traffic_class="callback_ack",
+                    chat_key="chat:20",
+                )
+            )
+            for _ in range(4)
+        ),
+        *(asyncio.create_task(messenger.call(blocked, chat_key=f"chat:{chat_id}")) for chat_id in (1, 2)),
+        asyncio.create_task(messenger.call(blocked, traffic_class="media")),
+        asyncio.create_task(messenger.call(blocked, traffic_class="maintenance")),
+    ]
+    try:
+        await asyncio.wait_for(all_started.wait(), timeout=0.2)
+        snapshot = messenger.snapshot()["traffic_classes"]
+        assert {name: values["active"] for name, values in snapshot.items()} == {
+            "callback_ack": 4,
+            "interactive": 2,
+            "media": 1,
+            "maintenance": 1,
+        }
+        assert {name: values["concurrency"] for name, values in snapshot.items()} == {
+            "callback_ack": 4,
+            "interactive": 2,
+            "media": 1,
+            "maintenance": 1,
+        }
+    finally:
+        release.set()
+        await asyncio.gather(*tasks)
+        await messenger.stop()
+
+
+@pytest.mark.asyncio
+async def test_interactive_traffic_preserves_chat_fifo_while_other_chat_progresses() -> None:
+    messenger = OutboundMessenger()
+    release = asyncio.Event()
+    first_started = asyncio.Event()
+    other_started = asyncio.Event()
+    events: list[str] = []
+
+    async def first() -> None:
+        events.append("same-1-start")
+        first_started.set()
+        await release.wait()
+        events.append("same-1-end")
+
+    async def second() -> None:
+        events.append("same-2")
+
+    async def other() -> None:
+        events.append("other")
+        other_started.set()
+
+    messenger.start()
+    first_task = asyncio.create_task(messenger.call(first, chat_key="chat:1"))
+    await first_started.wait()
+    second_task = asyncio.create_task(messenger.call(second, chat_key="chat:1"))
+    other_task = asyncio.create_task(messenger.call(other, chat_key="chat:2"))
+    await asyncio.wait_for(other_started.wait(), timeout=0.2)
+    await asyncio.sleep(0)
+    assert events == ["same-1-start", "other"]
+
+    release.set()
+    await asyncio.gather(first_task, second_task, other_task)
+    await messenger.stop()
+
+    assert events == ["same-1-start", "other", "same-1-end", "same-2"]
+
+
+@pytest.mark.asyncio
+async def test_interactive_retry_cannot_be_overtaken_within_chat() -> None:
+    messenger = OutboundMessenger(retries=1)
+    events: list[str] = []
+    attempts = 0
+
+    async def first() -> None:
+        nonlocal attempts
+        attempts += 1
+        events.append(f"first-{attempts}")
+        if attempts == 1:
+            raise RetryAfter(0)
+
+    async def second() -> None:
+        events.append("second")
+
+    async def other() -> None:
+        events.append("other")
+
+    messenger.start()
+    tasks = [
+        asyncio.create_task(messenger.call(first, chat_key="chat:1")),
+        asyncio.create_task(messenger.call(second, chat_key="chat:1")),
+        asyncio.create_task(messenger.call(other, chat_key="chat:2")),
+    ]
+    await asyncio.gather(*tasks)
+    await messenger.stop()
+
+    assert events == ["first-1", "other", "first-2", "second"]
+
+
+@pytest.mark.asyncio
+async def test_callback_ack_bypasses_blocked_interactive_work_for_same_chat() -> None:
+    messenger = OutboundMessenger()
+    interactive_started = asyncio.Event()
+    callback_started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def interactive() -> None:
+        interactive_started.set()
+        await release.wait()
+
+    async def callback() -> None:
+        callback_started.set()
+
+    messenger.start()
+    interactive_task = asyncio.create_task(
+        messenger.call(interactive, traffic_class="interactive", chat_key="chat:20")
+    )
+    await interactive_started.wait()
+    callback_task = asyncio.create_task(
+        messenger.call(callback, traffic_class="callback_ack", chat_key="callback:1")
+    )
+    await asyncio.wait_for(callback_started.wait(), timeout=0.2)
+
+    release.set()
+    await asyncio.gather(interactive_task, callback_task)
+    await messenger.stop()
