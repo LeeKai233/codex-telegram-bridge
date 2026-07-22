@@ -739,7 +739,7 @@ async def test_resolved_server_request_notifies_before_pending_input_is_deleted(
 
     await bridge._on_notification("serverRequest/resolved", {"requestId": 42})
 
-    assert existed_during_hook == [True]
+    assert existed_during_hook == [False]
     assert store.get_pending_input("request-key") is None
     assert "request-key" not in bridge._pending_requests
     store.close()
@@ -804,8 +804,8 @@ async def test_command_approval_persists_and_responds_with_protocol_decision(
     await bridge.answer_command_approval(request_key, decision)
 
     assert responses == [(42, {"decision": wire_decision})]
-    assert store.get_pending_input(request_key) is None
-    assert request_key not in bridge._pending_requests
+    assert store.get_pending_input(request_key)["status"] == "awaiting_resolved"  # type: ignore[index]
+    assert request_key in bridge._pending_requests
     store.close()
 
 
@@ -858,7 +858,7 @@ async def test_command_approval_validates_and_preserves_available_decisions(tmp_
     await bridge.answer_command_approval(request_key, amendment)
 
     assert responses == [("approval-rpc-id", {"decision": amendment})]
-    assert store.get_pending_input(request_key) is None
+    assert store.get_pending_input(request_key)["status"] == "awaiting_resolved"  # type: ignore[index]
     store.close()
 
 
@@ -903,6 +903,86 @@ async def test_legacy_command_approval_normalizes_conversation_and_call_ids(tmp_
     await bridge.answer_command_approval(request_key, "cancel")
 
     assert responses == [(73, {"decision": "abort"})]
+    store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "params", "decision", "wire_response"),
+    (
+        (
+            "item/fileChange/requestApproval",
+            {
+                "threadId": "thread-generic",
+                "turnId": "turn-file",
+                "itemId": "item-file",
+                "availableDecisions": ["acceptForSession", "decline"],
+            },
+            "acceptForSession",
+            {"decision": "acceptForSession"},
+        ),
+        (
+            "item/permissions/requestApproval",
+            {
+                "threadId": "thread-generic",
+                "turnId": "turn-permissions",
+                "itemId": "item-permissions",
+            },
+            {
+                "permissions": {"fileSystem": "workspaceWrite"},
+                "scope": "session",
+                "strictAutoReview": True,
+            },
+            {
+                "permissions": {"fileSystem": "workspaceWrite"},
+                "scope": "session",
+                "strictAutoReview": True,
+            },
+        ),
+        (
+            "applyPatchApproval",
+            {
+                "conversationId": "thread-generic",
+                "turnId": "turn-patch",
+                "callId": "item-patch",
+            },
+            "accept",
+            {"decision": "approved"},
+        ),
+    ),
+)
+async def test_generic_approval_methods_emit_exact_wire_payloads(
+    tmp_path: Path,
+    method: str,
+    params: dict[str, Any],
+    decision: Any,
+    wire_response: dict[str, Any],
+) -> None:
+    bridge, store = make_bridge(tmp_path)
+    store.subscribe("thread-generic")
+    request_keys: list[str] = []
+    responses: list[tuple[int | str, dict[str, Any], int | None]] = []
+
+    async def forward(request_key: str, _params: dict[str, Any]) -> None:
+        request_keys.append(request_key)
+
+    async def respond(
+        request_id: int | str,
+        result: dict[str, Any],
+        *,
+        generation: int | None = None,
+    ) -> None:
+        responses.append((request_id, result, generation))
+
+    bridge.on_command_approval = forward
+    bridge.client.respond = respond  # type: ignore[method-assign]
+
+    await bridge._on_server_request(84, method, params, bridge.client.generation)
+    [request_key] = request_keys
+    await bridge.answer_command_approval(request_key, decision)
+
+    assert responses == [(84, wire_response, bridge.client.generation)]
+    assert store.get_pending_input(request_key)["status"] == "awaiting_resolved"  # type: ignore[index]
     store.close()
 
 
@@ -2066,4 +2146,378 @@ async def test_subagent_hydration_retries_transient_failures_in_one_coalesced_ta
         "gpt-5.6-luna",
         "max",
     )
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_prompt_choice_reuses_client_id_for_steer_and_rejects_racing_queue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, store = make_bridge(tmp_path)
+    store.save_thread(
+        ThreadState(
+            thread_id="thread-choice", cwd=str(tmp_path), status="active",
+            turn_id="turn-active", turn_status="inProgress",
+        )
+    )
+
+    async def snapshot(_thread_id: str) -> dict[str, Any]:
+        return {
+            "id": "thread-choice", "cwd": str(tmp_path), "status": {"type": "active"},
+            "turns": [{"id": "turn-active", "status": "inProgress"}],
+        }
+
+    async def steer(*_args: Any, **_kwargs: Any) -> None:
+        pass
+
+    monkeypatch.setattr(bridge, "_live_thread_snapshot", snapshot)
+    monkeypatch.setattr(bridge.client, "steer_turn", steer)
+
+    assert await bridge.send_prompt(
+        "thread-choice", "work", client_message_id="choice-1"
+    ) == "choose"
+    assert await bridge.send_prompt(
+        "thread-choice", "work", mode="steer", client_message_id="choice-1"
+    ) == "steered"
+    with pytest.raises(ValueError, match="already resolved"):
+        await bridge.send_prompt(
+            "thread-choice", "work", mode="queue", client_message_id="choice-1"
+        )
+    assert store.get_prompt_intent("choice-1").state == "steered"  # type: ignore[union-attr]
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_turn_gate_ignores_mismatched_completion_and_releases_matching_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, store = make_bridge(tmp_path)
+    store.save_thread(ThreadState(thread_id="thread-gate", cwd=str(tmp_path), status="idle"))
+    store.subscribe("thread-gate")
+    retries: list[str] = []
+    async def no_schedule(*_args: Any, **_kwargs: Any) -> None:
+        pass
+
+    monkeypatch.setattr(bridge.dashboard, "schedule", no_schedule)
+    monkeypatch.setattr(
+        bridge, "_request_queue_after_completion", lambda thread_id: retries.append(thread_id)
+    )
+    assert await bridge._begin_turn_gate("thread-gate", "client-gate")
+    bridge._bind_turn_gate("thread-gate", "client-gate", "turn-right")
+
+    await bridge._on_notification(
+        "turn/completed",
+        {"threadId": "thread-gate", "turn": {"id": "turn-wrong", "status": "completed", "items": []}},
+    )
+    assert "thread-gate" in bridge._turn_gates
+    await bridge._on_notification(
+        "turn/completed",
+        {"threadId": "thread-gate", "turn": {"id": "turn-right", "status": "completed", "items": []}},
+    )
+    assert "thread-gate" not in bridge._turn_gates
+    assert retries == ["thread-gate"]
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_started_notification_is_not_blocked_by_slow_state_hook(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, store = make_bridge(tmp_path)
+    store.save_thread(ThreadState(thread_id="thread-effects", status="idle"))
+    store.subscribe("thread-effects")
+    release = asyncio.Event()
+    started = asyncio.Event()
+
+    async def slow_change(_state: ThreadState, _reason: str) -> None:
+        started.set()
+        await release.wait()
+
+    bridge.on_state_change = slow_change
+    bridge._accept_notification_effects = True
+    bridge._notification_effect_task = asyncio.create_task(bridge._run_notification_effects())
+    try:
+        await bridge._on_notification(
+            "turn/started",
+            {"threadId": "thread-effects", "turn": {"id": "turn-1", "status": "inProgress"}},
+        )
+        await asyncio.wait_for(started.wait(), timeout=1)
+        await asyncio.wait_for(
+            bridge._on_notification(
+                "item/started",
+                {
+                    "threadId": "thread-effects",
+                    "turnId": "turn-1",
+                    "item": {"id": "i", "type": "agentMessage", "text": "x"},
+                },
+            ),
+            timeout=0.1,
+        )
+    finally:
+        release.set()
+        await bridge._stop_notification_effects()
+        store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("winning_mode", "losing_mode", "winning_result"),
+    (("steer", "queue", "steered"), ("queue", "steer", "queued")),
+)
+async def test_awaiting_choice_has_one_atomic_steer_or_queue_winner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    winning_mode: str,
+    losing_mode: str,
+    winning_result: str,
+) -> None:
+    bridge, store = make_bridge(tmp_path)
+    thread_id = "thread-choice-race"
+    client_id = f"choice-{winning_mode}"
+    store.save_thread(
+        ThreadState(
+            thread_id=thread_id,
+            cwd=str(tmp_path),
+            status="active",
+            turn_id="turn-active",
+            turn_status="inProgress",
+        )
+    )
+    snapshot_started = asyncio.Event()
+    release_snapshot = asyncio.Event()
+    steer_calls: list[str] = []
+
+    async def snapshot(_thread_id: str) -> dict[str, Any]:
+        snapshot_started.set()
+        await release_snapshot.wait()
+        return {
+            "id": thread_id,
+            "cwd": str(tmp_path),
+            "status": {"type": "active"},
+            "turns": [{"id": "turn-active", "status": "inProgress"}],
+        }
+
+    async def steer(
+        _thread_id: str,
+        _turn_id: str,
+        _inputs: list[dict[str, Any]],
+        *,
+        client_message_id: str,
+    ) -> None:
+        steer_calls.append(client_message_id)
+
+    async def no_schedule(*_args: Any, **_kwargs: Any) -> None:
+        pass
+
+    monkeypatch.setattr(bridge, "_live_thread_snapshot", snapshot)
+    monkeypatch.setattr(bridge.client, "steer_turn", steer)
+    monkeypatch.setattr(bridge.dashboard, "schedule", no_schedule)
+
+    initial = store.create_prompt_intent(
+        client_id,
+        "legacy",
+        "work",
+        "auto",
+        thread_id=thread_id,
+    )
+    assert store.transition_prompt_intent(
+        client_id,
+        expected_states={"received"},
+        to_state="awaiting_choice",
+    )
+    assert initial.intent_id == store.get_prompt_intent(client_id).intent_id  # type: ignore[union-attr]
+
+    winner = asyncio.create_task(
+        bridge.send_prompt(
+            thread_id,
+            "work",
+            mode=winning_mode,
+            client_message_id=client_id,
+        )
+    )
+    await asyncio.wait_for(snapshot_started.wait(), timeout=1)
+    with pytest.raises(ValueError, match="already resolved"):
+        await bridge.send_prompt(
+            thread_id,
+            "work",
+            mode=losing_mode,
+            client_message_id=client_id,
+        )
+    release_snapshot.set()
+
+    assert await winner == winning_result
+    intent = store.get_prompt_intent(client_id)
+    assert intent is not None and intent.mode == winning_mode
+    assert steer_calls == ([client_id] if winning_mode == "steer" else [])
+    assert store.queue_count(thread_id) == (1 if winning_mode == "queue" else 0)
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_thread_snapshot_coalesces_same_generation_and_refreshes_after_reconnect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, store = make_bridge(tmp_path)
+    calls = 0
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def resume_thread(thread_id: str) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return {"id": thread_id, "generation": bridge.client.generation}
+
+    monkeypatch.setattr(bridge.client, "resume_thread", resume_thread)
+    first = asyncio.create_task(bridge._live_thread_snapshot("thread-snapshot"))
+    second = asyncio.create_task(bridge._live_thread_snapshot("thread-snapshot"))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    release.set()
+
+    assert await first == await second == {"id": "thread-snapshot", "generation": 0}
+    assert await bridge._live_thread_snapshot("thread-snapshot") == {
+        "id": "thread-snapshot",
+        "generation": 0,
+    }
+    assert calls == 1
+
+    bridge.client.generation = 1
+    assert await bridge._live_thread_snapshot("thread-snapshot") == {
+        "id": "thread-snapshot",
+        "generation": 1,
+    }
+    assert calls == 2
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_idle_reconciliation_advances_queue_only_after_confirmed_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, store = make_bridge(tmp_path)
+    thread_id = "thread-reconcile"
+    store.save_thread(ThreadState(thread_id=thread_id, cwd=str(tmp_path), status="idle"))
+    retries: list[str] = []
+    receipts: list[tuple[bool | None, dict[str, Any] | None]] = [
+        (None, None),
+        (False, None),
+    ]
+
+    async def receipt(
+        _thread_id: str, _client_message_id: str
+    ) -> tuple[bool | None, dict[str, Any] | None]:
+        return receipts.pop(0)
+
+    monkeypatch.setattr(bridge_module, "_TURN_RECONCILE_SECONDS", 0.0)
+    monkeypatch.setattr(bridge, "_client_message_receipt", receipt)
+    monkeypatch.setattr(
+        bridge, "_request_queue_after_completion", lambda value: retries.append(value)
+    )
+    bridge.client._connected.set()
+    assert await bridge._begin_turn_gate(thread_id, "client-reconcile")
+
+    bridge._schedule_turn_reconciliation(thread_id)
+    await bridge._turn_reconcile_tasks[thread_id]
+    assert thread_id in bridge._turn_gates
+    assert retries == []
+
+    bridge._schedule_turn_reconciliation(thread_id)
+    await bridge._turn_reconcile_tasks[thread_id]
+    assert thread_id not in bridge._turn_gates
+    assert retries == [thread_id]
+    store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("connected", "expected"),
+    ((True, "safe_to_submit"), (False, "uncertain")),
+)
+async def test_plan_decision_gate_requires_connected_idle_absence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    connected: bool,
+    expected: str,
+) -> None:
+    bridge, store = make_bridge(tmp_path)
+    thread_id = "thread-plan-gate"
+    store.save_thread(ThreadState(thread_id=thread_id, cwd=str(tmp_path), status="idle"))
+    store.save_session_space(
+        SessionSpace(space_id="space-plan-gate", lifecycle="active", thread_id=thread_id)
+    )
+    assert store.claim_plan_publication(
+        space_id="space-plan-gate",
+        generation=1,
+        item_id="plan-item",
+        revision_key="revision",
+        thread_id=thread_id,
+        turn_id="turn-plan",
+        plan_text="Plan",
+    )
+
+    async def absent(
+        _thread_id: str, _client_message_id: str
+    ) -> tuple[bool, None]:
+        return False, None
+
+    monkeypatch.setattr(bridge, "_client_message_receipt", absent)
+    if connected:
+        bridge.client._connected.set()
+
+    result = await bridge.wait_for_plan_decision_gate(
+        "space-plan-gate",
+        1,
+        "plan-item",
+        "revision",
+        "client-plan",
+        timeout=0,
+    )
+
+    assert result == {"status": expected}
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_notification_effects_run_fifo_and_shutdown_accounts_for_dropped_items(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, store = make_bridge(tmp_path)
+    order: list[int] = []
+    bridge._accept_notification_effects = True
+    bridge._notification_effect_task = asyncio.create_task(bridge._run_notification_effects())
+
+    for value in range(3):
+        async def effect(item: int = value) -> None:
+            await asyncio.sleep(0)
+            order.append(item)
+
+        await bridge._dispatch_notification_effect(str(value), effect)
+    await asyncio.wait_for(bridge._notification_effects.join(), timeout=1)
+    assert order == [0, 1, 2]
+    await bridge._stop_notification_effects()
+
+    blocked = asyncio.Event()
+    second_ran = False
+
+    async def blocking_effect() -> None:
+        blocked.set()
+        await asyncio.Event().wait()
+
+    async def dropped_effect() -> None:
+        nonlocal second_ran
+        second_ran = True
+
+    monkeypatch.setattr(bridge_module, "_NOTIFICATION_EFFECT_DRAIN_SECONDS", 0.01)
+    bridge._accept_notification_effects = True
+    bridge._notification_effect_task = asyncio.create_task(bridge._run_notification_effects())
+    await bridge._dispatch_notification_effect("blocking", blocking_effect)
+    await bridge._dispatch_notification_effect("dropped", dropped_effect)
+    await asyncio.wait_for(blocked.wait(), timeout=1)
+
+    await bridge._stop_notification_effects()
+
+    await asyncio.wait_for(bridge._notification_effects.join(), timeout=0.1)
+    assert bridge._notification_effects.empty()
+    assert second_ran is False
     store.close()

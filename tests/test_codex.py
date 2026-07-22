@@ -291,6 +291,41 @@ async def test_collaboration_modes_are_validated_and_resolved() -> None:
 
 
 @pytest.mark.asyncio
+async def test_collaboration_modes_are_cached_per_connection_generation() -> None:
+    client = CodexClient(Path("/tmp/not-used.sock"))
+    calls = 0
+
+    async def request(
+        method: str, params: dict[str, Any], timeout: float = 30.0
+    ) -> dict[str, Any]:
+        nonlocal calls
+        del timeout
+        assert (method, params) == ("collaborationMode/list", {})
+        calls += 1
+        return {
+            "data": [
+                {
+                    "name": "Default",
+                    "mode": "default",
+                    "model": f"model-generation-{client.generation}",
+                    "reasoning_effort": "high",
+                }
+            ]
+        }
+
+    client.request = request  # type: ignore[method-assign]
+    first = await client.list_collaboration_modes()
+    first[0]["model"] = "mutated-by-caller"
+
+    assert (await client.list_collaboration_modes())[0]["model"] == "model-generation-0"
+    assert calls == 1
+
+    client.generation = 1
+    assert (await client.list_collaboration_modes())[0]["model"] == "model-generation-1"
+    assert calls == 2
+
+
+@pytest.mark.asyncio
 async def test_collaboration_modes_fail_closed_on_missing_or_invalid_capability() -> None:
     client = CodexClient(Path("/tmp/not-used.sock"))
 
@@ -364,6 +399,48 @@ async def test_model_options_follow_pagination_and_validate_efforts() -> None:
         ("model/list", {"limit": 1}),
         ("model/list", {"limit": 1, "cursor": "page-2"}),
     ]
+
+
+@pytest.mark.asyncio
+async def test_model_options_are_cached_for_five_minutes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = CodexClient(Path("/tmp/not-used.sock"))
+    now = 10.0
+    calls = 0
+
+    monkeypatch.setattr(codex_module.time, "monotonic", lambda: now)
+
+    async def request(
+        method: str, params: dict[str, Any], timeout: float = 30.0
+    ) -> dict[str, Any]:
+        nonlocal calls
+        del timeout
+        assert (method, params) == ("model/list", {"limit": 100})
+        calls += 1
+        return {
+            "data": [
+                {
+                    "model": "gpt-test",
+                    "displayName": "GPT Test",
+                    "defaultReasoningEffort": "high",
+                    "isDefault": True,
+                    "supportedReasoningEfforts": [{"reasoningEffort": "high"}],
+                }
+            ],
+            "nextCursor": None,
+        }
+
+    client.request = request  # type: ignore[method-assign]
+
+    assert [item.model for item in await client.list_model_options()] == ["gpt-test"]
+    now += 299.9
+    assert [item.model for item in await client.list_model_options()] == ["gpt-test"]
+    assert calls == 1
+
+    now += 0.1
+    assert [item.model for item in await client.list_model_options()] == ["gpt-test"]
+    assert calls == 2
 
 
 @pytest.mark.asyncio
@@ -1382,3 +1459,23 @@ async def test_server_requests_are_bounded_and_serial_per_thread() -> None:
         await asyncio.sleep(0)
     assert len(started) == 10
     assert duplicate_thread_overlap is False
+
+
+@pytest.mark.asyncio
+async def test_find_user_message_returns_turn_receipt_from_supplied_history() -> None:
+    client = CodexClient(Path("/tmp/not-used.sock"))
+    receipt = await client.find_user_message(
+        "thread",
+        "client-1",
+        payload={
+            "turns": [
+                {
+                    "id": "turn-1",
+                    "status": "inProgress",
+                    "items": [{"id": "message", "type": "userMessage", "clientId": "client-1"}],
+                }
+            ]
+        },
+    )
+    assert receipt is not None
+    assert (receipt["turn_id"], receipt["turn_status"]) == ("turn-1", "inProgress")

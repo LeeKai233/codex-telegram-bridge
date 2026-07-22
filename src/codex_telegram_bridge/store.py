@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
 import sqlite3
 import threading
@@ -15,9 +16,10 @@ from pathlib import Path
 from typing import Any
 
 from .config import ensure_private_directory
-from .models import InteractionDraft, Owner, QueuedPrompt, SessionSpace, ThreadState
+from .models import InteractionDraft, Owner, PromptIntent, QueuedPrompt, SessionSpace, ThreadState
 
-SCHEMA_VERSION = 10
+LOGGER = logging.getLogger(__name__)
+SCHEMA_VERSION = 11
 CONTROL_BOT_ROLE = "control"
 EVENT_RETENTION_DAYS = 7
 EVENT_RECEIPT_LIMIT = 100_000
@@ -31,6 +33,18 @@ _PLAN_ACTION_TERMINAL_STATUSES = frozenset({"executed", "revision_started", "dis
 _PLAN_UI_REPAIR_STATUSES = frozenset(
     {"published", "executing", "revising", "executed", "revision_started", "dismissed", "superseded"}
 )
+_PROMPT_INTENT_TRANSITIONS: dict[str, frozenset[str]] = {
+    "received": frozenset({"awaiting_choice", "queued", "submitting", "failed", "cancelled"}),
+    "awaiting_choice": frozenset({"queued", "submitting", "cancelled"}),
+    "queued": frozenset({"submitting", "failed", "uncertain", "cancelled"}),
+    "submitting": frozenset({"started", "steered", "failed", "uncertain", "cancelled"}),
+    "started": frozenset({"completed", "failed", "cancelled"}),
+    "steered": frozenset({"completed", "failed", "cancelled"}),
+    "completed": frozenset(),
+    "failed": frozenset(),
+    "uncertain": frozenset(),
+    "cancelled": frozenset(),
+}
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS metadata (
@@ -92,9 +106,31 @@ CREATE TABLE IF NOT EXISTS prompt_queue (
     created_at INTEGER NOT NULL,
     dispatched_at INTEGER,
     space_id TEXT,
-    generation INTEGER NOT NULL DEFAULT 0
+    generation INTEGER NOT NULL DEFAULT 0,
+    prompt_intent_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_prompt_queue_thread ON prompt_queue(thread_id, status, id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_prompt_queue_intent
+    ON prompt_queue(prompt_intent_id) WHERE prompt_intent_id IS NOT NULL;
+CREATE TABLE IF NOT EXISTS prompt_intents (
+    intent_id TEXT PRIMARY KEY,
+    client_message_id TEXT NOT NULL UNIQUE,
+    source TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    thread_id TEXT,
+    space_id TEXT,
+    generation INTEGER NOT NULL DEFAULT 0,
+    state TEXT NOT NULL DEFAULT 'received',
+    turn_id TEXT,
+    queue_id INTEGER,
+    error TEXT,
+    receipt_key TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_prompt_intents_thread_state
+    ON prompt_intents(thread_id, state, updated_at);
 CREATE TABLE IF NOT EXISTS callbacks (
     nonce TEXT PRIMARY KEY,
     action TEXT NOT NULL,
@@ -135,7 +171,13 @@ CREATE TABLE IF NOT EXISTS pending_inputs (
     item_id TEXT NOT NULL,
     questions_json TEXT NOT NULL,
     expires_at INTEGER,
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    claimed_at INTEGER,
+    responded_at INTEGER,
+    resolved_at INTEGER,
+    response_json TEXT,
+    resolution_source TEXT
 );
 CREATE TABLE IF NOT EXISTS recovery_codes (
     code_hash TEXT PRIMARY KEY,
@@ -289,6 +331,18 @@ CREATE TABLE IF NOT EXISTS health_snapshots (
     snapshot_json TEXT NOT NULL,
     updated_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS telegram_message_state (
+    message_key TEXT PRIMARY KEY,
+    bot_role TEXT NOT NULL,
+    chat_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    semantic_fingerprint TEXT NOT NULL,
+    state TEXT NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_telegram_message_state_message
+    ON telegram_message_state(bot_role, chat_id, message_id);
 """
 
 
@@ -556,6 +610,24 @@ class Store:
             update_columns = _columns(self._connection, "telegram_updates")
             if update_columns and "bot_role" not in update_columns:
                 self._connection.execute("ALTER TABLE telegram_updates RENAME TO telegram_updates_legacy")
+            prompt_columns = _columns(self._connection, "prompt_queue")
+            if prompt_columns and "prompt_intent_id" not in prompt_columns:
+                self._connection.execute("ALTER TABLE prompt_queue ADD COLUMN prompt_intent_id TEXT")
+            pending_columns = _columns(self._connection, "pending_inputs")
+            pending_additions = {
+                "status": "TEXT NOT NULL DEFAULT 'pending'",
+                "claimed_at": "INTEGER",
+                "responded_at": "INTEGER",
+                "resolved_at": "INTEGER",
+                "response_json": "TEXT",
+                "resolution_source": "TEXT",
+            }
+            if pending_columns:
+                for name, declaration in pending_additions.items():
+                    if name not in pending_columns:
+                        self._connection.execute(
+                            f"ALTER TABLE pending_inputs ADD COLUMN {name} {declaration}"
+                        )
             for statement in _schema_statements():
                 self._connection.execute(statement)
             if _columns(self._connection, "plan_publications_v6"):
@@ -613,6 +685,24 @@ class Store:
             if "generation" not in prompt_columns:
                 self._connection.execute(
                     "ALTER TABLE prompt_queue ADD COLUMN generation INTEGER NOT NULL DEFAULT 0"
+                )
+            rows = self._connection.execute(
+                "SELECT space_id, state_json FROM session_spaces"
+            ).fetchall()
+            for row in rows:
+                try:
+                    raw_space = json.loads(str(row[1]))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if not isinstance(raw_space, dict):
+                    continue
+                current_mode = str(raw_space.get("current_mode") or "default")
+                raw_space.setdefault("desired_mode", current_mode)
+                raw_space.setdefault("observed_mode", "unknown")
+                raw_space["current_mode"] = str(raw_space.get("desired_mode") or current_mode)
+                self._connection.execute(
+                    "UPDATE session_spaces SET state_json=? WHERE space_id=?",
+                    (_json_mapping(raw_space), str(row[0])),
                 )
             callback_columns = _columns(self._connection, "callbacks")
             additions = {
@@ -996,10 +1086,24 @@ class Store:
             space[name] = int(space[name]) if space.get(name) is not None else None
         for name in ("normal_model", "normal_effort", "plan_model", "plan_effort"):
             space[name] = str(space.get(name) or "").strip()
-        current_mode = str(space.get("current_mode") or "default")
-        if current_mode not in {"default", "plan"}:
-            raise ValueError(f"Unsupported session collaboration mode: {current_mode}")
-        space["current_mode"] = current_mode
+        desired_mode = str(space.get("desired_mode") or space.get("current_mode") or "default")
+        legacy_mode = str(space.get("current_mode") or desired_mode)
+        if legacy_mode != desired_mode:
+            LOGGER.info(
+                "event=session_space_legacy_mode_override space_id=%s desired=%s current=%s",
+                space_id,
+                desired_mode,
+                legacy_mode,
+            )
+            desired_mode = legacy_mode
+        if desired_mode not in {"default", "plan"}:
+            raise ValueError(f"Unsupported desired collaboration mode: {desired_mode}")
+        observed_mode = str(space.get("observed_mode") or "unknown")
+        if observed_mode not in {"unknown", "default", "plan"}:
+            raise ValueError(f"Unsupported observed collaboration mode: {observed_mode}")
+        space["desired_mode"] = desired_mode
+        space["observed_mode"] = observed_mode
+        space["current_mode"] = desired_mode
         return space
 
     @staticmethod
@@ -1227,7 +1331,8 @@ class Store:
             if (
                 thread_id
                 and connection.execute(
-                    "SELECT 1 FROM pending_inputs WHERE thread_id=? LIMIT 1", (thread_id,)
+                    "SELECT 1 FROM pending_inputs WHERE thread_id=? AND status!='resolved' LIMIT 1",
+                    (thread_id,),
                 ).fetchone()
             ):
                 raise RuntimeError("当前 Session 仍有待回答问题，不能重建 Telegram 帖子")
@@ -1289,6 +1394,7 @@ class Store:
                     **current,
                     "lifecycle": "repair_required",
                     "generation": generation + 1,
+                    "observed_mode": "unknown",
                     "channel_post_id": None,
                     "discussion_root_id": None,
                     "status_message_id": None,
@@ -1315,7 +1421,12 @@ class Store:
             if expected_generation is not None and generation != expected_generation:
                 return None
             value = self._canonical_space(
-                {**current, "lifecycle": "closed", "generation": generation + 1},
+                {
+                    **current,
+                    "lifecycle": "closed",
+                    "generation": generation + 1,
+                    "observed_mode": "unknown",
+                },
                 now=int(time.time()),
                 created_at=int(current["created_at"]),
             )
@@ -1447,6 +1558,8 @@ class Store:
             "plan_model",
             "plan_effort",
             "current_mode",
+            "desired_mode",
+            "observed_mode",
             "created_at",
             "updated_at",
             "last_error",
@@ -1575,6 +1688,314 @@ class Store:
             ).fetchall()
         return [{"kind": row[0], "payload": json.loads(row[1]), "created_at": int(row[2])} for row in rows]
 
+    @staticmethod
+    def _prompt_intent_from_row(row: sqlite3.Row) -> PromptIntent:
+        return PromptIntent(
+            intent_id=str(row[0]),
+            client_message_id=str(row[1]),
+            source=str(row[2]),
+            prompt=str(row[3]),
+            mode=str(row[4]),
+            thread_id=str(row[5]) if row[5] else None,
+            space_id=str(row[6]) if row[6] else None,
+            generation=int(row[7]),
+            state=str(row[8]),
+            turn_id=str(row[9]) if row[9] else None,
+            queue_id=int(row[10]) if row[10] is not None else None,
+            error=str(row[11]) if row[11] else None,
+            receipt_key=str(row[12]) if row[12] else None,
+            created_at=int(row[13]),
+            updated_at=int(row[14]),
+        )
+
+    def create_prompt_intent(
+        self,
+        client_message_id: str,
+        source: str,
+        prompt: str,
+        mode: str,
+        *,
+        thread_id: str | None = None,
+        space_id: str | None = None,
+        generation: int = 0,
+        receipt_key: str | None = None,
+    ) -> PromptIntent:
+        if not client_message_id.strip() or not source.strip() or not mode.strip():
+            raise ValueError("Prompt intent identifiers must not be empty")
+        if generation < 0:
+            raise ValueError("generation must not be negative")
+        now = int(time.time())
+        with self._immediate_transaction() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO prompt_intents("
+                "intent_id, client_message_id, source, prompt, mode, thread_id, space_id, generation, "
+                "state, receipt_key, created_at, updated_at) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'received', ?, ?, ?)",
+                (
+                    uuid.uuid4().hex,
+                    client_message_id,
+                    source,
+                    prompt,
+                    mode,
+                    thread_id,
+                    space_id,
+                    generation,
+                    receipt_key,
+                    now,
+                    now,
+                ),
+            )
+            row = connection.execute(
+                "SELECT intent_id, client_message_id, source, prompt, mode, thread_id, space_id, "
+                "generation, state, turn_id, queue_id, error, receipt_key, created_at, updated_at "
+                "FROM prompt_intents WHERE client_message_id=?",
+                (client_message_id,),
+            ).fetchone()
+        assert row is not None
+        intent = self._prompt_intent_from_row(row)
+        requested = (source, prompt, mode, thread_id, space_id, generation)
+        persisted = (
+            intent.source,
+            intent.prompt,
+            intent.mode,
+            intent.thread_id,
+            intent.space_id,
+            intent.generation,
+        )
+        if persisted != requested:
+            raise ValueError(f"Prompt client_message_id collision: {client_message_id}")
+        return intent
+
+    def get_prompt_intent(self, client_message_id: str) -> PromptIntent | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT intent_id, client_message_id, source, prompt, mode, thread_id, space_id, "
+                "generation, state, turn_id, queue_id, error, receipt_key, created_at, updated_at "
+                "FROM prompt_intents WHERE client_message_id=?",
+                (client_message_id,),
+            ).fetchone()
+        return self._prompt_intent_from_row(row) if row is not None else None
+
+    def resolve_prompt_intent_choice(
+        self,
+        client_message_id: str,
+        *,
+        mode: str,
+    ) -> PromptIntent | None:
+        if mode not in {"queue", "steer"}:
+            raise ValueError(f"Unsupported prompt choice: {mode}")
+        with self._immediate_transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE prompt_intents SET mode=?, updated_at=? WHERE client_message_id=? "
+                "AND state='awaiting_choice' AND mode='auto'",
+                (mode, int(time.time()), client_message_id),
+            )
+            if cursor.rowcount != 1:
+                return None
+            row = connection.execute(
+                "SELECT intent_id, client_message_id, source, prompt, mode, thread_id, space_id, "
+                "generation, state, turn_id, queue_id, error, receipt_key, created_at, updated_at "
+                "FROM prompt_intents WHERE client_message_id=?",
+                (client_message_id,),
+            ).fetchone()
+        return self._prompt_intent_from_row(row) if row is not None else None
+
+    def link_prompt_intent_receipt(
+        self,
+        client_message_id: str,
+        receipt_key: str,
+    ) -> PromptIntent | None:
+        if not receipt_key.strip():
+            raise ValueError("receipt_key must not be empty")
+        with self._immediate_transaction() as connection:
+            current = connection.execute(
+                "SELECT receipt_key FROM prompt_intents WHERE client_message_id=?",
+                (client_message_id,),
+            ).fetchone()
+            if current is None:
+                return None
+            if current[0] not in {None, receipt_key}:
+                raise ValueError(f"Prompt intent receipt collision: {client_message_id}")
+            connection.execute(
+                "UPDATE prompt_intents SET receipt_key=?, updated_at=? WHERE client_message_id=?",
+                (receipt_key, int(time.time()), client_message_id),
+            )
+            row = connection.execute(
+                "SELECT intent_id, client_message_id, source, prompt, mode, thread_id, space_id, "
+                "generation, state, turn_id, queue_id, error, receipt_key, created_at, updated_at "
+                "FROM prompt_intents WHERE client_message_id=?",
+                (client_message_id,),
+            ).fetchone()
+        return self._prompt_intent_from_row(row) if row is not None else None
+
+    def transition_prompt_intent(
+        self,
+        client_message_id: str,
+        *,
+        expected_states: set[str] | None,
+        to_state: str,
+        turn_id: str | None = None,
+        queue_id: int | None = None,
+        error: str | None = None,
+        receipt_key: str | None = None,
+    ) -> PromptIntent | None:
+        if to_state not in _PROMPT_INTENT_TRANSITIONS:
+            raise ValueError(f"Unsupported prompt intent state: {to_state}")
+        with self._immediate_transaction() as connection:
+            current = connection.execute(
+                "SELECT state FROM prompt_intents WHERE client_message_id=?",
+                (client_message_id,),
+            ).fetchone()
+            if current is None:
+                return None
+            current_state = str(current[0])
+            if expected_states is not None and current_state not in expected_states:
+                return None
+            if current_state != to_state and to_state not in _PROMPT_INTENT_TRANSITIONS[current_state]:
+                raise ValueError(f"Invalid prompt intent transition: {current_state} -> {to_state}")
+            connection.execute(
+                "UPDATE prompt_intents SET state=?, turn_id=COALESCE(?, turn_id), "
+                "queue_id=COALESCE(?, queue_id), error=COALESCE(?, error), "
+                "receipt_key=COALESCE(?, receipt_key), updated_at=? WHERE client_message_id=?",
+                (
+                    to_state,
+                    turn_id,
+                    queue_id,
+                    error,
+                    receipt_key,
+                    int(time.time()),
+                    client_message_id,
+                ),
+            )
+            row = connection.execute(
+                "SELECT intent_id, client_message_id, source, prompt, mode, thread_id, space_id, "
+                "generation, state, turn_id, queue_id, error, receipt_key, created_at, updated_at "
+                "FROM prompt_intents WHERE client_message_id=?",
+                (client_message_id,),
+            ).fetchone()
+        return self._prompt_intent_from_row(row) if row is not None else None
+
+    def reconcile_prompt_intent(
+        self,
+        client_message_id: str,
+        *,
+        delivered: bool | None,
+        turn_id: str | None = None,
+        error: str | None = None,
+    ) -> PromptIntent | None:
+        current = self.get_prompt_intent(client_message_id)
+        if current is None or current.state in {"completed", "failed", "uncertain", "cancelled"}:
+            return current
+        if delivered:
+            target = "steered" if current.mode == "steer" else "started"
+            if current.state == "queued":
+                current = self.transition_prompt_intent(
+                    client_message_id,
+                    expected_states={"queued"},
+                    to_state="submitting",
+                    turn_id=turn_id,
+                    error=error,
+                ) or current
+            return self.transition_prompt_intent(
+                client_message_id,
+                expected_states={"received", "awaiting_choice", "submitting"},
+                to_state=target,
+                turn_id=turn_id,
+                error=error,
+            )
+        return self.transition_prompt_intent(
+            client_message_id,
+            expected_states={"submitting", "queued"},
+            to_state="uncertain",
+            turn_id=turn_id,
+            error=error or "delivery could not be reconciled",
+        )
+
+    def finish_prompt_intents(
+        self,
+        thread_id: str,
+        turn_id: str,
+        *,
+        status: str,
+        error: str | None = None,
+    ) -> int:
+        target = {"completed": "completed", "interrupted": "cancelled", "failed": "failed"}.get(
+            status
+        )
+        if target is None:
+            raise ValueError(f"Unsupported terminal turn status: {status}")
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                "UPDATE prompt_intents SET state=?, error=COALESCE(?, error), updated_at=? "
+                "WHERE thread_id=? AND turn_id=? AND state IN ('started', 'steered')",
+                (target, error, int(time.time()), thread_id, turn_id),
+            )
+        return int(cursor.rowcount)
+
+    def put_telegram_message_state(
+        self,
+        message_key: str,
+        *,
+        bot_role: str,
+        chat_id: int,
+        message_id: int,
+        semantic_fingerprint: str,
+        state: str,
+        payload: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if not message_key.strip() or not bot_role.strip() or not state.strip():
+            raise ValueError("Telegram message state identifiers must not be empty")
+        now = int(time.time())
+        encoded = _json_mapping(payload or {})
+        with self._lock, self._connection:
+            self._connection.execute(
+                "INSERT INTO telegram_message_state(message_key, bot_role, chat_id, message_id, "
+                "semantic_fingerprint, state, payload_json, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(message_key) DO UPDATE SET bot_role=excluded.bot_role, "
+                "chat_id=excluded.chat_id, message_id=excluded.message_id, "
+                "semantic_fingerprint=excluded.semantic_fingerprint, state=excluded.state, "
+                "payload_json=excluded.payload_json, updated_at=excluded.updated_at",
+                (
+                    message_key,
+                    bot_role,
+                    int(chat_id),
+                    int(message_id),
+                    semantic_fingerprint,
+                    state,
+                    encoded,
+                    now,
+                ),
+            )
+        return self.get_telegram_message_state(message_key) or {}
+
+    def get_telegram_message_state(self, message_key: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT bot_role, chat_id, message_id, semantic_fingerprint, state, payload_json, "
+                "updated_at FROM telegram_message_state WHERE message_key=?",
+                (message_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        payload = json.loads(str(row[5]))
+        return {
+            "message_key": message_key,
+            "bot_role": str(row[0]),
+            "chat_id": int(row[1]),
+            "message_id": int(row[2]),
+            "semantic_fingerprint": str(row[3]),
+            "state": str(row[4]),
+            "payload": payload if isinstance(payload, dict) else {},
+            "updated_at": int(row[6]),
+        }
+
+    def delete_telegram_message_state(self, message_key: str) -> bool:
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                "DELETE FROM telegram_message_state WHERE message_key=?", (message_key,)
+            )
+        return cursor.rowcount == 1
+
     def enqueue_prompt(
         self,
         thread_id: str,
@@ -1584,13 +2005,14 @@ class Store:
         *,
         space_id: str | None = None,
         generation: int = 0,
+        prompt_intent_id: str | None = None,
     ) -> int:
         if generation < 0:
             raise ValueError("generation must not be negative")
         with self._lock, self._connection:
             cursor = self._connection.execute(
                 "INSERT INTO prompt_queue(thread_id, prompt, inputs_json, client_message_id, created_at, "
-                "space_id, generation) VALUES(?, ?, ?, ?, ?, ?, ?)",
+                "space_id, generation, prompt_intent_id) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     thread_id,
                     prompt,
@@ -1599,6 +2021,7 @@ class Store:
                     int(time.time()),
                     space_id,
                     generation,
+                    prompt_intent_id,
                 ),
             )
         return int(cursor.lastrowid)
@@ -1606,7 +2029,8 @@ class Store:
     def next_prompt(self, thread_id: str) -> QueuedPrompt | None:
         with self._lock:
             row = self._connection.execute(
-                "SELECT id, thread_id, prompt, inputs_json, client_message_id, created_at "
+                "SELECT id, thread_id, prompt, inputs_json, client_message_id, created_at, "
+                "prompt_intent_id "
                 "FROM prompt_queue WHERE thread_id=? AND status='queued' ORDER BY id LIMIT 1",
                 (thread_id,),
             ).fetchone()
@@ -1619,6 +2043,7 @@ class Store:
             inputs=json.loads(row[3]),
             client_message_id=str(row[4]),
             created_at=int(row[5]),
+            prompt_intent_id=str(row[6]) if row[6] else None,
         )
 
     def mark_prompt_dispatched(self, queue_id: int) -> None:
@@ -2747,9 +3172,10 @@ class Store:
         while True:
             rows = connection.execute(
                 "SELECT request_key FROM pending_inputs "
-                "WHERE expires_at IS NOT NULL AND expires_at < ? "
+                "WHERE status='resolved' OR (expires_at IS NOT NULL AND expires_at < ?) "
                 "UNION SELECT messages.request_key FROM question_messages AS messages "
                 "LEFT JOIN pending_inputs AS pending ON pending.request_key=messages.request_key "
+                "AND pending.status!='resolved' "
                 "WHERE pending.request_key IS NULL ORDER BY request_key LIMIT ?",
                 (now, MAINTENANCE_BATCH_SIZE),
             ).fetchall()
@@ -2859,6 +3285,15 @@ class Store:
             "prompt_runs": cls._delete_in_batches(
                 connection, "prompt_runs", "updated_at < ?", (retention_cutoff,)
             ),
+            "prompt_intents": cls._delete_in_batches(
+                connection,
+                "prompt_intents",
+                "state IN ('completed', 'failed', 'uncertain', 'cancelled') AND updated_at < ?",
+                (retention_cutoff,),
+            ),
+            "telegram_message_state": cls._delete_in_batches(
+                connection, "telegram_message_state", "updated_at < ?", (retention_cutoff,)
+            ),
             "plan_publications": cls._delete_in_batches(
                 connection,
                 "plan_publications",
@@ -2941,7 +3376,8 @@ class Store:
     def queue_entries(self, thread_id: str) -> list[QueuedPrompt]:
         with self._lock:
             rows = self._connection.execute(
-                "SELECT id, thread_id, prompt, inputs_json, client_message_id, created_at "
+                "SELECT id, thread_id, prompt, inputs_json, client_message_id, created_at, "
+                "prompt_intent_id "
                 "FROM prompt_queue WHERE thread_id=? AND status='queued' ORDER BY id",
                 (thread_id,),
             ).fetchall()
@@ -2953,6 +3389,7 @@ class Store:
                 inputs=json.loads(row[3]),
                 client_message_id=str(row[4]),
                 created_at=int(row[5]),
+                prompt_intent_id=str(row[6]) if row[6] else None,
             )
             for row in rows
         ]
@@ -2965,7 +3402,8 @@ class Store:
             parameters.append(generation)
         with self._lock:
             rows = self._connection.execute(
-                "SELECT id, thread_id, prompt, inputs_json, client_message_id, created_at, generation "
+                "SELECT id, thread_id, prompt, inputs_json, client_message_id, created_at, generation, "
+                "prompt_intent_id "
                 "FROM prompt_queue WHERE space_id=? AND status='queued'" + generation_filter + " ORDER BY id",
                 parameters,
             ).fetchall()
@@ -2979,6 +3417,7 @@ class Store:
                 "created_at": int(row[5]),
                 "space_id": space_id,
                 "generation": int(row[6]),
+                "prompt_intent_id": str(row[7]) if row[7] else None,
             }
             for row in rows
         ]
@@ -3145,7 +3584,8 @@ class Store:
             self._connection.execute(
                 "INSERT OR REPLACE INTO pending_inputs("
                 "request_key, request_id, generation, thread_id, turn_id, "
-                "item_id, questions_json, expires_at, created_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "item_id, questions_json, expires_at, created_at, status) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')",
                 (
                     request_key,
                     request_id,
@@ -3158,6 +3598,61 @@ class Store:
                     int(time.time()),
                 ),
             )
+
+    def claim_pending_input(self, request_key: str) -> dict[str, Any] | None:
+        with self._immediate_transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE pending_inputs SET status='claimed', claimed_at=? "
+                "WHERE request_key=? AND status='pending'",
+                (int(time.time()), request_key),
+            )
+            if cursor.rowcount != 1:
+                return None
+        return self.get_pending_input(request_key)
+
+    def release_pending_input_claim(self, request_key: str) -> bool:
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                "UPDATE pending_inputs SET status='pending', claimed_at=NULL "
+                "WHERE request_key=? AND status='claimed'",
+                (request_key,),
+            )
+        return cursor.rowcount == 1
+
+    def mark_pending_input_responded(
+        self,
+        request_key: str,
+        response: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        encoded = _json_mapping(response)
+        with self._immediate_transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE pending_inputs SET status='awaiting_resolved', responded_at=?, response_json=? "
+                "WHERE request_key=? AND status='claimed'",
+                (int(time.time()), encoded, request_key),
+            )
+            if cursor.rowcount != 1:
+                return None
+        return self.get_pending_input(request_key)
+
+    def resolve_pending_input(
+        self,
+        request_key: str,
+        *,
+        source: str,
+        response: Mapping[str, Any] | None = None,
+    ) -> bool:
+        if not source.strip():
+            raise ValueError("Pending input resolution source must not be empty")
+        encoded = _json_mapping(response) if response is not None else None
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                "UPDATE pending_inputs SET status='resolved', resolved_at=?, "
+                "response_json=COALESCE(?, response_json), resolution_source=? "
+                "WHERE request_key=? AND status!='resolved'",
+                (int(time.time()), encoded, source, request_key),
+            )
+        return cursor.rowcount == 1
 
     def record_question_message(
         self,
@@ -3269,9 +3764,10 @@ class Store:
             else:
                 rows = connection.execute(
                     "SELECT request_key FROM pending_inputs "
-                    "WHERE expires_at IS NOT NULL AND expires_at < ? "
+                    "WHERE status='resolved' OR (expires_at IS NOT NULL AND expires_at < ?) "
                     "UNION SELECT messages.request_key FROM question_messages AS messages "
                     "LEFT JOIN pending_inputs AS pending ON pending.request_key=messages.request_key "
+                    "AND pending.status!='resolved' "
                     "WHERE pending.request_key IS NULL ORDER BY request_key",
                     (timestamp,),
                 ).fetchall()
@@ -3306,8 +3802,9 @@ class Store:
     def get_pending_input(self, request_key: str) -> dict[str, Any] | None:
         with self._lock:
             row = self._connection.execute(
-                "SELECT request_id, generation, thread_id, turn_id, item_id, questions_json, expires_at "
-                "FROM pending_inputs WHERE request_key=?",
+                "SELECT request_id, generation, thread_id, turn_id, item_id, questions_json, expires_at, "
+                "status, claimed_at, responded_at, resolved_at, response_json, resolution_source "
+                "FROM pending_inputs WHERE request_key=? AND status!='resolved'",
                 (request_key,),
             ).fetchone()
         if not row:
@@ -3320,6 +3817,12 @@ class Store:
             "item_id": row[4],
             "questions": json.loads(row[5]),
             "expires_at": int(row[6]) if row[6] is not None else None,
+            "status": str(row[7]),
+            "claimed_at": int(row[8]) if row[8] is not None else None,
+            "responded_at": int(row[9]) if row[9] is not None else None,
+            "resolved_at": int(row[10]) if row[10] is not None else None,
+            "response": json.loads(str(row[11])) if row[11] else None,
+            "resolution_source": str(row[12]) if row[12] else None,
         }
 
     def pending_input_keys_for_request(self, request_id: int | str) -> list[str]:
@@ -3330,6 +3833,7 @@ class Store:
         with self._lock:
             rows = self._connection.execute(
                 f"SELECT request_key FROM pending_inputs WHERE request_id IN ({placeholders}) "
+                "AND status!='resolved' "
                 "ORDER BY created_at, request_key",
                 candidates,
             ).fetchall()
@@ -3352,6 +3856,8 @@ class Store:
             connection.execute("DELETE FROM pending_inputs")
             connection.execute("DELETE FROM question_resolutions")
             connection.execute("DELETE FROM prompt_runs")
+            connection.execute("DELETE FROM prompt_intents")
+            connection.execute("DELETE FROM telegram_message_state")
             connection.execute("DELETE FROM plan_publications")
             connection.execute("UPDATE subscriptions SET dashboard_message_id=NULL")
             connection.execute("UPDATE prompt_queue SET status='cancelled' WHERE status='queued'")
@@ -3366,6 +3872,7 @@ class Store:
                         **current,
                         "lifecycle": "closed",
                         "generation": int(current["generation"]) + 1,
+                        "observed_mode": "unknown",
                     },
                     now=now,
                     created_at=int(current["created_at"]),

@@ -151,6 +151,8 @@ class SessionSpaceCoordinator:
             "plan_model": state.model,
             "plan_effort": state.reasoning_effort,
             "current_mode": "default",
+            "desired_mode": "default",
+            "observed_mode": "unknown",
         }
         return await self._create_space(
             value,
@@ -195,6 +197,8 @@ class SessionSpaceCoordinator:
             "plan_model": plan_model or "",
             "plan_effort": plan_effort or "",
             "current_mode": current_mode,
+            "desired_mode": current_mode,
+            "observed_mode": "unknown",
         }
         return await self._create_space(value, render_pending_space(value))
 

@@ -23,6 +23,7 @@ class BridgeStub:
         self.activations: list[tuple[str, str]] = []
         self.closures: list[tuple[str, int]] = []
         self.subscriptions: list[str] = []
+        self.path_policy = SimpleNamespace(validate_directory=lambda path: path)
 
     async def subscribe_space_thread(self, thread_id: str) -> ThreadState:
         self.subscriptions.append(thread_id)
@@ -94,6 +95,22 @@ def make_coordinator(
         provision_retry_seconds=provision_retry_seconds,
     )
     return coordinator, store, bridge, dashboards
+
+
+@pytest.mark.asyncio
+async def test_new_spaces_initialize_desired_mode_without_claiming_observation(tmp_path: Path) -> None:
+    coordinator, store, _bridge, _dashboards = make_coordinator(tmp_path)
+    store.set_telegram_binding({"channel_chat_id": -1001, "discussion_chat_id": -1002})
+    space = await coordinator.create_pending(
+        tmp_path,
+        "Plan first",
+        plan_model="gpt-test",
+        plan_effort="high",
+        current_mode="plan",
+    )
+    assert space["current_mode"] == space["desired_mode"] == "plan"
+    assert space["observed_mode"] == "unknown"
+    store.close()
 
 
 @pytest.mark.asyncio

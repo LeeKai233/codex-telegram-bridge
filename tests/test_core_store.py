@@ -1478,7 +1478,7 @@ def test_v10_migration_compacts_managed_events_and_preserves_tui_fact(tmp_path: 
 
     store = Store(path)
     try:
-        assert store.schema_version == 10
+        assert store.schema_version == SCHEMA_VERSION
         assert store.last_backup_path is not None
         assert store._connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         tables = {
@@ -1694,4 +1694,152 @@ def test_health_snapshot_lock_contention_returns_after_one_second(tmp_path: Path
     finally:
         blocker.rollback()
         blocker.close()
+        store.close()
+
+
+def test_v11_migrates_legacy_space_modes_and_adds_state_tables(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE session_spaces(
+            space_id TEXT PRIMARY KEY, thread_id TEXT, lifecycle TEXT NOT NULL,
+            generation INTEGER NOT NULL, channel_chat_id INTEGER, channel_post_id INTEGER,
+            discussion_chat_id INTEGER, discussion_root_id INTEGER, status_message_id INTEGER,
+            state_json TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+        );
+        CREATE TABLE prompt_queue(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, thread_id TEXT NOT NULL, prompt TEXT NOT NULL,
+            inputs_json TEXT NOT NULL, client_message_id TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL DEFAULT 'queued', created_at INTEGER NOT NULL,
+            dispatched_at INTEGER, space_id TEXT, generation INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE pending_inputs(
+            request_key TEXT PRIMARY KEY, request_id TEXT NOT NULL, generation INTEGER NOT NULL,
+            thread_id TEXT NOT NULL, turn_id TEXT NOT NULL, item_id TEXT NOT NULL,
+            questions_json TEXT NOT NULL, expires_at INTEGER, created_at INTEGER NOT NULL
+        );
+        PRAGMA user_version=10;
+        """
+    )
+    for index, lifecycle in enumerate(("active", "pending", "closed"), start=1):
+        value = {
+            "space_id": f"space-{lifecycle}",
+            "thread_id": "thread" if lifecycle == "active" else None,
+            "lifecycle": lifecycle,
+            "generation": index,
+            "current_mode": "plan" if lifecycle == "active" else "default",
+            "created_at": 1,
+            "updated_at": 1,
+        }
+        connection.execute(
+            "INSERT INTO session_spaces(space_id, thread_id, lifecycle, generation, state_json, "
+            "created_at, updated_at) VALUES(?, ?, ?, ?, ?, 1, 1)",
+            (value["space_id"], value["thread_id"], lifecycle, index, json.dumps(value)),
+        )
+    connection.commit()
+    connection.close()
+
+    store = Store(path)
+    try:
+        assert store.schema_version == 11
+        assert store.last_backup_path is not None
+        for lifecycle in ("active", "pending", "closed"):
+            space = store.get_space(f"space-{lifecycle}")
+            assert space is not None
+            assert space["desired_mode"] == space["current_mode"]
+            assert space["observed_mode"] == "unknown"
+        tables = {
+            row[0]
+            for row in store._connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        assert {"prompt_intents", "telegram_message_state"} <= tables
+        assert {"status", "claimed_at", "responded_at", "resolved_at"} <= {
+            row[1] for row in store._connection.execute("PRAGMA table_info(pending_inputs)")
+        }
+    finally:
+        store.close()
+
+
+def test_space_mode_roundtrip_honors_legacy_current_mode_writer(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    try:
+        created = store.create_space(
+            {
+                "space_id": "space-mode",
+                "lifecycle": "pending",
+                "generation": 1,
+                "current_mode": "default",
+            }
+        )
+        assert (created["desired_mode"], created["observed_mode"]) == ("default", "unknown")
+        updated = store.update_space("space-mode", {"current_mode": "plan"})
+        assert updated is not None
+        assert (updated["current_mode"], updated["desired_mode"]) == ("plan", "plan")
+        assert store.get_session_space("space-mode").observed_mode == "unknown"  # type: ignore[union-attr]
+    finally:
+        store.close()
+
+
+def test_prompt_intent_cas_choice_collision_and_queue_linkage(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    try:
+        intent = store.create_prompt_intent(
+            "client-1", "space", "work", "auto", thread_id="thread", space_id="space", generation=2
+        )
+        assert intent.state == "received"
+        same = store.create_prompt_intent(
+            "client-1", "space", "work", "auto", thread_id="thread", space_id="space", generation=2
+        )
+        assert same.intent_id == intent.intent_id
+        with pytest.raises(ValueError, match="collision"):
+            store.create_prompt_intent(
+                "client-1", "space", "other", "auto", thread_id="thread", space_id="space", generation=2
+            )
+        assert store.transition_prompt_intent(
+            "client-1", expected_states={"received"}, to_state="awaiting_choice"
+        )
+        chosen = store.resolve_prompt_intent_choice("client-1", mode="queue")
+        assert chosen is not None and chosen.mode == "queue"
+        assert store.resolve_prompt_intent_choice("client-1", mode="steer") is None
+        queue_id = store.enqueue_prompt(
+            "thread", "work", [{"type": "text", "text": "work"}], "client-1",
+            space_id="space", generation=2, prompt_intent_id=intent.intent_id,
+        )
+        queued = store.transition_prompt_intent(
+            "client-1", expected_states={"awaiting_choice"}, to_state="queued", queue_id=queue_id
+        )
+        assert queued is not None and queued.queue_id == queue_id
+        assert store.next_prompt("thread").prompt_intent_id == intent.intent_id  # type: ignore[union-attr]
+    finally:
+        store.close()
+
+
+def test_pending_input_lifecycle_and_telegram_message_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    try:
+        store.put_pending_input("request", "1", 1, "thread", "turn", "item", [], None)
+        assert store.claim_pending_input("request")["status"] == "claimed"  # type: ignore[index]
+        assert store.claim_pending_input("request") is None
+        assert store.mark_pending_input_responded("request", {"decision": "accept"})
+        assert store.get_pending_input("request")["status"] == "awaiting_resolved"  # type: ignore[index]
+        assert store.resolve_pending_input("request", source="serverRequest/resolved")
+        assert store.get_pending_input("request") is None
+
+        old = int(time.time()) - 8 * 86400
+        monkeypatch.setattr(time, "time", lambda: old)
+        store.put_telegram_message_state(
+            "message", bot_role="discussion", chat_id=1, message_id=2,
+            semantic_fingerprint="abc", state="sent", payload={"kind": "prompt"},
+        )
+        monkeypatch.undo()
+        deleted = store.cleanup(event_days=7)
+        assert deleted["telegram_message_state"] == 1
+        assert store.get_telegram_message_state("message") is None
+    finally:
         store.close()

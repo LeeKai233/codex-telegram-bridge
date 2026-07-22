@@ -334,11 +334,12 @@ async def test_thread_settings_notification_updates_space_mode_and_profile(tmp_p
     space = store.get_session_space("space-settings")
     state = store.get_thread("thread-settings")
     assert space is not None
-    assert (space.current_mode, space.plan_model, space.plan_effort) == (
+    assert (space.observed_mode, space.plan_model, space.plan_effort) == (
         "plan",
         "gpt-5.6-sol",
         "xhigh",
     )
+    assert space.current_mode == space.desired_mode == "default"
     assert state is not None and state.latest_activity == "Session settings updated"
     assert (state.permissions, state.approval_policy, state.approvals_reviewer) == (
         "workspace-safe",
@@ -927,4 +928,39 @@ async def test_mixed_subagent_profiles_are_not_overwritten_by_group_activity(
         "child-luna": ("gpt-5.6-luna", "max"),
         "child-sol": ("gpt-5.6-sol", "xhigh"),
     }
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_resume_snapshot_does_not_prove_mode_but_settings_notification_does(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    store.save_session_space(
+        SessionSpace(
+            space_id="space-mode", lifecycle="active", thread_id="thread-mode",
+            desired_mode="plan", current_mode="plan", observed_mode="unknown",
+        )
+    )
+    projector = managed_projector(store)
+    projector.apply_thread(
+        {"id": "thread-mode", "status": {"type": "idle"}, "collaborationMode": {"mode": "plan"}}
+    )
+    assert store.get_session_space("space-mode").observed_mode == "unknown"  # type: ignore[union-attr]
+
+    await projector.ingest(
+        "thread/settings/updated",
+        {
+            "threadId": "thread-mode",
+            "threadSettings": {
+                "collaborationMode": {
+                    "mode": "plan",
+                    "settings": {"model": "gpt-test", "reasoning_effort": "high"},
+                }
+            },
+        },
+    )
+    space = store.get_session_space("space-mode")
+    assert space is not None
+    assert (space.desired_mode, space.observed_mode) == ("plan", "plan")
     store.close()

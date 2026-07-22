@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import time
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -17,6 +18,7 @@ from .models import ModelOption
 
 LOGGER = logging.getLogger(__name__)
 Json = dict[str, Any]
+_MODEL_OPTIONS_CACHE_SECONDS = 300.0
 NotificationHandler = Callable[[str, Json], Awaitable[None]]
 ServerRequestHandler = Callable[[int | str, str, Json, int], Awaitable[None]]
 ConnectionHandler = Callable[[bool, int, str | None], Awaitable[None]]
@@ -256,6 +258,8 @@ class CodexClient:
         self._stopping = asyncio.Event()
         self._runner: asyncio.Task[None] | None = None
         self.generation = 0
+        self._model_options_cache: tuple[float, tuple[ModelOption, ...]] | None = None
+        self._collaboration_modes_cache: tuple[int, tuple[Json, ...]] | None = None
 
     @property
     def connected(self) -> bool:
@@ -878,6 +882,31 @@ class CodexClient:
         result = await self.request("thread/read", {"threadId": thread_id, "includeTurns": include_turns})
         return dict((result or {}).get("thread") or {})
 
+    async def find_user_message(
+        self,
+        thread_id: str,
+        client_message_id: str,
+        *,
+        payload: Json | None = None,
+    ) -> Json | None:
+        snapshot = payload or await self.read_thread(thread_id, include_turns=True)
+        for turn in snapshot.get("turns") or []:
+            if not isinstance(turn, dict):
+                continue
+            for item in turn.get("items") or []:
+                if (
+                    isinstance(item, dict)
+                    and item.get("type") == "userMessage"
+                    and str(item.get("clientId") or "") == client_message_id
+                ):
+                    return {
+                        "thread_id": thread_id,
+                        "turn_id": str(turn.get("id") or ""),
+                        "turn_status": str(turn.get("status") or ""),
+                        "item": item,
+                    }
+        return None
+
     async def resume_thread(self, thread_id: str) -> Json:
         result = await self.request(
             "thread/resume",
@@ -907,6 +936,9 @@ class CodexClient:
 
     async def list_collaboration_modes(self) -> list[Json]:
         """Return validated collaboration-mode masks advertised by app-server."""
+        cached = self._collaboration_modes_cache
+        if cached is not None and cached[0] == self.generation:
+            return [dict(item) for item in cached[1]]
         try:
             result = await self.request("collaborationMode/list", {})
         except CodexRpcError as exc:
@@ -933,12 +965,17 @@ class CodexClient:
             if effort is not None and not isinstance(effort, str):
                 raise RuntimeError("Codex returned an invalid collaboration-mode effort")
             modes.append(dict(item))
-        return modes
+        self._collaboration_modes_cache = (self.generation, tuple(dict(item) for item in modes))
+        return [dict(item) for item in modes]
 
     async def list_model_options(self, *, page_size: int = 100) -> list[ModelOption]:
         """Return the complete validated model picker advertised by app-server."""
         if page_size <= 0:
             raise ValueError("Model page size must be positive")
+        cached = self._model_options_cache
+        now = time.monotonic()
+        if cached is not None and cached[0] > now:
+            return list(cached[1])
         options: list[ModelOption] = []
         seen_models: set[str] = set()
         seen_cursors: set[str] = set()
@@ -999,7 +1036,11 @@ class CodexClient:
             if cursor in seen_cursors:
                 raise RuntimeError("Codex returned a repeated model-list cursor")
             seen_cursors.add(cursor)
-        return options
+        self._model_options_cache = (
+            time.monotonic() + _MODEL_OPTIONS_CACHE_SECONDS,
+            tuple(options),
+        )
+        return list(options)
 
     async def resolve_collaboration_mode(
         self,

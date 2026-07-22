@@ -217,6 +217,8 @@ class SessionSpace:
     plan_model: str = ""
     plan_effort: str = ""
     current_mode: str = "default"
+    desired_mode: str = ""
+    observed_mode: str = "unknown"
     created_at: int = field(default_factory=lambda: int(time.time()))
     updated_at: int = field(default_factory=lambda: int(time.time()))
     last_error: str = ""
@@ -228,12 +230,20 @@ class SessionSpace:
     def active(self) -> bool:
         return self.lifecycle == "active" and bool(self.thread_id)
 
+    def __post_init__(self) -> None:
+        self.desired_mode = self.desired_mode or self.current_mode
+        self.current_mode = self.desired_mode
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> SessionSpace:
-        return cls(**value)
+        data = dict(value)
+        data.setdefault("desired_mode", str(data.get("current_mode") or "default"))
+        data.setdefault("current_mode", str(data["desired_mode"] or "default"))
+        data.setdefault("observed_mode", "unknown")
+        return cls(**data)
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,3 +261,23 @@ class QueuedPrompt:
     inputs: list[dict[str, Any]]
     client_message_id: str
     created_at: int
+    prompt_intent_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PromptIntent:
+    intent_id: str
+    client_message_id: str
+    source: str
+    prompt: str
+    mode: str
+    thread_id: str | None
+    space_id: str | None
+    generation: int
+    state: str
+    turn_id: str | None
+    queue_id: int | None
+    error: str | None
+    receipt_key: str | None
+    created_at: int
+    updated_at: int

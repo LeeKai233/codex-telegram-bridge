@@ -409,27 +409,32 @@ class EventProjector:
         self._refresh_agent_counts(state)
 
     async def ingest(self, method: str, params: dict[str, Any]) -> None:
+        for state, reason in self.project(method, params):
+            await self.on_change(state, reason)
+
+    def project(self, method: str, params: dict[str, Any]) -> list[tuple[ThreadState, str]]:
+        changes: list[tuple[ThreadState, str]] = []
         thread_id = self._thread_id(params)
         if not thread_id or not self.is_managed(method, params):
-            return
+            return changes
         if method not in {"thread/tokenUsage/updated"}:
             digest = _canonical_hash(method, params)
             if method in _REPEATABLE_NOTIFICATIONS:
                 marker = (method, digest)
                 if marker == self._last_repeatable_event:
-                    return
+                    return changes
                 self._last_repeatable_event = marker
                 event_key = f"{digest}:{time.time_ns()}"
             else:
                 self._last_repeatable_event = None
                 event_key = digest
             if not self.store.record_event(event_key, thread_id, method, params, managed=True):
-                return
+                return changes
         if method == "thread/started":
             state = self.apply_thread(dict(params.get("thread") or {}))
-            await self.on_change(state, method)
-            await self._notify_parent_changes("subagent/updated")
-            return
+            changes.append((state, method))
+            changes.extend((parent, "subagent/updated") for parent in self.take_parent_changes())
+            return changes
         if method == "thread/settings/updated":
             self._sync_space_settings(thread_id, params)
         state = self.store.get_thread(thread_id) or ThreadState(thread_id=thread_id)
@@ -439,14 +444,15 @@ class EventProjector:
         else:
             changed = self._apply(state, method, params)
         if not changed:
-            return
+            return changes
         state.queue_count = self.store.queue_count(thread_id)
         state.updated_at = int(time.time())
         self.store.save_thread(state)
         self._sync_parent_agent_metadata(state)
         if notify:
-            await self.on_change(state, method)
-        await self._notify_parent_changes("subagent/updated")
+            changes.append((state, method))
+        changes.extend((parent, "subagent/updated") for parent in self.take_parent_changes())
+        return changes
 
     async def _notify_parent_changes(self, reason: str) -> None:
         for parent in self.take_parent_changes():
@@ -476,7 +482,7 @@ class EventProjector:
             space = self.store.get_session_space(str(raw["space_id"]))
             if space is None:
                 continue
-            space.current_mode = mode
+            space.observed_mode = mode
             if model and effort:
                 if mode == "plan":
                     space.plan_model = model

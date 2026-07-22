@@ -7,6 +7,8 @@ import logging
 import time
 import uuid
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -45,8 +47,28 @@ TuiPlanApprovedHandler = Callable[[str, str], Awaitable[None]]
 
 _FINAL_TURN_STATUSES = {"completed", "failed", "interrupted"}
 _SUBAGENT_PROFILE_RETRY_DELAYS = (1.0, 5.0, 30.0, 120.0)
+_THREAD_SNAPSHOT_SECONDS = 5.0
+_TURN_RECONCILE_SECONDS = 1.0
+_NOTIFICATION_EFFECT_CAPACITY = 256
+_NOTIFICATION_EFFECT_DRAIN_SECONDS = 5.0
 # The Codex TUI emits this fixed input after "Yes, implement this plan" is selected.
 TUI_PLAN_APPROVAL_PROMPT = "Implement the plan."
+
+
+@dataclass(slots=True)
+class _ThreadSnapshot:
+    generation: int
+    payload: Json
+    expires_at: float
+
+
+@dataclass(slots=True)
+class _TurnGate:
+    client_message_id: str
+    expected_turn_id: str | None = None
+
+
+NotificationEffect = tuple[str, Callable[[], Awaitable[None]]]
 
 
 def _workspace_write_policy() -> Json:
@@ -216,6 +238,17 @@ class Bridge:
         self._resolved_request_ids: dict[tuple[int, str], None] = {}
         self._notified_plan_items: dict[tuple[str, str, str], None] = {}
         self._terminal_turns: dict[tuple[str, str], tuple[str, str]] = {}
+        self._thread_snapshots: dict[str, _ThreadSnapshot] = {}
+        self._thread_refresh_tasks: dict[str, asyncio.Task[Json]] = {}
+        self._turn_locks: dict[str, asyncio.Lock] = {}
+        self._turn_gates: dict[str, _TurnGate] = {}
+        self._turn_reconcile_tasks: dict[str, asyncio.Task[None]] = {}
+        self._plan_decision_events: dict[tuple[str, int], asyncio.Event] = {}
+        self._notification_effects: asyncio.Queue[NotificationEffect] = asyncio.Queue(
+            maxsize=_NOTIFICATION_EFFECT_CAPACITY
+        )
+        self._notification_effect_task: asyncio.Task[None] | None = None
+        self._accept_notification_effects = False
         self._maintenance_task: asyncio.Task[None] | None = None
         self._resync_started_at: int | None = None
         self._resync_finished_at: int | None = None
@@ -227,6 +260,10 @@ class Bridge:
         if self._started:
             return
         self._started = True
+        self._accept_notification_effects = True
+        self._notification_effect_task = asyncio.create_task(
+            self._run_notification_effects(), name="bridge-notification-effects"
+        )
         if self._manage_messenger:
             self.messenger.start()
         if self._owns_delivery:
@@ -261,13 +298,80 @@ class Bridge:
             task.cancel()
         if profile_tasks:
             await asyncio.gather(*profile_tasks, return_exceptions=True)
+        reconcile_tasks = list(self._turn_reconcile_tasks.values())
+        self._turn_reconcile_tasks.clear()
+        for task in reconcile_tasks:
+            task.cancel()
+        if reconcile_tasks:
+            await asyncio.gather(*reconcile_tasks, return_exceptions=True)
+        refresh_tasks = list(self._thread_refresh_tasks.values())
+        self._thread_refresh_tasks.clear()
+        for task in refresh_tasks:
+            task.cancel()
+        if refresh_tasks:
+            await asyncio.gather(*refresh_tasks, return_exceptions=True)
+        self._thread_snapshots.clear()
+        for thread_id in list(self._turn_gates):
+            self._release_turn_gate(thread_id, None)
+        await self.client.stop()
+        await self._stop_notification_effects()
         await self.dashboard.stop()
         if self._owns_delivery:
             await self.delivery.stop()
         await self.metrics.stop()
-        await self.client.stop()
         if self._manage_messenger:
             await self.messenger.stop()
+
+    async def _run_notification_effects(self) -> None:
+        while True:
+            name, effect = await self._notification_effects.get()
+            try:
+                await effect()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOGGER.exception("event=notification_effect_failed effect=%s", name)
+            finally:
+                self._notification_effects.task_done()
+
+    async def _stop_notification_effects(self) -> None:
+        self._accept_notification_effects = False
+        task = self._notification_effect_task
+        self._notification_effect_task = None
+        if task is None:
+            return
+        try:
+            await asyncio.wait_for(
+                self._notification_effects.join(),
+                timeout=_NOTIFICATION_EFFECT_DRAIN_SECONDS,
+            )
+        except TimeoutError:
+            LOGGER.warning(
+                "event=notification_effect_shutdown_timeout pending=%s",
+                self._notification_effects.qsize(),
+            )
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        while True:
+            try:
+                self._notification_effects.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            self._notification_effects.task_done()
+
+    async def _dispatch_notification_effect(self, name: str, effect: Callable[[], Awaitable[None]]) -> None:
+        task = self._notification_effect_task
+        if not self._accept_notification_effects or task is None or task.done():
+            await effect()
+            return
+        if self._notification_effects.full():
+            LOGGER.warning(
+                "event=notification_effect_backpressure effect=%s capacity=%s",
+                name,
+                _NOTIFICATION_EFFECT_CAPACITY,
+            )
+        await self._notification_effects.put((name, effect))
 
     def _cleanup_local_state(self) -> None:
         protected = self.store.queued_file_paths() | self.store.pending_callback_file_paths()
@@ -602,6 +706,178 @@ class Bridge:
         with contextlib.suppress(CodexRpcError, RuntimeError):
             await self.client.request("thread/unsubscribe", {"threadId": thread_id})
 
+    async def _live_thread_snapshot(self, thread_id: str, *, force: bool = False) -> Json:
+        generation = self.client.generation
+        cached = self._thread_snapshots.get(thread_id)
+        if (
+            not force
+            and cached is not None
+            and cached.generation == generation
+            and cached.expires_at > time.monotonic()
+        ):
+            return dict(cached.payload)
+        running = self._thread_refresh_tasks.get(thread_id)
+        if running is None or running.done():
+
+            async def refresh_snapshot() -> Json:
+                payload = await self.client.resume_thread(thread_id)
+                self._thread_snapshots[thread_id] = _ThreadSnapshot(
+                    generation=self.client.generation,
+                    payload=dict(payload),
+                    expires_at=time.monotonic() + _THREAD_SNAPSHOT_SECONDS,
+                )
+                return dict(payload)
+
+            running = asyncio.create_task(
+                refresh_snapshot(), name=f"thread-snapshot-{thread_id[:8]}"
+            )
+            self._thread_refresh_tasks[thread_id] = running
+            running.add_done_callback(
+                lambda completed, key=thread_id: (
+                    self._thread_refresh_tasks.pop(key, None)
+                    if self._thread_refresh_tasks.get(key) is completed
+                    else None
+                )
+            )
+        return dict(await asyncio.shield(running))
+
+    def _invalidate_thread_snapshot(self, thread_id: str) -> None:
+        if thread_id:
+            self._thread_snapshots.pop(thread_id, None)
+
+    async def _client_message_receipt(
+        self, thread_id: str, client_message_id: str
+    ) -> tuple[bool | None, Json | None]:
+        try:
+            payload = await self.client.read_thread(thread_id, include_turns=True)
+            receipt = await self.client.find_user_message(
+                thread_id, client_message_id, payload=payload
+            )
+        except Exception:
+            return None, None
+        return receipt is not None, receipt
+
+    async def _reconcile_prompt_delivery(
+        self,
+        thread_id: str,
+        client_message_id: str,
+        *,
+        error: Exception | None = None,
+        expected_turn_id: str | None = None,
+    ) -> tuple[bool | None, Json | None]:
+        delivered, receipt = await self._client_message_receipt(thread_id, client_message_id)
+        receipt_turn_id = str((receipt or {}).get("turn_id") or "") or None
+        if delivered and expected_turn_id and receipt_turn_id != expected_turn_id:
+            self.store.transition_prompt_intent(
+                client_message_id,
+                expected_states={"submitting"},
+                to_state="uncertain",
+                turn_id=receipt_turn_id,
+                error="steer target mismatch",
+            )
+            return None, receipt
+        if delivered is False and isinstance(error, CodexRpcError):
+            self.store.transition_prompt_intent(
+                client_message_id,
+                expected_states={"submitting", "queued"},
+                to_state="failed",
+                error=type(error).__name__,
+            )
+        else:
+            self.store.reconcile_prompt_intent(
+                client_message_id,
+                delivered=delivered,
+                turn_id=receipt_turn_id,
+                error=type(error).__name__ if error is not None else None,
+            )
+        return delivered, receipt
+
+    async def _begin_turn_gate(self, thread_id: str, client_message_id: str) -> bool:
+        lock = self._turn_locks.setdefault(thread_id, asyncio.Lock())
+        if lock.locked():
+            return False
+        await lock.acquire()
+        self._turn_gates[thread_id] = _TurnGate(client_message_id=client_message_id)
+        return True
+
+    def _bind_turn_gate(self, thread_id: str, client_message_id: str, turn_id: str) -> None:
+        gate = self._turn_gates.get(thread_id)
+        if gate is None or gate.client_message_id != client_message_id or not turn_id:
+            return
+        gate.expected_turn_id = turn_id
+        if (thread_id, turn_id) in self._terminal_turns and self._release_turn_gate(
+            thread_id, turn_id
+        ):
+            self._request_queue_after_completion(thread_id)
+
+    def _release_turn_gate(self, thread_id: str, completed_turn_id: str | None) -> bool:
+        gate = self._turn_gates.get(thread_id)
+        if gate is None:
+            return False
+        if completed_turn_id is not None and gate.expected_turn_id != completed_turn_id:
+            return False
+        self._turn_gates.pop(thread_id, None)
+        lock = self._turn_locks.get(thread_id)
+        if lock is not None and lock.locked():
+            lock.release()
+        return True
+
+    def _schedule_turn_reconciliation(self, thread_id: str) -> None:
+        gate = self._turn_gates.get(thread_id)
+        if gate is None:
+            return
+        current = self._turn_reconcile_tasks.get(thread_id)
+        if current is not None and not current.done():
+            return
+
+        async def reconcile() -> None:
+            try:
+                await asyncio.sleep(_TURN_RECONCILE_SECONDS)
+                current_gate = self._turn_gates.get(thread_id)
+                if current_gate is None:
+                    return
+                delivered, receipt = await self._client_message_receipt(
+                    thread_id, current_gate.client_message_id
+                )
+                if delivered and receipt is not None:
+                    turn_id = str(receipt.get("turn_id") or "")
+                    self._bind_turn_gate(thread_id, current_gate.client_message_id, turn_id)
+                    if (
+                        str(receipt.get("turn_status") or "") in _FINAL_TURN_STATUSES
+                        and self._release_turn_gate(thread_id, turn_id)
+                    ):
+                        self._request_queue_after_completion(thread_id)
+                    return
+                state = self.store.get_thread(thread_id)
+                if (
+                    delivered is False
+                    and self.client.connected
+                    and state
+                    and state.status == "idle"
+                    and self._release_turn_gate(thread_id, None)
+                ):
+                    self._request_queue_after_completion(thread_id)
+            finally:
+                if self._turn_reconcile_tasks.get(thread_id) is asyncio.current_task():
+                    self._turn_reconcile_tasks.pop(thread_id, None)
+
+        self._turn_reconcile_tasks[thread_id] = asyncio.create_task(
+            reconcile(), name=f"turn-reconcile-{thread_id[:8]}"
+        )
+
+    def _request_queue_after_completion(self, thread_id: str) -> None:
+        spaces = self._active_spaces_for_thread(thread_id)
+        if spaces:
+            for space in spaces:
+                self._request_queue_retry(
+                    thread_id,
+                    delay=0.0,
+                    space_id=str(space["space_id"]),
+                    generation=int(space["generation"]),
+                )
+            return
+        self._request_queue_retry(thread_id, delay=0.0)
+
     async def refresh(self, thread_id: str) -> ThreadState:
         payload = await self.client.read_thread(thread_id, include_turns=True)
         state = self.projector.apply_thread(payload)
@@ -627,13 +903,52 @@ class Bridge:
         finally:
             self._finish_owned_thread_start(start_token)
         await self.tmux.ensure_window(state.thread_id, state.title, cwd)
-        await self.client.start_turn(
-            state.thread_id,
-            [text_input(prompt)],
-            client_message_id=client_message_id,
-            cwd=cwd,
-            **_writable_turn_security(state),
+        self.store.create_prompt_intent(
+            client_message_id,
+            "new_session",
+            prompt,
+            "default",
+            thread_id=state.thread_id,
         )
+        if not await self._begin_turn_gate(state.thread_id, client_message_id):
+            raise RuntimeError("A turn is already active for the new session")
+        self.store.transition_prompt_intent(
+            client_message_id,
+            expected_states={"received"},
+            to_state="submitting",
+        )
+        try:
+            turn = await self.client.start_turn(
+                state.thread_id,
+                [text_input(prompt)],
+                client_message_id=client_message_id,
+                cwd=cwd,
+                **_writable_turn_security(state),
+            )
+            turn_id = str((turn or {}).get("id") or "")
+            if not turn_id:
+                raise RuntimeError("Codex did not return an ID for the new-session turn")
+            self._bind_turn_gate(state.thread_id, client_message_id, turn_id)
+            self.store.transition_prompt_intent(
+                client_message_id,
+                expected_states={"submitting"},
+                to_state="started",
+                turn_id=turn_id,
+            )
+        except Exception as exc:
+            delivered, receipt = await self._reconcile_prompt_delivery(
+                state.thread_id, client_message_id, error=exc
+            )
+            if delivered:
+                self._bind_turn_gate(
+                    state.thread_id,
+                    client_message_id,
+                    str((receipt or {}).get("turn_id") or ""),
+                )
+            else:
+                self._schedule_turn_reconciliation(state.thread_id)
+            if delivered is not True:
+                raise
         await self.dashboard.schedule(state, immediate=True)
         return state
 
@@ -688,18 +1003,35 @@ class Bridge:
                 created_now = True
 
             await self.tmux.ensure_window(state.thread_id, state.title, cwd)
+            intent = self.store.create_prompt_intent(
+                client_message_id,
+                "session_activation",
+                space.pending_prompt,
+                space.desired_mode,
+                thread_id=state.thread_id,
+                space_id=space.space_id,
+                generation=space.generation,
+            )
             delivered = (
                 False
                 if created_now
                 else await self._client_message_exists(state.thread_id, client_message_id)
             )
             if delivered is None:
+                self.store.reconcile_prompt_intent(client_message_id, delivered=None)
                 space.last_error = "initial prompt delivery could not be reconciled"
                 self.store.save_session_space(space)
                 raise RuntimeError(space.last_error)
             if not delivered:
+                if not await self._begin_turn_gate(state.thread_id, client_message_id):
+                    raise RuntimeError("A turn is already active for this session")
+                self.store.transition_prompt_intent(
+                    client_message_id,
+                    expected_states={"received", "awaiting_choice"},
+                    to_state="submitting",
+                )
                 try:
-                    await self.client.start_turn(
+                    turn = await self.client.start_turn(
                         state.thread_id,
                         [text_input(space.pending_prompt)],
                         client_message_id=client_message_id,
@@ -707,17 +1039,47 @@ class Bridge:
                         **_writable_turn_security(state),
                         collaboration_mode=collaboration_mode,
                     )
+                    turn_id = str((turn or {}).get("id") or "")
+                    if turn_id:
+                        self._bind_turn_gate(state.thread_id, client_message_id, turn_id)
+                        self.store.transition_prompt_intent(
+                            client_message_id,
+                            expected_states={"submitting"},
+                            to_state="started",
+                            turn_id=turn_id,
+                        )
+                    else:
+                        self._schedule_turn_reconciliation(state.thread_id)
                 except Exception as exc:
-                    delivered = await self._client_message_exists(state.thread_id, client_message_id)
+                    delivered, receipt = await self._reconcile_prompt_delivery(
+                        state.thread_id, client_message_id, error=exc
+                    )
+                    if delivered:
+                        self._bind_turn_gate(
+                            state.thread_id,
+                            client_message_id,
+                            str((receipt or {}).get("turn_id") or ""),
+                        )
+                    else:
+                        self._schedule_turn_reconciliation(state.thread_id)
                     if not delivered:
                         space.last_error = f"initial prompt delivery failed ({type(exc).__name__})"
                         self.store.save_session_space(space)
                         raise
+            elif intent.state not in {"started", "completed"}:
+                _, receipt = await self._client_message_receipt(state.thread_id, client_message_id)
+                self.store.reconcile_prompt_intent(
+                    client_message_id,
+                    delivered=True,
+                    turn_id=str((receipt or {}).get("turn_id") or "") or None,
+                )
 
             space.lifecycle = "active"
             space.last_error = ""
             space.pending_cwd = ""
             space.pending_prompt = ""
+            if collaboration_mode is not None:
+                space.observed_mode = space.desired_mode
             self.store.save_session_space(space)
             await self._notify_state_change(state, "session/activated")
             return state
@@ -785,6 +1147,9 @@ class Bridge:
             else:
                 current.normal_model = profile.model
                 current.normal_effort = profile.effort
+            current.current_mode = mode
+            current.desired_mode = mode
+            current.observed_mode = mode
             self.store.save_session_space(current)
             if state := self.store.get_thread(current.thread_id or ""):
                 await self._notify_state_change(state, "thread/settings/updated")
@@ -860,7 +1225,16 @@ class Bridge:
             space = self._require_active_space(space_id)
             generation = space.generation
             thread_id = space.thread_id or ""
-            payload = await self.client.resume_thread(space.thread_id or "")
+            self.store.create_prompt_intent(
+                client_message_id,
+                "collaboration",
+                prompt,
+                mode,
+                thread_id=thread_id,
+                space_id=space.space_id,
+                generation=generation,
+            )
+            payload = await self._live_thread_snapshot(space.thread_id or "")
             state = self.projector.apply_thread(payload)
             await self._notify_projector_parent_changes("subagent/resync")
             if state.thread_id != thread_id:
@@ -897,20 +1271,52 @@ class Bridge:
             current = self._require_active_space(space_id)
             if current.generation != generation or current.thread_id != thread_id:
                 raise RuntimeError("Session space generation is stale")
-            turn = await self.client.start_turn(
-                state.thread_id,
-                [text_input(prompt)],
-                client_message_id=client_message_id,
-                cwd=cwd,
-                **_writable_turn_security(state),
-                collaboration_mode=collaboration_mode,
+            if not await self._begin_turn_gate(thread_id, client_message_id):
+                raise RuntimeError("当前 turn 正在运行，请稍后重试")
+            self.store.transition_prompt_intent(
+                client_message_id,
+                expected_states={"received"},
+                to_state="submitting",
             )
-            if not (turn or {}).get("id"):
-                raise RuntimeError("Codex did not return an ID for the collaboration turn")
+            try:
+                turn = await self.client.start_turn(
+                    state.thread_id,
+                    [text_input(prompt)],
+                    client_message_id=client_message_id,
+                    cwd=cwd,
+                    **_writable_turn_security(state),
+                    collaboration_mode=collaboration_mode,
+                )
+                turn_id = str((turn or {}).get("id") or "")
+                if not turn_id:
+                    raise RuntimeError("Codex did not return an ID for the collaboration turn")
+                self._bind_turn_gate(thread_id, client_message_id, turn_id)
+                self.store.transition_prompt_intent(
+                    client_message_id,
+                    expected_states={"submitting"},
+                    to_state="started",
+                    turn_id=turn_id,
+                )
+            except Exception as exc:
+                delivered, receipt = await self._reconcile_prompt_delivery(
+                    thread_id, client_message_id, error=exc
+                )
+                if delivered:
+                    self._bind_turn_gate(
+                        thread_id,
+                        client_message_id,
+                        str((receipt or {}).get("turn_id") or ""),
+                    )
+                else:
+                    self._schedule_turn_reconciliation(thread_id)
+                if delivered is not True:
+                    raise
             current = self._require_active_space(space_id)
             if current.generation != generation or current.thread_id != thread_id:
                 raise RuntimeError("Session space generation is stale")
             current.current_mode = mode
+            current.desired_mode = mode
+            current.observed_mode = mode
             if profile is not None:
                 if mode == "plan":
                     current.plan_model = profile.model
@@ -951,9 +1357,73 @@ class Bridge:
             return "unknown"
         if delivered:
             space.current_mode = "default"
+            space.desired_mode = "default"
+            space.observed_mode = "default"
             self.store.save_session_space(space)
             return "delivered"
         return "absent"
+
+    async def wait_for_plan_decision_gate(
+        self,
+        space_id: str,
+        generation: int,
+        item_id: str,
+        revision_key: str,
+        client_message_id: str,
+        *,
+        timeout: float = 1.0,
+    ) -> dict[str, str]:
+        space = self._require_active_space(space_id)
+        if space.generation != generation:
+            raise RuntimeError("Session space generation is stale")
+        publication = self.store.latest_plan_publication(space_id, generation)
+        if (
+            publication is None
+            or str(publication.get("item_id") or "") != item_id
+            or str(publication.get("revision_key") or "") != revision_key
+        ):
+            raise RuntimeError("Plan publication is stale")
+        thread_id = space.thread_id or ""
+        event = self._plan_decision_events.setdefault((space_id, generation), asyncio.Event())
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            approval_turn = self.store.find_tui_plan_approval_turn(
+                thread_id,
+                after=int(publication.get("created_at") or 0),
+                prompt=TUI_PLAN_APPROVAL_PROMPT,
+            )
+            if approval_turn:
+                return {"status": "tui_approval_observed", "turn_id": approval_turn}
+            delivered, receipt = await self._client_message_receipt(
+                thread_id, client_message_id
+            )
+            if delivered:
+                result = {"status": "already_delivered"}
+                turn_id = str((receipt or {}).get("turn_id") or "")
+                if turn_id:
+                    result["turn_id"] = turn_id
+                return result
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                state = self.store.get_thread(thread_id)
+                gate = self._turn_gates.get(thread_id)
+                safe = (
+                    delivered is False
+                    and self.client.connected
+                    and gate is None
+                    and state is not None
+                    and state.status == "idle"
+                    and state.turn_status != "inProgress"
+                )
+                return {"status": "safe_to_submit" if safe else "uncertain"}
+            if event.is_set():
+                event.clear()
+                continue
+            try:
+                await asyncio.wait_for(event.wait(), timeout=remaining)
+            except TimeoutError:
+                continue
+            event.clear()
 
     async def dispatch_space_queue(
         self,
@@ -1026,22 +1496,72 @@ class Bridge:
             space = self._require_active_space(space_id)
             if space.generation != generation or space.thread_id != thread_id:
                 raise RuntimeError("Session space generation is stale")
-        payload = await self.client.resume_thread(thread_id)
+        client_message_id = client_message_id or f"telegram-{uuid.uuid4()}"
+        source = "space" if space_id is not None else "legacy"
+        intent = self.store.get_prompt_intent(client_message_id)
+        choice_resolved = False
+        if intent is not None:
+            compatible = (
+                intent.source == source
+                and intent.prompt == prompt
+                and intent.thread_id == thread_id
+                and intent.space_id == space_id
+                and intent.generation == (generation or 0)
+            )
+            if not compatible:
+                raise ValueError(f"Prompt client_message_id collision: {client_message_id}")
+        if intent is not None and intent.mode != mode:
+            intent = self.store.resolve_prompt_intent_choice(
+                client_message_id,
+                mode=mode,
+            )
+            if intent is None:
+                raise ValueError(f"Prompt choice already resolved: {client_message_id}")
+            choice_resolved = True
+        if intent is None:
+            intent = self.store.create_prompt_intent(
+                client_message_id,
+                source,
+                prompt,
+                mode,
+                thread_id=thread_id,
+                space_id=space_id,
+                generation=generation or 0,
+            )
+        prior_results = {
+            "queued": "queued",
+            "awaiting_choice": "choose",
+            "started": "started",
+            "steered": "steered",
+        }
+        if intent.state in prior_results and not (
+            choice_resolved and intent.state == "awaiting_choice"
+        ):
+            return prior_results[intent.state]
+        if intent.state in {"completed", "failed", "uncertain", "cancelled"}:
+            raise RuntimeError(f"Prompt intent is already terminal: {intent.state}")
+        payload = await self._live_thread_snapshot(thread_id)
         state = self.projector.apply_thread(payload)
         await self._notify_projector_parent_changes("subagent/resync")
         if not state.cwd:
             raise ValueError("Session does not report a working directory")
         cwd = self.path_policy.validate_directory(Path(state.cwd))
-        client_message_id = client_message_id or f"telegram-{uuid.uuid4()}"
         values = list(inputs or [text_input(prompt)])
         if mode == "queue":
-            self.store.enqueue_prompt(
+            queue_id = self.store.enqueue_prompt(
                 thread_id,
                 prompt,
                 values,
                 client_message_id,
                 space_id=space_id,
                 generation=generation or 0,
+                prompt_intent_id=intent.intent_id,
+            )
+            self.store.transition_prompt_intent(
+                client_message_id,
+                expected_states={"received", "awaiting_choice"},
+                to_state="queued",
+                queue_id=queue_id,
             )
             state.queue_count = self._queue_count(thread_id, space_id, generation)
             self.store.save_thread(state)
@@ -1057,12 +1577,39 @@ class Bridge:
             return "queued"
         if state.status == "active" or state.turn_status == "inProgress":
             if mode != "steer":
+                self.store.transition_prompt_intent(
+                    client_message_id,
+                    expected_states={"received"},
+                    to_state="awaiting_choice",
+                )
                 return "choose"
             if not state.turn_id:
                 raise RuntimeError("Active turn ID is unavailable")
-            await self.client.steer_turn(
-                thread_id, state.turn_id, values, client_message_id=client_message_id
+            self.store.transition_prompt_intent(
+                client_message_id,
+                expected_states={"received", "awaiting_choice"},
+                to_state="submitting",
             )
+            try:
+                await self.client.steer_turn(
+                    thread_id, state.turn_id, values, client_message_id=client_message_id
+                )
+            except Exception as exc:
+                delivered, _ = await self._reconcile_prompt_delivery(
+                    thread_id,
+                    client_message_id,
+                    error=exc,
+                    expected_turn_id=state.turn_id,
+                )
+                if delivered is not True:
+                    raise
+            else:
+                self.store.transition_prompt_intent(
+                    client_message_id,
+                    expected_states={"submitting"},
+                    to_state="steered",
+                    turn_id=state.turn_id,
+                )
             LOGGER.info(
                 "event=prompt_injected space_id=%s thread_id=%s turn_id=%s",
                 space_id or "legacy",
@@ -1070,14 +1617,47 @@ class Bridge:
                 state.turn_id[:8],
             )
             return "steered"
-        turn = await self.client.start_turn(
-            thread_id,
-            values,
-            client_message_id=client_message_id,
-            cwd=cwd,
-            **_writable_turn_security(state),
+        if not await self._begin_turn_gate(thread_id, client_message_id):
+            self.store.transition_prompt_intent(
+                client_message_id,
+                expected_states={"received"},
+                to_state="awaiting_choice",
+            )
+            return "choose"
+        self.store.transition_prompt_intent(
+            client_message_id,
+            expected_states={"received", "awaiting_choice"},
+            to_state="submitting",
         )
-        turn_id = str((turn or {}).get("id") or "")
+        try:
+            turn = await self.client.start_turn(
+                thread_id,
+                values,
+                client_message_id=client_message_id,
+                cwd=cwd,
+                **_writable_turn_security(state),
+            )
+            turn_id = str((turn or {}).get("id") or "")
+            if not turn_id:
+                raise RuntimeError("Codex did not return an ID for the turn")
+            self._bind_turn_gate(thread_id, client_message_id, turn_id)
+            self.store.transition_prompt_intent(
+                client_message_id,
+                expected_states={"submitting"},
+                to_state="started",
+                turn_id=turn_id,
+            )
+        except Exception as exc:
+            delivered, receipt = await self._reconcile_prompt_delivery(
+                thread_id, client_message_id, error=exc
+            )
+            if delivered:
+                turn_id = str((receipt or {}).get("turn_id") or "")
+                self._bind_turn_gate(thread_id, client_message_id, turn_id)
+            else:
+                self._schedule_turn_reconciliation(thread_id)
+            if delivered is not True:
+                raise
         if space_id is not None and generation is not None:
             await self._track_prompt_run(
                 space_id=space_id,
@@ -1127,10 +1707,29 @@ class Bridge:
                 queue_id = int(queued["queue_id"])
                 inputs = list(queued["inputs"])
                 client_message_id = str(queued["client_message_id"])
+                prompt_text = str(queued.get("prompt") or "")
             else:
                 queue_id = queued.queue_id
                 inputs = queued.inputs
                 client_message_id = queued.client_message_id
+                prompt_text = queued.prompt
+            intent = self.store.get_prompt_intent(client_message_id)
+            if intent is None:
+                intent = self.store.create_prompt_intent(
+                    client_message_id,
+                    "queue",
+                    prompt_text,
+                    "queue",
+                    thread_id=thread_id,
+                    space_id=space_id,
+                    generation=generation or 0,
+                )
+                intent = self.store.transition_prompt_intent(
+                    client_message_id,
+                    expected_states={"received"},
+                    to_state="queued",
+                    queue_id=queue_id,
+                ) or intent
             if not state.cwd:
                 await self._mark_prompt_failed(
                     state,
@@ -1152,13 +1751,41 @@ class Bridge:
                 )
                 return
             delivered = await self._client_message_exists(thread_id, client_message_id)
+            receipt = None
+            if delivered:
+                _, receipt = await self._client_message_receipt(thread_id, client_message_id)
             if delivered is None:
                 LOGGER.warning("Cannot reconcile queued prompt %s; postponing delivery", queue_id)
                 self._request_queue_retry(thread_id, space_id=space_id, generation=generation)
                 return
             if delivered:
+                self.store.reconcile_prompt_intent(
+                    client_message_id,
+                    delivered=True,
+                    turn_id=str((receipt or {}).get("turn_id") or "") or None,
+                )
+                receipt_turn_id = str((receipt or {}).get("turn_id") or "")
+                if (
+                    receipt_turn_id
+                    and
+                    str((receipt or {}).get("turn_status") or "") not in _FINAL_TURN_STATUSES
+                    and await self._begin_turn_gate(thread_id, client_message_id)
+                ):
+                    self._bind_turn_gate(
+                        thread_id,
+                        client_message_id,
+                        receipt_turn_id,
+                    )
                 await self._mark_prompt_dispatched(state, queue_id, space_id=space_id, generation=generation)
                 return
+            if not await self._begin_turn_gate(thread_id, client_message_id):
+                return
+            self.store.transition_prompt_intent(
+                client_message_id,
+                expected_states={"queued"},
+                to_state="submitting",
+                queue_id=queue_id,
+            )
             try:
                 turn = await self.client.start_turn(
                     thread_id,
@@ -1168,7 +1795,17 @@ class Bridge:
                     **_writable_turn_security(state),
                 )
                 turn_id = str((turn or {}).get("id") or "")
-                if space_id is not None and generation is not None:
+                if turn_id:
+                    self._bind_turn_gate(thread_id, client_message_id, turn_id)
+                    self.store.transition_prompt_intent(
+                        client_message_id,
+                        expected_states={"submitting"},
+                        to_state="started",
+                        turn_id=turn_id,
+                    )
+                else:
+                    self._schedule_turn_reconciliation(thread_id)
+                if turn_id and space_id is not None and generation is not None:
                     await self._track_prompt_run(
                         space_id=space_id,
                         generation=generation,
@@ -1177,12 +1814,20 @@ class Bridge:
                         client_message_id=client_message_id,
                     )
             except Exception as exc:
-                delivered = await self._client_message_exists(thread_id, client_message_id)
+                delivered, receipt = await self._reconcile_prompt_delivery(
+                    thread_id, client_message_id, error=exc
+                )
                 if delivered:
+                    self._bind_turn_gate(
+                        thread_id,
+                        client_message_id,
+                        str((receipt or {}).get("turn_id") or ""),
+                    )
                     await self._mark_prompt_dispatched(
                         state, queue_id, space_id=space_id, generation=generation
                     )
                 elif delivered is False and isinstance(exc, CodexRpcError):
+                    self._release_turn_gate(thread_id, None)
                     await self._mark_prompt_failed(
                         state,
                         queue_id,
@@ -1196,8 +1841,10 @@ class Bridge:
                         "Prompt %s has uncertain delivery; reconciliation is required before retry",
                         queue_id,
                     )
+                    self._schedule_turn_reconciliation(thread_id)
                 else:
                     LOGGER.exception("Failed to dispatch queued prompt %s", queue_id)
+                    self._schedule_turn_reconciliation(thread_id)
                 self._request_queue_retry(thread_id, space_id=space_id, generation=generation)
                 return
             await self._mark_prompt_dispatched(state, queue_id, space_id=space_id, generation=generation)
@@ -1364,19 +2011,8 @@ class Bridge:
         return thread_id
 
     async def _client_message_exists(self, thread_id: str, client_message_id: str) -> bool | None:
-        try:
-            payload = await self.client.read_thread(thread_id, include_turns=True)
-        except Exception:
-            return None
-        for turn in payload.get("turns") or []:
-            for item in (turn or {}).get("items") or []:
-                if (
-                    isinstance(item, dict)
-                    and item.get("type") == "userMessage"
-                    and str(item.get("clientId") or "") == client_message_id
-                ):
-                    return True
-        return False
+        delivered, _ = await self._client_message_receipt(thread_id, client_message_id)
+        return delivered
 
     async def resolve_directory(self, description: str) -> list[Path]:
         return await self.resolver.resolve_directory(description)
@@ -1430,17 +2066,20 @@ class Bridge:
 
     async def answer_question(self, request_key: str, answers: dict[str, list[str]]) -> None:
         pending = self._pending_requests.get(request_key)
-        stored = self.store.get_pending_input(request_key)
+        stored = self.store.claim_pending_input(request_key)
         if not pending or not stored:
             raise RuntimeError("该问题已过期或已由其他客户端回答")
         request_id, generation = pending
         if generation != self.client.generation:
+            self.store.resolve_pending_input(request_key, source="connection_generation_changed")
             raise RuntimeError("Codex 连接已经重建，原问题已失效")
         result = {"answers": {key: {"answers": values} for key, values in answers.items()}}
-        await self.client.respond(request_id, result, generation=generation)
-        await self._notify_question_resolved(request_key)
-        self._pending_requests.pop(request_key, None)
-        self.store.delete_pending_input(request_key)
+        try:
+            await self.client.respond(request_id, result, generation=generation)
+        except Exception:
+            self.store.release_pending_input_claim(request_key)
+            raise
+        self.store.mark_pending_input_responded(request_key, result)
 
     async def answer_command_approval(
         self,
@@ -1458,7 +2097,8 @@ class Bridge:
             (
                 value
                 for value in stored["questions"]
-                if isinstance(value, dict) and value.get("_bridge_request_kind") == "command_approval"
+                if isinstance(value, dict)
+                and value.get("_bridge_request_kind") in {"command_approval", "generic_approval"}
             ),
             None,
         )
@@ -1466,29 +2106,38 @@ class Bridge:
             raise RuntimeError("该请求不是可由 Telegram 处理的命令审批")
         method = str(metadata.get("_bridge_approval_method") or "")
         raw_available = metadata.get("_bridge_available_decisions")
-        if "_bridge_available_decisions" in metadata:
-            available = raw_available if isinstance(raw_available, list) else []
-        else:
-            raw_params = metadata.get("params")
-            available = command_approval_decisions(
-                method,
-                raw_params if isinstance(raw_params, dict) else {},
-            )
-        if not approval_decision_is_available(decision, available):
-            raise ValueError("命令审批决定不在当前请求允许的选项中")
-        if method == "execCommandApproval":
+        available = raw_available if isinstance(raw_available, list) else []
+        if method in {
+            "item/commandExecution/requestApproval",
+            "item/fileChange/requestApproval",
+        }:
+            if not approval_decision_is_available(decision, available):
+                raise ValueError("审批决定不在当前请求允许的选项中")
+            response: Json = {"decision": decision}
+        elif method == "item/permissions/requestApproval":
+            if not isinstance(decision, dict):
+                raise ValueError("权限审批需要明确的 permissions 与 scope")
+            permissions = decision.get("permissions")
+            scope = decision.get("scope")
+            if permissions is None or scope is None:
+                raise ValueError("权限审批缺少 permissions 或 scope")
+            response = {"permissions": permissions, "scope": scope}
+            if "strictAutoReview" in decision:
+                response["strictAutoReview"] = decision["strictAutoReview"]
+        elif method in {"execCommandApproval", "applyPatchApproval"}:
             if not isinstance(decision, str):
-                raise ValueError("命令审批决定无效")
+                raise ValueError("审批决定无效")
             mapped = {
                 "accept": "approved",
                 "acceptForSession": "approved_for_session",
                 "decline": "denied",
                 "cancel": "abort",
-            }[decision]
-        elif method == "item/commandExecution/requestApproval":
-            mapped = decision
+            }.get(decision)
+            if mapped is None or (available and decision not in available):
+                raise ValueError("审批决定不在当前请求允许的选项中")
+            response = {"decision": mapped}
         else:
-            raise RuntimeError("未知的命令审批协议")
+            raise RuntimeError("未知的审批协议")
         raw_request_id = stored["request_id"]
         try:
             request_id = json.loads(str(raw_request_id))
@@ -1496,22 +2145,26 @@ class Bridge:
             request_id = raw_request_id
         if not isinstance(request_id, int | str):
             request_id = str(raw_request_id)
+        claimed = self.store.claim_pending_input(request_key)
+        if claimed is None:
+            raise RuntimeError("该审批已由其他客户端处理")
         try:
-            await self.client.respond(request_id, {"decision": mapped}, generation=generation)
+            await self.client.respond(request_id, response, generation=generation)
         except Exception:
             if generation != self.client.generation:
                 await self._retire_command_approval(request_key)
+            else:
+                self.store.release_pending_input_claim(request_key)
             raise
-        await self._notify_question_resolved(request_key)
-        self._pending_requests.pop(request_key, None)
-        self.store.delete_pending_input(request_key)
+        self.store.mark_pending_input_responded(request_key, response)
 
     async def _retire_command_approval(self, request_key: str) -> None:
         await self._notify_question_resolved(request_key)
         self._pending_requests.pop(request_key, None)
-        self.store.delete_pending_input(request_key)
+        self.store.resolve_pending_input(request_key, source="connection_generation_changed")
 
     async def _on_notification(self, method: str, params: Json) -> None:
+        effects: list[NotificationEffect] = []
         if method == "serverRequest/resolved":
             raw_request_id = params.get("requestId")
             request_id = "" if raw_request_id is None else str(raw_request_id)
@@ -1527,9 +2180,13 @@ class Bridge:
                 if str(value) == request_id and key not in stale
             )
             for key in stale:
-                await self._notify_question_resolved(key)
+                self.store.resolve_pending_input(key, source="serverRequest/resolved")
                 self._pending_requests.pop(key, None)
-                self.store.delete_pending_input(key)
+                effects.append(
+                    ("question_resolved", partial(self._notify_question_resolved, key))
+                )
+            for name, effect in effects:
+                await self._dispatch_notification_effect(name, effect)
             return
         if not self._notification_is_managed(method, params):
             LOGGER.debug(
@@ -1538,7 +2195,17 @@ class Bridge:
                 self._notification_thread_id(params)[:8] or "missing",
             )
             return
-        await self.projector.ingest(method, params)
+        if "ingest" in self.projector.__dict__:
+            await self.projector.ingest(method, params)
+            changes = []
+        else:
+            changes = self.projector.project(method, params)
+        thread_id = self._notification_thread_id(params)
+        self._invalidate_thread_snapshot(thread_id)
+        effects.extend(
+            ("state_change", partial(self._on_state_change, state, reason))
+            for state, reason in changes
+        )
         if method in {"item/started", "item/completed", "turn/completed"}:
             self._invalidate_interest_cache()
         if method == "item/started":
@@ -1546,23 +2213,27 @@ class Bridge:
             thread_id = str(params.get("threadId") or "")
             turn_id = str(params.get("turnId") or "")
             if thread_id and turn_id and _is_tui_plan_approval_item(item):
-                try:
-                    await self.on_tui_plan_approved(thread_id, turn_id)
-                except Exception:
-                    LOGGER.exception(
-                        "event=tui_plan_approval_hook_failed thread_id=%s turn_id=%s",
-                        thread_id[:8],
-                        turn_id[:8],
+                effects.append(
+                    (
+                        "tui_plan_approved",
+                        partial(self.on_tui_plan_approved, thread_id, turn_id),
                     )
+                )
         self._schedule_subagent_profile_refresh(method, params)
         if method == "item/completed":
             item = params.get("item") or {}
             if isinstance(item, dict) and item.get("type") == "plan":
-                await self._notify_plan_completed(
-                    str(params.get("threadId") or ""),
-                    str(params.get("turnId") or ""),
-                    str(item.get("id") or ""),
-                    str(item.get("text") or ""),
+                effects.append(
+                    (
+                        "plan_completed",
+                        partial(
+                            self._notify_plan_completed,
+                            str(params.get("threadId") or ""),
+                            str(params.get("turnId") or ""),
+                            str(item.get("id") or ""),
+                            str(item.get("text") or ""),
+                        ),
+                    )
                 )
         elif method == "turn/completed":
             thread_id = str(params.get("threadId") or "")
@@ -1572,11 +2243,17 @@ class Bridge:
             turn_id = str(turn.get("id") or "")
             for item in turn.get("items") or []:
                 if isinstance(item, dict) and item.get("type") == "plan":
-                    await self._notify_plan_completed(
-                        thread_id,
-                        turn_id,
-                        str(item.get("id") or ""),
-                        str(item.get("text") or ""),
+                    effects.append(
+                        (
+                            "plan_completed",
+                            partial(
+                                self._notify_plan_completed,
+                                thread_id,
+                                turn_id,
+                                str(item.get("id") or ""),
+                                str(item.get("text") or ""),
+                            ),
+                        )
                     )
             status = str(turn.get("status") or "")
             if not thread_id or not turn_id or status not in _FINAL_TURN_STATUSES:
@@ -1586,18 +2263,43 @@ class Bridge:
                     turn_id[:8] or "missing",
                     status or "missing",
                 )
-                return
-            error_kind = _turn_error_kind(turn.get("error"))
-            marker = (thread_id, turn_id)
-            self._terminal_turns[marker] = (status, error_kind)
-            while len(self._terminal_turns) > 512:
-                self._terminal_turns.pop(next(iter(self._terminal_turns)))
-            await self._finish_prompt_runs(
-                thread_id,
-                turn_id,
-                status=status,
-                error_kind=error_kind,
-            )
+            else:
+                error_kind = _turn_error_kind(turn.get("error"))
+                marker = (thread_id, turn_id)
+                self._terminal_turns[marker] = (status, error_kind)
+                while len(self._terminal_turns) > 512:
+                    self._terminal_turns.pop(next(iter(self._terminal_turns)))
+                self.store.finish_prompt_intents(
+                    thread_id,
+                    turn_id,
+                    status=status,
+                    error=error_kind or None,
+                )
+                if self._release_turn_gate(thread_id, turn_id):
+                    self._request_queue_after_completion(thread_id)
+                runs = self.store.finish_prompt_runs(
+                    thread_id,
+                    turn_id,
+                    status=status,
+                    error_kind=error_kind,
+                )
+                effects.extend(
+                    ("prompt_completed", partial(self._notify_prompt_completed, run))
+                    for run in runs
+                )
+        if method == "thread/status/changed":
+            status = params.get("status")
+            if isinstance(status, dict) and status.get("type") == "idle":
+                self._schedule_turn_reconciliation(thread_id)
+        if method in {"item/started", "turn/started", "turn/completed", "thread/status/changed"}:
+            for raw_space in self._active_spaces_for_thread(thread_id):
+                event = self._plan_decision_events.get(
+                    (str(raw_space["space_id"]), int(raw_space["generation"]))
+                )
+                if event is not None:
+                    event.set()
+        for name, effect in effects:
+            await self._dispatch_notification_effect(name, effect)
 
     def _schedule_subagent_profile_refresh(self, method: str, params: Json) -> None:
         if method not in {"item/started", "item/completed"}:
@@ -1703,18 +2405,6 @@ class Bridge:
         immediate = reason in {"error", "turn/completed", "thread/goal/updated", "thread/status/changed"}
         await self.dashboard.schedule(state, immediate=immediate)
         await self._notify_state_change(state, reason)
-        if reason == "thread/status/changed" and state.status == "idle":
-            spaces = self._active_spaces_for_thread(state.thread_id)
-            if spaces:
-                for space in spaces:
-                    self._request_queue_retry(
-                        state.thread_id,
-                        delay=0.0,
-                        space_id=str(space["space_id"]),
-                        generation=int(space["generation"]),
-                    )
-            else:
-                self._request_queue_retry(state.thread_id, delay=0.0)
 
     async def _notify_state_change(self, state: ThreadState, reason: str) -> None:
         try:
@@ -1787,6 +2477,13 @@ class Bridge:
             if method in {"item/commandExecution/requestApproval", "execCommandApproval"}
             else params
         )
+        if method == "applyPatchApproval":
+            approval_params = {
+                **params,
+                "threadId": params.get("conversationId") or params.get("threadId") or "",
+                "turnId": params.get("turnId") or "",
+                "itemId": params.get("callId") or params.get("itemId") or "",
+            }
         thread_id = self._notification_thread_id(approval_params) or None
         if thread_id is None or thread_id not in self._managed_thread_ids():
             LOGGER.info(
@@ -1822,9 +2519,31 @@ class Bridge:
             )
             await self.on_question(request_key, params)
             return
-        if method in {"item/commandExecution/requestApproval", "execCommandApproval"}:
+        if method in {
+            "item/commandExecution/requestApproval",
+            "item/fileChange/requestApproval",
+            "item/permissions/requestApproval",
+            "execCommandApproval",
+            "applyPatchApproval",
+        }:
             thread_id = str(approval_params.get("threadId") or "") or None
-            available_decisions = command_approval_decisions(method, approval_params)
+            if method in {"item/commandExecution/requestApproval", "execCommandApproval"}:
+                available_decisions = command_approval_decisions(method, approval_params)
+            elif method == "item/fileChange/requestApproval":
+                raw_available = approval_params.get("availableDecisions")
+                available_decisions = (
+                    [
+                        value
+                        for value in raw_available
+                        if approval_decision_is_available(value, list(raw_available))
+                    ]
+                    if isinstance(raw_available, list)
+                    else ["accept", "acceptForSession", "decline"]
+                )
+            elif method == "applyPatchApproval":
+                available_decisions = ["accept", "acceptForSession", "decline", "cancel"]
+            else:
+                available_decisions = []
             request_key = f"approval:{uuid.uuid4().hex[:16]}"
             expires = int(time.time()) + max(
                 self.config.callback_seconds,
@@ -1832,7 +2551,7 @@ class Bridge:
             )
             self._pending_requests[request_key] = (request_id, generation)
             approval_metadata = {
-                "_bridge_request_kind": "command_approval",
+                "_bridge_request_kind": "generic_approval",
                 "_bridge_approval_method": method,
                 "_bridge_available_decisions": available_decisions,
                 "params": approval_params,
@@ -1848,18 +2567,11 @@ class Bridge:
                 expires,
             )
             LOGGER.info(
-                "event=command_approval_requested request_key=%s thread_id=%s method=%s",
+                "event=approval_requested request_key=%s thread_id=%s method=%s",
                 request_key,
                 str(thread_id or "")[:8],
                 method,
             )
             await self.on_command_approval(request_key, approval_params)
-            return
-        if method in {
-            "item/fileChange/requestApproval",
-            "item/permissions/requestApproval",
-            "applyPatchApproval",
-        }:
-            await self.on_notice("Codex 正在等待本机审批；Bot 不会自动批准", thread_id)
             return
         LOGGER.info("Ignoring unsupported app-server request %s", method)
