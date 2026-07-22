@@ -103,6 +103,7 @@ class SpaceDashboardManager:
         self._animation_indices: dict[str, int] = {}
         self._animation_batches: dict[str, _AnimationBatch] = {}
         self._delivery_tickets: dict[DeliveryKey, asyncio.Future[DeliveryOutcome]] = {}
+        self._delivery_fingerprints: dict[asyncio.Future[DeliveryOutcome], str] = {}
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._stopping = False
 
@@ -133,6 +134,7 @@ class SpaceDashboardManager:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._delivery_tickets.clear()
+        self._delivery_fingerprints.clear()
 
     async def on_thread_change(self, state: ThreadState, reason: str) -> None:
         for space in self.store.list_spaces():
@@ -193,11 +195,12 @@ class SpaceDashboardManager:
             return
         state = self._state_for_space(space)
         terminal = self._is_terminal(space, state)
+        animated = self._is_animated(space, state)
         status_keyboard = self._status_keyboard(space, terminal=terminal)
         targets: list[
             tuple[DeliveryKey, RenderedMessage, InlineKeyboardMarkup | None]
         ] = []
-        frame = self._frame_for(space_id, terminal=terminal)
+        frame = self._frame_for(space_id, terminal=terminal) if animated or terminal else 0
         if space.get("channel_chat_id") and space.get("channel_post_id"):
             key = DeliveryKey(
                 CONTROL_ROLE,
@@ -220,7 +223,7 @@ class SpaceDashboardManager:
         self._animation_batches[space_id] = _AnimationBatch(
             frame=frame,
             targets={key for key, *_ in targets},
-            advance=not terminal,
+            advance=animated,
         )
         for key, rendered, reply_markup in targets:
             self._submit_target(
@@ -242,17 +245,25 @@ class SpaceDashboardManager:
         reply_markup: InlineKeyboardMarkup | None = None,
         animation_frame: int = 0,
     ) -> None:
+        fingerprint = delivery_fingerprint(
+            rendered.markdown,
+            rendered.plain,
+            reply_markup,
+        )
+        if self._persisted_fingerprint(key) == fingerprint:
+            batch = self._animation_batches.get(space_id)
+            if batch is not None and batch.frame == animation_frame:
+                batch.acknowledged.add(key)
+                if batch.targets <= batch.acknowledged:
+                    self._animation_batches.pop(space_id, None)
+            return
         ticket = self.delivery.submit(
             DeliveryIntent(
                 key=key,
                 markdown=rendered.markdown,
                 plain=rendered.plain,
                 reply_markup=reply_markup,
-                fingerprint=delivery_fingerprint(
-                    rendered.markdown,
-                    rendered.plain,
-                    reply_markup,
-                ),
+                fingerprint=fingerprint,
                 priority=5 if terminal else 10,
                 terminal=terminal,
                 context=f"space:{space_id}",
@@ -261,6 +272,7 @@ class SpaceDashboardManager:
         if self._delivery_tickets.get(key) is ticket:
             return
         self._delivery_tickets[key] = ticket
+        self._delivery_fingerprints[ticket] = fingerprint
 
         def on_done(completed: asyncio.Future[DeliveryOutcome]) -> None:
             self._delivery_finished(key, space_id, completed, animation_frame)
@@ -277,6 +289,7 @@ class SpaceDashboardManager:
         if self._delivery_tickets.get(key) is not ticket:
             return
         self._delivery_tickets.pop(key, None)
+        fingerprint = self._delivery_fingerprints.pop(ticket, "")
         if ticket.cancelled():
             return
         try:
@@ -284,6 +297,8 @@ class SpaceDashboardManager:
         except Exception:
             return
         if outcome.status == "delivered":
+            if fingerprint:
+                self._save_persisted_fingerprint(key, fingerprint)
             batch = self._animation_batches.get(space_id)
             if batch is not None and batch.frame == animation_frame:
                 batch.performed = batch.performed or outcome.performed
@@ -318,6 +333,48 @@ class SpaceDashboardManager:
         goal = state.goal if isinstance(state, ThreadState) else state.get("goal")
         return isinstance(goal, dict) and str(goal.get("status") or "") == "complete"
 
+    @staticmethod
+    def _is_animated(space: dict[str, Any], state: ThreadState | dict[str, Any]) -> bool:
+        if str(space.get("lifecycle") or "") != "active":
+            return False
+        status = state.status if isinstance(state, ThreadState) else state.get("status")
+        turn_status = (
+            state.turn_status if isinstance(state, ThreadState) else state.get("turn_status")
+        )
+        return str(status or "") == "active" or str(turn_status or "") == "inProgress"
+
+    @staticmethod
+    def _fingerprint_key(key: DeliveryKey) -> str:
+        return f"dashboard:{key.bot_role}:{key.chat_id}:{key.message_id}"
+
+    @staticmethod
+    def _legacy_fingerprint_key(key: DeliveryKey) -> str:
+        return f"telegram-message:dashboard:{key.bot_role}:{key.chat_id}:{key.message_id}"
+
+    def _persisted_fingerprint(self, key: DeliveryKey) -> str:
+        getter = getattr(self.store, "get_telegram_message_state", None)
+        if callable(getter):
+            stored = getter(self._fingerprint_key(key))
+            if stored is not None:
+                return str(stored.get("semantic_fingerprint") or "")
+        value = self.store.get_meta(self._legacy_fingerprint_key(key))
+        return str(value or "")
+
+    def _save_persisted_fingerprint(self, key: DeliveryKey, fingerprint: str) -> None:
+        putter = getattr(self.store, "put_telegram_message_state", None)
+        if callable(putter):
+            putter(
+                self._fingerprint_key(key),
+                bot_role=key.bot_role,
+                chat_id=key.chat_id,
+                message_id=key.message_id,
+                semantic_fingerprint=fingerprint,
+                state="delivered",
+                payload={"surface": "dashboard"},
+            )
+            return
+        self.store.set_meta(self._legacy_fingerprint_key(key), fingerprint)
+
     def _state_for_space(self, space: dict[str, Any]) -> ThreadState | dict[str, Any]:
         thread_id = str(space.get("thread_id") or "")
         if thread_id:
@@ -349,7 +406,7 @@ class SpaceDashboardManager:
         remaining = self.security.space_unlock_remaining(str(space["space_id"]))
         auth_expires_at = int(time.time()) + remaining if remaining > 0 else None
         render_now: int | None = None
-        if self._is_terminal(space, state):
+        if self._is_terminal(space, state) or not self._is_animated(space, state):
             updated = state.updated_at if isinstance(state, ThreadState) else state.get("updated_at")
             render_now = int(updated or space.get("updated_at") or time.time())
             auth_expires_at = None
@@ -423,5 +480,5 @@ class SpaceDashboardManager:
             for space in self.store.list_spaces():
                 if space.get("lifecycle") in {"pending", "active"}:
                     state = self._state_for_space(space)
-                    if not self._is_terminal(space, state):
+                    if self._is_animated(space, state):
                         await self.schedule_space(str(space["space_id"]), immediate=True)

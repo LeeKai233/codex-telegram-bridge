@@ -15,6 +15,10 @@ from telegram.constants import ChatType, ParseMode
 from telegram.error import TelegramError
 from telegram.ext import ApplicationHandlerStop
 
+from codex_telegram_bridge.approval import (
+    approval_response_payload,
+    interactive_approval_decisions,
+)
 from codex_telegram_bridge.config import Config
 from codex_telegram_bridge.control_bot import ControlBotController
 from codex_telegram_bridge.deletions import MessageDeletionManager
@@ -155,6 +159,8 @@ class FakeBridge:
         self.collaboration_calls: list[dict[str, Any]] = []
         self.collaboration_error: RuntimeError | None = None
         self.reconcile_status = "unknown"
+        self.plan_gate_result: dict[str, str] = {"status": "safe_to_submit"}
+        self.plan_gate_calls: list[dict[str, Any]] = []
         self.on_question: Any = None
         self.on_notice: Any = None
         self.on_question_resolved: Any = None
@@ -305,6 +311,28 @@ class FakeBridge:
     ) -> str:
         return self.reconcile_status
 
+    async def wait_for_plan_decision_gate(
+        self,
+        space_id: str,
+        generation: int,
+        item_id: str,
+        revision_key: str,
+        client_message_id: str,
+        *,
+        timeout: float,
+    ) -> dict[str, str]:
+        self.plan_gate_calls.append(
+            {
+                "space_id": space_id,
+                "generation": generation,
+                "item_id": item_id,
+                "revision_key": revision_key,
+                "client_message_id": client_message_id,
+                "timeout": timeout,
+            }
+        )
+        return dict(self.plan_gate_result)
+
 
 class FakeSecurity:
     def __init__(self) -> None:
@@ -361,6 +389,43 @@ def rig(tmp_path: Path) -> Iterator[Rig]:
         callback_seconds=60,
     )
     store = Store(config.database_path)
+    telegram_message_states: dict[str, dict[str, Any]] = {}
+    prompt_receipt_links: list[tuple[str, str]] = []
+
+    def put_telegram_message_state(
+        message_key: str,
+        *,
+        bot_role: str,
+        chat_id: int,
+        message_id: int,
+        semantic_fingerprint: str,
+        state: str,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        row = {
+            "message_key": message_key,
+            "bot_role": bot_role,
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "semantic_fingerprint": semantic_fingerprint,
+            "state": state,
+            "payload": dict(payload or {}),
+            "updated_at": int(time.time()),
+        }
+        telegram_message_states[message_key] = row
+        return dict(row)
+
+    def get_telegram_message_state(message_key: str) -> dict[str, Any] | None:
+        row = telegram_message_states.get(message_key)
+        return dict(row) if row is not None else None
+
+    def link_prompt_intent_receipt(client_message_id: str, receipt_key: str) -> None:
+        prompt_receipt_links.append((client_message_id, receipt_key))
+
+    store.put_telegram_message_state = put_telegram_message_state  # type: ignore[attr-defined]
+    store.get_telegram_message_state = get_telegram_message_state  # type: ignore[attr-defined]
+    store.link_prompt_intent_receipt = link_prompt_intent_receipt  # type: ignore[attr-defined]
+    store._test_prompt_receipt_links = prompt_receipt_links  # type: ignore[attr-defined]
     store.set_owner(Owner(OWNER_ID, OWNER_CHAT_ID, "owner"))
     store.set_telegram_binding(
         {
@@ -1091,6 +1156,7 @@ async def test_tmux_question_resolution_deletes_all_forwarded_question_messages(
     ]
 
     await rig.discussion.question_resolved("request-1")
+    await asyncio.gather(*list(rig.discussion._background_tasks))
 
     assert rig.discussion_endpoint.deleted == [(DISCUSSION_CHAT_ID, 2001)]
     [summary] = rig.discussion_endpoint.edited
@@ -1163,6 +1229,7 @@ async def test_telegram_question_answer_is_persisted_before_rpc_and_archived(rig
             "answer": "Queue",
         },
     )
+    await asyncio.gather(*list(rig.discussion._background_tasks))
 
     assert observed == [
         {
@@ -1483,9 +1550,6 @@ async def test_tui_plan_prompt_disappearance_deletes_every_plan_chunk(
     monkeypatch.setattr(
         "codex_telegram_bridge.discussion_bot._PLAN_PROMPT_POLL_SECONDS", 0
     )
-    monkeypatch.setattr(
-        "codex_telegram_bridge.discussion_bot._PLAN_DECISION_GRACE_SECONDS", 0
-    )
     add_active_space(
         rig,
         space_id="space-plan-dismissed",
@@ -1609,9 +1673,7 @@ async def test_plan_prompt_monitor_backs_off_and_stops_after_ten_minutes(
 async def test_telegram_plan_choices_update_the_original_articles(
     rig: Rig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(
-        "codex_telegram_bridge.discussion_bot._PLAN_DECISION_GRACE_SECONDS", 0
-    )
+    del monkeypatch
     execute_space = add_active_space(
         rig,
         space_id="space-plan-article-execute",
@@ -1797,9 +1859,10 @@ async def test_tg_tui_plan_race_does_not_start_a_second_collaboration_turn(
         await rig.discussion.plan_turn_started(thread_id, "turn-tui-race")
 
     monkeypatch.setattr(rig.discussion, "_dismiss_tmux_plan_prompt", approve_from_tui)
-    monkeypatch.setattr(
-        "codex_telegram_bridge.discussion_bot._PLAN_DECISION_GRACE_SECONDS", 0
-    )
+    rig.bridge.plan_gate_result = {
+        "status": "tui_approval_observed",
+        "turn_id": "turn-tui-race",
+    }
 
     await rig.discussion._execute_plan(
         space,
@@ -2228,6 +2291,7 @@ async def test_command_approval_is_forwarded_and_consumed_from_discussion_callba
     ) is None
     assert "已批准本 Session" in rig.discussion_endpoint.sent[-1]["markdown"]
     await rig.discussion.question_resolved(request_key)
+    await asyncio.gather(*list(rig.discussion._background_tasks))
     assert "Codex 命令审批 · 已处理" in rig.discussion_endpoint.edited[-1]["markdown"]
     assert rig.discussion_endpoint.deleted == []
 
@@ -2458,6 +2522,138 @@ async def test_plan_revision_force_reply_starts_plan_turn(rig: Rig) -> None:
     assert (
         rig.store.latest_plan_publication("space-revise", 1)["status"]
         == "revision_started"
+    )
+
+
+@pytest.mark.asyncio
+async def test_plan_revision_gate_reconciles_tui_approval_without_force_reply(rig: Rig) -> None:
+    space = add_active_space(
+        rig,
+        space_id="space-revise-tui-gate",
+        thread_id="thread-revise-tui-gate",
+        root_message_id=551,
+        channel_post_id=151,
+    )
+    await rig.discussion.plan_completed(
+        "thread-revise-tui-gate",
+        "turn-plan",
+        "item-plan",
+        "Review this plan in TUI.",
+    )
+    publication = rig.store.latest_plan_publication("space-revise-tui-gate", 1)
+    assert publication is not None
+    sent_before = len(rig.discussion_endpoint.sent)
+    rig.bridge.plan_gate_result = {
+        "status": "tui_approval_observed",
+        "turn_id": "turn-tui-approval",
+    }
+
+    await rig.discussion._begin_plan_revision(
+        space,
+        {
+            "item_id": "item-plan",
+            "revision_key": publication["revision_key"],
+            "thread_id": "thread-revise-tui-gate",
+            "turn_id": "turn-plan",
+        },
+    )
+
+    current = rig.store.latest_plan_publication("space-revise-tui-gate", 1)
+    assert current is not None and current["status"] == "executed"
+    assert current["decision_turn_id"] == "turn-tui-approval"
+    assert len(rig.discussion_endpoint.sent) == sent_before
+    assert rig.bridge.collaboration_calls == []
+
+
+@pytest.mark.asyncio
+async def test_plan_revision_gate_reconciles_existing_delivery_without_force_reply(
+    rig: Rig,
+) -> None:
+    space = add_active_space(
+        rig,
+        space_id="space-revise-delivery-gate",
+        thread_id="thread-revise-delivery-gate",
+        root_message_id=552,
+        channel_post_id=152,
+    )
+    await rig.discussion.plan_completed(
+        "thread-revise-delivery-gate",
+        "turn-plan",
+        "item-plan",
+        "Review this delivered revision.",
+    )
+    publication = rig.store.latest_plan_publication("space-revise-delivery-gate", 1)
+    assert publication is not None
+    sent_before = len(rig.discussion_endpoint.sent)
+    rig.bridge.plan_gate_result = {"status": "already_delivered"}
+
+    await rig.discussion._begin_plan_revision(
+        space,
+        {
+            "item_id": "item-plan",
+            "revision_key": publication["revision_key"],
+            "thread_id": "thread-revise-delivery-gate",
+            "turn_id": "turn-plan",
+        },
+    )
+
+    current = rig.store.latest_plan_publication("space-revise-delivery-gate", 1)
+    assert current is not None and current["status"] == "revision_started"
+    assert not current.get("decision_turn_id")
+    assert len(rig.discussion_endpoint.sent) == sent_before
+    [gate_call] = rig.bridge.plan_gate_calls
+    assert gate_call == {
+        "space_id": "space-revise-delivery-gate",
+        "generation": 1,
+        "item_id": "item-plan",
+        "revision_key": publication["revision_key"],
+        "client_message_id": (
+            "telegram-plan-revise-space-revise-delivery-gate-1-item-plan-"
+            f"{publication['revision_key']}"
+        ),
+        "timeout": 1.0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_plan_revision_gate_uncertain_keeps_buttons_removed_without_force_reply(
+    rig: Rig,
+) -> None:
+    space = add_active_space(
+        rig,
+        space_id="space-revise-uncertain-gate",
+        thread_id="thread-revise-uncertain-gate",
+        root_message_id=553,
+        channel_post_id=153,
+    )
+    await rig.discussion.plan_completed(
+        "thread-revise-uncertain-gate",
+        "turn-plan",
+        "item-plan",
+        "Review this uncertain revision.",
+    )
+    publication = rig.store.latest_plan_publication("space-revise-uncertain-gate", 1)
+    assert publication is not None
+    sent_before = len(rig.discussion_endpoint.sent)
+    rig.bridge.plan_gate_result = {"status": "uncertain"}
+
+    await rig.discussion._begin_plan_revision(
+        space,
+        {
+            "item_id": "item-plan",
+            "revision_key": publication["revision_key"],
+            "thread_id": "thread-revise-uncertain-gate",
+            "turn_id": "turn-plan",
+        },
+    )
+
+    current = rig.store.latest_plan_publication("space-revise-uncertain-gate", 1)
+    assert current is not None and current["status"] == "revising"
+    assert len(rig.discussion_endpoint.sent) == sent_before
+    assert any(
+        "修改请求送达状态待确认" in edit.get("markdown", "")
+        and edit.get("reply_markup") is None
+        for edit in rig.discussion_endpoint.edited
     )
 
 
@@ -2862,6 +3058,139 @@ async def test_prompt_completion_receipt_is_scoped_to_active_generation(rig: Rig
         }
     )
     assert len(rig.discussion_endpoint.sent) == count
+
+
+@pytest.mark.asyncio
+async def test_prompt_receipt_survives_restart_and_completion_edits_same_message(rig: Rig) -> None:
+    space = add_active_space(
+        rig,
+        space_id="space-receipt-restart",
+        thread_id="thread-receipt-restart",
+        root_message_id=554,
+        channel_post_id=154,
+    )
+    client_message_id = "telegram-receipt-restart"
+
+    await rig.discussion._send_prompt(
+        space,
+        "Run focused tests.",
+        "auto",
+        client_message_id=client_message_id,
+    )
+
+    receipt_message_id = rig.discussion_endpoint.next_message_id - 1
+    assert rig.store._test_prompt_receipt_links == [  # type: ignore[attr-defined]
+        (client_message_id, f"prompt:{client_message_id}")
+    ]
+    stored = rig.store.get_telegram_message_state(f"prompt:{client_message_id}")  # type: ignore[attr-defined]
+    assert stored is not None and stored["state"] == "started"
+    rig.discussion._prompt_receipts.clear()
+
+    await rig.discussion.prompt_completed(
+        {
+            "space_id": "space-receipt-restart",
+            "generation": 1,
+            "thread_id": "thread-receipt-restart",
+            "client_message_id": client_message_id,
+            "turn_id": "turn-receipt-restart",
+            "status": "completed",
+        }
+    )
+
+    assert rig.discussion_endpoint.edited[-1]["message_id"] == receipt_message_id
+    assert "任务已完成" in rig.discussion_endpoint.edited[-1]["markdown"]
+    terminal = rig.store.get_telegram_message_state(f"prompt:{client_message_id}")  # type: ignore[attr-defined]
+    assert terminal is not None and terminal["state"] == "completed"
+    assert terminal["message_id"] == receipt_message_id
+
+
+@pytest.mark.asyncio
+async def test_prompt_choose_callback_reuses_client_id_and_receipt_message(rig: Rig) -> None:
+    space = add_active_space(
+        rig,
+        space_id="space-receipt-choose",
+        thread_id="thread-receipt-choose",
+        root_message_id=555,
+        channel_post_id=155,
+    )
+    rig.security.unlocked.add("space-receipt-choose")
+    outcomes = iter(("choose", "queued"))
+
+    async def send_prompt(
+        space_id: str,
+        prompt: str,
+        *,
+        mode: str,
+        client_message_id: str,
+    ) -> str:
+        rig.bridge.prompt_calls.append(
+            {
+                "space_id": space_id,
+                "prompt": prompt,
+                "mode": mode,
+                "client_message_id": client_message_id,
+            }
+        )
+        return next(outcomes)
+
+    rig.bridge.send_space_prompt = send_prompt  # type: ignore[method-assign]
+    client_message_id = "telegram-receipt-choose"
+
+    await rig.discussion._send_prompt(
+        space,
+        "Queue after choice.",
+        "auto",
+        client_message_id=client_message_id,
+    )
+    receipt_message_id = rig.discussion_endpoint.next_message_id - 1
+    markup = rig.discussion_endpoint.edited[-1]["reply_markup"]
+    queue_button = markup.inline_keyboard[1][0]
+    nonce = str(queue_button.callback_data)[3:]
+    callback = rig.store.peek_callback(
+        nonce,
+        OWNER_ID,
+        bot_role=DISCUSSION_ROLE,
+        chat_id=DISCUSSION_CHAT_ID,
+        space_id="space-receipt-choose",
+        generation=1,
+    )
+    assert callback is not None
+
+    action, payload = callback
+    await rig.discussion._dispatch_callback(action, payload, space)
+
+    assert rig.bridge.prompt_calls[-1]["client_message_id"] == client_message_id
+    assert rig.discussion_endpoint.edited[-1]["message_id"] == receipt_message_id
+    assert "已加入队列" in rig.discussion_endpoint.edited[-1]["markdown"]
+
+
+def test_interactive_approval_payloads_cover_file_permissions_and_legacy_patch() -> None:
+    file_choices = interactive_approval_decisions(
+        "item/fileChange/requestApproval",
+        {"availableDecisions": ["accept", "acceptForSession", "decline"]},
+    )
+    assert file_choices == ["accept", "acceptForSession", "decline"]
+    assert approval_response_payload(
+        "item/fileChange/requestApproval", "acceptForSession"
+    ) == {"decision": "acceptForSession"}
+
+    requested = {"fileSystem": {"read": ["/workspace"]}}
+    assert interactive_approval_decisions(
+        "item/permissions/requestApproval", {"permissions": requested}
+    ) == [{"permissions": requested, "scope": "turn"}]
+    assert approval_response_payload(
+        "item/permissions/requestApproval",
+        {"permissions": requested, "scope": "turn", "strictAutoReview": True},
+    ) == {"permissions": requested, "scope": "turn", "strictAutoReview": True}
+    with pytest.raises(ValueError, match="Session"):
+        approval_response_payload(
+            "item/permissions/requestApproval",
+            {"permissions": requested, "scope": "session", "strictAutoReview": True},
+        )
+
+    assert approval_response_payload("applyPatchApproval", "accept") == {
+        "decision": "approved"
+    }
 
 
 @pytest.mark.asyncio

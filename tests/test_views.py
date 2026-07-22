@@ -9,7 +9,6 @@ import pytest
 from codex_telegram_bridge.models import (
     LifecycleActivity,
     PlanStep,
-    SessionSpace,
     TaskState,
     ThreadState,
 )
@@ -224,32 +223,58 @@ def test_status_comment_shows_animated_mode_and_main_and_subagent_profiles() -> 
             reasoning_effort="max",
         )
     ]
-    space = SessionSpace(
-        space_id="space-1",
-        lifecycle="active",
-        thread_id="parent",
-        normal_model="gpt-5.6-luna",
-        normal_effort="max",
-        plan_model="gpt-5.6-sol",
-        plan_effort="xhigh",
-        current_mode="plan",
-    )
+    space = {
+        "space_id": "space-1",
+        "lifecycle": "active",
+        "thread_id": "parent",
+        "normal_model": "gpt-5.6-luna",
+        "normal_effort": "max",
+        "plan_model": "gpt-5.6-sol",
+        "plan_effort": "xhigh",
+        "current_mode": "plan",
+        "desired_mode": "plan",
+        "observed_mode": "plan",
+    }
 
     rendered = render_status_comment(state, space=space, animation_frame=1)
 
-    assert rendered.markdown.startswith("🌒 *🧭 Plan mode*")
+    assert rendered.markdown.startswith("🌒 *🧭 期望 Plan mode · TUI Plan mode*")
     assert "*🧠 Main*  `gpt-5.6-sol` · Effort `xhigh`" in rendered.markdown
     assert "`gpt-5.6-luna/max`" in rendered.markdown
-    assert rendered.plain.startswith("🌒 🧭 Plan mode")
+    assert rendered.plain.startswith("🌒 🧭 期望 Plan mode · TUI Plan mode")
 
     channel = render_channel_post(state, space=space, animation_frame=1)
-    assert channel.markdown.startswith("🌒 *🧭 Plan mode*")
+    assert channel.markdown.startswith("🌒 *🧭 期望 Plan mode · TUI Plan mode*")
     assert "*🧠 Main*  `gpt-5.6-sol` · Effort `xhigh`" in channel.markdown
 
-    space.current_mode = "default"
+    space["desired_mode"] = "default"
+    space["current_mode"] = "default"
+    space["observed_mode"] = "plan"
     normal = render_channel_post(state, space=space, animation_frame=2)
-    assert normal.markdown.startswith("🌓 *⚙️ Normal mode*")
+    assert normal.markdown.startswith("🌓 *⚠️ 期望 Normal mode · TUI Plan mode*")
     assert "*🧠 Main*  `gpt-5.6-luna` · Effort `max`" in normal.markdown
+
+
+def test_legacy_space_mode_is_desired_only_and_observed_remains_unknown() -> None:
+    state = ThreadState(
+        thread_id="late-attached",
+        title="Late attached TUI",
+        status="idle",
+    )
+    legacy_space = {
+        "thread_id": "late-attached",
+        "current_mode": "plan",
+        "plan_model": "gpt-5.6-sol",
+        "plan_effort": "xhigh",
+    }
+
+    status = render_status_comment(state, space=legacy_space)
+    channel = render_channel_post(state, space=legacy_space)
+
+    assert status.markdown.startswith("*🧭 期望 Plan mode · TUI 模式未确认*")
+    assert channel.markdown.startswith("*🧭 期望 Plan mode · TUI 模式未确认*")
+    assert "TUI Plan mode" not in status.plain
+    assert "TUI Plan mode" not in channel.plain
 
 
 def test_status_comment_separates_interrupted_tasks_and_warns_on_goal_plan_mismatch() -> None:

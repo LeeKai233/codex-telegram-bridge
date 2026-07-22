@@ -571,6 +571,7 @@ async def test_tmux_resolution_deletes_every_persisted_question_message(tmp_path
     store.record_question_message("request-key", CONTROL_ROLE, 9527, 13)
 
     await bridge._on_notification("serverRequest/resolved", {"requestId": 42})
+    await asyncio.gather(*list(controller._background_tasks))
 
     assert discussion.deleted == [(-1001, 11), (-1001, 12)]
     assert control.deleted == [(9527, 13)]
@@ -583,7 +584,7 @@ async def test_tmux_resolution_deletes_every_persisted_question_message(tmp_path
 
 @pytest.mark.asyncio
 async def test_tmux_resolution_after_restart_uses_persisted_request_key(tmp_path: Path) -> None:
-    bridge, store, _controller, _control, discussion = make_runtime(tmp_path)
+    bridge, store, controller, _control, discussion = make_runtime(tmp_path)
     put_pending(store, "request-after-restart", json.dumps("rpc-string-id"))
     store.record_question_message(
         "request-after-restart", DISCUSSION_ROLE, -1001, 15
@@ -593,6 +594,7 @@ async def test_tmux_resolution_after_restart_uses_persisted_request_key(tmp_path
     await bridge._on_notification(
         "serverRequest/resolved", {"requestId": "rpc-string-id"}
     )
+    await asyncio.gather(*list(controller._background_tasks))
 
     assert discussion.deleted == [(-1001, 15)]
     assert store.question_messages("request-after-restart") == []
@@ -604,7 +606,7 @@ async def test_tmux_resolution_after_restart_uses_persisted_request_key(tmp_path
 async def test_telegram_answer_uses_the_same_question_cleanup_hook(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    bridge, store, _controller, _control, discussion = make_runtime(tmp_path)
+    bridge, store, controller, _control, discussion = make_runtime(tmp_path)
     put_pending(store, "request-key", "77")
     bridge._pending_requests["request-key"] = (77, bridge.client.generation)
     store.record_question_message("request-key", DISCUSSION_ROLE, -1001, 21)
@@ -618,6 +620,7 @@ async def test_telegram_answer_uses_the_same_question_cleanup_hook(
     monkeypatch.setattr(bridge.client, "respond", respond)
 
     await bridge.answer_question("request-key", {"answer": ["yes"]})
+    await asyncio.gather(*list(controller._background_tasks))
 
     assert responses == [(77, {"answers": {"answer": {"answers": ["yes"]}}})]
     assert discussion.deleted == [(-1001, 21)]
@@ -679,6 +682,7 @@ async def test_question_sent_during_resolution_is_deleted_before_it_can_be_recor
 
     async def send_space(*_args: Any, **_kwargs: Any) -> SimpleNamespace:
         await controller.question_resolved("request-key")
+        await asyncio.gather(*list(controller._background_tasks))
         return SimpleNamespace(message_id=32)
 
     monkeypatch.setattr(controller, "_send_space", send_space)
@@ -700,6 +704,7 @@ async def test_duplicate_resolution_notifications_do_not_delete_twice(tmp_path: 
         controller.question_resolved("request-key"),
         controller.question_resolved("request-key"),
     )
+    await asyncio.gather(*list(controller._background_tasks))
 
     assert discussion.deleted == [(-1001, 41)]
     assert store.question_messages("request-key") == []
@@ -712,6 +717,7 @@ async def test_resolved_question_tombstones_and_locks_are_bounded(tmp_path: Path
 
     for index in range(600):
         await controller.question_resolved(f"request-{index}")
+    await asyncio.gather(*list(controller._background_tasks))
 
     assert len(controller._resolved_questions) == 512
     assert "request-87" not in controller._resolved_questions

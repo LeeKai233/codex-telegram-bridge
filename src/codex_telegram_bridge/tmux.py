@@ -107,6 +107,11 @@ class TmuxManager:
         window = self._find_window(thread_id)
         if not window:
             return None
+        pane = self._run(
+            "display-message", "-p", "-t", window, "#{pane_dead}", check=False
+        )
+        if pane.returncode != 0 or pane.stdout.strip() == "1":
+            return None
         captured = self._run(
             "capture-pane",
             "-p",

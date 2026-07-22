@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import difflib
 import html
+import json
 import logging
 import re
 import secrets
@@ -41,13 +42,14 @@ from telegram.ext import (
 
 from .approval import (
     ApprovalDecision,
-    approval_decision_is_available,
     approval_decision_kind,
-    command_approval_decisions,
+    interactive_approval_decisions,
+    interactive_approval_is_available,
 )
 from .bridge import TUI_PLAN_APPROVAL_PROMPT, Bridge
 from .config import Config
 from .deletions import MessageDeletionManager
+from .delivery import delivery_fingerprint
 from .files import FileCandidate, PathPolicyError, prepare_inbox_path
 from .markdown import clip, compact_path, escape, inline_code
 from .models import plan_revision_key
@@ -83,11 +85,12 @@ _PLAN_PROMPT_POLL_SECONDS = 2.0
 _PLAN_PROMPT_FAST_WINDOW_SECONDS = 30.0
 _PLAN_PROMPT_SLOW_POLL_SECONDS = 10.0
 _PLAN_PROMPT_MONITOR_SECONDS = 10 * 60.0
-_PLAN_DECISION_GRACE_SECONDS = 2.0
 _GETFILE_PAGE_SIZE = 8
 _CIRCLED_FILE_BUTTON_LABELS = "①②③④⑤⑥⑦⑧"
 _BOT_URL_TOKEN = re.compile(r"(https://api\.telegram\.org/bot)[^/\s]+", re.IGNORECASE)
 _BOT_TOKEN = re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{16,}\b")
+_MODEL_CACHE_SECONDS = 5 * 60.0
+_STATUS_REFRESH_SECONDS = 5.0
 
 
 def _redacted_error(error: object) -> str:
@@ -158,6 +161,13 @@ class DiscussionBotController:
         self._ask_waiting_messages: dict[asyncio.Task[Any], tuple[int, int, str]] = {}
         self._interaction_tasks: dict[str, asyncio.Task[None]] = {}
         self._plan_prompt_tasks: dict[str, asyncio.Task[None]] = {}
+        self._background_tasks: set[asyncio.Task[Any]] = set()
+        self._status_refresh_tasks: dict[str, asyncio.Task[None]] = {}
+        self._status_refreshed_at: dict[str, float] = {}
+        self._model_cache: tuple[Any, ...] = ()
+        self._model_cache_at = 0.0
+        self._model_cache_task: asyncio.Task[list[Any]] | None = None
+        self._prompt_receipts: dict[str, dict[str, Any]] = {}
         self._plan_recovery_done = False
         self._plan_recovery_task: asyncio.Task[None] | None = None
         self._workloads = KeyedWorkScheduler("discussion-work", max_pending=256, max_running=8)
@@ -239,6 +249,19 @@ class DiscussionBotController:
 
     async def stop(self) -> None:
         await self._workloads.stop()
+        background = list(self._background_tasks)
+        self._background_tasks.clear()
+        for task in self._status_refresh_tasks.values():
+            if task not in background:
+                background.append(task)
+        self._status_refresh_tasks.clear()
+        if self._model_cache_task is not None and self._model_cache_task not in background:
+            background.append(self._model_cache_task)
+        self._model_cache_task = None
+        for task in background:
+            task.cancel()
+        if background:
+            await asyncio.gather(*background, return_exceptions=True)
         plan_prompt_tasks = list(self._plan_prompt_tasks.values())
         self._plan_prompt_tasks.clear()
         for task in plan_prompt_tasks:
@@ -529,17 +552,17 @@ class DiscussionBotController:
     async def status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         del context
         space = self._require_space(update)
-        if space.get("thread_id"):
-            await self.bridge.refresh(str(space["thread_id"]))
         await self.dashboards.schedule_space(str(space["space_id"]), immediate=True)
         link = self.coordinator.status_link(space)
         await self._send_space(
             space,
-            "实时状态已刷新。",
+            "状态快照已显示，后台刷新中。",
             reply_markup=(
                 InlineKeyboardMarkup([[InlineKeyboardButton("打开状态", url=link)]]) if link else None
             ),
         )
+        if space.get("thread_id"):
+            self._schedule_status_refresh(space)
 
     async def totp(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         del context
@@ -805,24 +828,76 @@ class DiscussionBotController:
             reply_markup=InlineKeyboardMarkup(rows) if rows else None,
         )
 
-    async def _send_prompt(self, space: dict[str, Any], prompt: str, mode: str) -> None:
-        result = await self.bridge.send_space_prompt(
-            str(space["space_id"]),
-            prompt,
-            mode=mode,
-            client_message_id=f"telegram-{space['space_id']}-{uuid.uuid4()}",
+    async def _send_prompt(
+        self,
+        space: dict[str, Any],
+        prompt: str,
+        mode: str,
+        *,
+        client_message_id: str | None = None,
+        receipt_message_id: int | None = None,
+    ) -> None:
+        client_message_id = client_message_id or f"telegram-{space['space_id']}-{uuid.uuid4()}"
+        if receipt_message_id is None:
+            receipt = await self._send_space(space, "📨 已收到请求。", priority=5)
+            receipt_message_id = int(receipt.message_id)
+        receipt_state = {
+            "space_id": str(space["space_id"]),
+            "generation": int(space["generation"]),
+            "message_id": receipt_message_id,
+            "state": "received",
+        }
+        self._prompt_receipts[client_message_id] = receipt_state
+        self._persist_prompt_receipt(
+            space,
+            client_message_id,
+            receipt_state,
+            "📨 已收到请求。",
         )
-        if result == "choose":
-            await self._send_space(
+        await self._edit_prompt_receipt(space, client_message_id, "submitting")
+        try:
+            result = await self.bridge.send_space_prompt(
+                str(space["space_id"]),
+                prompt,
+                mode=mode,
+                client_message_id=client_message_id,
+            )
+            self.store.link_prompt_intent_receipt(
+                client_message_id,
+                self._prompt_receipt_key(client_message_id),
+            )
+        except asyncio.CancelledError:
+            await asyncio.shield(self._edit_prompt_receipt(space, client_message_id, "cancelled"))
+            raise
+        except (TimeoutError, OSError):
+            await self._edit_prompt_receipt(space, client_message_id, "uncertain")
+            return
+        except Exception as exc:
+            await self._edit_prompt_receipt(
                 space,
-                "当前 turn 正在运行，请选择投递方式：",
+                client_message_id,
+                "failed",
+                detail=_redacted_error(exc),
+            )
+            return
+        if result == "choose":
+            await self._edit_prompt_receipt(
+                space,
+                client_message_id,
+                "choose",
+                text="当前 turn 正在运行，请选择投递方式：",
                 reply_markup=InlineKeyboardMarkup(
                     [
                         [
                             self._button(
                                 "BTW · 当前 turn",
                                 "prompt_mode",
-                                {"prompt": prompt, "mode": "steer"},
+                                {
+                                    "prompt": prompt,
+                                    "mode": "steer",
+                                    "client_message_id": client_message_id,
+                                    "receipt_message_id": receipt_message_id,
+                                },
                                 space,
                             )
                         ],
@@ -830,7 +905,12 @@ class DiscussionBotController:
                             self._button(
                                 "Queue · 稍后",
                                 "prompt_mode",
-                                {"prompt": prompt, "mode": "queue"},
+                                {
+                                    "prompt": prompt,
+                                    "mode": "queue",
+                                    "client_message_id": client_message_id,
+                                    "receipt_message_id": receipt_message_id,
+                                },
                                 space,
                             ),
                         ]
@@ -838,12 +918,122 @@ class DiscussionBotController:
                 ),
             )
             return
+        state = result if result in {"started", "steered", "queued"} else "failed"
+        await self._edit_prompt_receipt(space, client_message_id, state, detail=str(result))
+
+    async def _edit_prompt_receipt(
+        self,
+        space: dict[str, Any],
+        client_message_id: str,
+        state: str,
+        *,
+        detail: str = "",
+        text: str | None = None,
+        reply_markup: InlineKeyboardMarkup | None = None,
+    ) -> bool:
+        receipt = self._prompt_receipt(space, client_message_id)
+        if receipt is None:
+            return False
         labels = {
-            "started": "已开始执行。",
-            "steered": "已注入当前 turn。",
-            "queued": "已加入队列。",
+            "received": "📨 已收到请求。",
+            "choose": "当前 turn 正在运行，请选择投递方式：",
+            "queued": "📥 已加入队列。",
+            "submitting": "⏳ 正在提交给 Codex。",
+            "started": "▶️ 已开始执行。",
+            "steered": "↪️ 已注入当前 turn。",
+            "completed": "✅ `/prompt` 任务已完成。Codex 将继续此前工作；若无待处理指令则进入空闲。",
+            "failed": "❌ `/prompt` 任务失败。",
+            "uncertain": "⚠️ 请求送达状态待确认；请勿重复提交。",
+            "cancelled": "⏹ `/prompt` 任务已取消。",
         }
-        await self._send_space(space, labels.get(result, escape(result)))
+        message = text or labels.get(state, escape(state))
+        if detail and state == "failed":
+            message += f"\n{inline_code(clip(detail, 160))}"
+        try:
+            await self.discussion.edit_text(
+                int(space["discussion_chat_id"]),
+                int(receipt["message_id"]),
+                message,
+                reply_markup=reply_markup,
+                priority=5,
+            )
+        except TelegramError:
+            replacement = await self._send_space(
+                space,
+                message,
+                reply_markup=reply_markup,
+                priority=5,
+            )
+            receipt["message_id"] = int(replacement.message_id)
+        receipt["state"] = state
+        self._persist_prompt_receipt(
+            space,
+            client_message_id,
+            receipt,
+            message,
+            reply_markup=reply_markup,
+        )
+        return True
+
+    @staticmethod
+    def _prompt_receipt_key(client_message_id: str) -> str:
+        return f"prompt:{client_message_id}"
+
+    def _prompt_receipt(
+        self,
+        space: Mapping[str, Any],
+        client_message_id: str,
+    ) -> dict[str, Any] | None:
+        receipt = self._prompt_receipts.get(client_message_id)
+        if receipt is not None:
+            return receipt
+        stored = self.store.get_telegram_message_state(
+            self._prompt_receipt_key(client_message_id)
+        )
+        if stored is None:
+            return None
+        payload = stored.get("payload")
+        if not isinstance(payload, Mapping):
+            return None
+        if (
+            str(stored.get("bot_role") or "") != DISCUSSION_ROLE
+            or int(stored.get("chat_id") or 0) != int(space["discussion_chat_id"])
+            or str(payload.get("space_id") or "") != str(space["space_id"])
+            or int(payload.get("generation") or 0) != int(space["generation"])
+            or str(payload.get("client_message_id") or "") != client_message_id
+        ):
+            return None
+        receipt = {
+            "space_id": str(space["space_id"]),
+            "generation": int(space["generation"]),
+            "message_id": int(stored["message_id"]),
+            "state": str(stored.get("state") or "received"),
+        }
+        self._prompt_receipts[client_message_id] = receipt
+        return receipt
+
+    def _persist_prompt_receipt(
+        self,
+        space: Mapping[str, Any],
+        client_message_id: str,
+        receipt: Mapping[str, Any],
+        message: str,
+        *,
+        reply_markup: InlineKeyboardMarkup | None = None,
+    ) -> None:
+        self.store.put_telegram_message_state(
+            self._prompt_receipt_key(client_message_id),
+            bot_role=DISCUSSION_ROLE,
+            chat_id=int(space["discussion_chat_id"]),
+            message_id=int(receipt["message_id"]),
+            semantic_fingerprint=delivery_fingerprint(message, message, reply_markup),
+            state=str(receipt.get("state") or "received"),
+            payload={
+                "space_id": str(space["space_id"]),
+                "generation": int(space["generation"]),
+                "client_message_id": client_message_id,
+            },
+        )
 
     async def planmode(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         del context
@@ -905,7 +1095,7 @@ class DiscussionBotController:
         await self._announce_model_change(updated, profile)
 
     async def _begin_profile_interaction(self, space: dict[str, Any], kind: str) -> None:
-        options = await self.bridge.list_model_options()
+        options = await self._model_options()
         if not options:
             raise RuntimeError("Codex 当前没有返回可用模型")
         draft = self._replace_interaction(
@@ -953,7 +1143,7 @@ class DiscussionBotController:
         option = next(
             (
                 candidate
-                for candidate in await self.bridge.list_model_options()
+                for candidate in await self._model_options()
                 if str(_value(candidate, "model")) == model
             ),
             None,
@@ -1214,7 +1404,7 @@ class DiscussionBotController:
         *,
         prompt: str | None = None,
     ) -> str:
-        options = await self.bridge.list_model_options()
+        options = await self._model_options()
         if not options:
             return f"/{command} <model> | <effort>"
         by_model = {str(_value(option, "model")): option for option in options}
@@ -1909,7 +2099,17 @@ class DiscussionBotController:
             await self.coordinator.close(str(space["space_id"]), int(space["generation"]))
         elif action == "prompt_mode":
             self._ensure_unlocked(space)
-            await self._send_prompt(space, str(payload["prompt"]), str(payload["mode"]))
+            await self._send_prompt(
+                space,
+                str(payload["prompt"]),
+                str(payload["mode"]),
+                client_message_id=str(payload.get("client_message_id") or "") or None,
+                receipt_message_id=(
+                    int(payload["receipt_message_id"])
+                    if payload.get("receipt_message_id") is not None
+                    else None
+                ),
+            )
         elif action == "queue_cancel":
             self._ensure_unlocked(space)
             cancelled = self.store.cancel_space_prompt(
@@ -2283,21 +2483,38 @@ class DiscussionBotController:
                 await asyncio.sleep(min(poll_seconds, max(0.0, deadline - time.monotonic())))
                 continue
 
-            await asyncio.sleep(
-                min(_PLAN_DECISION_GRACE_SECONDS, max(0.0, deadline - time.monotonic()))
-            )
-            if time.monotonic() >= deadline:
-                return
             latest = self.store.latest_plan_publication(space_id, generation)
             if latest is None or str(latest.get("status") or "") != "published":
                 return
-            approval_turn = self.store.find_tui_plan_approval_turn(
-                thread_id,
-                after=int(latest.get("created_at") or 0),
-                prompt=TUI_PLAN_APPROVAL_PROMPT,
+            client_message_id = self._plan_client_message_id(space, latest)
+            gate = await self.bridge.wait_for_plan_decision_gate(
+                space_id,
+                generation,
+                item_id,
+                revision_key,
+                client_message_id,
+                timeout=1.0,
             )
-            if approval_turn:
-                await self.plan_turn_started(thread_id, approval_turn)
+            gate_status = str(gate.get("status") or "uncertain")
+            if gate_status == "tui_approval_observed":
+                approval_turn = str(gate.get("turn_id") or "")
+                if approval_turn:
+                    await self.plan_turn_started(thread_id, approval_turn)
+                return
+            if gate_status == "already_delivered":
+                self.store.mark_external_plan_action(
+                    space_id,
+                    generation,
+                    item_id,
+                    revision_key=revision_key,
+                    status="executed",
+                    expected_statuses={"published", "executing"},
+                )
+                delivered = self.store.latest_plan_publication(space_id, generation)
+                if delivered is not None:
+                    await self._finalize_plan_ui(space, delivered, status="executed")
+                return
+            if gate_status != "safe_to_submit":
                 return
             if not self.store.mark_external_plan_action(
                 space_id,
@@ -2544,6 +2761,18 @@ class DiscussionBotController:
             return
         status = str(run.get("status") or "completed")
         turn_id = str(run.get("turn_id") or "")
+        receipt_state = "cancelled" if status == "interrupted" else status
+        if receipt_state not in {"completed", "failed", "uncertain", "cancelled"}:
+            receipt_state = "failed"
+        client_message_id = str(run.get("client_message_id") or "")
+        if client_message_id and await self._edit_prompt_receipt(
+                space,
+                client_message_id,
+                receipt_state,
+                detail=str(run.get("error_kind") or status),
+            ):
+            self._prompt_receipts.pop(client_message_id, None)
+            return
         if status == "completed":
             message = "✅ `/prompt` 任务已完成。Codex 将继续此前工作；若无待处理指令则进入空闲。"
         elif status == "interrupted":
@@ -2611,14 +2840,55 @@ class DiscussionBotController:
             callback_chat_id=callback_chat_id,
         )
         await self._dismiss_tmux_plan_prompt(str(space.get("thread_id") or ""))
-        await asyncio.sleep(_PLAN_DECISION_GRACE_SECONDS)
-        approval_turn = self.store.find_tui_plan_approval_turn(
-            str(space.get("thread_id") or ""),
-            after=int(latest.get("created_at") or 0),
-            prompt=TUI_PLAN_APPROVAL_PROMPT,
+        wait_for_gate = getattr(self.bridge, "wait_for_plan_decision_gate", None)
+        gate = (
+            await wait_for_gate(
+                str(space["space_id"]),
+                int(space["generation"]),
+                str(latest["item_id"]),
+                str(latest.get("revision_key") or ""),
+                client_message_id,
+                timeout=1.0,
+            )
+            if wait_for_gate is not None
+            else {"status": "safe_to_submit"}
         )
-        if approval_turn:
-            await self.plan_turn_started(str(space.get("thread_id") or ""), approval_turn)
+        gate_status = str(gate.get("status") or "uncertain")
+        if gate_status == "tui_approval_observed":
+            approval_turn = str(gate.get("turn_id") or "")
+            if approval_turn:
+                await self.plan_turn_started(str(space.get("thread_id") or ""), approval_turn)
+            return
+        if gate_status == "already_delivered":
+            self.store.complete_plan_action(
+                str(space["space_id"]),
+                int(space["generation"]),
+                str(latest["item_id"]),
+                revision_key=str(latest.get("revision_key") or ""),
+                expected_status="executing",
+                status="executed",
+                decision_turn_id=str(gate.get("turn_id") or ""),
+            )
+            delivered = self.store.latest_plan_publication(
+                str(space["space_id"]), int(space["generation"])
+            )
+            if delivered is not None:
+                await self._finalize_plan_ui(space, delivered, status="executed")
+            return
+        if gate_status != "safe_to_submit":
+            uncertain = self.store.latest_plan_publication(
+                str(space["space_id"]), int(space["generation"])
+            )
+            if uncertain is not None:
+                await self._update_plan_article_status(
+                    space,
+                    uncertain,
+                    status="executing",
+                    custom_status=(
+                        "⚠ <b>状态：</b>批准请求送达状态待确认，已移除按钮以防重复执行。",
+                        "⚠ 状态：批准请求送达状态待确认，已移除按钮以防重复执行。",
+                    ),
+                )
             return
         current = self.store.latest_plan_publication(
             str(space["space_id"]), int(space["generation"])
@@ -3020,14 +3290,50 @@ class DiscussionBotController:
             callback_chat_id=callback_chat_id,
         )
         await self._dismiss_tmux_plan_prompt(str(space.get("thread_id") or ""))
-        await asyncio.sleep(_PLAN_DECISION_GRACE_SECONDS)
-        approval_turn = self.store.find_tui_plan_approval_turn(
-            str(space.get("thread_id") or ""),
-            after=int(latest.get("created_at") or 0),
-            prompt=TUI_PLAN_APPROVAL_PROMPT,
+        client_message_id = self._plan_revision_client_message_id(space, latest)
+        gate = await self.bridge.wait_for_plan_decision_gate(
+            str(space["space_id"]),
+            int(space["generation"]),
+            str(latest["item_id"]),
+            str(latest.get("revision_key") or ""),
+            client_message_id,
+            timeout=1.0,
         )
-        if approval_turn:
-            await self.plan_turn_started(str(space.get("thread_id") or ""), approval_turn)
+        gate_status = str(gate.get("status") or "uncertain")
+        if gate_status == "tui_approval_observed":
+            approval_turn = str(gate.get("turn_id") or "")
+            if approval_turn:
+                await self.plan_turn_started(str(space.get("thread_id") or ""), approval_turn)
+            return
+        if gate_status == "already_delivered":
+            self.store.complete_plan_action(
+                str(space["space_id"]),
+                int(space["generation"]),
+                str(latest["item_id"]),
+                revision_key=str(latest.get("revision_key") or ""),
+                expected_status="revising",
+                status="revision_started",
+            )
+            delivered = self.store.latest_plan_publication(
+                str(space["space_id"]), int(space["generation"])
+            )
+            if delivered is not None:
+                await self._finalize_plan_ui(space, delivered, status="revision_started")
+            return
+        if gate_status != "safe_to_submit":
+            uncertain = self.store.latest_plan_publication(
+                str(space["space_id"]), int(space["generation"])
+            )
+            if uncertain is not None:
+                await self._update_plan_article_status(
+                    space,
+                    uncertain,
+                    status="revising",
+                    custom_status=(
+                        "⚠ <b>状态：</b>修改请求送达状态待确认，已移除按钮以防重复提交。",
+                        "⚠ 状态：修改请求送达状态待确认，已移除按钮以防重复提交。",
+                    ),
+                )
             return
         try:
             prompt = await self._send_space(
@@ -3103,14 +3409,6 @@ class DiscussionBotController:
                 thread_id[:8],
             )
             return
-        raw_command = params.get("command")
-        if isinstance(raw_command, list):
-            command = shlex.join(str(value) for value in raw_command)
-        else:
-            command = str(raw_command or "未知命令")
-        command = clip(command, 1600)
-        cwd = clip(str(params.get("cwd") or "未知目录"), 500)
-        reason = clip(str(params.get("reason") or "该命令需要额外权限。"), 500)
         stored = self.store.get_pending_input(request_key)
         metadata = next(
             (
@@ -3121,11 +3419,27 @@ class DiscussionBotController:
             None,
         )
         method = str(metadata.get("_bridge_approval_method") or "") if metadata else ""
+        raw_command = params.get("command")
+        if isinstance(raw_command, list):
+            command = shlex.join(str(value) for value in raw_command)
+        else:
+            command = str(raw_command or "未知命令")
+        subject_label = "命令"
+        if method == "item/permissions/requestApproval":
+            requested = params.get("permissions") or params.get("requestedPermissions") or {}
+            command = json.dumps(requested, ensure_ascii=False, sort_keys=True)
+            subject_label = "权限"
+        elif method in {"item/fileChange/requestApproval", "applyPatchApproval"}:
+            command = str(params.get("grantRoot") or params.get("cwd") or "当前文件变更")
+            subject_label = "变更范围"
+        command = clip(command, 1600)
+        cwd = clip(str(params.get("cwd") or "未知目录"), 500)
+        reason = clip(str(params.get("reason") or "该命令需要额外权限。"), 500)
         if metadata and "_bridge_available_decisions" in metadata:
             raw_available = metadata.get("_bridge_available_decisions")
             available: list[ApprovalDecision] = raw_available if isinstance(raw_available, list) else []
         else:
-            available = command_approval_decisions(method, params)
+            available = interactive_approval_decisions(method, params)
         ttl = max(self.config.callback_seconds, self.config.totp_unlock_seconds)
         buttons = [
             self._button(
@@ -3138,7 +3452,16 @@ class DiscussionBotController:
             for decision in available
         ]
         markup = InlineKeyboardMarkup([[button] for button in buttons]) if buttons else None
-        heading = "*⚠️ Codex 命令审批需重试*" if retry else "*⚠️ Codex 请求执行命令*"
+        approval_kind = {
+            "item/fileChange/requestApproval": "修改文件",
+            "applyPatchApproval": "应用文件补丁",
+            "item/permissions/requestApproval": "授予临时权限",
+        }.get(method, "执行命令")
+        heading = (
+            f"*⚠️ Codex {approval_kind}审批需重试*"
+            if retry
+            else f"*⚠️ Codex 请求{approval_kind}*"
+        )
         instruction = (
             "上一选择未送达 Codex，请使用下面的新按钮。"
             if retry
@@ -3152,7 +3475,7 @@ class DiscussionBotController:
                 [
                     heading,
                     f"Session {inline_code(thread_id[:8])}",
-                    f"命令：{inline_code(command)}",
+                    f"{subject_label}：{inline_code(command)}",
                     f"目录：{inline_code(cwd)}",
                     f"原因：{escape(reason)}",
                     instruction,
@@ -3179,6 +3502,9 @@ class DiscussionBotController:
 
     @staticmethod
     def _command_approval_button_label(decision: ApprovalDecision) -> str:
+        if isinstance(decision, dict) and isinstance(decision.get("permissions"), dict):
+            scope = str(decision.get("scope") or "turn")
+            return "仅本 Turn 授权" if scope == "turn" else "本 Session 授权"
         kind = approval_decision_kind(decision)
         if kind == "accept":
             return "批准执行"
@@ -3805,11 +4131,11 @@ class DiscussionBotController:
             available = raw_available if isinstance(raw_available, list) else []
         else:
             raw_params = metadata.get("params")
-            available = command_approval_decisions(
+            available = interactive_approval_decisions(
                 method,
                 raw_params if isinstance(raw_params, dict) else {},
             )
-        if not approval_decision_is_available(decision, available):
+        if not interactive_approval_is_available(method, decision, available):
             raise ValueError("命令审批决定不在当前请求允许的选项中")
         if not self.store.save_question_resolution(
             request_key,
@@ -3817,11 +4143,6 @@ class DiscussionBotController:
             source="telegram",
         ):
             raise RuntimeError("该命令审批已提交，不能重复处理")
-        await self._clear_callback_markup(
-            space,
-            message_id,
-            chat_id=chat_id,
-        )
         try:
             await self.bridge.answer_command_approval(request_key, decision)
         except Exception as exc:
@@ -3842,6 +4163,16 @@ class DiscussionBotController:
                 await self.forward_command_approval(request_key, retry_params, retry=True)
                 return
             raise RuntimeError("Codex 连接已经重建，原命令审批已失效") from exc
+        self._track_task(
+            asyncio.create_task(
+                self._clear_callback_markup(
+                    space,
+                    message_id,
+                    chat_id=chat_id,
+                ),
+                name=f"approval-cleanup:{request_key[:12]}",
+            )
+        )
         kind = approval_decision_kind(decision)
         labels = {
             "accept": "已批准本次命令执行。",
@@ -3854,6 +4185,14 @@ class DiscussionBotController:
         await self._send_space(space, labels.get(kind, "命令审批已提交。"), priority=5)
 
     async def question_resolved(self, request_key: str) -> None:
+        self._track_task(
+            asyncio.create_task(
+                self._cleanup_question_resolution(request_key),
+                name=f"question-resolved:{request_key[:12]}",
+            )
+        )
+
+    async def _cleanup_question_resolution(self, request_key: str) -> None:
         lock = self._question_locks.setdefault(request_key, asyncio.Lock())
         async with lock:
             self._resolved_questions.pop(request_key, None)
@@ -4128,6 +4467,70 @@ class DiscussionBotController:
         if not space.get("thread_id"):
             raise RuntimeError("当前 Session 尚未创建")
         return await self.bridge.refresh(str(space["thread_id"]))
+
+    def _track_task(self, task: asyncio.Task[Any]) -> None:
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    def _schedule_status_refresh(self, space: dict[str, Any]) -> None:
+        space_id = str(space["space_id"])
+        current = self._status_refresh_tasks.get(space_id)
+        if current is not None and not current.done():
+            return
+        task = asyncio.create_task(
+            self._refresh_status(space_id, int(space["generation"])),
+            name=f"discussion-status-refresh:{space_id[:8]}",
+        )
+        self._status_refresh_tasks[space_id] = task
+        self._track_task(task)
+
+    async def _refresh_status(self, space_id: str, generation: int) -> None:
+        delay = max(
+            0.0,
+            self._status_refreshed_at.get(space_id, 0.0)
+            + _STATUS_REFRESH_SECONDS
+            - time.monotonic(),
+        )
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            current = self.store.get_space(space_id)
+            if (
+                current is None
+                or int(current.get("generation") or 0) != generation
+                or not current.get("thread_id")
+            ):
+                return
+            await self.bridge.refresh(str(current["thread_id"]))
+            self._status_refreshed_at[space_id] = time.monotonic()
+            await self.dashboards.schedule_space(space_id, immediate=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOGGER.warning("Unable to refresh /status snapshot", exc_info=True)
+        finally:
+            if self._status_refresh_tasks.get(space_id) is asyncio.current_task():
+                self._status_refresh_tasks.pop(space_id, None)
+
+    async def _model_options(self) -> list[Any]:
+        now = time.monotonic()
+        if self._model_cache and now - self._model_cache_at < _MODEL_CACHE_SECONDS:
+            return list(self._model_cache)
+        task = self._model_cache_task
+        if task is None or task.done():
+            task = asyncio.create_task(
+                self.bridge.list_model_options(),
+                name="discussion-model-catalog-refresh",
+            )
+            self._model_cache_task = task
+        try:
+            options = await task
+        finally:
+            if self._model_cache_task is task:
+                self._model_cache_task = None
+        self._model_cache = tuple(options)
+        self._model_cache_at = time.monotonic()
+        return list(self._model_cache)
 
     def _button(
         self,

@@ -592,6 +592,94 @@ async def test_space_dashboard_submits_channel_and_discussion_independently(tmp_
 
 
 @pytest.mark.asyncio
+async def test_space_dashboard_restart_uses_persisted_message_state_for_noop(
+    tmp_path: Path,
+) -> None:
+    config = replace(
+        Config.default(),
+        config_dir=tmp_path / "config",
+        state_dir=tmp_path / "state",
+        allowed_root=tmp_path,
+    )
+    store = Store(config.database_path)
+    message_states: dict[str, dict[str, Any]] = {}
+
+    def get_message_state(message_key: str) -> dict[str, Any] | None:
+        return message_states.get(message_key)
+
+    def put_message_state(
+        message_key: str,
+        *,
+        bot_role: str,
+        chat_id: int,
+        message_id: int,
+        semantic_fingerprint: str,
+        state: str,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        row = {
+            "message_key": message_key,
+            "bot_role": bot_role,
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "semantic_fingerprint": semantic_fingerprint,
+            "state": state,
+            "payload": dict(payload or {}),
+        }
+        message_states[message_key] = row
+        return row
+
+    store.get_telegram_message_state = get_message_state  # type: ignore[attr-defined]
+    store.put_telegram_message_state = put_message_state  # type: ignore[attr-defined]
+    store.create_space(
+        {
+            "space_id": "space-restart-noop",
+            "lifecycle": "active",
+            "thread_id": "thread-restart-noop",
+            "channel_chat_id": -100122,
+            "channel_post_id": 39,
+        }
+    )
+    store.save_thread(
+        ThreadState(
+            thread_id="thread-restart-noop",
+            title="Stable dashboard",
+            status="idle",
+            updated_at=1_700_000_000,
+        )
+    )
+
+    first_delivery = RecordingDelivery()
+    first = SpaceDashboardManager(
+        config,
+        store,
+        StaticSecurity(),  # type: ignore[arg-type]
+        RecordingEndpoint(),  # type: ignore[arg-type]
+        RecordingEndpoint(),  # type: ignore[arg-type]
+        first_delivery,  # type: ignore[arg-type]
+    )
+    await first._flush("space-restart-noop")
+    await asyncio.sleep(0)
+
+    assert len(first_delivery.intents) == 1
+    assert message_states["dashboard:control:-100122:39"]["state"] == "delivered"
+
+    restarted_delivery = RecordingDelivery()
+    restarted = SpaceDashboardManager(
+        config,
+        store,
+        StaticSecurity(),  # type: ignore[arg-type]
+        RecordingEndpoint(),  # type: ignore[arg-type]
+        RecordingEndpoint(),  # type: ignore[arg-type]
+        restarted_delivery,  # type: ignore[arg-type]
+    )
+    await restarted._flush("space-restart-noop")
+
+    assert restarted_delivery.intents == []
+    store.close()
+
+
+@pytest.mark.asyncio
 async def test_complete_goal_uses_full_moon_terminal_delivery(tmp_path: Path) -> None:
     config = replace(
         Config.default(),

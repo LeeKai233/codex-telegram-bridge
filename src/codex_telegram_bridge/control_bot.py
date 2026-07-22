@@ -64,11 +64,13 @@ _PRIVATE_COMMANDS = (
 
 _SESSIONS_DELETE_SECONDS = 15 * 60
 _PERF_LIFETIME_SECONDS = 30.0
-_PERF_UPDATE_SECONDS = 1.05
+_PERF_UPDATE_SECONDS = 5.0
 _PERF_FRAMES = ("🕛", "🕒", "🕕", "🕘")
 _NEW_INTERACTION_SECONDS = 5 * 60
 _NEW_PROMPT_SECONDS = 30
 _NEW_INTERACTION_KIND = "control_new"
+_MODEL_CACHE_SECONDS = 5 * 60.0
+_SESSION_REFRESH_SECONDS = 5.0
 
 
 @dataclass(slots=True)
@@ -76,6 +78,7 @@ class _PerfRun:
     task: asyncio.Task[None]
     message_ids: tuple[int, int]
     group_key: str
+    content: tuple[str, str]
 
 
 class ControlBotController:
@@ -98,6 +101,13 @@ class ControlBotController:
         self.deletions = deletions
         self._perf_runs: dict[int, _PerfRun] = {}
         self._new_timeouts: dict[str, asyncio.Task[None]] = {}
+        self._background_tasks: set[asyncio.Task[Any]] = set()
+        self._session_refresh_task: asyncio.Task[None] | None = None
+        self._session_refresh_targets: set[tuple[int, int, str, int]] = set()
+        self._session_refreshed_at = 0.0
+        self._model_cache: tuple[Any, ...] = ()
+        self._model_cache_at = 0.0
+        self._model_cache_task: asyncio.Task[list[Any]] | None = None
         self._application: Application | None = None
         self._workloads = KeyedWorkScheduler("control-work", max_pending=128, max_running=2)
 
@@ -227,6 +237,12 @@ class ControlBotController:
                 delete_at=deadline,
                 group_key=group_key,
             )
+            self._schedule_sessions_refresh(
+                chat.id,
+                int(reply.message_id),
+                raw_arguments(update),
+                1,
+            )
 
     async def _show_sessions(
         self,
@@ -239,7 +255,7 @@ class ControlBotController:
         chat = update.effective_chat
         if not chat:
             return
-        states = await self.bridge.list_sessions(search_term=query or None, limit=1000)
+        states = self._filter_session_states(self.store.list_threads(), query)
         view = render_sessions_page(states, page=page, query=query)
         rows: list[list[InlineKeyboardButton]] = []
         if view.details:
@@ -281,6 +297,112 @@ class ControlBotController:
             plain=view.message.plain,
             reply_markup=markup,
         )
+
+    def _schedule_sessions_refresh(
+        self,
+        chat_id: int,
+        message_id: int,
+        query: str,
+        page: int,
+    ) -> None:
+        self._session_refresh_targets.add((chat_id, message_id, query, page))
+        if self._session_refresh_task is not None and not self._session_refresh_task.done():
+            return
+        self._session_refresh_task = asyncio.create_task(
+            self._refresh_sessions(),
+            name="control-sessions-refresh",
+        )
+
+    async def _refresh_sessions(self) -> None:
+        delay = max(
+            0.0,
+            self._session_refreshed_at + _SESSION_REFRESH_SECONDS - time.monotonic(),
+        )
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            states = await self.bridge.list_sessions(search_term=None, limit=1000)
+            self._session_refreshed_at = time.monotonic()
+            while self._session_refresh_targets:
+                chat_id, message_id, query, page = self._session_refresh_targets.pop()
+                view = render_sessions_page(
+                    self._filter_session_states(states, query),
+                    page=page,
+                    query=query,
+                )
+                rows: list[list[InlineKeyboardButton]] = []
+                if view.details:
+                    rows.append(
+                        [
+                            self._button(
+                                detail.label,
+                                "session_detail",
+                                {"thread_id": detail.thread_id},
+                                chat_id,
+                            )
+                            for detail in view.details
+                        ]
+                    )
+                rows.append(
+                    [
+                        self._button(
+                            button.label,
+                            "sessions_current" if button.current else "sessions_page",
+                            {"query": query, "page": button.page},
+                            chat_id,
+                        )
+                        for button in view.navigation
+                    ]
+                )
+                with contextlib.suppress(TelegramError):
+                    await self.endpoint.edit_text(
+                        chat_id,
+                        message_id,
+                        view.message.markdown,
+                        plain=view.message.plain,
+                        reply_markup=InlineKeyboardMarkup(rows),
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOGGER.warning("Unable to refresh /sessions snapshot", exc_info=True)
+        finally:
+            if self._session_refresh_task is asyncio.current_task():
+                self._session_refresh_task = None
+
+    async def _refresh_session_detail(
+        self,
+        chat_id: int,
+        message_id: int,
+        thread_id: str,
+        markup: InlineKeyboardMarkup,
+    ) -> None:
+        try:
+            state = await self.bridge.refresh(thread_id)
+            rendered = render_status_comment(state)
+            await self.endpoint.edit_text(
+                chat_id,
+                message_id,
+                rendered.markdown,
+                plain=rendered.plain,
+                reply_markup=markup,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOGGER.warning("Unable to refresh session detail", exc_info=True)
+
+    @staticmethod
+    def _filter_session_states(states: list[Any], query: str) -> list[Any]:
+        term = query.strip().casefold()
+        if not term:
+            return list(states)
+        return [
+            state
+            for state in states
+            if term in str(getattr(state, "thread_id", "")).casefold()
+            or term in str(getattr(state, "title", "")).casefold()
+        ]
 
     async def topics(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         del context
@@ -423,11 +545,16 @@ class ControlBotController:
             return
         await self._cancel_perf(chat.id, delete=True)
         group_key = f"perf:{update.update_id}"
-        snapshot = await self.bridge.metrics.with_gpu()
+        snapshot = getattr(self.bridge.metrics, "snapshot", None)
+        if snapshot is None:
+            sample = getattr(self.bridge.metrics, "sample", None)
+            snapshot = await (sample() if sample is not None else self.bridge.metrics.with_gpu())
+        markdown = self._render_perf(snapshot, 0, plain=False)
+        plain = self._render_perf(snapshot, 0, plain=True)
         reply = await self.endpoint.send_text(
             chat.id,
-            self._render_perf(snapshot, 0, plain=False),
-            plain=self._render_perf(snapshot, 0, plain=True),
+            markdown,
+            plain=plain,
         )
         started = time.monotonic()
         deadline = math.ceil(time.time() + _PERF_LIFETIME_SECONDS)
@@ -443,7 +570,7 @@ class ControlBotController:
             self._run_perf(chat.id, reply_id, started),
             name=f"control-perf:{chat.id}",
         )
-        run = _PerfRun(task, (message.message_id, reply_id), group_key)
+        run = _PerfRun(task, (message.message_id, reply_id), group_key, (markdown, plain))
         self._perf_runs[chat.id] = run
         task.add_done_callback(lambda completed: self._finish_perf(chat.id, completed))
 
@@ -507,12 +634,19 @@ class ControlBotController:
     ) -> None:
         try:
             if action == "sessions_page":
-                await self._show_sessions(
+                result = await self._show_sessions(
                     update,
                     query=str(payload.get("query") or ""),
                     page=int(payload.get("page") or 1),
                     edit=True,
                 )
+                if result is not None:
+                    self._schedule_sessions_refresh(
+                        chat_id,
+                        int(result.message_id),
+                        str(payload.get("query") or ""),
+                        int(payload.get("page") or 1),
+                    )
             elif action == "session_detail":
                 await self._session_detail(chat_id, str(payload["thread_id"]))
             elif action == "follow_space":
@@ -549,7 +683,8 @@ class ControlBotController:
             await self._handle_project_value(draft, text)
 
     async def _session_detail(self, chat_id: int, thread_id: str) -> None:
-        state = await self.bridge.refresh(thread_id)
+        cached = self.store.get_thread(thread_id)
+        state = cached or await self.bridge.refresh(thread_id)
         rendered = render_status_comment(state)
         space = self.store.get_space_by_thread(thread_id)
         if space:
@@ -558,12 +693,24 @@ class ControlBotController:
             markup = InlineKeyboardMarkup(
                 [[self._button("关注", "follow_space", {"thread_id": thread_id}, chat_id)]]
             )
-        await self.endpoint.send_text(
+        message = await self.endpoint.send_text(
             chat_id,
             rendered.markdown,
             plain=rendered.plain,
             reply_markup=markup,
         )
+        if cached is not None:
+            self._track_task(
+                asyncio.create_task(
+                    self._refresh_session_detail(
+                        chat_id,
+                        int(message.message_id),
+                        thread_id,
+                        markup,
+                    ),
+                    name=f"control-session-refresh:{thread_id[:8]}",
+                )
+            )
 
     async def _follow(self, chat_id: int, thread_id: str) -> None:
         space = await self.coordinator.follow_thread(thread_id)
@@ -581,7 +728,7 @@ class ControlBotController:
         )
 
     async def _show_model_choices(self, chat_id: int, draft: Any, *, plan: bool) -> None:
-        options = await self.bridge.list_model_options()
+        options = await self._model_options()
         if not options:
             raise RuntimeError("当前没有可用模型。")
         event = "plan_model" if plan else "normal_model"
@@ -991,14 +1138,20 @@ class ControlBotController:
                 snapshot = await self.bridge.metrics.with_gpu()
                 if time.monotonic() >= expires:
                     return
-                frame = tick % len(_PERF_FRAMES)
+                markdown = self._render_perf(snapshot, 0, plain=False)
+                plain = self._render_perf(snapshot, 0, plain=True)
+                current = self._perf_runs.get(chat_id)
+                if current is None or current.content == (markdown, plain):
+                    tick += 1
+                    continue
                 await self.endpoint.edit_text(
                     chat_id,
                     message_id,
-                    self._render_perf(snapshot, frame, plain=False),
-                    plain=self._render_perf(snapshot, frame, plain=True),
+                    markdown,
+                    plain=plain,
                     priority=50,
                 )
+                current.content = (markdown, plain)
             except TelegramError:
                 LOGGER.debug("Unable to update dynamic /perf message", exc_info=True)
                 return
@@ -1030,6 +1183,30 @@ class ControlBotController:
             with contextlib.suppress(Exception):
                 task.result()
 
+    def _track_task(self, task: asyncio.Task[Any]) -> None:
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _model_options(self) -> list[Any]:
+        now = time.monotonic()
+        if self._model_cache and now - self._model_cache_at < _MODEL_CACHE_SECONDS:
+            return list(self._model_cache)
+        task = self._model_cache_task
+        if task is None or task.done():
+            task = asyncio.create_task(
+                self.bridge.list_model_options(),
+                name="control-model-catalog-refresh",
+            )
+            self._model_cache_task = task
+        try:
+            options = await task
+        finally:
+            if self._model_cache_task is task:
+                self._model_cache_task = None
+        self._model_cache = tuple(options)
+        self._model_cache_at = time.monotonic()
+        return list(self._model_cache)
+
     async def stop(self) -> None:
         await self._workloads.stop()
         for chat_id in list(self._perf_runs):
@@ -1040,6 +1217,17 @@ class ControlBotController:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        background = list(self._background_tasks)
+        self._background_tasks.clear()
+        for task in (self._session_refresh_task, self._model_cache_task):
+            if task is not None and task not in background:
+                background.append(task)
+        self._session_refresh_task = None
+        self._model_cache_task = None
+        for task in background:
+            task.cancel()
+        if background:
+            await asyncio.gather(*background, return_exceptions=True)
 
     def _new_button(
         self,
@@ -1107,7 +1295,7 @@ class ControlBotController:
             )
 
     async def _model_option(self, model: str) -> Any:
-        for option in await self.bridge.list_model_options():
+        for option in await self._model_options():
             if str(option.model) == model:
                 return option
         raise ValueError(f"模型 {model!r} 已不可用，请重新执行 /new")
@@ -1238,7 +1426,7 @@ class ControlBotController:
             str | None,
         ],
     ) -> None:
-        options = await self.bridge.list_model_options()
+        options = await self._model_options()
         if not options:
             await self.endpoint.send_text(chat_id, "当前没有可用模型。")
             return

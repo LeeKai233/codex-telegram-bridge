@@ -385,14 +385,14 @@ def render_channel_post(
     title = clip(_title(state), 80)
     thread_id = _thread_id(state) or "Pending"
     cwd = _cwd(state)
-    current_mode, main_model, main_effort = _main_profile(space, state)
+    desired_mode, observed_mode, main_model, main_effort = _main_profile(space, state)
     frame = ANIMATION_FRAMES[animation_frame % len(ANIMATION_FRAMES)] if animation_frame is not None else ""
-    mode_icon, mode_label = ("🧭", "Plan mode") if current_mode == "plan" else ("⚙️", "Normal mode")
+    mode_icon, mode_label = _mode_status(desired_mode, observed_mode)
     frame_prefix = f"{frame} " if frame else ""
     progress = 100.0 * completed / plan_total if plan_total else 0.0
     markdown_lines: list[str] = []
     plain_lines: list[str] = []
-    if current_mode:
+    if desired_mode:
         markdown_lines.append(f"{frame_prefix}*{mode_icon} {mode_label}*")
         plain_lines.append(f"{frame_prefix}{mode_icon} {mode_label}")
         frame_prefix = ""
@@ -405,7 +405,7 @@ def render_channel_post(
                     f"*🧠 Main*  {inline_code(main_model or 'N/A', 80)} · "
                     f"Effort {inline_code(main_effort or 'N/A', 32)}"
                 ]
-                if current_mode or main_model or main_effort
+                if desired_mode or main_model or main_effort
                 else []
             ),
             f"🎯 Goal {goal_icon} {inline_code(goal_status)}",
@@ -424,7 +424,7 @@ def render_channel_post(
             f"{thread_id} · {icon} {status} · 总执行 {duration}",
             *(
                 [f"🧠 Main · {main_model or 'N/A'} · Effort {main_effort or 'N/A'}"]
-                if current_mode or main_model or main_effort
+                if desired_mode or main_model or main_effort
                 else []
             ),
             f"🎯 Goal {goal_icon} {goal_status}",
@@ -571,11 +571,18 @@ def _agent_lines(task: object, now: int) -> tuple[str, str]:
     return markdown, plain
 
 
-def _main_profile(space: object | None, state: object) -> tuple[str, str, str]:
-    mode = str(_value(space, "current_mode", default="") or "")
-    if mode not in {"default", "plan"}:
-        mode = ""
-    if mode == "plan":
+def _main_profile(space: object | None, state: object) -> tuple[str, str, str, str]:
+    desired_mode = str(
+        _value(space, "desired_mode", default=None)
+        or _value(space, "current_mode", default="")
+        or ""
+    )
+    if desired_mode not in {"default", "plan"}:
+        desired_mode = ""
+    observed_mode = str(_value(space, "observed_mode", default="unknown") or "unknown")
+    if observed_mode not in {"unknown", "default", "plan"}:
+        observed_mode = "unknown"
+    if desired_mode == "plan":
         model = str(_value(space, "plan_model", default="") or "")
         effort = str(_value(space, "plan_effort", default="") or "")
     else:
@@ -583,7 +590,17 @@ def _main_profile(space: object | None, state: object) -> tuple[str, str, str]:
         effort = str(_value(space, "normal_effort", default="") or "")
     model = model or str(_value(state, "model", default="") or "")
     effort = effort or str(_value(state, "reasoning_effort", "reasoningEffort", default="") or "")
-    return mode, model, effort
+    return desired_mode, observed_mode, model, effort
+
+
+def _mode_status(desired_mode: str, observed_mode: str) -> tuple[str, str]:
+    desired_label = "Plan mode" if desired_mode == "plan" else "Normal mode"
+    desired_icon = "🧭" if desired_mode == "plan" else "⚙️"
+    if observed_mode == "unknown":
+        return desired_icon, f"期望 {desired_label} · TUI 模式未确认"
+    observed_label = "Plan mode" if observed_mode == "plan" else "Normal mode"
+    icon = desired_icon if desired_mode == observed_mode else "⚠️"
+    return icon, f"期望 {desired_label} · TUI {observed_label}"
 
 
 def render_status_comment(
@@ -609,12 +626,12 @@ def render_status_comment(
     duration = _duration(_total_duration(state, now, total_duration_seconds))
     title = clip(_title(state), 80)
     thread_id = _thread_id(state) or str(_value(space, "thread_id", default="Pending") or "Pending")
-    current_mode, main_model, main_effort = _main_profile(space, state)
+    desired_mode, observed_mode, main_model, main_effort = _main_profile(space, state)
     progress = 100.0 * completed / plan_total if plan_total else 0.0
     markdown_lines: list[str] = []
     plain_lines: list[str] = []
-    if current_mode:
-        mode_icon, mode_label = ("🧭", "Plan mode") if current_mode == "plan" else ("⚙️", "Normal mode")
+    if desired_mode:
+        mode_icon, mode_label = _mode_status(desired_mode, observed_mode)
         frame = ""
         if animation_frame is not None:
             frame = ANIMATION_FRAMES[animation_frame % len(ANIMATION_FRAMES)]
@@ -631,7 +648,7 @@ def render_status_comment(
                     f"*🧠 Main*  {inline_code(main_model or 'N/A', 80)} · "
                     f"Effort {inline_code(main_effort or 'N/A', 32)}"
                 ]
-                if current_mode or main_model or main_effort
+                if desired_mode or main_model or main_effort
                 else []
             ),
             "",
@@ -647,7 +664,7 @@ def render_status_comment(
             f"{thread_id} · {icon} {status} · 总执行 {duration}",
             *(
                 [f"🧠 Main · {main_model or 'N/A'} · Effort {main_effort or 'N/A'}"]
-                if current_mode or main_model or main_effort
+                if desired_mode or main_model or main_effort
                 else []
             ),
             "",

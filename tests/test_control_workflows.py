@@ -359,6 +359,17 @@ async def test_installed_control_handlers_are_nonblocking_keyed_actors(tmp_path:
         await controller.stop()
 
 
+def test_session_snapshot_filter_matches_title_or_thread_id() -> None:
+    states = [
+        SimpleNamespace(thread_id="thread-alpha", title="Build release"),
+        SimpleNamespace(thread_id="thread-beta", title="Review dashboard"),
+    ]
+
+    assert ControlBotController._filter_session_states(states, "RELEASE") == [states[0]]
+    assert ControlBotController._filter_session_states(states, "beta") == [states[1]]
+    assert ControlBotController._filter_session_states(states, "") == states
+
+
 @pytest.mark.asyncio
 async def test_new_interactive_flow_captures_project_and_prompt(tmp_path: Path) -> None:
     controller, store, endpoint, _bridge, coordinator, _deletions = build_controller(tmp_path)
@@ -651,7 +662,7 @@ async def test_perf_refreshes_frames_and_uses_one_fixed_deadline(
 
         assert bridge.metrics.calls >= 2
         assert endpoint.sent[-1]["markdown"].startswith("*🕛 动态性能*")
-        assert endpoint.edited[0]["markdown"].startswith("*🕒 动态性能*")
+        assert endpoint.edited[0]["markdown"].startswith("*🕛 动态性能*")
         assert all(item["priority"] == 50 for item in endpoint.edited)
         assert [item["message_ids"] for item in deletions.scheduled] == [(30, 1000)]
         assert {item["delete_at"] for item in deletions.scheduled} == {10_001}
