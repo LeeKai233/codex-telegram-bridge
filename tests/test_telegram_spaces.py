@@ -2305,6 +2305,122 @@ async def test_command_approval_is_forwarded_and_consumed_from_discussion_callba
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "method",
+        "decision",
+        "heading",
+        "button_label",
+        "confirmation",
+        "summary_heading",
+    ),
+    [
+        (
+            "item/fileChange/requestApproval",
+            "acceptForSession",
+            "请求修改文件",
+            "本 Session 放行",
+            "已批准本 Session 后续文件变更",
+            "Codex 文件变更审批 · 已处理",
+        ),
+        (
+            "item/permissions/requestApproval",
+            {
+                "permissions": {"fileSystem": {"read": ["/workspace"]}},
+                "scope": "session",
+            },
+            "请求授予临时权限",
+            "本 Session 授权",
+            "已授予请求的权限",
+            "Codex 权限审批 · 已处理",
+        ),
+        (
+            "applyPatchApproval",
+            "cancel",
+            "请求应用文件补丁",
+            "拒绝并中止 Turn",
+            "已拒绝文件变更并中止当前 Turn",
+            "Codex 文件变更审批 · 已处理",
+        ),
+    ],
+)
+async def test_generic_approvals_are_forwarded_answered_and_summarized(
+    rig: Rig,
+    method: str,
+    decision: Any,
+    heading: str,
+    button_label: str,
+    confirmation: str,
+    summary_heading: str,
+) -> None:
+    space = add_active_space(
+        rig,
+        space_id="space-generic-approval",
+        thread_id="thread-generic-approval",
+        root_message_id=539,
+        channel_post_id=139,
+    )
+    params: dict[str, Any] = {
+        "threadId": "thread-generic-approval",
+        "turnId": "turn-generic-approval",
+        "itemId": "item-generic-approval",
+        "cwd": str(rig.config.allowed_root),
+        "reason": "needs confirmation",
+    }
+    if method == "item/fileChange/requestApproval":
+        params["availableDecisions"] = ["accept", "acceptForSession", "decline"]
+        params["grantRoot"] = str(rig.config.allowed_root)
+    elif method == "item/permissions/requestApproval":
+        params["permissions"] = {"fileSystem": {"read": ["/workspace"]}}
+    available = interactive_approval_decisions(method, params)
+    request_key = f"approval:generic-{method.split('/')[0]}"
+    rig.store.put_pending_input(
+        request_key,
+        "94",
+        1,
+        "thread-generic-approval",
+        "turn-generic-approval",
+        "item-generic-approval",
+        [
+            {
+                "_bridge_request_kind": "generic_approval",
+                "_bridge_approval_method": method,
+                "_bridge_available_decisions": available,
+                "params": params,
+            }
+        ],
+        int(time.time()) + 300,
+    )
+    decisions: list[tuple[str, Any]] = []
+
+    async def answer(request: str, selected: Any) -> None:
+        decisions.append((request, selected))
+
+    rig.bridge.answer_command_approval = answer  # type: ignore[attr-defined]
+    await rig.discussion.forward_command_approval(request_key, params)
+
+    message = rig.discussion_endpoint.sent[-1]
+    assert heading in message["markdown"]
+    assert button_label in [
+        button.text
+        for row in message["reply_markup"].inline_keyboard
+        for button in row
+    ]
+
+    await rig.discussion._answer_command_approval(  # noqa: SLF001
+        space,
+        {"request_key": request_key, "decision": decision},
+    )
+
+    assert decisions == [(request_key, decision)]
+    assert confirmation in rig.discussion_endpoint.sent[-1]["markdown"]
+    await rig.discussion.question_resolved(request_key)
+    await asyncio.gather(*list(rig.discussion._background_tasks))
+    assert summary_heading in rig.discussion_endpoint.edited[-1]["markdown"]
+    assert "Codex 请求输入" not in rig.discussion_endpoint.edited[-1]["markdown"]
+
+
+@pytest.mark.asyncio
 async def test_command_approval_buttons_follow_available_decision_order(rig: Rig) -> None:
     add_active_space(
         rig,

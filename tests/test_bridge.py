@@ -1216,6 +1216,64 @@ async def test_resync_never_loads_global_thread_list_and_isolates_root_timeouts(
 
 
 @pytest.mark.asyncio
+async def test_reconnect_resync_releases_idle_turn_gate_and_retries_queue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, store = make_bridge(tmp_path)
+    thread_id = "thread-reconnect-gate"
+    store.create_space(
+        {
+            "space_id": "space-reconnect-gate",
+            "space_type": "existing",
+            "lifecycle": "active",
+            "thread_id": thread_id,
+        }
+    )
+    retries: list[tuple[str, str | None, int | None]] = []
+
+    async def resume_thread(value: str) -> dict[str, Any]:
+        assert value == thread_id
+        return {
+            "id": thread_id,
+            "cwd": str(tmp_path),
+            "status": {"type": "idle"},
+            "turns": [{"id": "turn-before-reconnect", "status": "completed"}],
+        }
+
+    async def get_goal(_thread_id: str) -> None:
+        return None
+
+    def retry(
+        value: str,
+        *,
+        delay: float = 0.0,
+        space_id: str | None = None,
+        generation: int | None = None,
+    ) -> None:
+        del delay
+        retries.append((value, space_id, generation))
+
+    monkeypatch.setattr(bridge.client, "resume_thread", resume_thread)
+    monkeypatch.setattr(bridge.client, "get_goal", get_goal)
+    monkeypatch.setattr(bridge, "_request_queue_retry", retry)
+    assert await bridge._begin_turn_gate(thread_id, "client-before-reconnect")
+    bridge._bind_turn_gate(
+        thread_id,
+        "client-before-reconnect",
+        "turn-before-reconnect",
+    )
+
+    await bridge._on_codex_connection(True, 2, None)
+
+    assert thread_id not in bridge._turn_gates
+    assert not bridge._turn_locks[thread_id].locked()
+    assert retries == [(thread_id, "space-reconnect-gate", 1)]
+    assert await bridge._begin_turn_gate(thread_id, "client-after-reconnect")
+    assert bridge._release_turn_gate(thread_id, None)
+    store.close()
+
+
+@pytest.mark.asyncio
 async def test_unmanaged_codex_traffic_is_rejected_before_projection_or_telegram(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2277,6 +2335,46 @@ async def test_turn_gate_ignores_mismatched_completion_and_releases_matching_tur
 
 
 @pytest.mark.asyncio
+async def test_permanent_direct_rpc_error_releases_turn_gate_without_reconciliation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, store = make_bridge(tmp_path)
+    thread_id = "thread-direct-rejected"
+
+    async def snapshot(_thread_id: str) -> dict[str, Any]:
+        return {
+            "id": thread_id,
+            "cwd": str(tmp_path),
+            "status": {"type": "idle"},
+        }
+
+    async def read_thread(_thread_id: str, *, include_turns: bool) -> dict[str, Any]:
+        assert include_turns
+        return {"turns": []}
+
+    async def start_turn(*_args: Any, **_kwargs: Any) -> None:
+        raise CodexRpcError("turn/start", {"message": "invalid input"})
+
+    monkeypatch.setattr(bridge, "_live_thread_snapshot", snapshot)
+    monkeypatch.setattr(bridge.client, "read_thread", read_thread)
+    monkeypatch.setattr(bridge.client, "start_turn", start_turn)
+
+    with pytest.raises(CodexRpcError):
+        await bridge.send_prompt(
+            thread_id,
+            "rejected",
+            client_message_id="client-direct-rejected",
+        )
+
+    assert thread_id not in bridge._turn_gates
+    assert not bridge._turn_locks[thread_id].locked()
+    assert bridge._turn_reconcile_tasks == {}
+    intent = store.get_prompt_intent("client-direct-rejected")
+    assert intent is not None and intent.state == "failed"
+    store.close()
+
+
+@pytest.mark.asyncio
 async def test_started_notification_is_not_blocked_by_slow_state_hook(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2449,7 +2547,7 @@ async def test_thread_snapshot_coalesces_same_generation_and_refreshes_after_rec
 
 
 @pytest.mark.asyncio
-async def test_idle_reconciliation_advances_queue_only_after_confirmed_release(
+async def test_idle_reconciliation_retries_until_confirmed_release(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     bridge, store = make_bridge(tmp_path)
@@ -2476,13 +2574,9 @@ async def test_idle_reconciliation_advances_queue_only_after_confirmed_release(
 
     bridge._schedule_turn_reconciliation(thread_id)
     await bridge._turn_reconcile_tasks[thread_id]
-    assert thread_id in bridge._turn_gates
-    assert retries == []
-
-    bridge._schedule_turn_reconciliation(thread_id)
-    await bridge._turn_reconcile_tasks[thread_id]
     assert thread_id not in bridge._turn_gates
     assert retries == [thread_id]
+    assert receipts == []
     store.close()
 
 

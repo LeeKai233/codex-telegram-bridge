@@ -96,6 +96,7 @@ _CIRCLED_FILE_BUTTON_LABELS = "①②③④⑤⑥⑦⑧"
 _BOT_URL_TOKEN = re.compile(r"(https://api\.telegram\.org/bot)[^/\s]+", re.IGNORECASE)
 _BOT_TOKEN = re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{16,}\b")
 _STATUS_REFRESH_SECONDS = 5.0
+_APPROVAL_REQUEST_KINDS = frozenset({"command_approval", "generic_approval"})
 
 _FILE_IO_CALLBACK_ACTIONS = frozenset({"send_file", "getfile_page", "send_upload"})
 _PROMPT_CALLBACK_ACTIONS = frozenset(
@@ -3468,7 +3469,8 @@ class DiscussionBotController:
             (
                 value
                 for value in (stored["questions"] if stored else [])
-                if isinstance(value, dict) and value.get("_bridge_request_kind") == "command_approval"
+                if isinstance(value, dict)
+                and value.get("_bridge_request_kind") in _APPROVAL_REQUEST_KINDS
             ),
             None,
         )
@@ -4175,12 +4177,13 @@ class DiscussionBotController:
             (
                 value
                 for value in stored["questions"]
-                if isinstance(value, dict) and value.get("_bridge_request_kind") == "command_approval"
+                if isinstance(value, dict)
+                and value.get("_bridge_request_kind") in _APPROVAL_REQUEST_KINDS
             ),
             None,
         )
         if metadata is None:
-            raise RuntimeError("该请求不是可由 Telegram 处理的命令审批")
+            raise RuntimeError("该请求不是可由 Telegram 处理的审批")
         method = str(metadata.get("_bridge_approval_method") or "")
         raw_available = metadata.get("_bridge_available_decisions")
         if "_bridge_available_decisions" in metadata:
@@ -4235,15 +4238,20 @@ class DiscussionBotController:
             message = "已授予请求的权限。" if permissions else "已拒绝请求的权限。"
             await self._send_space(space, message, priority=5)
             return
+        subject = (
+            "文件变更"
+            if method in {"item/fileChange/requestApproval", "applyPatchApproval"}
+            else "命令执行"
+        )
         labels = {
-            "accept": "已批准本次命令执行。",
-            "acceptForSession": "已批准本 Session 后续命令执行。",
-            "acceptWithExecpolicyAmendment": "已批准命令并应用命令规则。",
+            "accept": f"已批准本次{subject}。",
+            "acceptForSession": f"已批准本 Session 后续{subject}。",
+            "acceptWithExecpolicyAmendment": f"已批准{subject}并应用命令规则。",
             "applyNetworkPolicyAmendment": "已提交网络策略决定。",
-            "decline": "已拒绝本次命令执行。",
-            "cancel": "已拒绝命令并中止当前 Turn。",
+            "decline": f"已拒绝本次{subject}。",
+            "cancel": f"已拒绝{subject}并中止当前 Turn。",
         }
-        await self._send_space(space, labels.get(kind, "命令审批已提交。"), priority=5)
+        await self._send_space(space, labels.get(kind, "审批已提交。"), priority=5)
 
     async def question_resolved(self, request_key: str) -> None:
         self._track_task(
@@ -4328,18 +4336,32 @@ class DiscussionBotController:
             (
                 value
                 for value in stored.get("questions") or []
-                if isinstance(value, dict) and value.get("_bridge_request_kind") == "command_approval"
+                if isinstance(value, dict)
+                and value.get("_bridge_request_kind") in _APPROVAL_REQUEST_KINDS
             ),
             None,
         )
         if metadata is not None:
             params = metadata.get("params") if isinstance(metadata.get("params"), dict) else {}
-            raw_command = params.get("command")
-            command = (
-                shlex.join(str(value) for value in raw_command)
-                if isinstance(raw_command, list)
-                else str(raw_command or "未知命令")
-            )
+            method = str(metadata.get("_bridge_approval_method") or "")
+            raw_subject = params.get("command")
+            subject_label = "命令"
+            approval_kind = "命令"
+            if method == "item/permissions/requestApproval":
+                requested = params.get("permissions") or params.get("requestedPermissions") or {}
+                subject = json.dumps(requested, ensure_ascii=False, sort_keys=True)
+                subject_label = "权限"
+                approval_kind = "权限"
+            elif method in {"item/fileChange/requestApproval", "applyPatchApproval"}:
+                subject = str(params.get("grantRoot") or params.get("cwd") or "当前文件变更")
+                subject_label = "变更范围"
+                approval_kind = "文件变更"
+            else:
+                subject = (
+                    shlex.join(str(value) for value in raw_subject)
+                    if isinstance(raw_subject, list)
+                    else str(raw_subject or "未知命令")
+                )
             cwd = str(params.get("cwd") or "未知目录")
             reason = str(params.get("reason") or "该命令需要额外权限。")
             selected = answers.get("decision") if isinstance(answers, dict) else None
@@ -4351,14 +4373,14 @@ class DiscussionBotController:
             )
             source_label = "Telegram" if source == "telegram" else "终端"
             thread_id = str(stored.get("thread_id") or "")
-            html_lines = ["<b>Codex 命令审批 · 已处理</b>"]
-            plain_lines = ["Codex 命令审批 · 已处理"]
+            html_lines = [f"<b>Codex {approval_kind}审批 · 已处理</b>"]
+            plain_lines = [f"Codex {approval_kind}审批 · 已处理"]
             if thread_id:
                 html_lines.append(f"Session <code>{html.escape(thread_id[:8])}</code>")
                 plain_lines.append(f"Session {thread_id[:8]}")
             html_lines.extend(
                 [
-                    f"命令：<code>{html.escape(clip(command, 1600))}</code>",
+                    f"{subject_label}：<code>{html.escape(clip(subject, 1600))}</code>",
                     f"目录：<code>{html.escape(clip(cwd, 500))}</code>",
                     f"原因：{html.escape(clip(reason, 500))}",
                     f"<b>决定：</b>{html.escape(decision_label)}",
@@ -4367,7 +4389,7 @@ class DiscussionBotController:
             )
             plain_lines.extend(
                 [
-                    f"命令：{clip(command, 1600)}",
+                    f"{subject_label}：{clip(subject, 1600)}",
                     f"目录：{clip(cwd, 500)}",
                     f"原因：{clip(reason, 500)}",
                     f"决定：{decision_label}",

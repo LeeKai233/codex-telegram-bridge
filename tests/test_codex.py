@@ -444,6 +444,42 @@ async def test_model_options_are_cached_for_five_minutes(
 
 
 @pytest.mark.asyncio
+async def test_model_options_cache_is_scoped_to_connection_generation() -> None:
+    client = CodexClient(Path("/tmp/not-used.sock"))
+    calls = 0
+
+    async def request(
+        method: str, params: dict[str, Any], timeout: float = 30.0
+    ) -> dict[str, Any]:
+        nonlocal calls
+        del timeout
+        assert (method, params) == ("model/list", {"limit": 100})
+        calls += 1
+        return {
+            "data": [
+                {
+                    "model": f"model-generation-{client.generation}",
+                    "displayName": f"Generation {client.generation}",
+                    "defaultReasoningEffort": "high",
+                    "isDefault": True,
+                    "supportedReasoningEfforts": [{"reasoningEffort": "high"}],
+                }
+            ],
+            "nextCursor": None,
+        }
+
+    client.request = request  # type: ignore[method-assign]
+
+    assert (await client.list_model_options())[0].model == "model-generation-0"
+    assert (await client.list_model_options())[0].model == "model-generation-0"
+    assert calls == 1
+
+    client.generation = 1
+    assert (await client.list_model_options())[0].model == "model-generation-1"
+    assert calls == 2
+
+
+@pytest.mark.asyncio
 async def test_update_thread_settings_sends_explicit_collaboration_profile() -> None:
     client = CodexClient(Path("/tmp/not-used.sock"))
     calls: list[tuple[str, dict[str, Any], float]] = []

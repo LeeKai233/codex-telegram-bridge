@@ -258,7 +258,7 @@ class CodexClient:
         self._stopping = asyncio.Event()
         self._runner: asyncio.Task[None] | None = None
         self.generation = 0
-        self._model_options_cache: tuple[float, tuple[ModelOption, ...]] | None = None
+        self._model_options_cache: tuple[int, float, tuple[ModelOption, ...]] | None = None
         self._collaboration_modes_cache: tuple[int, tuple[Json, ...]] | None = None
 
     @property
@@ -974,8 +974,8 @@ class CodexClient:
             raise ValueError("Model page size must be positive")
         cached = self._model_options_cache
         now = time.monotonic()
-        if cached is not None and cached[0] > now:
-            return list(cached[1])
+        if cached is not None and cached[0] == self.generation and cached[1] > now:
+            return list(cached[2])
         options: list[ModelOption] = []
         seen_models: set[str] = set()
         seen_cursors: set[str] = set()
@@ -1037,6 +1037,7 @@ class CodexClient:
                 raise RuntimeError("Codex returned a repeated model-list cursor")
             seen_cursors.add(cursor)
         self._model_options_cache = (
+            self.generation,
             time.monotonic() + _MODEL_OPTIONS_CACHE_SECONDS,
             tuple(options),
         )

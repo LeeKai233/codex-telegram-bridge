@@ -51,6 +51,7 @@ _FINAL_TURN_STATUSES = {"completed", "failed", "interrupted"}
 _SUBAGENT_PROFILE_RETRY_DELAYS = (1.0, 5.0, 30.0, 120.0)
 _THREAD_SNAPSHOT_SECONDS = 5.0
 _TURN_RECONCILE_SECONDS = 1.0
+_TURN_RECONCILE_MAX_SECONDS = 30.0
 _NOTIFICATION_EFFECT_CAPACITY = 256
 _NOTIFICATION_EFFECT_DRAIN_SECONDS = 5.0
 # The Codex TUI emits this fixed input after "Yes, implement this plan" is selected.
@@ -417,6 +418,27 @@ class Bridge:
                 if thread_id in space_subscriptions:
                     await self._notify_state_change(state, "thread/resynced")
                 if state.status == "idle":
+                    gate = self._turn_gates.get(thread_id)
+                    if gate is not None:
+                        turn_id = str(state.turn_id or "")
+                        turn_status = str(state.turn_status or "")
+                        if (
+                            turn_id
+                            and turn_id == gate.expected_turn_id
+                            and turn_status in _FINAL_TURN_STATUSES
+                        ):
+                            self.store.finish_prompt_intents(
+                                thread_id,
+                                turn_id,
+                                status=turn_status,
+                                error=None,
+                            )
+                        if self._release_turn_gate(thread_id, None):
+                            LOGGER.info(
+                                "event=turn_gate_released_on_resync thread_id=%s turn_id=%s",
+                                thread_id[:8],
+                                turn_id[:8] or "unknown",
+                            )
                     active_spaces = self._active_spaces_for_thread(thread_id)
                     for space in active_spaces:
                         self._request_queue_retry(
@@ -834,31 +856,45 @@ class Bridge:
 
         async def reconcile() -> None:
             try:
-                await asyncio.sleep(_TURN_RECONCILE_SECONDS)
-                current_gate = self._turn_gates.get(thread_id)
-                if current_gate is None:
-                    return
-                delivered, receipt = await self._client_message_receipt(
-                    thread_id, current_gate.client_message_id
-                )
-                if delivered and receipt is not None:
-                    turn_id = str(receipt.get("turn_id") or "")
-                    self._bind_turn_gate(thread_id, current_gate.client_message_id, turn_id)
-                    if (
-                        str(receipt.get("turn_status") or "") in _FINAL_TURN_STATUSES
-                        and self._release_turn_gate(thread_id, turn_id)
-                    ):
-                        self._request_queue_after_completion(thread_id)
-                    return
-                state = self.store.get_thread(thread_id)
-                if (
-                    delivered is False
-                    and self.client.connected
-                    and state
-                    and state.status == "idle"
-                    and self._release_turn_gate(thread_id, None)
-                ):
-                    self._request_queue_after_completion(thread_id)
+                delay = max(0.0, _TURN_RECONCILE_SECONDS)
+                while True:
+                    await asyncio.sleep(delay)
+                    current_gate = self._turn_gates.get(thread_id)
+                    if current_gate is None:
+                        return
+                    delivered, receipt = await self._client_message_receipt(
+                        thread_id, current_gate.client_message_id
+                    )
+                    if delivered and receipt is not None:
+                        turn_id = str(receipt.get("turn_id") or "")
+                        turn_status = str(receipt.get("turn_status") or "")
+                        self._bind_turn_gate(thread_id, current_gate.client_message_id, turn_id)
+                        if turn_status in _FINAL_TURN_STATUSES and self._release_turn_gate(
+                            thread_id, turn_id
+                        ):
+                            self.store.finish_prompt_intents(
+                                thread_id,
+                                turn_id,
+                                status=turn_status,
+                                error=None,
+                            )
+                            self._request_queue_after_completion(thread_id)
+                            return
+                    else:
+                        state = self.store.get_thread(thread_id)
+                        if (
+                            delivered is False
+                            and self.client.connected
+                            and state
+                            and state.status == "idle"
+                            and self._release_turn_gate(thread_id, None)
+                        ):
+                            self._request_queue_after_completion(thread_id)
+                            return
+                    delay = min(
+                        _TURN_RECONCILE_MAX_SECONDS,
+                        max(_TURN_RECONCILE_SECONDS, delay * 2),
+                    )
             finally:
                 if self._turn_reconcile_tasks.get(thread_id) is asyncio.current_task():
                     self._turn_reconcile_tasks.pop(thread_id, None)
@@ -866,6 +902,18 @@ class Bridge:
         self._turn_reconcile_tasks[thread_id] = asyncio.create_task(
             reconcile(), name=f"turn-reconcile-{thread_id[:8]}"
         )
+
+    def _reconcile_turn_gate_after_start_error(
+        self,
+        thread_id: str,
+        *,
+        delivered: bool | None,
+        error: Exception,
+    ) -> None:
+        if delivered is False and isinstance(error, CodexRpcError):
+            self._release_turn_gate(thread_id, None)
+            return
+        self._schedule_turn_reconciliation(thread_id)
 
     def _request_queue_after_completion(self, thread_id: str) -> None:
         spaces = self._active_spaces_for_thread(thread_id)
@@ -1063,7 +1111,11 @@ class Bridge:
                             str((receipt or {}).get("turn_id") or ""),
                         )
                     else:
-                        self._schedule_turn_reconciliation(state.thread_id)
+                        self._reconcile_turn_gate_after_start_error(
+                            state.thread_id,
+                            delivered=delivered,
+                            error=exc,
+                        )
                     if not delivered:
                         space.last_error = f"initial prompt delivery failed ({type(exc).__name__})"
                         self.store.save_session_space(space)
@@ -1310,7 +1362,11 @@ class Bridge:
                         str((receipt or {}).get("turn_id") or ""),
                     )
                 else:
-                    self._schedule_turn_reconciliation(thread_id)
+                    self._reconcile_turn_gate_after_start_error(
+                        thread_id,
+                        delivered=delivered,
+                        error=exc,
+                    )
                 if delivered is not True:
                     raise
             current = self._require_active_space(space_id)
@@ -1657,7 +1713,11 @@ class Bridge:
                 turn_id = str((receipt or {}).get("turn_id") or "")
                 self._bind_turn_gate(thread_id, client_message_id, turn_id)
             else:
-                self._schedule_turn_reconciliation(thread_id)
+                self._reconcile_turn_gate_after_start_error(
+                    thread_id,
+                    delivered=delivered,
+                    error=exc,
+                )
             if delivered is not True:
                 raise
         if space_id is not None and generation is not None:
