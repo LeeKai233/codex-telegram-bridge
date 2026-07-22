@@ -352,6 +352,137 @@ async def test_thread_settings_notification_updates_space_mode_and_profile(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_settings_notifications_allow_default_plan_default_but_deduplicate_adjacent(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    changes: list[str] = []
+
+    async def changed(_state: ThreadState, reason: str) -> None:
+        changes.append(reason)
+
+    store.save_thread(ThreadState(thread_id="thread-mode-cycle", status="idle"))
+    store.save_session_space(
+        SessionSpace(
+            space_id="space-mode-cycle",
+            lifecycle="active",
+            thread_id="thread-mode-cycle",
+        )
+    )
+    projector = managed_projector(store, changed)
+
+    def settings(mode: str) -> dict[str, object]:
+        return {
+            "threadId": "thread-mode-cycle",
+            "threadSettings": {
+                "model": "gpt-5.6-sol",
+                "effort": "xhigh",
+                "collaborationMode": {
+                    "mode": mode,
+                    "settings": {
+                        "model": "gpt-5.6-sol",
+                        "reasoning_effort": "xhigh",
+                    },
+                },
+            },
+        }
+
+    default = settings("default")
+    await projector.ingest("thread/settings/updated", default)
+    await projector.ingest("thread/settings/updated", settings("plan"))
+    await projector.ingest("thread/settings/updated", default)
+    await projector.ingest("thread/settings/updated", default)
+
+    space = store.get_session_space("space-mode-cycle")
+    assert space is not None and space.observed_mode == "default"
+    assert changes == ["thread/settings/updated"] * 3
+    assert [event["kind"] for event in store.timeline("thread-mode-cycle")] == [
+        "thread/settings/updated",
+        "thread/settings/updated",
+        "thread/settings/updated",
+    ]
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_settings_notification_survives_durable_receipt_and_projector_restart(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    store.save_thread(ThreadState(thread_id="thread-mode-restart", status="idle"))
+    store.save_session_space(
+        SessionSpace(
+            space_id="space-mode-restart",
+            lifecycle="active",
+            thread_id="thread-mode-restart",
+            observed_mode="plan",
+        )
+    )
+    payload = {
+        "threadId": "thread-mode-restart",
+        "threadSettings": {
+            "collaborationMode": {
+                "mode": "default",
+                "settings": {"model": "gpt-test", "reasoning_effort": "high"},
+            }
+        },
+    }
+
+    await managed_projector(store).ingest("thread/settings/updated", payload)
+    space = store.get_session_space("space-mode-restart")
+    assert space is not None
+    space.observed_mode = "plan"
+    store.save_session_space(space)
+
+    await managed_projector(store).ingest("thread/settings/updated", payload)
+
+    restarted = store.get_session_space("space-mode-restart")
+    assert restarted is not None and restarted.observed_mode == "default"
+    assert len(store.timeline("thread-mode-restart")) == 2
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_settings_notification_reconfirms_mode_after_same_projector_connection_gap(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    store.save_thread(ThreadState(thread_id="thread-mode-gap", status="idle"))
+    store.save_session_space(
+        SessionSpace(
+            space_id="space-mode-gap",
+            lifecycle="active",
+            thread_id="thread-mode-gap",
+            observed_mode="unknown",
+        )
+    )
+    payload = {
+        "threadId": "thread-mode-gap",
+        "threadSettings": {
+            "collaborationMode": {
+                "mode": "default",
+                "settings": {"model": "gpt-test", "reasoning_effort": "high"},
+            }
+        },
+    }
+    projector = managed_projector(store)
+
+    await projector.ingest("thread/settings/updated", payload)
+    space = store.get_session_space("space-mode-gap")
+    assert space is not None
+    space.observed_mode = "unknown"
+    store.save_session_space(space)
+
+    projector.reset_repeatable_deduplication()
+    await projector.ingest("thread/settings/updated", payload)
+
+    reconnected = store.get_session_space("space-mode-gap")
+    assert reconnected is not None and reconnected.observed_mode == "default"
+    assert len(store.timeline("thread-mode-gap")) == 2
+    store.close()
+
+
+@pytest.mark.asyncio
 async def test_child_status_change_notifies_parent_dashboard(tmp_path: Path) -> None:
     store = Store(tmp_path / "state.sqlite3")
     changes: list[tuple[str, str]] = []

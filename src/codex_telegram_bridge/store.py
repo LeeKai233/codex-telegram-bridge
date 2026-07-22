@@ -21,6 +21,8 @@ from .models import InteractionDraft, Owner, PromptIntent, QueuedPrompt, Session
 LOGGER = logging.getLogger(__name__)
 SCHEMA_VERSION = 11
 CONTROL_BOT_ROLE = "control"
+DISCUSSION_BOT_ROLE = "discussion"
+STATUS_BOT_ROLE = "status"
 EVENT_RETENTION_DAYS = 7
 EVENT_RECEIPT_LIMIT = 100_000
 TIMELINE_PER_THREAD_LIMIT = 500
@@ -437,6 +439,33 @@ def _compact_event_payload(kind: str, payload: Mapping[str, Any]) -> dict[str, A
         message = payload.get("message") or payload.get("text")
         if message:
             compact["message"] = " ".join(str(message).split())[:360]
+    if kind == "thread/settings/updated":
+        thread_settings = payload.get("threadSettings")
+        if isinstance(thread_settings, Mapping):
+            settings_compact: dict[str, Any] = {}
+            for name in ("model", "effort"):
+                value = thread_settings.get(name)
+                if value:
+                    settings_compact[name] = str(value)[:160]
+            collaboration = thread_settings.get("collaborationMode")
+            if isinstance(collaboration, Mapping):
+                collaboration_compact: dict[str, Any] = {}
+                mode = collaboration.get("mode")
+                if mode:
+                    collaboration_compact["mode"] = str(mode)[:80]
+                mode_settings = collaboration.get("settings")
+                if isinstance(mode_settings, Mapping):
+                    mode_settings_compact: dict[str, Any] = {}
+                    for name in ("model", "reasoning_effort"):
+                        value = mode_settings.get(name)
+                        if value:
+                            mode_settings_compact[name] = str(value)[:160]
+                    if mode_settings_compact:
+                        collaboration_compact["settings"] = mode_settings_compact
+                if collaboration_compact:
+                    settings_compact["collaborationMode"] = collaboration_compact
+            if settings_compact:
+                compact["threadSettings"] = settings_compact
     return compact
 
 
@@ -1084,6 +1113,14 @@ class Store:
             "status_message_id",
         ):
             space[name] = int(space[name]) if space.get(name) is not None else None
+        status_message_id = space.get("status_message_id")
+        status_bot_role = str(
+            space.get("status_bot_role")
+            or (DISCUSSION_BOT_ROLE if status_message_id is not None else STATUS_BOT_ROLE)
+        )
+        if status_bot_role not in {DISCUSSION_BOT_ROLE, STATUS_BOT_ROLE}:
+            raise ValueError(f"Unsupported status bot role: {status_bot_role}")
+        space["status_bot_role"] = status_bot_role
         for name in ("normal_model", "normal_effort", "plan_model", "plan_effort"):
             space[name] = str(space.get(name) or "").strip()
         desired_mode = str(space.get("desired_mode") or space.get("current_mode") or "default")
@@ -1296,6 +1333,55 @@ class Store:
         if status_message_id is not None:
             updates["status_message_id"] = status_message_id
         return self.update_space(space_id, updates, expected_generation=expected_generation)
+
+    def bind_status_message(
+        self,
+        space_id: str,
+        *,
+        status_message_id: int,
+        status_bot_role: str,
+        expected_generation: int | None = None,
+    ) -> dict[str, Any] | None:
+        """Atomically replace a status message and retain the previous owner for cleanup."""
+        if status_bot_role not in {DISCUSSION_BOT_ROLE, STATUS_BOT_ROLE}:
+            raise ValueError(f"Unsupported status bot role: {status_bot_role}")
+        with self._immediate_transaction() as connection:
+            row = connection.execute(
+                "SELECT state_json FROM session_spaces WHERE space_id=?", (space_id,)
+            ).fetchone()
+            if not row:
+                return None
+            current = self._space_from_row(row)
+            if expected_generation is not None and int(current["generation"]) != expected_generation:
+                return None
+            old_id = current.get("status_message_id")
+            old_role = str(current.get("status_bot_role") or DISCUSSION_BOT_ROLE)
+            updates = {
+                **current,
+                "status_message_id": int(status_message_id),
+                "status_bot_role": status_bot_role,
+            }
+            if old_id is not None and int(old_id) != int(status_message_id):
+                updates["legacy_status_message_id"] = int(old_id)
+                updates["legacy_status_bot_role"] = old_role
+                updates["legacy_status_delete_pending"] = True
+            value = self._canonical_space(
+                updates,
+                now=int(time.time()),
+                created_at=int(current["created_at"]),
+            )
+            self._write_space(connection, value)
+        return value
+
+    def retire_status_callbacks(self, space_id: str, generation: int) -> int:
+        now = int(time.time())
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                "UPDATE callbacks SET used_at=? WHERE space_id=? AND generation=? "
+                "AND bot_role=? AND action IN ('space_refresh', 'space_unwatch') AND used_at IS NULL",
+                (now, space_id, generation, DISCUSSION_BOT_ROLE),
+            )
+        return cursor.rowcount
 
     def reset_space_transport(self, space_id: str, *, expected_generation: int) -> dict[str, Any] | None:
         """Invalidate one space's Telegram messages while preserving its Codex thread."""

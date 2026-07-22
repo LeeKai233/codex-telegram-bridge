@@ -145,6 +145,7 @@ class DashboardManager:
                             plain=plain,
                             reply_markup=keyboard,
                             fingerprint=delivery_fingerprint(rendered, plain, keyboard),
+                            lane="interactive" if terminal else "live",
                             priority=5 if terminal else 10,
                             terminal=terminal,
                             context=f"subscription:{state.thread_id}",

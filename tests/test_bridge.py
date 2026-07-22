@@ -1274,6 +1274,79 @@ async def test_reconnect_resync_releases_idle_turn_gate_and_retries_queue(
 
 
 @pytest.mark.asyncio
+async def test_reconnect_invalidates_observed_modes_without_changing_desired_profiles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, store = make_bridge(tmp_path)
+    store.create_space(
+        {
+            "space_id": "space-reconnect-mode",
+            "space_type": "existing",
+            "lifecycle": "active",
+            "thread_id": "thread-reconnect-mode",
+            "desired_mode": "default",
+            "current_mode": "default",
+            "observed_mode": "plan",
+            "normal_model": "gpt-normal",
+            "normal_effort": "high",
+            "plan_model": "gpt-plan",
+            "plan_effort": "xhigh",
+        }
+    )
+    for lifecycle in ("pending", "repair_required", "closed"):
+        store.create_space(
+            {
+                "space_id": f"space-reconnect-{lifecycle}",
+                "space_type": "existing",
+                "lifecycle": lifecycle,
+                "thread_id": f"thread-reconnect-{lifecycle}",
+                "desired_mode": "plan",
+                "current_mode": "plan",
+                "observed_mode": "plan",
+            }
+        )
+    observations_during_resync: list[str] = []
+    deduplication_resets: list[None] = []
+
+    async def resync() -> None:
+        current = store.get_session_space("space-reconnect-mode")
+        assert current is not None
+        observations_during_resync.append(current.observed_mode)
+
+    monkeypatch.setattr(bridge, "resync", resync)
+    monkeypatch.setattr(
+        bridge.projector,
+        "reset_repeatable_deduplication",
+        lambda: deduplication_resets.append(None),
+    )
+
+    await bridge._on_codex_connection(True, 3, None)
+
+    space = store.get_session_space("space-reconnect-mode")
+    assert space is not None
+    assert observations_during_resync == ["unknown"]
+    assert deduplication_resets == [None]
+    assert (space.desired_mode, space.current_mode, space.observed_mode) == (
+        "default",
+        "default",
+        "unknown",
+    )
+    assert (
+        space.normal_model,
+        space.normal_effort,
+        space.plan_model,
+        space.plan_effort,
+    ) == ("gpt-normal", "high", "gpt-plan", "xhigh")
+    for lifecycle in ("pending", "repair_required"):
+        current = store.get_session_space(f"space-reconnect-{lifecycle}")
+        assert current is not None and current.observed_mode == "unknown"
+        assert current.desired_mode == current.current_mode == "plan"
+    closed = store.get_session_space("space-reconnect-closed")
+    assert closed is not None and closed.observed_mode == "plan"
+    store.close()
+
+
+@pytest.mark.asyncio
 async def test_unmanaged_codex_traffic_is_rejected_before_projection_or_telegram(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

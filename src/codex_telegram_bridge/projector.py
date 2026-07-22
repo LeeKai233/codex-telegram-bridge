@@ -24,6 +24,7 @@ def _canonical_hash(method: str, params: dict[str, Any]) -> str:
 
 _REPEATABLE_NOTIFICATIONS = {
     "thread/status/changed",
+    "thread/settings/updated",
     "error",
     "warning",
     "guardianWarning",
@@ -67,6 +68,9 @@ class EventProjector:
         changes = list(self._parent_changes.values())
         self._parent_changes.clear()
         return changes
+
+    def reset_repeatable_deduplication(self) -> None:
+        self._last_repeatable_event = None
 
     def apply_thread(self, payload: dict[str, Any]) -> ThreadState:
         thread_id = str(payload.get("id") or "")

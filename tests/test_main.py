@@ -147,12 +147,15 @@ def test_build_runtime_installs_redaction_before_application_builder(
 ) -> None:
     token = "123456789:BUILD-SECRET"
     discussion_token = "987654321:DISCUSSION-SECRET"
+    status_token = "111222333:STATUS-SECRET"
     config = make_config(tmp_path)
     config.config_dir.mkdir(mode=0o700)
     config.bot_token_path.write_text(token + "\n", encoding="utf-8")
     config.bot_token_path.chmod(0o600)
     config.forum_bot_token_path.write_text(discussion_token + "\n", encoding="utf-8")
     config.forum_bot_token_path.chmod(0o600)
+    config.status_bot_token_path.write_text(status_token + "\n", encoding="utf-8")
+    config.status_bot_token_path.chmod(0o600)
     logger = logging.getLogger("telegram.builder-redaction-test")
 
     def fail_builder(value: str, _polling_health: Any = None) -> None:
@@ -177,7 +180,7 @@ def test_build_runtime_installs_redaction_before_application_builder(
     assert "InvalidToken" in caplog.text
 
 
-def test_build_runtime_wires_distinct_control_and_discussion_applications(tmp_path: Path) -> None:
+def test_build_runtime_wires_distinct_three_bot_applications(tmp_path: Path) -> None:
     config = make_config(tmp_path)
     config.config_dir.mkdir(mode=0o700)
     config.bot_token_path.write_text(
@@ -186,16 +189,24 @@ def test_build_runtime_wires_distinct_control_and_discussion_applications(tmp_pa
     config.forum_bot_token_path.write_text(
         "987654321:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi\n", encoding="utf-8"
     )
+    config.status_bot_token_path.write_text(
+        "111222333:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi\n", encoding="utf-8"
+    )
     config.bot_token_path.chmod(0o600)
     config.forum_bot_token_path.chmod(0o600)
+    config.status_bot_token_path.chmod(0o600)
 
     runtime = _build_runtime(config)
     try:
-        assert len(runtime.applications) == 2
+        assert len(runtime.applications) == 3
         assert runtime.application is not runtime.discussion_application
+        assert runtime.status_application is not None
+        assert runtime.status_application is not runtime.application
+        assert runtime.status_application is not runtime.discussion_application
         assert runtime.telegram_runtime is not None
-        assert len(runtime.telegram_runtime.controllers) == 2
-        assert len(runtime.presence.probe_bots) == 2
+        assert len(runtime.telegram_runtime.controllers) == 3
+        assert runtime.telegram_runtime.status_messenger is not None
+        assert len(runtime.presence.probe_bots) == 3
         assert runtime.bridge.on_state_change == runtime.telegram_runtime.dashboards.on_thread_change
     finally:
         runtime.store.close()
@@ -207,8 +218,10 @@ def test_build_runtime_rejects_duplicate_tokens_with_generic_error(tmp_path: Pat
     config.config_dir.mkdir(mode=0o700)
     config.bot_token_path.write_text(token + "\n", encoding="utf-8")
     config.forum_bot_token_path.write_text(token + "\n", encoding="utf-8")
+    config.status_bot_token_path.write_text(token + "\n", encoding="utf-8")
     config.bot_token_path.chmod(0o600)
     config.forum_bot_token_path.chmod(0o600)
+    config.status_bot_token_path.chmod(0o600)
     root_handlers = list(logging.getLogger().handlers)
     original_formatters = [handler.formatter for handler in root_handlers]
 
@@ -219,7 +232,7 @@ def test_build_runtime_rejects_duplicate_tokens_with_generic_error(tmp_path: Pat
         for handler, formatter in zip(root_handlers, original_formatters, strict=True):
             handler.setFormatter(formatter)
 
-    assert str(captured.value) == "两个 Telegram Bot 必须使用不同 token"
+    assert str(captured.value) == "三个 Telegram Bot 必须使用不同 token"
     assert token not in str(captured.value)
 
 

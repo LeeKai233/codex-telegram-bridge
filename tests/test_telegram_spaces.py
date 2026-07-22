@@ -39,7 +39,7 @@ from codex_telegram_bridge.models import (
 from codex_telegram_bridge.space_coordinator import SessionSpaceCoordinator
 from codex_telegram_bridge.space_dashboard import SpaceDashboardManager
 from codex_telegram_bridge.store import Store
-from codex_telegram_bridge.telegram_common import CONTROL_ROLE, DISCUSSION_ROLE
+from codex_telegram_bridge.telegram_common import CONTROL_ROLE, DISCUSSION_ROLE, STATUS_ROLE
 from codex_telegram_bridge.workloads import (
     FILE_IO_SPACE,
     MAINTENANCE_SPACE,
@@ -665,7 +665,7 @@ async def test_update_deduplication_is_role_scoped_and_guards_enforce_owner(rig:
 
 
 @pytest.mark.asyncio
-async def test_locked_space_allows_only_totp_help_and_lock(rig: Rig) -> None:
+async def test_locked_space_allows_status_and_auth_commands_but_blocks_mutation(rig: Rig) -> None:
     space = add_active_space(
         rig,
         space_id="space-locked",
@@ -674,7 +674,7 @@ async def test_locked_space_allows_only_totp_help_and_lock(rig: Rig) -> None:
         channel_post_id=125,
     )
     blocked = update_for_message(
-        "/status",
+        "/planmode",
         update_id=140,
         message_id=60,
         chat_id=DISCUSSION_CHAT_ID,
@@ -685,7 +685,21 @@ async def test_locked_space_allows_only_totp_help_and_lock(rig: Rig) -> None:
         await rig.discussion._guard(blocked, SimpleNamespace())
     assert "写操作已锁定" in rig.discussion_endpoint.sent[-1]["markdown"]
 
-    for update_id, command in enumerate(("/totp 123456", "/help", "/lock"), 141):
+    status = update_for_message(
+        "/status",
+        update_id=141,
+        message_id=141,
+        chat_id=DISCUSSION_CHAT_ID,
+        chat_type=ChatType.SUPERGROUP,
+        message_thread_id=int(space["discussion_root_id"]),
+    )
+    await rig.discussion._guard(status, SimpleNamespace())
+    await rig.discussion.status(status, SimpleNamespace())
+    await asyncio.sleep(0)
+    assert ("space-locked", True) in rig.dashboards.calls
+    assert "状态快照已显示" in rig.discussion_endpoint.sent[-1]["markdown"]
+
+    for update_id, command in enumerate(("/totp 123456", "/help", "/lock"), 142):
         allowed = update_for_message(
             command,
             update_id=update_id,
@@ -695,6 +709,58 @@ async def test_locked_space_allows_only_totp_help_and_lock(rig: Rig) -> None:
             message_thread_id=int(space["discussion_root_id"]),
         )
         await rig.discussion._guard(allowed, SimpleNamespace())
+
+
+@pytest.mark.asyncio
+async def test_locked_status_bot_refresh_callback_is_read_only(rig: Rig) -> None:
+    space = add_active_space(
+        rig,
+        space_id="space-locked-refresh",
+        thread_id="thread-locked-refresh",
+        root_message_id=526,
+        channel_post_id=126,
+    )
+    nonce = rig.store.ensure_callback(
+        "status-refresh-nonce",
+        "space_refresh",
+        {"space_id": space["space_id"], "generation": space["generation"]},
+        OWNER_ID,
+        int(time.time()) + 60,
+        bot_role=STATUS_ROLE,
+        chat_id=DISCUSSION_CHAT_ID,
+        space_id=space["space_id"],
+        generation=int(space["generation"]),
+    )
+    query = SimpleNamespace(
+        data=f"cb:{nonce}",
+        message=SimpleNamespace(
+            chat=SimpleNamespace(id=DISCUSSION_CHAT_ID, type=ChatType.SUPERGROUP),
+            message_id=space["status_message_id"],
+        ),
+    )
+    update = SimpleNamespace(
+        callback_query=query,
+        effective_user=SimpleNamespace(id=OWNER_ID),
+        effective_chat=SimpleNamespace(id=DISCUSSION_CHAT_ID, type=ChatType.SUPERGROUP),
+    )
+
+    await rig.discussion.callback_for_role(
+        update,
+        SimpleNamespace(),
+        bot_role=STATUS_ROLE,
+        endpoint=rig.discussion_endpoint,  # type: ignore[arg-type]
+        allowed_actions=frozenset({"space_refresh"}),
+    )
+
+    assert (space["space_id"], True) in rig.dashboards.calls
+    assert rig.store.peek_callback(
+        nonce,
+        OWNER_ID,
+        bot_role=STATUS_ROLE,
+        chat_id=DISCUSSION_CHAT_ID,
+        space_id=space["space_id"],
+        generation=int(space["generation"]),
+    ) is None
 
 
 @pytest.mark.asyncio

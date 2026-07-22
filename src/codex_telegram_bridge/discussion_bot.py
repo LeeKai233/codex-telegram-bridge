@@ -83,7 +83,7 @@ from .workloads import (
 LOGGER = logging.getLogger(__name__)
 
 _MAX_RESOLVED_QUESTION_TOMBSTONES = 512
-_LOCKED_COMMAND_ALLOWLIST = {"/totp", "/help", "/lock"}
+_LOCKED_COMMAND_ALLOWLIST = {"/totp", "/help", "/lock", "/status"}
 _PLAN_ACTION_SECONDS = 24 * 60 * 60
 _INTERACTION_SECONDS = 5 * 60
 _PROMPT_WAIT_SECONDS = 30
@@ -1985,6 +1985,22 @@ class DiscussionBotController:
         )
 
     async def callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self.callback_for_role(
+            update,
+            context,
+            bot_role=DISCUSSION_ROLE,
+            endpoint=self.discussion,
+        )
+
+    async def callback_for_role(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        *,
+        bot_role: str,
+        endpoint: TelegramEndpoint,
+        allowed_actions: frozenset[str] | None = None,
+    ) -> None:
         del context
         query = update.callback_query
         user = update.effective_user
@@ -1999,7 +2015,7 @@ class DiscussionBotController:
         )
         data = str(query.data or "")
         pending = (
-            self.store.peek_callback(data[3:], user.id, bot_role=DISCUSSION_ROLE, chat_id=chat.id)
+            self.store.peek_callback(data[3:], user.id, bot_role=bot_role, chat_id=chat.id)
             if data.startswith("cb:")
             else None
         )
@@ -2009,11 +2025,14 @@ class DiscussionBotController:
                 chat.id,
                 data[:12],
             )
-            await self.discussion.answer_callback(
+            await endpoint.answer_callback(
                 query, "按钮已使用或过期，请重新执行命令。", show_alert=True
             )
             return
         action, payload = pending
+        if allowed_actions is not None and action not in allowed_actions:
+            await endpoint.answer_callback(query, "该按钮不属于状态 Bot。", show_alert=True)
+            return
         space = self.store.get_space(str(payload.get("space_id") or ""))
         if not space or int(payload.get("generation") or 0) != int(space["generation"]):
             LOGGER.warning(
@@ -2021,15 +2040,16 @@ class DiscussionBotController:
                 action,
                 chat.id,
             )
-            await self.discussion.answer_callback(query, "Session 状态已变化。", show_alert=True)
+            await endpoint.answer_callback(query, "Session 状态已变化。", show_alert=True)
             return
-        if not self.security.is_space_unlocked(str(space["space_id"])):
+        requires_unlock = action != "space_refresh"
+        if requires_unlock and not self.security.is_space_unlocked(str(space["space_id"])):
             LOGGER.info(
                 "event=telegram_callback_rejected reason=locked action=%s space_id=%s",
                 action,
                 str(space["space_id"])[:12],
             )
-            await self.discussion.answer_callback(
+            await endpoint.answer_callback(
                 query,
                 "写操作已锁定，请先发送 /totp <验证码>。认证后可再次点击原按钮。",
                 show_alert=True,
@@ -2045,17 +2065,17 @@ class DiscussionBotController:
             try:
                 self._ensure_latest_plan(space, payload)
             except RuntimeError as exc:
-                await self.discussion.answer_callback(query, str(exc), show_alert=True)
+                await endpoint.answer_callback(query, str(exc), show_alert=True)
                 return
         if not self._workloads.can_submit():
-            await self.discussion.answer_callback(
+            await endpoint.answer_callback(
                 query, "请求队列已满，请稍后重试。", show_alert=True
             )
             return
         consumed = self.store.consume_callback(
             data[3:],
             user.id,
-            bot_role=DISCUSSION_ROLE,
+            bot_role=bot_role,
             chat_id=chat.id,
             space_id=str(space["space_id"]),
             generation=int(space["generation"]),
@@ -2066,12 +2086,12 @@ class DiscussionBotController:
                 action,
                 str(space["space_id"])[:12],
             )
-            await self.discussion.answer_callback(
+            await endpoint.answer_callback(
                 query, "按钮已使用或过期，请重新执行命令。", show_alert=True
             )
             return
         action, payload = consumed
-        await self.discussion.answer_callback(query)
+        await endpoint.answer_callback(query)
         callback_message = getattr(query, "message", None)
         callback_message_id = getattr(callback_message, "message_id", None)
         submitted = self._workloads.submit(

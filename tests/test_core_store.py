@@ -1569,6 +1569,54 @@ def test_live_event_storage_rejects_large_nonapproval_tui_message(tmp_path: Path
         store.close()
 
 
+def test_settings_timeline_retains_mode_profile_without_developer_instructions(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    try:
+        assert store.record_event(
+            "settings-event",
+            "managed-thread",
+            "thread/settings/updated",
+            {
+                "threadId": "managed-thread",
+                "threadSettings": {
+                    "model": "gpt-normal",
+                    "effort": "high",
+                    "developer_instructions": "top-level secret",
+                    "collaborationMode": {
+                        "mode": "plan",
+                        "settings": {
+                            "model": "gpt-plan",
+                            "reasoning_effort": "xhigh",
+                            "developer_instructions": "nested secret",
+                        },
+                    },
+                },
+            },
+            managed=True,
+        )
+
+        payload = store.timeline("managed-thread")[0]["payload"]
+        assert payload == {
+            "threadId": "managed-thread",
+            "threadSettings": {
+                "model": "gpt-normal",
+                "effort": "high",
+                "collaborationMode": {
+                    "mode": "plan",
+                    "settings": {
+                        "model": "gpt-plan",
+                        "reasoning_effort": "xhigh",
+                    },
+                },
+            },
+        }
+        assert "developer_instructions" not in json.dumps(payload)
+    finally:
+        store.close()
+
+
 def test_cleanup_enforces_receipt_and_per_thread_timeline_caps(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -14,7 +14,7 @@ from .bridge import Bridge
 from .models import ThreadState
 from .space_dashboard import SpaceDashboardManager, channel_comment_link
 from .store import Store
-from .telegram_common import TelegramEndpoint
+from .telegram_common import STATUS_ROLE, TelegramEndpoint
 from .views import render_channel_post, render_pending_space, render_status_comment
 
 LOGGER = logging.getLogger(__name__)
@@ -28,6 +28,8 @@ class SessionSpaceCoordinator:
         control: TelegramEndpoint,
         discussion: TelegramEndpoint,
         dashboards: SpaceDashboardManager,
+        status: TelegramEndpoint | None = None,
+        deletions: Any | None = None,
         *,
         reconcile_seconds: float = 30.0,
         provision_max_attempts: int = 3,
@@ -37,6 +39,9 @@ class SessionSpaceCoordinator:
         self.bridge = bridge
         self.control = control
         self.discussion = discussion
+        self._status_enabled = status is not None
+        self.status = status or discussion
+        self.deletions = deletions
         self.dashboards = dashboards
         self._locks: dict[str, asyncio.Lock] = {}
         self._reconcile_seconds = max(1.0, reconcile_seconds)
@@ -76,6 +81,13 @@ class SessionSpaceCoordinator:
             if space.get("lifecycle") == "closed":
                 continue
             try:
+                if (
+                    space.get("status_message_id")
+                    and self._status_enabled
+                    and str(space.get("status_bot_role") or "discussion") != STATUS_ROLE
+                ):
+                    await self._migrate_status_message(space)
+                    continue
                 missing_channel_post = space.get("lifecycle") == "repair_required" and not space.get(
                     "channel_post_id"
                 )
@@ -354,6 +366,8 @@ class SessionSpaceCoordinator:
             if space.get("status_message_id"):
                 if space.get("lifecycle") == "repair_required":
                     return await self._repair_bound_status(space)
+                if self._status_enabled and str(space.get("status_bot_role") or "discussion") != STATUS_ROLE:
+                    return await self._migrate_status_message_locked(space)
                 return space
             root = self._discussion_root(space)
             if not root:
@@ -373,7 +387,7 @@ class SessionSpaceCoordinator:
                 else:
                     state = await self.bridge.subscribe_space_thread(str(space["thread_id"]))
                     rendered = render_status_comment(state, space={**space, "lifecycle": "active"})
-                message = await self.discussion.send_text(
+                message = await self.status.send_text(
                     int(root["discussion_chat_id"]),
                     rendered.markdown,
                     plain=rendered.plain,
@@ -390,6 +404,14 @@ class SessionSpaceCoordinator:
                     discussion_chat_id=int(root["discussion_chat_id"]),
                     discussion_root_id=int(root["root_message_id"]),
                     status_message_id=int(message.message_id),
+                    expected_generation=int(space["generation"]),
+                )
+                or space
+            )
+            space = (
+                self.store.update_space(
+                    space_id,
+                    {"status_bot_role": STATUS_ROLE},
                     expected_generation=int(space["generation"]),
                 )
                 or space
@@ -422,6 +444,68 @@ class SessionSpaceCoordinator:
             )
             await self.dashboards.schedule_space(space_id, immediate=True)
             return self.store.get_space(space_id) or space
+
+    async def _migrate_status_message(self, space: dict[str, Any]) -> dict[str, Any]:
+        """Move a live status message to the status Bot without losing the old binding."""
+        space_id = str(space["space_id"])
+        lock = self._locks.setdefault(space_id, asyncio.Lock())
+        async with lock:
+            return await self._migrate_status_message_locked(space)
+
+    async def _migrate_status_message_locked(self, space: dict[str, Any]) -> dict[str, Any]:
+        space_id = str(space["space_id"])
+        current = self.store.get_space(space_id) or space
+        if str(current.get("lifecycle") or "") == "closed":
+            return current
+        if str(current.get("status_bot_role") or "discussion") == STATUS_ROLE:
+            return current
+        root = self._discussion_root(current)
+        if not root:
+            return current
+        if current.get("space_type") == "pending_new" or not current.get("thread_id"):
+            rendered = render_pending_space(current)
+        else:
+            state = await self.bridge.subscribe_space_thread(str(current["thread_id"]))
+            rendered = render_status_comment(state, space={**current, "lifecycle": "active"})
+        message = await self.status.send_text(
+            int(root["discussion_chat_id"]),
+            rendered.markdown,
+            plain=rendered.plain,
+            reply_parameters=ReplyParameters(message_id=int(root["root_message_id"])),
+        )
+        migrated = self.store.bind_status_message(
+            space_id,
+            status_message_id=int(message.message_id),
+            status_bot_role=STATUS_ROLE,
+            expected_generation=int(current["generation"]),
+        )
+        if migrated is None:
+            return self.store.get_space(space_id) or current
+        self.store.retire_status_callbacks(space_id, int(current["generation"]))
+        legacy_id = migrated.get("legacy_status_message_id")
+        legacy_role = str(migrated.get("legacy_status_bot_role") or "discussion")
+        if legacy_id is not None and self.deletions is not None:
+            self.deletions.schedule(
+                legacy_role,
+                int(root["discussion_chat_id"]),
+                [int(legacy_id)],
+                delete_at=int(time.time()) + 600,
+                group_key=f"status-migration:{space_id}",
+            )
+        self.store.record_discussion_message(
+            int(root["discussion_chat_id"]),
+            int(message.message_id),
+            int(root["root_message_id"]),
+            space_id,
+        )
+        await self.dashboards.schedule_space(space_id, immediate=True)
+        LOGGER.info(
+            "event=status_message_migrated space_id=%s old_message_id=%s new_message_id=%s",
+            space_id[:12],
+            legacy_id or "none",
+            message.message_id,
+        )
+        return self.store.get_space(space_id) or migrated
 
     async def activate_pending(self, space_id: str) -> ThreadState:
         lock = self._locks.setdefault(space_id, asyncio.Lock())

@@ -4,7 +4,6 @@ import argparse
 import asyncio
 import contextlib
 import fcntl
-import hmac
 import logging
 import os
 import signal
@@ -385,13 +384,16 @@ class Runtime:
     allowed_updates: list[str]
     polling_health: tuple[Any, ...] = ()
     discussion_application: Any | None = None
+    status_application: Any | None = None
     telegram_runtime: Any | None = None
 
     @property
     def applications(self) -> tuple[Any, ...]:
         if self.discussion_application is None:
             return (self.application,)
-        return (self.application, self.discussion_application)
+        if self.status_application is None:
+            return (self.application, self.discussion_application)
+        return (self.application, self.discussion_application, self.status_application)
 
 
 def _runtime_health_payload(
@@ -405,7 +407,7 @@ def _runtime_health_payload(
     workloads: dict[str, Any] = {}
     delivery: dict[str, Any] = {}
     if telegram_runtime is not None:
-        for name in ("control_messenger", "discussion_messenger"):
+        for name in ("control_messenger", "discussion_messenger", "status_messenger"):
             component = getattr(telegram_runtime, name, None)
             snapshot = getattr(component, "snapshot", None)
             if callable(snapshot):
@@ -476,6 +478,7 @@ class TelegramRuntimeServices:
     controllers: tuple[Any, ...]
     coordinator: Any | None = None
     delivery: Any | None = None
+    status_messenger: Any | None = None
     _started: bool = False
     _quiesced: bool = False
     _maintenance_tasks: dict[str, asyncio.Task[None]] = field(
@@ -491,6 +494,8 @@ class TelegramRuntimeServices:
         self._quiesced = False
         self.control_messenger.start()
         self.discussion_messenger.start()
+        if self.status_messenger is not None:
+            self.status_messenger.start()
         try:
             if self.delivery is not None:
                 self.delivery.start()
@@ -585,6 +590,9 @@ class TelegramRuntimeServices:
                 await self.delivery.stop()
         with contextlib.suppress(Exception):
             await self.discussion_messenger.stop()
+        if self.status_messenger is not None:
+            with contextlib.suppress(Exception):
+                await self.status_messenger.stop()
         with contextlib.suppress(Exception):
             await self.control_messenger.stop()
 
@@ -601,10 +609,12 @@ def _build_runtime(config: Config) -> Runtime:
     from .security import SecurityManager
     from .space_coordinator import SessionSpaceCoordinator
     from .space_dashboard import SpaceDashboardManager
+    from .status_bot import StatusBotController
     from .telegram_common import (
         ALLOWED_UPDATES,
         CONTROL_ROLE,
         DISCUSSION_ROLE,
+        STATUS_ROLE,
         PollingHealth,
         TelegramEndpoint,
         build_application,
@@ -612,10 +622,12 @@ def _build_runtime(config: Config) -> Runtime:
 
     control_token = config.read_token(CONTROL_ROLE)
     discussion_token = config.read_token(DISCUSSION_ROLE)
+    status_token = config.read_token(STATUS_ROLE)
     _install_token_redaction(control_token)
     _install_token_redaction(discussion_token)
-    if hmac.compare_digest(control_token, discussion_token):
-        raise RuntimeError("两个 Telegram Bot 必须使用不同 token")
+    _install_token_redaction(status_token)
+    if len({control_token, discussion_token, status_token}) != 3:
+        raise RuntimeError("三个 Telegram Bot 必须使用不同 token")
     store = Store(config.database_path)
     try:
         recovered_intents = store.recover_outbound_intents()
@@ -626,8 +638,10 @@ def _build_runtime(config: Config) -> Runtime:
             )
         control_polling_health = PollingHealth(CONTROL_ROLE)
         discussion_polling_health = PollingHealth(DISCUSSION_ROLE)
+        status_polling_health = PollingHealth(STATUS_ROLE)
         control_application = build_application(control_token, control_polling_health)
         discussion_application = build_application(discussion_token, discussion_polling_health)
+        status_application = build_application(status_token, status_polling_health)
         async def recycle_control_transport() -> None:
             await control_application.bot.request.shutdown()
             await control_application.bot.request.initialize()
@@ -635,6 +649,10 @@ def _build_runtime(config: Config) -> Runtime:
         async def recycle_discussion_transport() -> None:
             await discussion_application.bot.request.shutdown()
             await discussion_application.bot.request.initialize()
+
+        async def recycle_status_transport() -> None:
+            await status_application.bot.request.shutdown()
+            await status_application.bot.request.initialize()
 
         control_messenger = OutboundMessenger(
             bot_role=CONTROL_ROLE,
@@ -646,16 +664,23 @@ def _build_runtime(config: Config) -> Runtime:
             journal=store,
             recycle_transport=recycle_discussion_transport,
         )
+        status_messenger = OutboundMessenger(
+            bot_role=STATUS_ROLE,
+            journal=store,
+            recycle_transport=recycle_status_transport,
+        )
         control_endpoint = TelegramEndpoint(
             CONTROL_ROLE, control_application.bot, control_messenger
         )
         discussion_endpoint = TelegramEndpoint(
             DISCUSSION_ROLE, discussion_application.bot, discussion_messenger
         )
+        status_endpoint = TelegramEndpoint(STATUS_ROLE, status_application.bot, status_messenger)
         delivery = TelegramDeliveryEngine(
             {
                 CONTROL_ROLE: control_endpoint,
                 DISCUSSION_ROLE: discussion_endpoint,
+                STATUS_ROLE: status_endpoint,
             }
         )
         bridge = Bridge(
@@ -675,6 +700,15 @@ def _build_runtime(config: Config) -> Runtime:
             control_endpoint,
             discussion_endpoint,
             delivery,
+            status=status_endpoint,
+        )
+        deletions = MessageDeletionManager(
+            store,
+            {
+                CONTROL_ROLE: control_endpoint,
+                DISCUSSION_ROLE: discussion_endpoint,
+                STATUS_ROLE: status_endpoint,
+            },
         )
         coordinator = SessionSpaceCoordinator(
             store,
@@ -682,13 +716,8 @@ def _build_runtime(config: Config) -> Runtime:
             control_endpoint,
             discussion_endpoint,
             dashboards,
-        )
-        deletions = MessageDeletionManager(
-            store,
-            {
-                CONTROL_ROLE: control_endpoint,
-                DISCUSSION_ROLE: discussion_endpoint,
-            },
+            status=status_endpoint,
+            deletions=deletions,
         )
         control_controller = ControlBotController(
             config,
@@ -712,21 +741,24 @@ def _build_runtime(config: Config) -> Runtime:
         )
         control_controller.install(control_application)
         discussion_controller.install(discussion_application)
+        status_controller = StatusBotController(store, discussion_controller, status_endpoint)
+        status_controller.install(status_application)
         bridge.on_state_change = dashboards.on_thread_change
         telegram_runtime = TelegramRuntimeServices(
             control_messenger,
             discussion_messenger,
             deletions,
             dashboards,
-            (control_controller, discussion_controller),
+            (control_controller, discussion_controller, status_controller),
             coordinator=coordinator,
             delivery=delivery,
+            status_messenger=status_messenger,
         )
         presence = ConnectionPresence(
             control_endpoint,
             store,
             config.disconnect_threshold_seconds,
-            probe_bots=(control_endpoint, discussion_endpoint),
+            probe_bots=(control_endpoint, discussion_endpoint, status_endpoint),
         )
         return Runtime(
             control_application,
@@ -734,8 +766,9 @@ def _build_runtime(config: Config) -> Runtime:
             store,
             presence,
             list(ALLOWED_UPDATES),
-            polling_health=(control_polling_health, discussion_polling_health),
+            polling_health=(control_polling_health, discussion_polling_health, status_polling_health),
             discussion_application=discussion_application,
+            status_application=status_application,
             telegram_runtime=telegram_runtime,
         )
     except Exception:

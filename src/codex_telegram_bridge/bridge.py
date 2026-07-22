@@ -399,6 +399,18 @@ class Bridge:
     async def _on_codex_connection(self, connected: bool, generation: int, reason: str | None) -> None:
         if connected:
             LOGGER.info("Connected to Codex app-server generation %s", generation)
+            self.projector.reset_repeatable_deduplication()
+            for space in self.store.list_spaces():
+                if (
+                    space.get("lifecycle") == "closed"
+                    or space.get("observed_mode") == "unknown"
+                ):
+                    continue
+                self.store.update_space(
+                    str(space["space_id"]),
+                    {"observed_mode": "unknown"},
+                    expected_generation=int(space["generation"]),
+                )
             await self.resync()
         else:
             LOGGER.warning("Codex app-server disconnected: %s", reason)
