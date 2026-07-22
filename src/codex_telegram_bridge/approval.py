@@ -97,7 +97,14 @@ def interactive_approval_decisions(method: str, params: dict[str, Any]) -> list[
         permissions = params.get("permissions") or params.get("requestedPermissions")
         if not isinstance(permissions, dict):
             return []
-        return [{"permissions": permissions, "scope": "turn"}]
+        turn_grant: ApprovalDecision = {"permissions": permissions, "scope": "turn"}
+        if not permissions:
+            return [turn_grant]
+        return [
+            turn_grant,
+            {"permissions": permissions, "scope": "session"},
+            {"permissions": {}, "scope": "turn"},
+        ]
     return []
 
 

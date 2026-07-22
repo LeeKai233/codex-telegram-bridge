@@ -286,10 +286,10 @@ class SpaceDashboardManager:
         ticket: asyncio.Future[DeliveryOutcome],
         animation_frame: int,
     ) -> None:
+        fingerprint = self._delivery_fingerprints.pop(ticket, "")
         if self._delivery_tickets.get(key) is not ticket:
             return
         self._delivery_tickets.pop(key, None)
-        fingerprint = self._delivery_fingerprints.pop(ticket, "")
         if ticket.cancelled():
             return
         try:

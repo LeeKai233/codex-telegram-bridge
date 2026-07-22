@@ -50,7 +50,7 @@ from .telegram_common import (
     raw_arguments,
 )
 from .views import render_help, render_sessions_page, render_status_comment
-from .workloads import KeyedWorkScheduler
+from .workloads import MAINTENANCE_SPACE, PROMPT_ACTION_SPACE, KeyedWorkScheduler, Space
 
 LOGGER = logging.getLogger(__name__)
 
@@ -69,7 +69,6 @@ _PERF_FRAMES = ("🕛", "🕒", "🕕", "🕘")
 _NEW_INTERACTION_SECONDS = 5 * 60
 _NEW_PROMPT_SECONDS = 30
 _NEW_INTERACTION_KIND = "control_new"
-_MODEL_CACHE_SECONDS = 5 * 60.0
 _SESSION_REFRESH_SECONDS = 5.0
 
 
@@ -105,34 +104,49 @@ class ControlBotController:
         self._session_refresh_task: asyncio.Task[None] | None = None
         self._session_refresh_targets: set[tuple[int, int, str, int]] = set()
         self._session_refreshed_at = 0.0
-        self._model_cache: tuple[Any, ...] = ()
-        self._model_cache_at = 0.0
-        self._model_cache_task: asyncio.Task[list[Any]] | None = None
         self._application: Application | None = None
-        self._workloads = KeyedWorkScheduler("control-work", max_pending=128, max_running=2)
+        self._workloads = KeyedWorkScheduler(
+            "control-work",
+            max_pending=128,
+            max_running=2,
+            spaces=(PROMPT_ACTION_SPACE, MAINTENANCE_SPACE),
+        )
 
     def install(self, application: Application) -> None:
         self._application = application
         application.add_handler(TypeHandler(Update, self._guard), group=-100)
-        for command, callback in (
-            ("pair", self.pair),
-            ("help", self.help),
-            ("sessions", self.sessions),
-            ("topics", self.topics),
-            ("new", self.new),
-            ("perf", self.perf),
+        for command, callback, workload_space in (
+            ("pair", self.pair, "default"),
+            ("help", self.help, "default"),
+            ("sessions", self.sessions, "default"),
+            ("topics", self.topics, "default"),
+            ("new", self.new, PROMPT_ACTION_SPACE),
+            ("perf", self.perf, MAINTENANCE_SPACE),
         ):
-            application.add_handler(CommandHandler(command, self._defer_handler(callback)))
+            application.add_handler(
+                CommandHandler(
+                    command,
+                    self._defer_handler(callback, workload_space=workload_space),
+                )
+            )
         application.add_handler(
             MessageHandler(
                 filters.TEXT & ~filters.COMMAND,
-                self._defer_handler(self.observe_message),
+                self._defer_handler(
+                    self.observe_message,
+                    workload_space=PROMPT_ACTION_SPACE,
+                ),
             )
         )
         application.add_handler(CallbackQueryHandler(self.callback, pattern=r"^cb:"))
         application.add_error_handler(self.error)
 
-    def _defer_handler(self, callback: Any) -> Any:
+    def _defer_handler(
+        self,
+        callback: Any,
+        *,
+        workload_space: str | Space = "default",
+    ) -> Any:
         async def deferred(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             chat = update.effective_chat
             key = f"chat:{chat.id}" if chat is not None else "control"
@@ -141,7 +155,7 @@ class ControlBotController:
                 with contextlib.suppress(ApplicationHandlerStop):
                     await callback(update, context)
 
-            if self._workloads.submit(key, run):
+            if self._workloads.submit(key, run, space=workload_space):
                 return
             if chat is not None:
                 await self.endpoint.send_text(chat.id, "请求队列已满，请稍后重试。")
@@ -618,6 +632,7 @@ class ControlBotController:
                 payload,
                 int(callback_message_id) if callback_message_id is not None else None,
             ),
+            space=PROMPT_ACTION_SPACE if action == "new_flow" else "default",
         )
         if not submitted:
             await self.endpoint.send_text(chat.id, "请求队列已满，请重新执行命令。")
@@ -1188,24 +1203,7 @@ class ControlBotController:
         task.add_done_callback(self._background_tasks.discard)
 
     async def _model_options(self) -> list[Any]:
-        now = time.monotonic()
-        if self._model_cache and now - self._model_cache_at < _MODEL_CACHE_SECONDS:
-            return list(self._model_cache)
-        task = self._model_cache_task
-        if task is None or task.done():
-            task = asyncio.create_task(
-                self.bridge.list_model_options(),
-                name="control-model-catalog-refresh",
-            )
-            self._model_cache_task = task
-        try:
-            options = await task
-        finally:
-            if self._model_cache_task is task:
-                self._model_cache_task = None
-        self._model_cache = tuple(options)
-        self._model_cache_at = time.monotonic()
-        return list(self._model_cache)
+        return await self.bridge.list_model_options()
 
     async def stop(self) -> None:
         await self._workloads.stop()
@@ -1219,11 +1217,9 @@ class ControlBotController:
             await asyncio.gather(*tasks, return_exceptions=True)
         background = list(self._background_tasks)
         self._background_tasks.clear()
-        for task in (self._session_refresh_task, self._model_cache_task):
-            if task is not None and task not in background:
-                background.append(task)
+        if self._session_refresh_task is not None and self._session_refresh_task not in background:
+            background.append(self._session_refresh_task)
         self._session_refresh_task = None
-        self._model_cache_task = None
         for task in background:
             task.cancel()
         if background:

@@ -23,7 +23,10 @@ from codex_telegram_bridge.config import Config
 from codex_telegram_bridge.control_bot import ControlBotController
 from codex_telegram_bridge.deletions import MessageDeletionManager
 from codex_telegram_bridge.delivery import TelegramDeliveryEngine
-from codex_telegram_bridge.discussion_bot import DiscussionBotController
+from codex_telegram_bridge.discussion_bot import (
+    DiscussionBotController,
+    _callback_workload_space,
+)
 from codex_telegram_bridge.files import FileCandidate
 from codex_telegram_bridge.metrics import MetricsSnapshot
 from codex_telegram_bridge.models import (
@@ -37,6 +40,11 @@ from codex_telegram_bridge.space_coordinator import SessionSpaceCoordinator
 from codex_telegram_bridge.space_dashboard import SpaceDashboardManager
 from codex_telegram_bridge.store import Store
 from codex_telegram_bridge.telegram_common import CONTROL_ROLE, DISCUSSION_ROLE
+from codex_telegram_bridge.workloads import (
+    FILE_IO_SPACE,
+    MAINTENANCE_SPACE,
+    PROMPT_ACTION_SPACE,
+)
 
 OWNER_ID = 7
 OWNER_CHAT_ID = 70
@@ -3156,11 +3164,26 @@ async def test_prompt_choose_callback_reuses_client_id_and_receipt_message(rig: 
     )
     assert callback is not None
 
+    replacement_message_id = receipt_message_id + 100
+    rig.store.put_telegram_message_state(  # type: ignore[attr-defined]
+        f"prompt:{client_message_id}",
+        bot_role=DISCUSSION_ROLE,
+        chat_id=DISCUSSION_CHAT_ID,
+        message_id=replacement_message_id,
+        semantic_fingerprint="replacement",
+        state="choose",
+        payload={
+            "space_id": "space-receipt-choose",
+            "generation": 1,
+            "client_message_id": client_message_id,
+        },
+    )
+    rig.discussion._prompt_receipts.clear()
     action, payload = callback
     await rig.discussion._dispatch_callback(action, payload, space)
 
     assert rig.bridge.prompt_calls[-1]["client_message_id"] == client_message_id
-    assert rig.discussion_endpoint.edited[-1]["message_id"] == receipt_message_id
+    assert rig.discussion_endpoint.edited[-1]["message_id"] == replacement_message_id
     assert "已加入队列" in rig.discussion_endpoint.edited[-1]["markdown"]
 
 
@@ -3177,11 +3200,18 @@ def test_interactive_approval_payloads_cover_file_permissions_and_legacy_patch()
     requested = {"fileSystem": {"read": ["/workspace"]}}
     assert interactive_approval_decisions(
         "item/permissions/requestApproval", {"permissions": requested}
-    ) == [{"permissions": requested, "scope": "turn"}]
+    ) == [
+        {"permissions": requested, "scope": "turn"},
+        {"permissions": requested, "scope": "session"},
+        {"permissions": {}, "scope": "turn"},
+    ]
     assert approval_response_payload(
         "item/permissions/requestApproval",
         {"permissions": requested, "scope": "turn", "strictAutoReview": True},
     ) == {"permissions": requested, "scope": "turn", "strictAutoReview": True}
+    assert DiscussionBotController._command_approval_button_label(  # noqa: SLF001
+        {"permissions": {}, "scope": "turn"}
+    ) == "拒绝权限"
     with pytest.raises(ValueError, match="Session"):
         approval_response_payload(
             "item/permissions/requestApproval",
@@ -3190,6 +3220,27 @@ def test_interactive_approval_payloads_cover_file_permissions_and_legacy_patch()
 
     assert approval_response_payload("applyPatchApproval", "accept") == {
         "decision": "approved"
+    }
+
+
+def test_callback_workload_spaces_isolate_file_prompt_and_maintenance_actions() -> None:
+    assert _callback_workload_space("send_file") == FILE_IO_SPACE
+    assert _callback_workload_space("plan_execute") == PROMPT_ACTION_SPACE
+    assert _callback_workload_space("space_refresh") == MAINTENANCE_SPACE
+    assert _callback_workload_space("unwatch_cancel") == "default"
+
+
+def test_controllers_register_named_workload_spaces(rig: Rig) -> None:
+    assert set(rig.control._workloads.snapshot()["spaces"]) == {  # noqa: SLF001
+        "default",
+        "prompt_action",
+        "maintenance",
+    }
+    assert set(rig.discussion._workloads.snapshot()["spaces"]) == {  # noqa: SLF001
+        "default",
+        "file_io",
+        "prompt_action",
+        "maintenance",
     }
 
 

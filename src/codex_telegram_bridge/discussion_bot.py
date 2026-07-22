@@ -72,7 +72,13 @@ from .views import (
     render_ask_waiting,
     render_help,
 )
-from .workloads import KeyedWorkScheduler
+from .workloads import (
+    FILE_IO_SPACE,
+    MAINTENANCE_SPACE,
+    PROMPT_ACTION_SPACE,
+    KeyedWorkScheduler,
+    Space,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -89,8 +95,34 @@ _GETFILE_PAGE_SIZE = 8
 _CIRCLED_FILE_BUTTON_LABELS = "①②③④⑤⑥⑦⑧"
 _BOT_URL_TOKEN = re.compile(r"(https://api\.telegram\.org/bot)[^/\s]+", re.IGNORECASE)
 _BOT_TOKEN = re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{16,}\b")
-_MODEL_CACHE_SECONDS = 5 * 60.0
 _STATUS_REFRESH_SECONDS = 5.0
+
+_FILE_IO_CALLBACK_ACTIONS = frozenset({"send_file", "getfile_page", "send_upload"})
+_PROMPT_CALLBACK_ACTIONS = frozenset(
+    {
+        "prompt_mode",
+        "queue_cancel",
+        "profile_model",
+        "profile_effort",
+        "profile_cancel",
+        "question",
+        "command_approval",
+        "question_custom",
+        "question_clarify",
+        "plan_execute",
+        "plan_continue",
+    }
+)
+
+
+def _callback_workload_space(action: str) -> str | Space:
+    if action in _FILE_IO_CALLBACK_ACTIONS:
+        return FILE_IO_SPACE
+    if action in _PROMPT_CALLBACK_ACTIONS:
+        return PROMPT_ACTION_SPACE
+    if action == "space_refresh":
+        return MAINTENANCE_SPACE
+    return "default"
 
 
 def _redacted_error(error: object) -> str:
@@ -164,41 +196,54 @@ class DiscussionBotController:
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._status_refresh_tasks: dict[str, asyncio.Task[None]] = {}
         self._status_refreshed_at: dict[str, float] = {}
-        self._model_cache: tuple[Any, ...] = ()
-        self._model_cache_at = 0.0
-        self._model_cache_task: asyncio.Task[list[Any]] | None = None
         self._prompt_receipts: dict[str, dict[str, Any]] = {}
         self._plan_recovery_done = False
         self._plan_recovery_task: asyncio.Task[None] | None = None
-        self._workloads = KeyedWorkScheduler("discussion-work", max_pending=256, max_running=8)
+        self._workloads = KeyedWorkScheduler(
+            "discussion-work",
+            max_pending=256,
+            max_running=8,
+            spaces=(FILE_IO_SPACE, PROMPT_ACTION_SPACE, MAINTENANCE_SPACE),
+        )
 
     def install(self, application: Application) -> None:
         self._application = application
         application.add_handler(TypeHandler(Update, self._guard), group=-100)
         application.add_handler(MessageHandler(filters.ALL, self.observe_message), group=-50)
         application.add_handler(
-            MessageHandler(filters.TEXT, self._defer_handler(self.reply_to_intent)),
+            MessageHandler(
+                filters.TEXT,
+                self._defer_handler(
+                    self.reply_to_intent,
+                    workload_space=PROMPT_ACTION_SPACE,
+                ),
+            ),
             group=-25,
         )
-        for command, callback in (
-            ("bind", self.bind),
-            ("help", self.help),
-            ("status", self.status),
-            ("totp", self.totp),
-            ("lock", self.lock),
-            ("prompt", self.prompt),
-            ("ask", self.ask),
-            ("queue", self.queue),
-            ("planmode", self.planmode),
-            ("changemodel", self.changemodel),
-            ("plan", self.plan),
-            ("timeline", self.timeline),
-            ("attach", self.attach),
-            ("getfile", self.getfile),
-            ("unwatch", self.unwatch),
-            ("answer", self.answer),
+        for command, callback, workload_space in (
+            ("bind", self.bind, "default"),
+            ("help", self.help, "default"),
+            ("status", self.status, MAINTENANCE_SPACE),
+            ("totp", self.totp, "default"),
+            ("lock", self.lock, "default"),
+            ("prompt", self.prompt, PROMPT_ACTION_SPACE),
+            ("ask", self.ask, PROMPT_ACTION_SPACE),
+            ("queue", self.queue, PROMPT_ACTION_SPACE),
+            ("planmode", self.planmode, PROMPT_ACTION_SPACE),
+            ("changemodel", self.changemodel, PROMPT_ACTION_SPACE),
+            ("plan", self.plan, PROMPT_ACTION_SPACE),
+            ("timeline", self.timeline, "default"),
+            ("attach", self.attach, "default"),
+            ("getfile", self.getfile, FILE_IO_SPACE),
+            ("unwatch", self.unwatch, "default"),
+            ("answer", self.answer, PROMPT_ACTION_SPACE),
         ):
-            application.add_handler(CommandHandler(command, self._defer_handler(callback)))
+            application.add_handler(
+                CommandHandler(
+                    command,
+                    self._defer_handler(callback, workload_space=workload_space),
+                )
+            )
         application.add_handler(
             MessageHandler(
                 filters.TEXT & filters.Regex(r"(?i)^/bind(?:@[a-z0-9_]+)?(?:\s|$)"),
@@ -209,7 +254,7 @@ class DiscussionBotController:
         application.add_handler(
             MessageHandler(
                 filters.Document.ALL | filters.PHOTO,
-                self._defer_handler(self.upload),
+                self._defer_handler(self.upload, workload_space=FILE_IO_SPACE),
             ),
             group=1,
         )
@@ -222,7 +267,12 @@ class DiscussionBotController:
         self.bridge.on_prompt_completed = self.prompt_completed
         self.bridge.on_tui_plan_approved = self.plan_turn_started
 
-    def _defer_handler(self, callback: Any) -> Any:
+    def _defer_handler(
+        self,
+        callback: Any,
+        *,
+        workload_space: str | Space = "default",
+    ) -> Any:
         async def deferred(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             message = update.effective_message
             space = self._space_for_message(message) if message is not None else None
@@ -236,7 +286,7 @@ class DiscussionBotController:
                 with contextlib.suppress(ApplicationHandlerStop):
                     await callback(update, context)
 
-            if self._workloads.submit(key, run):
+            if self._workloads.submit(key, run, space=workload_space):
                 return
             if space is not None:
                 await self._send_space(space, "请求队列已满，请稍后重试。")
@@ -255,9 +305,6 @@ class DiscussionBotController:
             if task not in background:
                 background.append(task)
         self._status_refresh_tasks.clear()
-        if self._model_cache_task is not None and self._model_cache_task not in background:
-            background.append(self._model_cache_task)
-        self._model_cache_task = None
         for task in background:
             task.cancel()
         if background:
@@ -837,23 +884,29 @@ class DiscussionBotController:
         client_message_id: str | None = None,
         receipt_message_id: int | None = None,
     ) -> None:
-        client_message_id = client_message_id or f"telegram-{space['space_id']}-{uuid.uuid4()}"
-        if receipt_message_id is None:
-            receipt = await self._send_space(space, "📨 已收到请求。", priority=5)
-            receipt_message_id = int(receipt.message_id)
-        receipt_state = {
-            "space_id": str(space["space_id"]),
-            "generation": int(space["generation"]),
-            "message_id": receipt_message_id,
-            "state": "received",
-        }
-        self._prompt_receipts[client_message_id] = receipt_state
-        self._persist_prompt_receipt(
-            space,
-            client_message_id,
-            receipt_state,
-            "📨 已收到请求。",
+        existing_receipt = (
+            self._prompt_receipt(space, client_message_id) if client_message_id else None
         )
+        client_message_id = client_message_id or f"telegram-{space['space_id']}-{uuid.uuid4()}"
+        receipt_state = existing_receipt
+        if receipt_state is None:
+            if receipt_message_id is None:
+                receipt = await self._send_space(space, "📨 已收到请求。", priority=5)
+                receipt_message_id = int(receipt.message_id)
+            receipt_state = {
+                "space_id": str(space["space_id"]),
+                "generation": int(space["generation"]),
+                "message_id": receipt_message_id,
+                "state": "received",
+            }
+            self._prompt_receipts[client_message_id] = receipt_state
+            self._persist_prompt_receipt(
+                space,
+                client_message_id,
+                receipt_state,
+                "📨 已收到请求。",
+            )
+        receipt_message_id = int(receipt_state["message_id"])
         await self._edit_prompt_receipt(space, client_message_id, "submitting")
         try:
             result = await self.bridge.send_space_prompt(
@@ -2031,6 +2084,7 @@ class DiscussionBotController:
                 ),
                 callback_chat_id=int(chat.id),
             ),
+            space=_callback_workload_space(action),
         )
         if not submitted:
             await self._send_space(space, "请求队列已满，请重新执行命令。")
@@ -3465,7 +3519,7 @@ class DiscussionBotController:
         instruction = (
             "上一选择未送达 Codex，请使用下面的新按钮。"
             if retry
-            else "请确认是否允许本次命令。"
+            else f"请确认是否允许本次{subject_label}。"
         )
         if not buttons:
             instruction = "该请求没有可由 Telegram 提交的决定，请在本机处理。"
@@ -3503,6 +3557,8 @@ class DiscussionBotController:
     @staticmethod
     def _command_approval_button_label(decision: ApprovalDecision) -> str:
         if isinstance(decision, dict) and isinstance(decision.get("permissions"), dict):
+            if not decision["permissions"]:
+                return "拒绝权限"
             scope = str(decision.get("scope") or "turn")
             return "仅本 Turn 授权" if scope == "turn" else "本 Session 授权"
         kind = approval_decision_kind(decision)
@@ -4174,6 +4230,11 @@ class DiscussionBotController:
             )
         )
         kind = approval_decision_kind(decision)
+        if method == "item/permissions/requestApproval" and isinstance(decision, dict):
+            permissions = decision.get("permissions")
+            message = "已授予请求的权限。" if permissions else "已拒绝请求的权限。"
+            await self._send_space(space, message, priority=5)
+            return
         labels = {
             "accept": "已批准本次命令执行。",
             "acceptForSession": "已批准本 Session 后续命令执行。",
@@ -4513,24 +4574,7 @@ class DiscussionBotController:
                 self._status_refresh_tasks.pop(space_id, None)
 
     async def _model_options(self) -> list[Any]:
-        now = time.monotonic()
-        if self._model_cache and now - self._model_cache_at < _MODEL_CACHE_SECONDS:
-            return list(self._model_cache)
-        task = self._model_cache_task
-        if task is None or task.done():
-            task = asyncio.create_task(
-                self.bridge.list_model_options(),
-                name="discussion-model-catalog-refresh",
-            )
-            self._model_cache_task = task
-        try:
-            options = await task
-        finally:
-            if self._model_cache_task is task:
-                self._model_cache_task = None
-        self._model_cache = tuple(options)
-        self._model_cache_at = time.monotonic()
-        return list(self._model_cache)
+        return await self.bridge.list_model_options()
 
     def _button(
         self,

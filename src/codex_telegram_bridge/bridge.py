@@ -17,7 +17,9 @@ from telegram import Bot
 from .approval import (
     ApprovalDecision,
     approval_decision_is_available,
+    approval_response_payload,
     command_approval_decisions,
+    interactive_approval_decisions,
     normalize_command_approval_params,
 )
 from .codex import CodexClient, CodexRpcError, file_input, text_input
@@ -2113,29 +2115,13 @@ class Bridge:
         }:
             if not approval_decision_is_available(decision, available):
                 raise ValueError("审批决定不在当前请求允许的选项中")
-            response: Json = {"decision": decision}
+            response = approval_response_payload(method, decision)
         elif method == "item/permissions/requestApproval":
-            if not isinstance(decision, dict):
-                raise ValueError("权限审批需要明确的 permissions 与 scope")
-            permissions = decision.get("permissions")
-            scope = decision.get("scope")
-            if permissions is None or scope is None:
-                raise ValueError("权限审批缺少 permissions 或 scope")
-            response = {"permissions": permissions, "scope": scope}
-            if "strictAutoReview" in decision:
-                response["strictAutoReview"] = decision["strictAutoReview"]
+            response = approval_response_payload(method, decision)
         elif method in {"execCommandApproval", "applyPatchApproval"}:
-            if not isinstance(decision, str):
-                raise ValueError("审批决定无效")
-            mapped = {
-                "accept": "approved",
-                "acceptForSession": "approved_for_session",
-                "decline": "denied",
-                "cancel": "abort",
-            }.get(decision)
-            if mapped is None or (available and decision not in available):
+            if available and not approval_decision_is_available(decision, available):
                 raise ValueError("审批决定不在当前请求允许的选项中")
-            response = {"decision": mapped}
+            response = approval_response_payload(method, decision)
         else:
             raise RuntimeError("未知的审批协议")
         raw_request_id = stored["request_id"]
@@ -2542,6 +2528,8 @@ class Bridge:
                 )
             elif method == "applyPatchApproval":
                 available_decisions = ["accept", "acceptForSession", "decline", "cancel"]
+            elif method == "item/permissions/requestApproval":
+                available_decisions = interactive_approval_decisions(method, approval_params)
             else:
                 available_decisions = []
             request_key = f"approval:{uuid.uuid4().hex[:16]}"

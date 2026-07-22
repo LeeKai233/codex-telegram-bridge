@@ -927,17 +927,29 @@ async def test_legacy_command_approval_normalizes_conversation_and_call_ids(tmp_
                 "threadId": "thread-generic",
                 "turnId": "turn-permissions",
                 "itemId": "item-permissions",
+                "permissions": {"fileSystem": "workspaceWrite"},
             },
             {
                 "permissions": {"fileSystem": "workspaceWrite"},
-                "scope": "session",
+                "scope": "turn",
                 "strictAutoReview": True,
             },
             {
                 "permissions": {"fileSystem": "workspaceWrite"},
-                "scope": "session",
+                "scope": "turn",
                 "strictAutoReview": True,
             },
+        ),
+        (
+            "item/permissions/requestApproval",
+            {
+                "threadId": "thread-generic",
+                "turnId": "turn-permissions-deny",
+                "itemId": "item-permissions-deny",
+                "permissions": {"network": {"enabled": True}},
+            },
+            {"permissions": {}, "scope": "turn"},
+            {"permissions": {}, "scope": "turn"},
         ),
         (
             "applyPatchApproval",
@@ -979,10 +991,55 @@ async def test_generic_approval_methods_emit_exact_wire_payloads(
 
     await bridge._on_server_request(84, method, params, bridge.client.generation)
     [request_key] = request_keys
+    if method == "item/permissions/requestApproval":
+        stored = store.get_pending_input(request_key)
+        assert stored is not None
+        assert stored["questions"][0]["_bridge_available_decisions"] == [
+            {"permissions": params.get("permissions", {}), "scope": "turn"},
+            {"permissions": params.get("permissions", {}), "scope": "session"},
+            {"permissions": {}, "scope": "turn"},
+        ]
     await bridge.answer_command_approval(request_key, decision)
 
     assert responses == [(84, wire_response, bridge.client.generation)]
     assert store.get_pending_input(request_key)["status"] == "awaiting_resolved"  # type: ignore[index]
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_permissions_approval_rejects_session_scoped_strict_review(tmp_path: Path) -> None:
+    bridge, store = make_bridge(tmp_path)
+    store.subscribe("thread-permissions")
+    request_keys: list[str] = []
+
+    async def forward(request_key: str, _params: dict[str, Any]) -> None:
+        request_keys.append(request_key)
+
+    bridge.on_command_approval = forward
+    await bridge._on_server_request(
+        85,
+        "item/permissions/requestApproval",
+        {
+            "threadId": "thread-permissions",
+            "turnId": "turn-permissions",
+            "itemId": "item-permissions",
+            "permissions": {"network": {"enabled": True}},
+        },
+        bridge.client.generation,
+    )
+
+    [request_key] = request_keys
+    with pytest.raises(ValueError, match="Session"):
+        await bridge.answer_command_approval(
+            request_key,
+            {
+                "permissions": {"network": {"enabled": True}},
+                "scope": "session",
+                "strictAutoReview": True,
+            },
+        )
+
+    assert store.get_pending_input(request_key)["status"] == "pending"  # type: ignore[index]
     store.close()
 
 

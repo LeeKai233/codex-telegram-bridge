@@ -551,6 +551,47 @@ async def test_animation_batch_requires_a_real_delivery_to_advance(
 
 
 @pytest.mark.asyncio
+async def test_superseded_dashboard_ticket_releases_its_fingerprint(tmp_path: Path) -> None:
+    config = replace(
+        Config.default(),
+        config_dir=tmp_path / "config",
+        state_dir=tmp_path / "state",
+        allowed_root=tmp_path,
+    )
+    store = Store(config.database_path)
+    manager = SpaceDashboardManager(
+        config,
+        store,
+        StaticSecurity(),  # type: ignore[arg-type]
+        RecordingEndpoint(),  # type: ignore[arg-type]
+        RecordingEndpoint(),  # type: ignore[arg-type]
+        RecordingDelivery(),  # type: ignore[arg-type]
+    )
+    key = DeliveryKey("discussion", -100123, 41)
+    old_ticket: asyncio.Future[DeliveryOutcome] = asyncio.get_running_loop().create_future()
+    current_ticket: asyncio.Future[DeliveryOutcome] = asyncio.get_running_loop().create_future()
+    manager._delivery_tickets[key] = current_ticket
+    manager._delivery_fingerprints[old_ticket] = "old"
+    manager._delivery_fingerprints[current_ticket] = "current"
+    old_ticket.set_result(
+        DeliveryOutcome(
+            key=key,
+            revision=1,
+            status="delivered",
+            attempts=1,
+            performed=True,
+        )
+    )
+
+    manager._delivery_finished(key, "space-superseded", old_ticket, 0)
+
+    assert old_ticket not in manager._delivery_fingerprints
+    assert manager._delivery_tickets[key] is current_ticket
+    assert manager._delivery_fingerprints[current_ticket] == "current"
+    store.close()
+
+
+@pytest.mark.asyncio
 async def test_space_dashboard_submits_channel_and_discussion_independently(tmp_path: Path) -> None:
     config = replace(
         Config.default(),

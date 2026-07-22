@@ -623,6 +623,13 @@ async def test_telegram_answer_uses_the_same_question_cleanup_hook(
     await asyncio.gather(*list(controller._background_tasks))
 
     assert responses == [(77, {"answers": {"answer": {"answers": ["yes"]}}})]
+    assert discussion.deleted == []
+    assert store.question_messages("request-key") != []
+    assert store.get_pending_input("request-key")["status"] == "awaiting_resolved"  # type: ignore[index]
+
+    await bridge._on_notification("serverRequest/resolved", {"requestId": 77})
+    await asyncio.gather(*list(controller._background_tasks))
+
     assert discussion.deleted == [(-1001, 21)]
     assert store.question_messages("request-key") == []
     assert store.get_pending_input("request-key") is None
