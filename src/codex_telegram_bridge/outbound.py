@@ -40,6 +40,7 @@ _LEGACY_TRAFFIC_CLASSES: dict[OutboundLane, TrafficClass] = {
 _KEYED_TRAFFIC_CLASSES = frozenset({"interactive"})
 OUTBOUND_STOP_GRACE_SECONDS = 1.0
 MAINTENANCE_CHAT_MINIMUM_INTERVAL_SECONDS = 6.0
+GROUP_CHAT_MINIMUM_INTERVAL_SECONDS = 4.1
 
 
 def _consume_task_result(task: asyncio.Task[None]) -> None:
@@ -66,6 +67,12 @@ class OutboundJournal(Protocol):
         attempts: int,
         error_type: str | None = None,
     ) -> None: ...
+
+
+class RateLimitStateStore(Protocol):
+    def get_meta(self, key: str, default: Any = None) -> Any: ...
+
+    def set_meta(self, key: str, value: str | int | float | bool) -> None: ...
 
 
 class TelegramOutcomeUncertain(NetworkError):
@@ -123,6 +130,7 @@ class OutboundMessenger:
         recycle_transport: Callable[[], Awaitable[None]] | None = None,
         max_queue_size: int = 1_000,
         maintenance_chat_interval: float = MAINTENANCE_CHAT_MINIMUM_INTERVAL_SECONDS,
+        group_chat_interval: float = GROUP_CHAT_MINIMUM_INTERVAL_SECONDS,
     ) -> None:
         # Keep the legacy observable value for callers that inspect it. A global
         # interval is only enabled when explicitly configured.
@@ -134,6 +142,12 @@ class OutboundMessenger:
         self.recycle_transport = recycle_transport
         self.max_queue_size = max(1, int(max_queue_size))
         self.maintenance_chat_interval = max(0.0, maintenance_chat_interval)
+        self.group_chat_interval = max(0.0, group_chat_interval)
+        self._rate_limit_store: RateLimitStateStore | None = None
+        if journal is not None and callable(getattr(journal, "get_meta", None)) and callable(
+            getattr(journal, "set_meta", None)
+        ):
+            self._rate_limit_store = journal  # type: ignore[assignment]
         self._queues: dict[TrafficClass, deque[_Job]] = {
             traffic_class: deque() for traffic_class in TRAFFIC_CLASS_CONCURRENCY
         }
@@ -145,6 +159,8 @@ class OutboundMessenger:
         self._stopping = False
         self._last_request = 0.0
         self._maintenance_request_at: dict[str, float] = {}
+        self._group_request_at: dict[str, float] = {}
+        self._group_interval_locks: dict[str, asyncio.Lock] = {}
         self._interval_lock = asyncio.Lock()
         self._active_jobs: dict[asyncio.Task[Any], _Job] = {}
         self._active_keys: set[tuple[int, str]] = set()
@@ -402,6 +418,9 @@ class OutboundMessenger:
         await self._pace_maintenance_chat(job)
         if not self._job_is_current(job):
             return
+        await self._pace_group_chat(job)
+        if not self._job_is_current(job):
+            return
         if self._interval_enabled:
             async with self._interval_lock:
                 delay = self.minimum_interval - (time.monotonic() - self._last_request)
@@ -457,6 +476,65 @@ class OutboundMessenger:
             await asyncio.sleep(delay)
         if self._job_is_current(job):
             self._maintenance_request_at[job.chat_key] = time.monotonic()
+
+    async def _pace_group_chat(self, job: _Job) -> None:
+        if self.group_chat_interval <= 0 or not job.chat_key.startswith("chat:"):
+            return
+        try:
+            chat_id = int(job.chat_key.removeprefix("chat:"))
+        except ValueError:
+            return
+        if chat_id >= 0:
+            return
+
+        lock = self._group_interval_locks.setdefault(job.chat_key, asyncio.Lock())
+        while self._job_is_current(job):
+            async with lock:
+                last_request = self._group_request_at.get(job.chat_key)
+                if last_request is None:
+                    last_request = self._load_group_request_at(chat_id)
+                    self._group_request_at[job.chat_key] = last_request
+                delay = self.group_chat_interval - (time.time() - last_request)
+                if delay <= 0:
+                    dispatched_at = time.time()
+                    self._group_request_at[job.chat_key] = dispatched_at
+                    self._save_group_request_at(chat_id, dispatched_at)
+                    return
+            await asyncio.sleep(min(self.group_chat_interval, max(0.01, delay)))
+
+    def _group_rate_limit_key(self, chat_id: int) -> str:
+        return f"telegram-group-rate:{self.bot_role}:{chat_id}"
+
+    def _load_group_request_at(self, chat_id: int) -> float:
+        if self._rate_limit_store is None:
+            return 0.0
+        try:
+            return max(
+                0.0,
+                float(self._rate_limit_store.get_meta(self._group_rate_limit_key(chat_id), 0.0)),
+            )
+        except Exception as exc:
+            LOGGER.warning(
+                "event=telegram_rate_limit_state_read_failed bot_role=%s error_type=%s",
+                self.bot_role,
+                type(exc).__name__,
+            )
+            return 0.0
+
+    def _save_group_request_at(self, chat_id: int, dispatched_at: float) -> None:
+        if self._rate_limit_store is None:
+            return
+        try:
+            self._rate_limit_store.set_meta(
+                self._group_rate_limit_key(chat_id),
+                dispatched_at,
+            )
+        except Exception as exc:
+            LOGGER.warning(
+                "event=telegram_rate_limit_state_write_failed bot_role=%s error_type=%s",
+                self.bot_role,
+                type(exc).__name__,
+            )
 
     async def _run_transport_operation(
         self,

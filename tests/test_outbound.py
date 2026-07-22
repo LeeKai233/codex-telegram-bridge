@@ -4,6 +4,7 @@ import asyncio
 import logging
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 from telegram.error import BadRequest, RetryAfter, TimedOut
@@ -473,6 +474,7 @@ async def test_maintenance_chat_pacing_preserves_interactive_latency() -> None:
     messenger = OutboundMessenger(
         minimum_interval=0,
         maintenance_chat_interval=0.05,
+        group_chat_interval=0,
     )
     events: list[tuple[str, float]] = []
 
@@ -513,6 +515,43 @@ async def test_maintenance_chat_pacing_preserves_interactive_latency() -> None:
         "maintenance-2",
     ]
     assert events[2][1] - events[0][1] >= 0.04
+
+
+@pytest.mark.asyncio
+async def test_group_chat_pacing_survives_messenger_restart() -> None:
+    class RateStore:
+        def __init__(self) -> None:
+            self.values: dict[str, float] = {}
+
+        def get_meta(self, key: str, default: Any = None) -> Any:
+            return self.values.get(key, default)
+
+        def set_meta(self, key: str, value: str | int | float | bool) -> None:
+            self.values[key] = float(value)
+
+    store = RateStore()
+    first = OutboundMessenger(
+        journal=store,  # type: ignore[arg-type]
+        maintenance_chat_interval=0,
+        group_chat_interval=0.05,
+    )
+    first.start()
+    await first.call(lambda: asyncio.sleep(0), chat_key="chat:-10020")
+    await first.stop()
+
+    restarted = OutboundMessenger(
+        journal=store,  # type: ignore[arg-type]
+        maintenance_chat_interval=0,
+        group_chat_interval=0.05,
+    )
+    restarted.start()
+    started_at = time.monotonic()
+    await restarted.call(lambda: asyncio.sleep(0), chat_key="chat:-10020")
+    elapsed = time.monotonic() - started_at
+    await restarted.stop()
+
+    assert elapsed >= 0.04
+    assert store.values.keys() == {"telegram-group-rate:control:-10020"}
 
 
 @pytest.mark.asyncio
