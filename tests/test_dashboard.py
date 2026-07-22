@@ -895,6 +895,6 @@ async def test_space_dashboard_start_has_no_periodic_animation_writes(
     assert set(scheduled) == {
         ("active-space", True),
         ("pending-space", True),
-        ("closed-space", True),
     }
+    assert ("closed-space", True) not in scheduled
     store.close()

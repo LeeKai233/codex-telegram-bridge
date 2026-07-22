@@ -114,6 +114,8 @@ class SpaceDashboardManager:
                 self._heartbeat_loop(), name="telegram-space-heartbeat"
             )
         for space in self.store.list_spaces():
+            if str(space.get("lifecycle") or "") == "closed":
+                continue
             if any(
                 space.get(name)
                 for name in ("channel_post_id", "status_message_id")
