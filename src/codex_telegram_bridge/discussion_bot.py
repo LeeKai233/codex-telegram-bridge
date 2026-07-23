@@ -47,6 +47,7 @@ from .approval import (
     interactive_approval_is_available,
 )
 from .bridge import TUI_PLAN_APPROVAL_PROMPT, Bridge
+from .codex import CodexDisconnected
 from .config import Config
 from .deletions import MessageDeletionManager
 from .delivery import delivery_fingerprint
@@ -142,6 +143,46 @@ def _pipe_arguments(raw: str, *, limit: int) -> list[str]:
     return [part.strip() for part in raw.split("|", max(0, limit - 1))]
 
 
+def _review_target(raw: str) -> dict[str, str]:
+    raw = raw.strip()
+    if not raw or raw.casefold() == "uncommitted":
+        return {"type": "uncommittedChanges"}
+    command, separator, remainder = raw.partition(" ")
+    command = command.casefold()
+    remainder = remainder.strip() if separator else ""
+    if command == "base":
+        if not remainder or "|" in remainder:
+            raise ValueError("用法：`/review base <branch>`")
+        return {"type": "baseBranch", "branch": remainder}
+    if command == "commit":
+        parts = _pipe_arguments(remainder, limit=2)
+        if not parts[0]:
+            raise ValueError("用法：`/review commit <sha> [ | title ]`")
+        target = {"type": "commit", "sha": parts[0]}
+        if len(parts) == 2 and parts[1]:
+            target["title"] = parts[1]
+        return target
+    if command == "custom":
+        if not remainder:
+            raise ValueError("用法：`/review custom <instructions>`")
+        return {"type": "custom", "instructions": remainder}
+    raise ValueError(
+        "用法：`/review`、`/review base <branch>`、`/review commit <sha> [ | title ]` "
+        "或 `/review custom <instructions>`"
+    )
+
+
+def _review_target_label(target: Mapping[str, Any]) -> str:
+    target_type = str(target.get("type") or "")
+    if target_type == "uncommittedChanges":
+        return "未提交变更"
+    if target_type == "baseBranch":
+        return f"基于 {str(target.get('branch') or '').strip()}"
+    if target_type == "commit":
+        return f"Commit {str(target.get('sha') or '').strip()[:12]}"
+    return "自定义审查"
+
+
 _SESSION_COMMANDS = (
     ("status", "刷新当前 Session 状态"),
     ("totp", "认证当前 Session"),
@@ -150,6 +191,7 @@ _SESSION_COMMANDS = (
     ("ask", "独立询问 Codex"),
     ("queue", "查看队列或加入 prompt"),
     ("planmode", "进入 Plan Mode"),
+    ("review", "执行一次 Codex Review"),
     ("changemodel", "切换当前模式的模型"),
     ("plan", "查看完整计划"),
     ("timeline", "查看近期事件"),
@@ -231,6 +273,7 @@ class DiscussionBotController:
             ("ask", self.ask, PROMPT_ACTION_SPACE),
             ("queue", self.queue, PROMPT_ACTION_SPACE),
             ("planmode", self.planmode, PROMPT_ACTION_SPACE),
+            ("review", self.review, PROMPT_ACTION_SPACE),
             ("changemodel", self.changemodel, PROMPT_ACTION_SPACE),
             ("plan", self.plan, PROMPT_ACTION_SPACE),
             ("timeline", self.timeline, "default"),
@@ -266,6 +309,7 @@ class DiscussionBotController:
         self.bridge.on_question_resolved = self.question_resolved
         self.bridge.on_plan_completed = self.plan_completed
         self.bridge.on_prompt_completed = self.prompt_completed
+        self.bridge.on_review_completed = self.review_completed
         self.bridge.on_tui_plan_approved = self.plan_turn_started
 
     def _defer_handler(
@@ -661,6 +705,45 @@ class DiscussionBotController:
             await self._send_space(space, "用法：`/ask <问题>`")
             return
         await self._launch_ask(space, question, clarification=False, update=update)
+
+    async def review(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        del context
+        space = self._require_active_unlocked(update)
+        try:
+            target = _review_target(raw_arguments(update))
+        except ValueError as exc:
+            await self._send_space(space, escape(str(exc)))
+            return
+        client_message_id = f"telegram-review-{space['space_id']}-{uuid.uuid4()}"
+        try:
+            result = await self.bridge.start_space_review(
+                str(space["space_id"]),
+                target,
+                client_message_id=client_message_id,
+            )
+        except (CodexDisconnected, TimeoutError, OSError):
+            await self._send_space(
+                space,
+                "⚠️ Review 请求送达状态待确认；请等待 TUI 状态更新后再重试。",
+                priority=5,
+            )
+            return
+        except Exception as exc:
+            await self._send_space(
+                space,
+                f"❌ Review 启动失败：{inline_code(_redacted_error(exc), 180)}",
+                priority=5,
+            )
+            return
+        turn_id = str((result.get("turn") or {}).get("id") or "")
+        await self.dashboards.schedule_space(str(space["space_id"]), immediate=True)
+        await self._send_space(
+            space,
+            "🔎 Review 已启动 · "
+            f"{escape(_review_target_label(target))}\n"
+            f"Turn {inline_code(turn_id[:8] or 'pending')}",
+            priority=5,
+        )
 
     async def _launch_ask(
         self,
@@ -2861,6 +2944,53 @@ class DiscussionBotController:
         LOGGER.info(
             "event=prompt_receipt_sent space_id=%s turn_id=%s status=%s",
             space_id[:12],
+            turn_id[:8],
+            status,
+        )
+
+    async def review_completed(self, run: dict[str, Any]) -> None:
+        thread_id = str(run.get("thread_id") or "")
+        turn_id = str(run.get("turn_id") or "")
+        expected_space_id = str(run.get("space_id") or "")
+        expected_generation = run.get("generation")
+        space = (
+            self.store.get_space(expected_space_id)
+            if expected_space_id
+            else self.store.get_space_by_thread(thread_id)
+        )
+        if (
+            not space
+            or space.get("lifecycle") != "active"
+            or str(space.get("thread_id") or "") != thread_id
+            or (
+                expected_generation is not None
+                and int(space.get("generation", 0)) != int(expected_generation)
+            )
+        ):
+            LOGGER.info(
+                "event=review_summary_skipped reason=no_active_space thread_id=%s",
+                thread_id[:8],
+            )
+            return
+        status = str(run.get("status") or "completed")
+        summary = clip(str(run.get("summary") or "").strip(), 1200)
+        if status == "completed":
+            message = "*🔎 Review 完成*"
+            if summary:
+                message += f"\n{escape(summary)}"
+            message += "\n\n完整 findings 请在 TUI 查看。"
+        elif status == "interrupted":
+            message = "⏹ Review 已中断。"
+        else:
+            detail = str(run.get("error") or status)
+            message = f"❌ Review 失败：{inline_code(clip(detail, 180))}"
+        if turn_id:
+            message += f"\nTurn {inline_code(turn_id[:8])}"
+        await self._send_space(space, message, priority=5)
+        await self.dashboards.schedule_space(str(space["space_id"]), immediate=True)
+        LOGGER.info(
+            "event=review_summary_sent space_id=%s turn_id=%s status=%s",
+            str(space["space_id"])[:12],
             turn_id[:8],
             status,
         )

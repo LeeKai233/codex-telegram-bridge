@@ -141,7 +141,9 @@ class EventProjector:
                         item,
                         completed=state.turn_status != "inProgress",
                         historical=True,
+                        turn_id=turn_id,
                     )
+            self._reconcile_review_turn_status(state, turn_id, state.turn_status)
             state.recent_activity = recent_activity
         self._reconcile_tasks_from_children(state)
         state.queue_count = self.store.queue_count(thread_id)
@@ -574,7 +576,14 @@ class EventProjector:
             state.latest_activity = turn_activity
             for item in turn.get("items") or []:
                 if isinstance(item, dict):
-                    self._apply_item(state, item, completed=True, historical=True)
+                    self._apply_item(
+                        state,
+                        item,
+                        completed=True,
+                        historical=True,
+                        turn_id=str(turn.get("id") or "") or None,
+                    )
+            self._reconcile_review_turn_status(state, state.turn_id, state.turn_status)
             self._reconcile_tasks_from_children(state)
             self._record_activity(state, method, turn_activity, state.turn_status)
             return True
@@ -596,7 +605,12 @@ class EventProjector:
         if method in {"item/started", "item/completed"}:
             item = params.get("item") or {}
             if isinstance(item, dict):
-                self._apply_item(state, item, completed=method == "item/completed")
+                self._apply_item(
+                    state,
+                    item,
+                    completed=method == "item/completed",
+                    turn_id=str(params.get("turnId") or "") or None,
+                )
                 return True
         if method == "error":
             error = params.get("error") or {}
@@ -611,6 +625,19 @@ class EventProjector:
             self._record_activity(state, method, state.latest_activity, "warning")
             return True
         return False
+
+    @staticmethod
+    def _reconcile_review_turn_status(
+        state: ThreadState,
+        turn_id: str | None,
+        turn_status: str | None,
+    ) -> None:
+        if not turn_id or state.review_turn_id != turn_id:
+            return
+        if turn_status == "completed":
+            state.review_status = "completed"
+        elif turn_status in {"failed", "interrupted"}:
+            state.review_status = turn_status
 
     @staticmethod
     def _clear_recoverable_error(state: ThreadState) -> bool:
@@ -669,6 +696,7 @@ class EventProjector:
         *,
         completed: bool,
         historical: bool = False,
+        turn_id: str | None = None,
     ) -> None:
         item_type = str(item.get("type") or "item")
         if item_type == "agentMessage":
@@ -686,6 +714,20 @@ class EventProjector:
                 state.latest_activity,
                 "completed" if completed else "inProgress",
             )
+            return
+        if item_type == "enteredReviewMode":
+            state.review_status = "inProgress"
+            state.review_target = str(item.get("review") or "")[:1000]
+            state.review_turn_id = turn_id or state.review_turn_id
+            state.latest_activity = "Review 正在执行"
+            self._record_activity(state, item_type, state.latest_activity, "inProgress")
+            return
+        if item_type == "exitedReviewMode":
+            state.review_status = "completed"
+            state.review_summary = str(item.get("review") or "")[:2400]
+            state.review_turn_id = turn_id or state.review_turn_id
+            state.latest_activity = "Review 已完成"
+            self._record_activity(state, item_type, state.latest_activity, "completed")
             return
         if item_type == "commandExecution":
             status = str(item.get("status") or ("completed" if completed else "inProgress"))

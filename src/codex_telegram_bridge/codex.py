@@ -258,6 +258,14 @@ class CodexClient:
         self._stopping = asyncio.Event()
         self._runner: asyncio.Task[None] | None = None
         self.generation = 0
+        self._active_generation: int | None = None
+        self._connection_state = "starting"
+        self._connection_attempts = 0
+        self._last_connection_attempt_at: float | None = None
+        self._next_connection_attempt_at: float | None = None
+        self._last_handshake_at: float | None = None
+        self._outage_started_at: float | None = None
+        self._last_disconnect_reason: str | None = None
         self._model_options_cache: tuple[int, float, tuple[ModelOption, ...]] | None = None
         self._collaboration_modes_cache: tuple[int, tuple[Json, ...]] | None = None
 
@@ -285,10 +293,12 @@ class CodexClient:
         finally:
             self._runner = None
             self._connected.clear()
+            self._connection_state = "stopped"
             await self._fail_pending(CodexDisconnected("Codex app-server client stopped"))
             await self._stop_notification_consumer()
             await self._cancel_connection_callbacks()
             self._connection_token = None
+            self._active_generation = None
 
     async def wait_connected(self, timeout: float = 15.0) -> None:
         try:
@@ -305,6 +315,9 @@ class CodexClient:
             websocket: ClientConnection | None = None
             connection_token = object()
             next_generation = self.generation + 1
+            self._connection_attempts += 1
+            self._last_connection_attempt_at = time.time()
+            self._next_connection_attempt_at = None
             try:
                 websocket = await unix_connect(
                     path=str(self.socket_path),
@@ -320,6 +333,7 @@ class CodexClient:
                 )
                 self._websocket = websocket
                 self._connection_token = connection_token
+                self._active_generation = next_generation
                 notification_queue: asyncio.Queue[_NotificationEnvelope] = asyncio.Queue(
                     maxsize=self.notification_capacity
                 )
@@ -329,7 +343,6 @@ class CodexClient:
                     name="codex-notification-consumer",
                 )
                 self._notification_task = notification_task
-                self.generation = next_generation
                 reader = asyncio.create_task(
                     self._reader(
                         websocket,
@@ -340,7 +353,12 @@ class CodexClient:
                     name="codex-app-server-reader",
                 )
                 await self._initialize()
+                self.generation = next_generation
                 self._connected.set()
+                self._connection_state = "healthy"
+                self._last_handshake_at = time.time()
+                self._outage_started_at = None
+                self._last_disconnect_reason = None
                 delay = 1.0
                 self._connected_callback_task = self._schedule_connection_callback(
                     True,
@@ -355,6 +373,7 @@ class CodexClient:
                 reason = f"{type(exc).__name__}: {exc}"
                 LOGGER.warning("Codex app-server connection failed: %s", reason)
             finally:
+                was_connected = self._connected.is_set()
                 self._connected.clear()
                 callback = self._connected_callback_task
                 if callback is not None and not callback.done():
@@ -384,9 +403,18 @@ class CodexClient:
                     self._websocket = None
                 if self._connection_token is connection_token:
                     self._connection_token = None
-                self._schedule_connection_callback(False, self.generation, reason)
+                if self._active_generation == next_generation:
+                    self._active_generation = None
+                self._last_disconnect_reason = reason
+                if was_connected and not self._stopping.is_set():
+                    self._connection_state = "disconnected"
+                    self._outage_started_at = self._outage_started_at or time.time()
+                    self._schedule_connection_callback(False, self.generation, reason)
+                elif not self._stopping.is_set():
+                    self._connection_state = "starting"
                 await asyncio.sleep(0)
             if not self._stopping.is_set():
+                self._next_connection_attempt_at = time.time() + delay
                 with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(self._stopping.wait(), timeout=delay)
                 delay = min(delay * 2, 30.0)
@@ -629,7 +657,8 @@ class CodexClient:
         *,
         generation: int | None = None,
     ) -> None:
-        if generation is not None and generation != self.generation:
+        current_generation = self._active_generation or self.generation
+        if generation is not None and generation != current_generation:
             raise CodexDisconnected("Codex server request belongs to a stale generation")
         await self._send({"id": request_id, "result": result})
 
@@ -641,7 +670,8 @@ class CodexClient:
         *,
         generation: int | None = None,
     ) -> None:
-        if generation is not None and generation != self.generation:
+        current_generation = self._active_generation or self.generation
+        if generation is not None and generation != current_generation:
             raise CodexDisconnected("Codex server request belongs to a stale generation")
         await self._send({"id": request_id, "error": {"code": code, "message": message}})
 
@@ -751,9 +781,22 @@ class CodexClient:
 
     def health_snapshot(self) -> dict[str, Any]:
         queue = self._notification_queue
+        outage_age = (
+            max(0.0, time.time() - self._outage_started_at)
+            if self._outage_started_at is not None
+            else None
+        )
         return {
             "connected": self.connected,
+            "connection_state": self._connection_state,
             "generation": self.generation,
+            "connection_attempts": self._connection_attempts,
+            "last_connection_attempt_at": self._last_connection_attempt_at,
+            "next_connection_attempt_at": self._next_connection_attempt_at,
+            "last_handshake_at": self._last_handshake_at,
+            "outage_started_at": self._outage_started_at,
+            "outage_age_seconds": outage_age,
+            "last_disconnect_reason": self._last_disconnect_reason,
             "pending_rpc": len(self._pending),
             "pending_rpc_capacity": self._pending_rpc_limit,
             "notification_queued": queue.qsize() if queue is not None else 0,
@@ -1348,6 +1391,57 @@ class CodexClient:
             params["collaborationMode"] = collaboration_mode
         result = await self.request("turn/start", params, timeout=60)
         return dict((result or {}).get("turn") or {})
+
+    async def start_review(
+        self,
+        thread_id: str,
+        target: Json,
+        *,
+        delivery: str = "inline",
+    ) -> Json:
+        """Start Codex's one-shot reviewer without changing collaboration mode."""
+        normalized_thread_id = thread_id.strip()
+        if not normalized_thread_id:
+            raise ValueError("Thread ID must not be empty")
+        if delivery not in {"inline", "detached"}:
+            raise ValueError(f"Unsupported review delivery: {delivery!r}")
+        normalized_target = self.normalize_review_target(target)
+        result = await self.request(
+            "review/start",
+            {
+                "threadId": normalized_thread_id,
+                "delivery": delivery,
+                "target": normalized_target,
+            },
+            timeout=60,
+        )
+        return dict(result or {})
+
+    @staticmethod
+    def normalize_review_target(target: Json) -> Json:
+        """Validate and canonicalize the target before any turn-side effects."""
+        if not isinstance(target, dict):
+            raise ValueError("Review target must be an object")
+        review_type = str(target.get("type") or "")
+        required = {
+            "uncommittedChanges": (),
+            "baseBranch": ("branch",),
+            "commit": ("sha",),
+            "custom": ("instructions",),
+        }.get(review_type)
+        if required is None:
+            raise ValueError(f"Unsupported review target: {review_type!r}")
+        normalized_target: Json = {"type": review_type}
+        for name in required:
+            value = str(target.get(name) or "").strip()
+            if not value:
+                raise ValueError(f"Review target field {name!r} must not be empty")
+            normalized_target[name] = value
+        if review_type == "commit" and target.get("title") is not None:
+            title = str(target.get("title") or "").strip()
+            if title:
+                normalized_target["title"] = title
+        return normalized_target
 
     async def steer_turn(
         self, thread_id: str, turn_id: str, inputs: list[Json], *, client_message_id: str | None = None

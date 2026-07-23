@@ -6,8 +6,29 @@ import stat
 import tomllib
 import unicodedata
 from dataclasses import dataclass, fields
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
+
+
+class AppServerMode(StrEnum):
+    """Ownership boundary for the Codex app-server socket."""
+
+    INSTALLER_SERVICE = "installer-service"
+    MANAGED_DAEMON = "managed-daemon"
+    EXTERNAL = "external"
+
+    @classmethod
+    def parse(cls, value: object) -> AppServerMode:
+        if isinstance(value, cls):
+            return value
+        if not isinstance(value, str):
+            raise ValueError("app_server_mode must be a string")
+        try:
+            return cls(value.strip().casefold())
+        except ValueError as exc:
+            allowed = ", ".join(mode.value for mode in cls)
+            raise ValueError(f"app_server_mode must be one of: {allowed}") from exc
 
 
 def _expand_path(value: str | Path) -> Path:
@@ -164,6 +185,7 @@ class Config:
     codex_socket: Path
     codex_binary: Path
     allowed_root: Path
+    app_server_mode: AppServerMode = AppServerMode.EXTERNAL
     tmux_session: str = "CodexBot"
     dashboard_debounce_seconds: float = 0.5
     heartbeat_seconds: int = 60
@@ -182,6 +204,7 @@ class Config:
     ask_reasoning_effort: str | None = "medium"
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "app_server_mode", AppServerMode.parse(self.app_server_mode))
         for name in ("control_bot_label", "discussion_bot_label"):
             object.__setattr__(self, name, _normalize_bot_label(name, getattr(self, name)))
         for name in ("ask_model", "ask_reasoning_effort"):
@@ -227,6 +250,9 @@ class Config:
             codex_socket=codex_home / "app-server-control" / "app-server-control.sock",
             codex_binary=home / ".local" / "bin" / "codex",
             allowed_root=home,
+            app_server_mode=AppServerMode.parse(
+                os.environ.get("CODEX_APP_SERVER_MODE", AppServerMode.EXTERNAL.value)
+            ),
         )
 
     @classmethod

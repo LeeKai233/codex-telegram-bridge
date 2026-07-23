@@ -386,13 +386,16 @@ def render_channel_post(
     thread_id = _thread_id(state) or "Pending"
     cwd = _cwd(state)
     desired_mode, observed_mode, main_model, main_effort = _main_profile(space, state)
+    review_active, review_icon, review_label = _review_status(state)
     frame = ANIMATION_FRAMES[animation_frame % len(ANIMATION_FRAMES)] if animation_frame is not None else ""
     mode_icon, mode_label = _mode_status(desired_mode, observed_mode)
+    if review_active:
+        mode_icon, mode_label = review_icon, review_label
     frame_prefix = f"{frame} " if frame else ""
     progress = 100.0 * completed / plan_total if plan_total else 0.0
     markdown_lines: list[str] = []
     plain_lines: list[str] = []
-    if desired_mode:
+    if review_active or desired_mode:
         markdown_lines.append(f"{frame_prefix}*{mode_icon} {mode_label}*")
         plain_lines.append(f"{frame_prefix}{mode_icon} {mode_label}")
         frame_prefix = ""
@@ -405,7 +408,7 @@ def render_channel_post(
                     f"*🧠 Main*  {inline_code(main_model or 'N/A', 80)} · "
                     f"Effort {inline_code(main_effort or 'N/A', 32)}"
                 ]
-                if desired_mode or main_model or main_effort
+                if review_active or desired_mode or main_model or main_effort
                 else []
             ),
             f"🎯 Goal {goal_icon} {inline_code(goal_status)}",
@@ -603,6 +606,13 @@ def _mode_status(desired_mode: str, observed_mode: str) -> tuple[str, str]:
     return icon, f"期望 {desired_label} · TUI {observed_label}"
 
 
+def _review_status(state: object) -> tuple[bool, str, str]:
+    active = str(_value(state, "review_status", default="idle") or "idle") == "inProgress"
+    if not active:
+        return False, "", ""
+    return True, "🔎", "Review · 执行中"
+
+
 def render_status_comment(
     state: object,
     *,
@@ -627,11 +637,16 @@ def render_status_comment(
     title = clip(_title(state), 80)
     thread_id = _thread_id(state) or str(_value(space, "thread_id", default="Pending") or "Pending")
     desired_mode, observed_mode, main_model, main_effort = _main_profile(space, state)
+    review_active, review_icon, review_label = _review_status(state)
     progress = 100.0 * completed / plan_total if plan_total else 0.0
     markdown_lines: list[str] = []
     plain_lines: list[str] = []
-    if desired_mode:
-        mode_icon, mode_label = _mode_status(desired_mode, observed_mode)
+    if review_active or desired_mode:
+        mode_icon, mode_label = (
+            (review_icon, review_label)
+            if review_active
+            else _mode_status(desired_mode, observed_mode)
+        )
         frame = ""
         if animation_frame is not None:
             frame = ANIMATION_FRAMES[animation_frame % len(ANIMATION_FRAMES)]
@@ -648,7 +663,7 @@ def render_status_comment(
                     f"*🧠 Main*  {inline_code(main_model or 'N/A', 80)} · "
                     f"Effort {inline_code(main_effort or 'N/A', 32)}"
                 ]
-                if desired_mode or main_model or main_effort
+                if review_active or desired_mode or main_model or main_effort
                 else []
             ),
             "",
@@ -664,7 +679,7 @@ def render_status_comment(
             f"{thread_id} · {icon} {status} · 总执行 {duration}",
             *(
                 [f"🧠 Main · {main_model or 'N/A'} · Effort {main_effort or 'N/A'}"]
-                if desired_mode or main_model or main_effort
+                if review_active or desired_mode or main_model or main_effort
                 else []
             ),
             "",
@@ -1000,6 +1015,7 @@ def render_help(
             ("/ask <question>", "独立提问，不影响当前任务"),
             ("/queue [text]", "查看或加入队列"),
             ("/planmode [model | effort | prompt]", "切入 Plan Mode"),
+            ("/review [target]", "执行一次 Codex Review"),
             ("/changemodel [model | effort]", "切换当前模式配置"),
             ("/plan", "查看完整计划"),
             ("/timeline", "查看近期事件"),

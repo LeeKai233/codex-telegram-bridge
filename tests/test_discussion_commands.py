@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from codex_telegram_bridge.codex import CodexDisconnected
 from codex_telegram_bridge.config import Config
 from codex_telegram_bridge.discussion_bot import DiscussionBotController
 from codex_telegram_bridge.models import Owner, ThreadState
@@ -241,6 +242,7 @@ class FakeBridge:
         self.profile_sets: list[tuple[str, str, str, str]] = []
         self.model_changes: list[tuple[str, str, str]] = []
         self.turns: list[dict[str, Any]] = []
+        self.review_runs: list[dict[str, Any]] = []
         self.reconcile_status = "absent"
 
     async def list_model_options(self) -> list[object]:
@@ -285,6 +287,22 @@ class FakeBridge:
             }
         )
         return {"id": "turn-planmode"}
+
+    async def start_space_review(
+        self,
+        space_id: str,
+        target: dict[str, Any],
+        *,
+        client_message_id: str,
+    ) -> dict[str, Any]:
+        self.review_runs.append(
+            {
+                "space_id": space_id,
+                "target": dict(target),
+                "client_message_id": client_message_id,
+            }
+        )
+        return {"turn": {"id": "turn-review"}}
 
     async def reconcile_plan_execution(
         self,
@@ -378,6 +396,73 @@ async def test_planmode_full_command_preserves_pipe_text_and_uses_selected_profi
         "gpt-5.6-luna",
         "max",
     )
+
+
+@pytest.mark.asyncio
+async def test_review_command_parses_custom_target_and_reports_turn(
+    command_runtime: SimpleNamespace,
+) -> None:
+    runtime = command_runtime
+
+    await runtime.controller.review(
+        update("/review custom inspect the patch | focus on regressions"), SimpleNamespace()
+    )
+
+    assert runtime.bridge.review_runs[0]["target"] == {
+        "type": "custom",
+        "instructions": "inspect the patch | focus on regressions",
+    }
+    assert "Review 已启动" in runtime.sent[-1]["markdown"]
+    assert "turn-rev" in runtime.sent[-1]["markdown"]
+    assert runtime.dashboards.calls == [("space-command", True)]
+
+
+@pytest.mark.asyncio
+async def test_review_command_rejects_unknown_target_without_starting_turn(
+    command_runtime: SimpleNamespace,
+) -> None:
+    runtime = command_runtime
+
+    await runtime.controller.review(update("/review unknown value"), SimpleNamespace())
+
+    assert runtime.bridge.review_runs == []
+    assert "用法" in runtime.sent[-1]["markdown"]
+
+
+@pytest.mark.asyncio
+async def test_review_command_reports_codex_disconnect_as_uncertain_delivery(
+    command_runtime: SimpleNamespace,
+) -> None:
+    runtime = command_runtime
+
+    async def disconnected(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        raise CodexDisconnected("connection lost")
+
+    runtime.bridge.start_space_review = disconnected  # type: ignore[method-assign]
+    await runtime.controller.review(update("/review"), SimpleNamespace())
+
+    assert "送达状态待确认" in runtime.sent[-1]["markdown"]
+    assert "启动失败" not in runtime.sent[-1]["markdown"]
+
+
+@pytest.mark.asyncio
+async def test_review_completion_ignores_stale_space_generation(
+    command_runtime: SimpleNamespace,
+) -> None:
+    runtime = command_runtime
+
+    await runtime.controller.review_completed(
+        {
+            "thread_id": "thread-command",
+            "turn_id": "stale-turn",
+            "space_id": "space-command",
+            "generation": 2,
+            "status": "completed",
+            "summary": "stale",
+        }
+    )
+
+    assert runtime.sent == []
 
 
 @pytest.mark.asyncio

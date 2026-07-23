@@ -1862,6 +1862,44 @@ class Store:
             ).fetchone()
         return self._prompt_intent_from_row(row) if row is not None else None
 
+    def find_prompt_intent_for_turn(
+        self,
+        thread_id: str,
+        turn_id: str,
+        *,
+        source: str | None = None,
+    ) -> PromptIntent | None:
+        query = (
+            "SELECT intent_id, client_message_id, source, prompt, mode, thread_id, space_id, "
+            "generation, state, turn_id, queue_id, error, receipt_key, created_at, updated_at "
+            "FROM prompt_intents WHERE thread_id=? AND turn_id=?"
+        )
+        params: list[object] = [thread_id, turn_id]
+        if source is not None:
+            query += " AND source=?"
+            params.append(source)
+        query += " ORDER BY updated_at DESC LIMIT 1"
+        with self._lock:
+            row = self._connection.execute(query, tuple(params)).fetchone()
+        return self._prompt_intent_from_row(row) if row is not None else None
+
+    def find_active_prompt_intent(
+        self,
+        thread_id: str,
+        *,
+        source: str,
+    ) -> PromptIntent | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT intent_id, client_message_id, source, prompt, mode, thread_id, space_id, "
+                "generation, state, turn_id, queue_id, error, receipt_key, created_at, updated_at "
+                "FROM prompt_intents WHERE thread_id=? AND source=? "
+                "AND state IN ('received', 'submitting', 'started') "
+                "ORDER BY updated_at DESC LIMIT 1",
+                (thread_id, source),
+            ).fetchone()
+        return self._prompt_intent_from_row(row) if row is not None else None
+
     def resolve_prompt_intent_choice(
         self,
         client_message_id: str,

@@ -199,6 +199,59 @@ async def test_start_turn_passes_named_permissions_and_reviewer() -> None:
 
 
 @pytest.mark.asyncio
+async def test_start_review_sends_canonical_review_start_payload() -> None:
+    client = CodexClient(Path("/tmp/not-used.sock"))
+    calls: list[tuple[str, dict[str, Any], float]] = []
+
+    async def request(method: str, params: dict[str, Any], timeout: float = 30.0) -> dict[str, Any]:
+        calls.append((method, params, timeout))
+        return {"turn": {"id": "review-turn"}}
+
+    client.request = request  # type: ignore[method-assign]
+
+    result = await client.start_review(
+        "thread-review",
+        {
+            "type": "commit",
+            "sha": "abc123",
+            "title": "  inspect patch  ",
+            "ignored": "field",
+        },
+    )
+
+    assert result == {"turn": {"id": "review-turn"}}
+    assert calls == [
+        (
+            "review/start",
+            {
+                "threadId": "thread-review",
+                "delivery": "inline",
+                "target": {"type": "commit", "sha": "abc123", "title": "inspect patch"},
+            },
+            60,
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_start_review_rejects_invalid_target_before_rpc() -> None:
+    client = CodexClient(Path("/tmp/not-used.sock"))
+    called = False
+
+    async def request(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        nonlocal called
+        called = True
+        return {}
+
+    client.request = request  # type: ignore[method-assign]
+
+    with pytest.raises(ValueError, match="Unsupported review target"):
+        await client.start_review("thread-review", {"type": "invalid"})
+
+    assert called is False
+
+
+@pytest.mark.asyncio
 async def test_start_turn_passes_resolved_collaboration_mode() -> None:
     client = CodexClient(Path("/tmp/not-used.sock"))
     calls: list[tuple[str, dict[str, Any], float]] = []

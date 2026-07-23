@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly INSTALLER_VERSION="0.2.8"
+readonly INSTALLER_VERSION="0.3.0"
 readonly UV_VERSION="0.11.28"
 readonly PROJECT="codex-telegram-bridge"
 readonly REPOSITORY="LeeKai233/codex-telegram-bridge"
@@ -19,7 +19,7 @@ SKIP_ONBOARDING=0
 REUSE_EXISTING_APP_SERVER=0
 CHECK_ONLY=0
 PREFLIGHT_FAILED=0
-EXTERNAL_APP_SERVER=0
+APP_SERVER_MODE="external"
 TEMP_FILES=()
 
 BIN_DIR=""
@@ -692,12 +692,99 @@ write_initial_config() {
         printf 'codex_socket = %s\n' "$(toml_quote "$CODEX_SOCKET")"
         printf 'codex_binary = %s\n' "$(toml_quote "$CODEX_BIN")"
         printf 'allowed_root = %s\n' "$(toml_quote "$HOME")"
+        printf 'app_server_mode = %s\n' "$(toml_quote "$APP_SERVER_MODE")"
         printf 'tmux_session = "CodexBot"\n'
         printf 'control_bot_label = %s\n' "$(toml_quote "$control_label")"
         printf 'discussion_bot_label = %s\n' "$(toml_quote "$discussion_label")"
     } >"$temporary"
     mv "$temporary" "$CONFIG_FILE"
     info "Created private configuration at $CONFIG_FILE."
+}
+
+persist_app_server_mode() {
+    [[ -f "$CONFIG_FILE" && ! -L "$CONFIG_FILE" ]] || die "config.toml is not a regular file"
+    CONFIG_FILE="$CONFIG_FILE" APP_SERVER_MODE="$APP_SERVER_MODE" "$PYTHON_BIN" <<'PY'
+import json
+import os
+import re
+import stat
+import tempfile
+from pathlib import Path
+
+
+config_path = Path(os.environ["CONFIG_FILE"])
+mode = os.environ["APP_SERVER_MODE"]
+if mode not in {"installer-service", "managed-daemon", "external"}:
+    raise SystemExit(f"unsupported app-server mode: {mode}")
+
+text = config_path.read_text(encoding="utf-8")
+newline = "\r\n" if "\r\n" in text else "\n"
+lines = text.splitlines(keepends=True)
+section_pattern = re.compile(r"^\s*\[[^]]+\]")
+key_pattern = re.compile(r"^\s*app_server_mode\s*=")
+
+bridge_start = next(
+    (index for index, line in enumerate(lines) if line.strip() == "[bridge]"),
+    None,
+)
+if bridge_start is None:
+    section_end = next(
+        (index for index, line in enumerate(lines) if section_pattern.match(line)),
+        len(lines),
+    )
+    key_indexes = [index for index in range(section_end) if key_pattern.match(lines[index])]
+    insert_at = section_end
+else:
+    section_end = next(
+        (
+            index
+            for index in range(bridge_start + 1, len(lines))
+            if section_pattern.match(lines[index])
+        ),
+        len(lines),
+    )
+    key_indexes = [
+        index
+        for index in range(bridge_start + 1, section_end)
+        if key_pattern.match(lines[index])
+    ]
+    insert_at = bridge_start + 1
+
+key_line = f"app_server_mode = {json.dumps(mode, ensure_ascii=False)}{newline}"
+if key_indexes:
+    lines[key_indexes[0]] = key_line
+    for index in reversed(key_indexes[1:]):
+        del lines[index]
+else:
+    if bridge_start is not None and lines[bridge_start] and not lines[bridge_start].endswith(("\n", "\r")):
+        lines[bridge_start] += newline
+    lines.insert(insert_at, key_line)
+
+updated = "".join(lines)
+metadata = config_path.stat()
+descriptor, temporary_name = tempfile.mkstemp(
+    prefix=".config.toml.mode.",
+    dir=config_path.parent,
+    text=True,
+)
+try:
+    with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
+        descriptor = -1
+        handle.write(updated)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(temporary_name, stat.S_IMODE(metadata.st_mode))
+    os.replace(temporary_name, config_path)
+except BaseException:
+    if descriptor >= 0:
+        os.close(descriptor)
+    try:
+        os.unlink(temporary_name)
+    except FileNotFoundError:
+        pass
+    raise
+PY
+    info "Persisted app-server ownership mode: $APP_SERVER_MODE"
 }
 
 semver_is_at_most() {
@@ -784,23 +871,28 @@ PY
 
 select_app_server_strategy() {
     local app_unit="codex-telegram-app-server.service"
+    APP_SERVER_MODE="external"
     if unit_exists "$app_unit"; then
         if unit_is_installer_owned "$app_unit"; then
-            EXTERNAL_APP_SERVER=0
+            APP_SERVER_MODE="installer-service"
         elif ((REUSE_EXISTING_APP_SERVER)); then
             [[ -S "$CODEX_SOCKET" ]] || die "unowned $app_unit exists but $CODEX_SOCKET is not active"
             validate_private_socket || die "existing Codex socket is not private and reachable"
-            EXTERNAL_APP_SERVER=1
+            APP_SERVER_MODE="external"
         else
             die "unowned $app_unit already exists; rerun with --reuse-existing-app-server only if its private socket is intentional"
         fi
+    elif unit_exists codex-managed-daemon-bootstrap.service; then
+        APP_SERVER_MODE="managed-daemon"
     elif [[ -e "$CODEX_SOCKET" || -L "$CODEX_SOCKET" ]]; then
         if ((REUSE_EXISTING_APP_SERVER)); then
             validate_private_socket || die "existing Codex socket is not private and reachable"
-            EXTERNAL_APP_SERVER=1
+            APP_SERVER_MODE="external"
         else
             die "$CODEX_SOCKET already exists outside an installer-owned unit; rerun with --reuse-existing-app-server to keep it"
         fi
+    else
+        APP_SERVER_MODE="installer-service"
     fi
 
     if unit_exists codex-telegram-bridge.service && ! unit_is_installer_owned codex-telegram-bridge.service; then
@@ -865,15 +957,63 @@ EOF
     mv "$temporary" "$destination"
 }
 
+write_managed_daemon_watchdog_units() {
+    local service="codex-managed-daemon-watchdog.service"
+    local timer="codex-managed-daemon-watchdog.timer"
+    local name destination temporary
+    for name in "$service" "$timer"; do
+        if unit_exists "$name" && ! unit_is_installer_owned "$name"; then
+            die "unowned $name already exists; refusing to overwrite it"
+        fi
+    done
+
+    destination="$USER_UNIT_DIR/$service"
+    temporary="$(mktemp "$USER_UNIT_DIR/.codex-managed-daemon-watchdog.XXXXXX")"
+    cat >"$temporary" <<EOF
+$UNIT_MARKER
+$UNIT_VERSION
+[Unit]
+Description=Codex managed daemon socket watchdog for Telegram Bridge
+After=codex-managed-daemon-bootstrap.service
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/codex-tg app-server-watchdog --recover
+Environment=CODEX_HOME=%h/.codex
+Environment=CODEX_APP_SERVER_MODE=managed-daemon
+EOF
+    chmod 0644 "$temporary"
+    mv "$temporary" "$destination"
+
+    destination="$USER_UNIT_DIR/$timer"
+    temporary="$(mktemp "$USER_UNIT_DIR/.codex-managed-daemon-watchdog-timer.XXXXXX")"
+    cat >"$temporary" <<EOF
+$UNIT_MARKER
+$UNIT_VERSION
+[Unit]
+Description=Periodic Codex managed daemon socket watchdog
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+Unit=codex-managed-daemon-watchdog.service
+
+[Install]
+WantedBy=timers.target
+EOF
+    chmod 0644 "$temporary"
+    mv "$temporary" "$destination"
+}
+
 write_bridge_unit() {
     local destination="$USER_UNIT_DIR/codex-telegram-bridge.service"
     local wants="network-online.target"
     local after="network-online.target"
     local temporary
-    if ((EXTERNAL_APP_SERVER == 0)); then
+    if [[ "$APP_SERVER_MODE" == "installer-service" ]]; then
         after="network-online.target codex-telegram-app-server.service"
     fi
-    if unit_exists codex-managed-daemon-bootstrap.service; then
+    if [[ "$APP_SERVER_MODE" == "managed-daemon" ]]; then
         wants+=" codex-managed-daemon-bootstrap.service"
         after+=" codex-managed-daemon-bootstrap.service"
     fi
@@ -892,7 +1032,6 @@ StartLimitBurst=30
 [Service]
 Type=simple
 WorkingDirectory=%h
-ExecStartPre=/usr/bin/test -S %h/.codex/app-server-control/app-server-control.sock
 ExecStart=/usr/bin/env CODEX_HOME=%h/.codex %h/.local/bin/codex-telegram-bridge
 Restart=on-failure
 RestartSec=30s
@@ -901,6 +1040,7 @@ KillSignal=SIGTERM
 KillMode=process
 Environment=PYTHONUNBUFFERED=1
 Environment=CODEX_HOME=%h/.codex
+Environment=CODEX_APP_SERVER_MODE=$APP_SERVER_MODE
 Environment=PATH=%h/.local/bin:%h/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin
 EnvironmentFile=-%h/.config/codex-telegram-bridge/proxy.env
 UMask=0077
@@ -943,30 +1083,40 @@ install_and_start_units() {
     install_user="$(id -un)"
     prepare_user_unit_dir
     select_app_server_strategy
-    if ((EXTERNAL_APP_SERVER == 0)); then
+    persist_app_server_mode
+    if [[ "$APP_SERVER_MODE" == "installer-service" ]]; then
         write_app_server_unit
-    else
+    elif [[ "$APP_SERVER_MODE" == "external" ]]; then
         info "Reusing the existing private Codex App Server socket."
     fi
-    if unit_exists codex-managed-daemon-bootstrap.service; then
+    if [[ "$APP_SERVER_MODE" == "managed-daemon" ]]; then
         write_managed_daemon_recovery_dropin
+        write_managed_daemon_watchdog_units
     fi
     write_bridge_unit
 
-    if ((EXTERNAL_APP_SERVER == 0)); then
+    if [[ "$APP_SERVER_MODE" == "installer-service" ]]; then
         systemd-analyze --user verify \
             "$USER_UNIT_DIR/codex-telegram-app-server.service" \
+            "$USER_UNIT_DIR/codex-telegram-bridge.service"
+    elif [[ "$APP_SERVER_MODE" == "managed-daemon" ]]; then
+        systemd-analyze --user verify \
+            "$USER_UNIT_DIR/codex-managed-daemon-watchdog.service" \
+            "$USER_UNIT_DIR/codex-managed-daemon-watchdog.timer" \
             "$USER_UNIT_DIR/codex-telegram-bridge.service"
     else
         systemd-analyze --user verify "$USER_UNIT_DIR/codex-telegram-bridge.service"
     fi
     sudo loginctl enable-linger "$install_user"
     systemctl --user daemon-reload
-    if ((EXTERNAL_APP_SERVER == 0)); then
+    if [[ "$APP_SERVER_MODE" == "installer-service" ]]; then
         systemctl --user enable codex-telegram-app-server.service
         systemctl --user restart codex-telegram-app-server.service
         wait_for_unit codex-telegram-app-server.service || die "Codex App Server failed to start"
         validate_private_socket || die "managed Codex socket did not become private and reachable"
+    fi
+    if [[ "$APP_SERVER_MODE" == "managed-daemon" ]]; then
+        systemctl --user enable --now codex-managed-daemon-watchdog.timer
     fi
     systemctl --user enable codex-telegram-bridge.service
     systemctl --user restart codex-telegram-bridge.service
@@ -1016,7 +1166,7 @@ main() {
     run_onboarding
 
     info "Installation complete."
-    info "Services: systemctl --user status codex-telegram-app-server codex-telegram-bridge"
+    info "Services: systemctl --user status codex-telegram-bridge"
     info "Diagnostics: $CODEX_TG_BIN doctor"
 }
 

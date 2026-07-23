@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .app_server import AppServerSupervisor
 from .config import Config, ensure_private_directory
 from .outbound import TelegramOutcomeUncertain
 from .store import Store
@@ -78,6 +79,15 @@ class AlreadyRunning(RuntimeError):
 
 class PollingRecoveryError(RuntimeError):
     pass
+
+
+class AppServerRecoveryError(RuntimeError):
+    pass
+
+
+async def _disabled_protocol_probe(_command: tuple[str, ...]) -> bool:
+    """Keep the in-process supervisor authoritative for fresh client generations."""
+    return False
 
 
 @contextmanager
@@ -692,6 +702,15 @@ def _build_runtime(config: Config) -> Runtime:
             delivery=delivery,
             manage_messenger=False,
         )
+        bridge.app_server_supervisor = AppServerSupervisor(
+            bridge.client,
+            config.app_server_mode,
+            config.codex_socket,
+            config.codex_binary,
+            config.state_dir,
+            installer_restart=_restart_installer_app_server,
+            protocol_probe=_disabled_protocol_probe,
+        )
         security = SecurityManager(store, config.totp_secret_path, config.totp_unlock_seconds)
         dashboards = SpaceDashboardManager(
             config,
@@ -781,6 +800,19 @@ async def _call_hook(hook: Any, application: Any) -> None:
         await hook(application)
 
 
+async def _restart_installer_app_server() -> int:
+    process = await asyncio.create_subprocess_exec(
+        "systemctl",
+        "--user",
+        "restart",
+        "codex-telegram-app-server.service",
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    return await process.wait()
+
+
 async def run_service(config: Config, stop_event: asyncio.Event | None = None) -> None:
     runtime = _build_runtime(config)
     applications = tuple(getattr(runtime, "applications", (runtime.application,)))
@@ -807,6 +839,7 @@ async def run_service(config: Config, stop_event: asyncio.Event | None = None) -
     health_task: asyncio.Task[None] | None = None
     polling_health_task: asyncio.Task[None] | None = None
     health_snapshot_task: asyncio.Task[None] | None = None
+    app_server_health_task: asyncio.Task[None] | None = None
     stop_wait_task: asyncio.Task[bool] | None = None
     polling_supervisor = PollingSupervisor(
         applications,
@@ -850,10 +883,20 @@ async def run_service(config: Config, stop_event: asyncio.Event | None = None) -
             _health_snapshot_monitor(runtime, polling_supervisor, stop_event),
             name="bridge-health-snapshot",
         )
+        app_server_supervisor = getattr(runtime.bridge, "app_server_supervisor", None)
+        if app_server_supervisor is not None:
+            app_server_health_task = asyncio.create_task(
+                app_server_supervisor.monitor(stop_event, interval=1.0),
+                name="codex-app-server-health",
+            )
         LOGGER.info("Codex Telegram Bridge is running")
         stop_wait_task = asyncio.create_task(stop_event.wait(), name="bridge-stop-wait")
         completed, _pending = await asyncio.wait(
-            (stop_wait_task, polling_health_task),
+            tuple(
+                task
+                for task in (stop_wait_task, polling_health_task, app_server_health_task)
+                if task is not None
+            ),
             return_when=asyncio.FIRST_COMPLETED,
         )
         if stop_event.is_set():
@@ -864,6 +907,16 @@ async def run_service(config: Config, stop_event: asyncio.Event | None = None) -
                 raise PollingRecoveryError("Telegram polling supervisor stopped unexpectedly")
             raise PollingRecoveryError(
                 f"Telegram polling supervisor crashed: {type(supervisor_error).__name__}"
+            ) from supervisor_error
+        elif app_server_health_task is not None and app_server_health_task in completed:
+            supervisor_error = app_server_health_task.exception()
+            app_server = getattr(runtime.bridge, "app_server_supervisor", None)
+            if app_server is not None and getattr(app_server, "fatal_error", None):
+                raise AppServerRecoveryError(str(app_server.fatal_error))
+            if supervisor_error is None:
+                raise AppServerRecoveryError("Codex app-server supervisor stopped unexpectedly")
+            raise AppServerRecoveryError(
+                f"Codex app-server supervisor crashed: {type(supervisor_error).__name__}"
             ) from supervisor_error
     finally:
         stop_event.set()
@@ -877,6 +930,14 @@ async def run_service(config: Config, stop_event: asyncio.Event | None = None) -
             polling_health_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await polling_health_task
+        if app_server_health_task is not None:
+            app_server_health_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await app_server_health_task
+        app_server_supervisor = getattr(runtime.bridge, "app_server_supervisor", None)
+        if app_server_supervisor is not None:
+            with contextlib.suppress(Exception):
+                await app_server_supervisor.stop()
         if health_snapshot_task is not None:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await health_snapshot_task

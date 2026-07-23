@@ -22,7 +22,7 @@ from .approval import (
     interactive_approval_decisions,
     normalize_command_approval_params,
 )
-from .codex import CodexClient, CodexRpcError, file_input, text_input
+from .codex import CodexClient, CodexDisconnected, CodexRpcError, file_input, text_input
 from .config import Config
 from .dashboard import DashboardManager
 from .delivery import TelegramDeliveryEngine
@@ -45,6 +45,7 @@ StateChangeHandler = Callable[[ThreadState, str], Awaitable[None]]
 QuestionResolvedHandler = Callable[[str], Awaitable[None]]
 PlanCompletedHandler = Callable[[str, str, str, str], Awaitable[None]]
 PromptCompletedHandler = Callable[[Json], Awaitable[None]]
+ReviewCompletedHandler = Callable[[Json], Awaitable[None]]
 TuiPlanApprovedHandler = Callable[[str, str], Awaitable[None]]
 
 _FINAL_TURN_STATUSES = {"completed", "failed", "interrupted"}
@@ -52,6 +53,7 @@ _SUBAGENT_PROFILE_RETRY_DELAYS = (1.0, 5.0, 30.0, 120.0)
 _THREAD_SNAPSHOT_SECONDS = 5.0
 _TURN_RECONCILE_SECONDS = 1.0
 _TURN_RECONCILE_MAX_SECONDS = 30.0
+_REVIEW_RECONCILE_DELAYS = (1.0, 2.0, 4.0, 8.0, 16.0, 30.0)
 _NOTIFICATION_EFFECT_CAPACITY = 256
 _NOTIFICATION_EFFECT_DRAIN_SECONDS = 5.0
 # The Codex TUI emits this fixed input after "Yes, implement this plan" is selected.
@@ -71,7 +73,97 @@ class _TurnGate:
     expected_turn_id: str | None = None
 
 
+@dataclass(slots=True)
+class _PendingReview:
+    client_message_id: str
+    space_id: str
+    generation: int
+    baseline_turn_ids: frozenset[str]
+    review_prompt: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ReviewTurnMatch:
+    turn: Json
+    entered_item: Json
+    exited_item: Json | None
+
+
 NotificationEffect = tuple[str, Callable[[], Awaitable[None]]]
+
+
+def _review_turn_ids(payload: Json) -> frozenset[str]:
+    return frozenset(
+        str(turn.get("id") or "")
+        for turn in payload.get("turns") or []
+        if isinstance(turn, dict) and str(turn.get("id") or "")
+    )
+
+
+def _find_review_turn(
+    payload: Json,
+    excluded_turn_ids: frozenset[str],
+    expected_review: str,
+) -> _ReviewTurnMatch | None:
+    matches: list[_ReviewTurnMatch] = []
+    for raw_turn in reversed(payload.get("turns") or []):
+        if not isinstance(raw_turn, dict):
+            continue
+        turn_id = str(raw_turn.get("id") or "")
+        if not turn_id or turn_id in excluded_turn_ids:
+            continue
+        items = raw_turn.get("items") or []
+        if not isinstance(items, list):
+            continue
+        entered_item = next(
+            (
+                item
+                for item in items
+                if isinstance(item, dict) and item.get("type") == "enteredReviewMode"
+            ),
+            None,
+        )
+        if entered_item is None:
+            continue
+        if not _review_hint_matches(
+            expected_review,
+            str(entered_item.get("review") or ""),
+        ):
+            continue
+        exited_item = next(
+            (
+                item
+                for item in reversed(items)
+                if isinstance(item, dict) and item.get("type") == "exitedReviewMode"
+            ),
+            None,
+        )
+        matches.append(
+            _ReviewTurnMatch(
+                turn=dict(raw_turn),
+                entered_item=dict(entered_item),
+                exited_item=dict(exited_item) if exited_item is not None else None,
+            )
+        )
+    # A timed-out review has no request correlation ID. Refuse to guess when
+    # more than one matching turn appeared after the baseline.
+    return matches[0] if len(matches) == 1 else None
+
+
+def _review_hint_matches(expected_review: str, actual_review: str) -> bool:
+    expected = " ".join(expected_review.split()).casefold()
+    actual = " ".join(actual_review.split()).casefold()
+    if not expected or not actual:
+        return False
+    if expected.startswith("commit "):
+        if not actual.startswith("commit "):
+            return False
+        expected_sha = expected.removeprefix("commit ").split(":", 1)[0].strip()
+        actual_sha = actual.removeprefix("commit ").split(":", 1)[0].strip()
+        return bool(expected_sha and actual_sha) and (
+            expected_sha.startswith(actual_sha) or actual_sha.startswith(expected_sha)
+        )
+    return actual == expected
 
 
 def _workspace_write_policy() -> Json:
@@ -167,6 +259,10 @@ async def _noop_prompt_completed(run: Json) -> None:
     del run
 
 
+async def _noop_review_completed(run: Json) -> None:
+    del run
+
+
 async def _noop_tui_plan_approved(thread_id: str, turn_id: str) -> None:
     del thread_id, turn_id
 
@@ -204,6 +300,7 @@ class Bridge:
         self.on_question_resolved: QuestionResolvedHandler = _noop_question_resolved
         self.on_plan_completed: PlanCompletedHandler = _noop_plan_completed
         self.on_prompt_completed: PromptCompletedHandler = _noop_prompt_completed
+        self.on_review_completed: ReviewCompletedHandler = _noop_review_completed
         self.on_tui_plan_approved: TuiPlanApprovedHandler = _noop_tui_plan_approved
         self.dashboard = DashboardManager(
             self.control_endpoint,
@@ -240,6 +337,9 @@ class Bridge:
         self._pending_requests: dict[str, tuple[int | str, int]] = {}
         self._resolved_request_ids: dict[tuple[int, str], None] = {}
         self._notified_plan_items: dict[tuple[str, str, str], None] = {}
+        self._notified_review_turns: dict[tuple[str, str, str], None] = {}
+        self._pending_reviews: dict[str, _PendingReview] = {}
+        self._review_reconcile_tasks: dict[str, asyncio.Task[None]] = {}
         self._terminal_turns: dict[tuple[str, str], tuple[str, str]] = {}
         self._thread_snapshots: dict[str, _ThreadSnapshot] = {}
         self._thread_refresh_tasks: dict[str, asyncio.Task[Json]] = {}
@@ -258,6 +358,9 @@ class Bridge:
         self._resync_failures = 0
         self._resync_last_error: str | None = None
         self._started = False
+        self.app_server_supervisor: Any | None = None
+        self._app_server_presence_task: asyncio.Task[None] | None = None
+        self._app_server_started_at: float | None = None
 
     async def start(self) -> None:
         if self._started:
@@ -275,7 +378,11 @@ class Bridge:
         self.dashboard.start()
         await self.directory_index.refresh()
         self.client.start()
-        await self.client.wait_connected(timeout=20)
+        self._app_server_started_at = time.monotonic()
+        self._app_server_presence_task = asyncio.create_task(
+            self._app_server_presence_loop(),
+            name="codex-app-server-presence",
+        )
         self._maintenance_task = asyncio.create_task(
             self._maintenance_loop(), name="bridge-local-maintenance"
         )
@@ -284,6 +391,12 @@ class Bridge:
         if not self._started:
             return
         self._started = False
+        presence_task = self._app_server_presence_task
+        self._app_server_presence_task = None
+        if presence_task is not None:
+            presence_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await presence_task
         if self._maintenance_task:
             self._maintenance_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -307,6 +420,12 @@ class Bridge:
             task.cancel()
         if reconcile_tasks:
             await asyncio.gather(*reconcile_tasks, return_exceptions=True)
+        review_reconcile_tasks = list(self._review_reconcile_tasks.values())
+        self._review_reconcile_tasks.clear()
+        for task in review_reconcile_tasks:
+            task.cancel()
+        if review_reconcile_tasks:
+            await asyncio.gather(*review_reconcile_tasks, return_exceptions=True)
         refresh_tasks = list(self._thread_refresh_tasks.values())
         self._thread_refresh_tasks.clear()
         for task in refresh_tasks:
@@ -316,6 +435,14 @@ class Bridge:
         self._thread_snapshots.clear()
         for thread_id in list(self._turn_gates):
             self._release_turn_gate(thread_id, None)
+        for thread_id, pending in tuple(self._pending_reviews.items()):
+            self._settle_pending_review(
+                thread_id,
+                pending.client_message_id,
+                to_state="cancelled",
+                error="Bridge stopped before Review delivery was confirmed",
+            )
+        self._pending_reviews.clear()
         await self.client.stop()
         await self._stop_notification_effects()
         await self.dashboard.stop()
@@ -385,6 +512,91 @@ class Bridge:
         )
         self.store.cleanup()
 
+    async def _app_server_presence_loop(self) -> None:
+        threshold = max(1, self.config.disconnect_threshold_seconds)
+        while self._started:
+            await asyncio.sleep(1.0)
+            if self.client.connected:
+                continue
+            started_at = self._app_server_started_at
+            if started_at is None or time.monotonic() - started_at < threshold:
+                continue
+            await self._begin_app_server_incident(
+                self.client.health_snapshot().get("last_disconnect_reason")
+                or "Codex app-server unavailable during startup",
+                initial=True,
+            )
+
+    def _app_server_incident(self) -> Json | None:
+        raw = self.store.get_meta("codex_app_server_incident")
+        if not isinstance(raw, str) or not raw.strip():
+            return None
+        try:
+            value = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+        return dict(value) if isinstance(value, dict) else None
+
+    def _save_app_server_incident(self, incident: Json) -> None:
+        self.store.set_meta("codex_app_server_incident", json.dumps(incident, ensure_ascii=False))
+
+    async def _begin_app_server_incident(self, reason: str, *, initial: bool) -> None:
+        incident = self._app_server_incident()
+        if incident is None or incident.get("state") != "open":
+            incident = {
+                "id": uuid.uuid4().hex,
+                "state": "open",
+                "started_at": int(time.time()),
+                "initial": initial,
+                "reason": reason,
+                "disconnect_notice_claimed": False,
+                "recovery_notice_claimed": False,
+            }
+        else:
+            incident.setdefault("reason", reason)
+            incident.setdefault("initial", initial)
+        if incident.get("disconnect_notice_claimed"):
+            self._save_app_server_incident(incident)
+            return
+        incident["disconnect_notice_claimed"] = True
+        incident["disconnect_notice_claimed_at"] = int(time.time())
+        self._save_app_server_incident(incident)
+        try:
+            await self.on_notice("Codex app-server 已断开，正在自动恢复", None)
+            incident["disconnect_notice_outcome"] = "delivered"
+        except Exception as exc:
+            incident["disconnect_notice_outcome"] = "failed"
+            LOGGER.warning(
+                "event=codex_app_server_disconnect_notice_failed error_type=%s",
+                type(exc).__name__,
+            )
+        self._save_app_server_incident(incident)
+
+    async def _finish_app_server_incident(self) -> None:
+        incident = self._app_server_incident()
+        if incident is None or incident.get("state") != "open":
+            return
+        started_at = int(incident.get("started_at") or int(time.time()))
+        duration = max(0, int(time.time()) - started_at)
+        if incident.get("disconnect_notice_claimed") and not incident.get("recovery_notice_claimed"):
+            incident["recovery_notice_claimed"] = True
+            incident["recovery_notice_claimed_at"] = int(time.time())
+            self._save_app_server_incident(incident)
+            text = f"Codex app-server 已恢复，连接与会话同步已完成（中断 {duration} 秒）"
+            try:
+                await self.on_notice(text, None)
+                incident["recovery_notice_outcome"] = "delivered"
+            except Exception as exc:
+                incident["recovery_notice_outcome"] = "failed"
+                LOGGER.warning(
+                    "event=codex_app_server_recovery_notice_failed error_type=%s",
+                    type(exc).__name__,
+                )
+        incident["state"] = "resolved"
+        incident["recovered_at"] = int(time.time())
+        incident["duration_seconds"] = duration
+        self._save_app_server_incident(incident)
+
     async def _maintenance_loop(self) -> None:
         while True:
             try:
@@ -412,10 +624,16 @@ class Bridge:
                     expected_generation=int(space["generation"]),
                 )
             await self.resync()
+            await self._finish_app_server_incident()
         else:
             LOGGER.warning("Codex app-server disconnected: %s", reason)
+            supervisor = self.app_server_supervisor
+            wake = getattr(supervisor, "wake", None)
+            if callable(wake):
+                with contextlib.suppress(Exception):
+                    await wake()
             if self._started:
-                await self.on_notice("Codex app-server 已断开，正在重连", None)
+                await self._begin_app_server_incident(reason or "connection closed", initial=False)
 
     async def resync(self) -> None:
         self._resync_started_at = int(time.time())
@@ -425,6 +643,7 @@ class Bridge:
         for thread_id in sorted(legacy_subscriptions | space_subscriptions):
             try:
                 state = await self.subscribe_space_thread(thread_id)
+                self._recover_review_intent(thread_id, state)
                 if thread_id in legacy_subscriptions:
                     await self.dashboard.schedule(state, immediate=True)
                 if thread_id in space_subscriptions:
@@ -465,12 +684,67 @@ class Bridge:
                 self._resync_failures += 1
                 self._resync_last_error = type(exc).__name__
                 LOGGER.exception("Failed to resync thread %s", thread_id)
+        for thread_id in tuple(self._pending_reviews):
+            self._schedule_review_reconciliation(thread_id)
         await self._hydrate_missing_subagent_profiles()
         self._resync_finished_at = int(time.time())
 
+    def _recover_review_intent(self, thread_id: str, state: ThreadState) -> None:
+        """Close Review intents whose in-memory delivery state was lost."""
+        if thread_id in self._pending_reviews:
+            return
+        intent = self.store.find_active_prompt_intent(thread_id, source="review")
+        if intent is None:
+            return
+        if intent.state in {"received", "submitting"}:
+            self.store.transition_prompt_intent(
+                intent.client_message_id,
+                expected_states={intent.state},
+                to_state="failed",
+                error="Review delivery state was lost during Bridge restart",
+            )
+            return
+        if intent.state != "started":
+            return
+        if intent.turn_id and intent.turn_id in {state.turn_id, state.review_turn_id}:
+            if state.review_turn_id != intent.turn_id:
+                state.review_turn_id = intent.turn_id
+                state.review_target = state.review_target or intent.prompt[:1000]
+                if state.turn_status == "inProgress":
+                    state.review_status = "inProgress"
+                elif state.turn_status in _FINAL_TURN_STATUSES:
+                    state.review_status = (
+                        "completed" if state.turn_status == "completed" else state.turn_status
+                    )
+                self.store.save_thread(state)
+            if state.turn_status in _FINAL_TURN_STATUSES:
+                self.store.finish_prompt_intents(
+                    thread_id,
+                    intent.turn_id,
+                    status=state.turn_status,
+                    error=state.last_error or None,
+                )
+                return
+            if state.review_status == "inProgress" or state.turn_status == "inProgress":
+                return
+        self.store.transition_prompt_intent(
+            intent.client_message_id,
+            expected_states={"started"},
+            to_state="failed",
+            error="Review turn was not present after Bridge restart",
+        )
+
     def health_snapshot(self) -> dict[str, Any]:
+        incident = self._app_server_incident()
         return {
             "codex": self.client.health_snapshot(),
+            "app_server_supervisor": (
+                self.app_server_supervisor.snapshot()
+                if self.app_server_supervisor is not None
+                and callable(getattr(self.app_server_supervisor, "snapshot", None))
+                else {}
+            ),
+            "app_server_incident": incident or {},
             "queue_retry_tasks": len(self._queue_retry_tasks),
             "subagent_profile_tasks": len(self._subagent_profile_tasks),
             "managed_threads": len(self._managed_thread_ids()),
@@ -926,6 +1200,149 @@ class Bridge:
             self._release_turn_gate(thread_id, None)
             return
         self._schedule_turn_reconciliation(thread_id)
+
+    def _release_pending_review_gate(
+        self,
+        thread_id: str,
+        pending: _PendingReview,
+        turn_id: str | None = None,
+    ) -> bool:
+        gate = self._turn_gates.get(thread_id)
+        if gate is None or gate.client_message_id != pending.client_message_id:
+            return False
+        return self._release_turn_gate(thread_id, turn_id)
+
+    def _settle_pending_review(
+        self,
+        thread_id: str,
+        client_message_id: str,
+        *,
+        to_state: str,
+        error: str,
+        turn_id: str | None = None,
+    ) -> bool:
+        pending = self._pending_reviews.get(thread_id)
+        if pending is None or pending.client_message_id != client_message_id:
+            return False
+        self._pending_reviews.pop(thread_id, None)
+        self.store.transition_prompt_intent(
+            client_message_id,
+            expected_states={"submitting", "uncertain"},
+            to_state=to_state,
+            turn_id=turn_id,
+            error=error,
+        )
+        self._release_pending_review_gate(thread_id, pending, turn_id)
+        return True
+
+    def _schedule_review_reconciliation(self, thread_id: str) -> None:
+        pending = self._pending_reviews.get(thread_id)
+        if pending is None:
+            return
+        current = self._review_reconcile_tasks.get(thread_id)
+        if current is not None and not current.done():
+            return
+
+        async def reconcile() -> None:
+            idle_observations = 0
+            try:
+                for delay in _REVIEW_RECONCILE_DELAYS:
+                    await asyncio.sleep(max(0.0, delay))
+                    current_pending = self._pending_reviews.get(thread_id)
+                    if current_pending is None:
+                        return
+                    space = self.store.get_space(current_pending.space_id)
+                    if (
+                        space is None
+                        or space.get("lifecycle") != "active"
+                        or int(space.get("generation", 0)) != current_pending.generation
+                        or str(space.get("thread_id") or "") != thread_id
+                    ):
+                        self._settle_pending_review(
+                            thread_id,
+                            current_pending.client_message_id,
+                            to_state="cancelled",
+                            error="SessionSpace generation is stale",
+                        )
+                        return
+                    try:
+                        payload = await self.client.read_thread(thread_id, include_turns=True)
+                    except Exception as exc:
+                        LOGGER.debug(
+                            "event=review_reconcile_read_failed thread_id=%s error_type=%s",
+                            thread_id[:8],
+                            type(exc).__name__,
+                        )
+                        idle_observations = 0
+                        continue
+                    found = _find_review_turn(
+                        payload,
+                        current_pending.baseline_turn_ids,
+                        current_pending.review_prompt,
+                    )
+                    if found is not None:
+                        turn = found.turn
+                        turn_id = str(turn.get("id") or "")
+                        if not turn_id:
+                            continue
+                        self._bind_pending_review(thread_id, turn_id, found.entered_item)
+                        status = str(turn.get("status") or "")
+                        if status in _FINAL_TURN_STATUSES:
+                            error_kind = _turn_error_kind(turn.get("error"))
+                            self.store.finish_prompt_intents(
+                                thread_id,
+                                turn_id,
+                                status=status,
+                                error=error_kind or None,
+                            )
+                            if self._release_turn_gate(thread_id, turn_id):
+                                self._request_queue_after_completion(thread_id)
+                            await self._notify_review_completed(
+                                {
+                                    "thread_id": thread_id,
+                                    "turn_id": turn_id,
+                                    "status": status,
+                                    "summary": str(
+                                        (found.exited_item or {}).get("review") or ""
+                                    ),
+                                    "error": error_kind,
+                                }
+                            )
+                        return
+                    state = self.store.get_thread(thread_id)
+                    if (
+                        self.client.connected
+                        and state is not None
+                        and state.status == "idle"
+                        and state.turn_status != "inProgress"
+                    ):
+                        idle_observations += 1
+                        if idle_observations >= 2:
+                            self._settle_pending_review(
+                                thread_id,
+                                current_pending.client_message_id,
+                                to_state="failed",
+                                error="Review turn was not observed after delivery timeout",
+                            )
+                            return
+                    else:
+                        idle_observations = 0
+                current_pending = self._pending_reviews.get(thread_id)
+                if current_pending is None:
+                    return
+                self._settle_pending_review(
+                    thread_id,
+                    current_pending.client_message_id,
+                    to_state="uncertain",
+                    error="Review delivery could not be reconciled",
+                )
+            finally:
+                if self._review_reconcile_tasks.get(thread_id) is asyncio.current_task():
+                    self._review_reconcile_tasks.pop(thread_id, None)
+
+        self._review_reconcile_tasks[thread_id] = asyncio.create_task(
+            reconcile(), name=f"review-reconcile-{thread_id[:8]}"
+        )
 
     def _request_queue_after_completion(self, thread_id: str) -> None:
         spaces = self._active_spaces_for_thread(thread_id)
@@ -1403,6 +1820,169 @@ class Bridge:
                 mode,
             )
             return turn or {}
+
+    @staticmethod
+    def _review_target_prompt(target: Json) -> str:
+        review_type = str(target.get("type") or "")
+        if review_type == "uncommittedChanges":
+            return "current changes"
+        if review_type == "baseBranch":
+            branch = str(target.get("branch") or "").strip()
+            return f"changes against '{branch}'"
+        if review_type == "commit":
+            sha = str(target.get("sha") or "").strip()
+            return f"commit {sha[:7]}"
+        if review_type == "custom":
+            return str(target.get("instructions") or "Review").strip()[:2000]
+        return "Review"
+
+    async def start_space_review(
+        self,
+        space_id: str,
+        target: Json,
+        *,
+        client_message_id: str,
+    ) -> Json:
+        """Start an inline Codex review as a serialized one-shot turn."""
+        normalized_target = self.client.normalize_review_target(target)
+        if not client_message_id.strip():
+            raise ValueError("Review client message ID must not be empty")
+        lock = self._space_locks.setdefault(space_id, asyncio.Lock())
+        async with lock:
+            space = self._require_active_space(space_id)
+            generation = space.generation
+            thread_id = space.thread_id or ""
+            existing = self.store.create_prompt_intent(
+                client_message_id,
+                "review",
+                self._review_target_prompt(normalized_target),
+                "review",
+                thread_id=thread_id,
+                space_id=space.space_id,
+                generation=generation,
+            )
+            if existing.state == "started" and existing.turn_id:
+                return {"reviewThreadId": thread_id, "turn": {"id": existing.turn_id}}
+            if existing.state in {"submitting", "uncertain"}:
+                raise RuntimeError("上一次 Review 的送达状态待确认，请先等待 TUI 状态更新")
+            if existing.state in {"completed", "failed", "cancelled"}:
+                raise RuntimeError(f"Review intent is already terminal: {existing.state}")
+            try:
+                active_review = self.store.find_active_prompt_intent(thread_id, source="review")
+                if active_review is not None and active_review.client_message_id != client_message_id:
+                    raise RuntimeError("当前已有 Review 正在运行或等待确认，请稍后重试")
+                payload = await self._live_thread_snapshot(thread_id)
+                state = self.projector.apply_thread(payload)
+                await self._notify_projector_parent_changes("subagent/resync")
+                if state.thread_id != thread_id:
+                    raise RuntimeError("Codex resumed a different session")
+                if state.is_subagent or state.ephemeral:
+                    raise RuntimeError("Review turns require a primary session")
+                if state.status == "active" or state.turn_status == "inProgress":
+                    raise RuntimeError("当前 turn 正在运行，请稍后重试")
+                if state.review_status == "inProgress":
+                    raise RuntimeError("当前 Review 正在运行，请稍后重试")
+                if self.store.space_queue_entries(space.space_id, generation):
+                    raise RuntimeError("当前 Session 仍有排队 prompt，请先处理队列")
+                current = self._require_active_space(space_id)
+                if current.generation != generation or current.thread_id != thread_id:
+                    raise RuntimeError("Session space generation is stale")
+            except Exception as exc:
+                if existing.state == "received":
+                    self.store.transition_prompt_intent(
+                        client_message_id,
+                        expected_states={"received"},
+                        to_state="failed",
+                        error=type(exc).__name__,
+                    )
+                raise
+            if not await self._begin_turn_gate(thread_id, client_message_id):
+                self.store.transition_prompt_intent(
+                    client_message_id,
+                    expected_states={"received"},
+                    to_state="failed",
+                    error="turn gate is busy",
+                )
+                raise RuntimeError("当前 turn 正在运行，请稍后重试")
+            self.store.transition_prompt_intent(
+                client_message_id,
+                expected_states={"received"},
+                to_state="submitting",
+            )
+            self._pending_reviews[thread_id] = _PendingReview(
+                client_message_id=client_message_id,
+                space_id=space.space_id,
+                generation=generation,
+                baseline_turn_ids=_review_turn_ids(payload),
+                review_prompt=self._review_target_prompt(normalized_target),
+            )
+            try:
+                result = await self.client.start_review(
+                    thread_id,
+                    normalized_target,
+                    delivery="inline",
+                )
+                turn = dict(result.get("turn") or {})
+                turn_id = str(turn.get("id") or "")
+                if not turn_id:
+                    raise RuntimeError("Codex did not return an ID for the review turn")
+                self._bind_turn_gate(thread_id, client_message_id, turn_id)
+                self.store.transition_prompt_intent(
+                    client_message_id,
+                    expected_states={"submitting"},
+                    to_state="started",
+                    turn_id=turn_id,
+                )
+                self._pending_reviews.pop(thread_id, None)
+            except CodexRpcError as exc:
+                self._settle_pending_review(
+                    thread_id,
+                    client_message_id,
+                    to_state="failed",
+                    error=type(exc).__name__,
+                )
+                raise
+            except (CodexDisconnected, OSError, TimeoutError) as exc:
+                # review/start has no clientUserMessageId field. Keep the gate and
+                # intent pending while a late review notification or thread history
+                # can bind the turn instead of allowing a duplicate submission.
+                self.store.transition_prompt_intent(
+                    client_message_id,
+                    expected_states={"submitting"},
+                    to_state="submitting",
+                    error=type(exc).__name__,
+                )
+                self._schedule_review_reconciliation(thread_id)
+                LOGGER.warning(
+                    "event=review_start_delivery_uncertain thread_id=%s error_type=%s",
+                    thread_id[:8],
+                    type(exc).__name__,
+                )
+                raise
+            except asyncio.CancelledError:
+                self._settle_pending_review(
+                    thread_id,
+                    client_message_id,
+                    to_state="uncertain",
+                    error="CancelledError",
+                )
+                raise
+            except Exception as exc:
+                self._settle_pending_review(
+                    thread_id,
+                    client_message_id,
+                    to_state="failed",
+                    error=type(exc).__name__,
+                )
+                raise
+            LOGGER.info(
+                "event=review_started space_id=%s thread_id=%s turn_id=%s target=%s",
+                space.space_id,
+                thread_id[:8],
+                turn_id[:8],
+                str(normalized_target.get("type") or "unknown"),
+            )
+            return result
 
     async def reconcile_plan_execution(
         self,
@@ -2270,6 +2850,8 @@ class Bridge:
             item = params.get("item") or {}
             thread_id = str(params.get("threadId") or "")
             turn_id = str(params.get("turnId") or "")
+            if thread_id and turn_id and isinstance(item, dict) and item.get("type") == "enteredReviewMode":
+                self._bind_pending_review(thread_id, turn_id, item)
             if thread_id and turn_id and _is_tui_plan_approval_item(item):
                 effects.append(
                     (
@@ -2293,12 +2875,28 @@ class Bridge:
                         ),
                     )
                 )
+            if isinstance(item, dict) and item.get("type") == "exitedReviewMode":
+                effects.append(
+                    (
+                        "review_completed",
+                        partial(
+                            self._notify_review_completed,
+                            {
+                                "thread_id": str(params.get("threadId") or ""),
+                                "turn_id": str(params.get("turnId") or ""),
+                                "status": "completed",
+                                "summary": str(item.get("review") or ""),
+                            },
+                        ),
+                    )
+                )
         elif method == "turn/completed":
             thread_id = str(params.get("threadId") or "")
             turn = params.get("turn") or {}
             if not isinstance(turn, dict):
                 return
             turn_id = str(turn.get("id") or "")
+            state = self.store.get_thread(thread_id)
             for item in turn.get("items") or []:
                 if isinstance(item, dict) and item.get("type") == "plan":
                     effects.append(
@@ -2313,6 +2911,52 @@ class Bridge:
                             ),
                         )
                     )
+            review_item_for_binding = next(
+                (
+                    item
+                    for item in turn.get("items") or []
+                    if isinstance(item, dict)
+                    and item.get("type") == "enteredReviewMode"
+                ),
+                None,
+            )
+            review_item = next(
+                (
+                    item
+                    for item in turn.get("items") or []
+                    if isinstance(item, dict) and item.get("type") == "exitedReviewMode"
+                ),
+                None,
+            )
+            if review_item_for_binding is not None and self._pending_reviews.get(thread_id):
+                self._bind_pending_review(thread_id, turn_id, review_item_for_binding)
+            review_intent = self.store.find_prompt_intent_for_turn(
+                thread_id,
+                turn_id,
+                source="review",
+            )
+            if review_item is not None or review_intent is not None or (
+                state is not None and state.review_turn_id == turn_id
+            ):
+                effects.append(
+                    (
+                        "review_completed",
+                        partial(
+                            self._notify_review_completed,
+                            {
+                                "thread_id": thread_id,
+                                "turn_id": turn_id,
+                                "status": str(turn.get("status") or "completed"),
+                                "summary": str(
+                                    (review_item or {}).get("review")
+                                    or (state.review_summary if state is not None else "")
+                                    or ""
+                                ),
+                                "error": _turn_error_kind(turn.get("error")),
+                            },
+                        ),
+                    )
+                )
             status = str(turn.get("status") or "")
             if not thread_id or not turn_id or status not in _FINAL_TURN_STATUSES:
                 LOGGER.warning(
@@ -2358,6 +3002,54 @@ class Bridge:
                     event.set()
         for name, effect in effects:
             await self._dispatch_notification_effect(name, effect)
+
+    def _bind_pending_review(
+        self,
+        thread_id: str,
+        turn_id: str,
+        review_item: Json | None = None,
+    ) -> None:
+        pending = self._pending_reviews.get(thread_id)
+        if pending is None or not turn_id or turn_id in pending.baseline_turn_ids:
+            return
+        if not isinstance(review_item, dict) or review_item.get("type") != "enteredReviewMode":
+            return
+        if not _review_hint_matches(
+            pending.review_prompt,
+            str(review_item.get("review") or ""),
+        ):
+            return
+        space = self.store.get_space(pending.space_id)
+        if (
+            space is None
+            or space.get("lifecycle") != "active"
+            or int(space.get("generation", 0)) != pending.generation
+            or str(space.get("thread_id") or "") != thread_id
+        ):
+            self._settle_pending_review(
+                thread_id,
+                pending.client_message_id,
+                to_state="cancelled",
+                error="SessionSpace generation is stale",
+            )
+            return
+        gate = self._turn_gates.get(thread_id)
+        if gate is None or gate.client_message_id != pending.client_message_id:
+            self._settle_pending_review(
+                thread_id,
+                pending.client_message_id,
+                to_state="cancelled",
+                error="Review turn gate is no longer active",
+            )
+            return
+        self._pending_reviews.pop(thread_id, None)
+        self._bind_turn_gate(thread_id, pending.client_message_id, turn_id)
+        self.store.transition_prompt_intent(
+            pending.client_message_id,
+            expected_states={"submitting"},
+            to_state="started",
+            turn_id=turn_id,
+        )
 
     def _schedule_subagent_profile_refresh(self, method: str, params: Json) -> None:
         if method not in {"item/started", "item/completed"}:
@@ -2460,7 +3152,15 @@ class Bridge:
         await self._notify_projector_parent_changes("subagent/profile")
 
     async def _on_state_change(self, state: ThreadState, reason: str) -> None:
-        immediate = reason in {"error", "turn/completed", "thread/goal/updated", "thread/status/changed"}
+        review_update = reason in {"item/started", "item/completed"} and str(
+            state.latest_activity or ""
+        ).startswith("Review ")
+        immediate = review_update or reason in {
+            "error",
+            "turn/completed",
+            "thread/goal/updated",
+            "thread/status/changed",
+        }
         await self.dashboard.schedule(state, immediate=immediate)
         await self._notify_state_change(state, reason)
 
@@ -2506,6 +3206,60 @@ class Bridge:
                 str(run.get("space_id") or "")[:12],
                 str(run.get("turn_id") or "")[:8],
             )
+
+    async def _notify_review_completed(self, run: Json) -> None:
+        thread_id = str(run.get("thread_id") or "")
+        turn_id = str(run.get("turn_id") or "")
+        status = str(run.get("status") or "completed")
+        summary = str(run.get("summary") or "")
+        if not thread_id or not turn_id:
+            return
+        intent = self.store.find_prompt_intent_for_turn(thread_id, turn_id, source="review")
+        if intent is not None:
+            if intent.space_id:
+                space = self.store.get_space(intent.space_id)
+                if (
+                    space is None
+                    or space.get("lifecycle") != "active"
+                    or int(space.get("generation", 0)) != intent.generation
+                    or str(space.get("thread_id") or "") != thread_id
+                ):
+                    LOGGER.info(
+                        "event=review_summary_skipped reason=stale_space thread_id=%s turn_id=%s",
+                        thread_id[:8],
+                        turn_id[:8],
+                    )
+                    return
+            run = {
+                **run,
+                "space_id": intent.space_id,
+                "generation": intent.generation,
+            }
+        marker = (thread_id, turn_id, plan_revision_key(turn_id, f"{status}\0{summary}"))
+        if marker in self._notified_review_turns:
+            return
+        try:
+            await self.on_review_completed(
+                {
+                    "thread_id": thread_id,
+                    "turn_id": turn_id,
+                    "space_id": run.get("space_id"),
+                    "generation": run.get("generation"),
+                    "status": status,
+                    "summary": summary,
+                    "error": str(run.get("error") or ""),
+                }
+            )
+        except Exception:
+            LOGGER.exception(
+                "event=review_summary_hook_failed thread_id=%s turn_id=%s",
+                thread_id[:8],
+                turn_id[:8],
+            )
+            return
+        self._notified_review_turns[marker] = None
+        while len(self._notified_review_turns) > 512:
+            self._notified_review_turns.pop(next(iter(self._notified_review_turns)))
 
     async def _finish_prompt_runs(
         self,

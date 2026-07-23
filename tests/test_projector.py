@@ -1095,3 +1095,101 @@ async def test_resume_snapshot_does_not_prove_mode_but_settings_notification_doe
     assert space is not None
     assert (space.desired_mode, space.observed_mode) == ("plan", "plan")
     store.close()
+
+
+@pytest.mark.asyncio
+async def test_review_projection_preserves_failure_and_interruption_status(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    projector = managed_projector(store)
+
+    await projector.ingest(
+        "item/started",
+        {
+            "threadId": "thread-review",
+            "turnId": "turn-review",
+            "item": {"id": "review-item", "type": "enteredReviewMode", "review": "changes"},
+        },
+    )
+    state = store.get_thread("thread-review")
+    assert state is not None and state.review_status == "inProgress"
+
+    await projector.ingest(
+        "turn/completed",
+        {
+            "threadId": "thread-review",
+            "turn": {
+                "id": "turn-review",
+                "status": "failed",
+                "items": [{"id": "review-item", "type": "enteredReviewMode", "review": "changes"}],
+            },
+        },
+    )
+    state = store.get_thread("thread-review")
+    assert state is not None and state.review_status == "failed"
+
+    await projector.ingest(
+        "item/started",
+        {
+            "threadId": "thread-review",
+            "turnId": "turn-interrupted",
+            "item": {
+                "id": "review-item-2",
+                "type": "enteredReviewMode",
+                "review": "changes",
+            },
+        },
+    )
+    await projector.ingest(
+        "turn/completed",
+        {
+            "threadId": "thread-review",
+            "turn": {
+                "id": "turn-interrupted",
+                "status": "interrupted",
+                "items": [
+                    {
+                        "id": "review-item-2",
+                        "type": "enteredReviewMode",
+                        "review": "changes",
+                    }
+                ],
+            },
+        },
+    )
+    state = store.get_thread("thread-review")
+    assert state is not None and state.review_status == "interrupted"
+    store.close()
+
+
+@pytest.mark.parametrize("terminal_status", ["failed", "interrupted"])
+def test_review_history_replay_preserves_terminal_status_after_entry_item(
+    tmp_path: Path, terminal_status: str
+) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    projector = managed_projector(store)
+
+    state = projector.apply_thread(
+        {
+            "id": "thread-review-history",
+            "status": {"type": "idle"},
+            "turns": [
+                {
+                    "id": "turn-review-history",
+                    "status": terminal_status,
+                    "items": [
+                        {
+                            "id": "review-entry",
+                            "type": "enteredReviewMode",
+                            "review": "current changes",
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+
+    assert state.review_status == terminal_status
+    assert state.review_turn_id == "turn-review-history"
+    store.close()

@@ -13,7 +13,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "install.sh"
 UNIT_MARKER = "# X-CodexTelegramBridge-Installer: managed"
-UNIT_VERSION = "# X-CodexTelegramBridge-Installer-Version: v0.2.8"
+UNIT_VERSION = "# X-CodexTelegramBridge-Installer-Version: v0.3.0"
 
 
 def run_installer_shell(
@@ -136,6 +136,32 @@ validate_existing_config_contract
 
     assert result.returncode == 1
     assert "unsupported custom installer paths" in result.stderr
+
+
+def test_final_app_server_mode_is_persisted_after_strategy_selection(tmp_path: Path) -> None:
+    config_dir = tmp_path / "home" / ".config" / "codex-telegram-bridge"
+    config_dir.mkdir(mode=0o700, parents=True)
+    config = config_dir / "config.toml"
+    config.write_text(
+        '[bridge]\napp_server_mode = "installer-service"\nask_model = "gpt-5.6-luna"\n',
+        encoding="utf-8",
+    )
+    config.chmod(0o600)
+
+    result = run_installer_shell(
+        tmp_path,
+        """
+initialize_paths
+PYTHON_BIN=$TEST_PYTHON
+prepare_private_config_dir
+APP_SERVER_MODE=managed-daemon
+persist_app_server_mode
+grep -Fxq 'app_server_mode = "managed-daemon"' "$CONFIG_FILE"
+[[ "$(grep -Fc 'app_server_mode =' "$CONFIG_FILE")" == 1 ]]
+""",
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.parametrize(
@@ -392,7 +418,7 @@ install_uv_and_python
     assert "is not the required version 0.11.28" in result.stderr
 
 
-def test_generated_bridge_unit_matches_static_unit_and_forces_codex_home(
+def test_generated_bridge_unit_forces_codex_home_without_socket_preflight(
     tmp_path: Path,
 ) -> None:
     result = run_installer_shell(
@@ -402,12 +428,11 @@ initialize_paths
 install -d -m 0700 "$USER_UNIT_DIR"
 unit_exists() { return 1; }
 write_bridge_unit
-cmp -s "$STATIC_UNIT" "$USER_UNIT_DIR/codex-telegram-bridge.service"
 grep -Fxq \
     'ExecStart=/usr/bin/env CODEX_HOME=%h/.codex %h/.local/bin/codex-telegram-bridge' \
     "$USER_UNIT_DIR/codex-telegram-bridge.service"
+! grep -Fq 'ExecStartPre=/usr/bin/test -S' "$USER_UNIT_DIR/codex-telegram-bridge.service"
 """,
-        extra_env={"STATIC_UNIT": str(ROOT / "systemd/codex-telegram-bridge.service")},
     )
 
     assert result.returncode == 0, result.stderr
@@ -419,7 +444,6 @@ def test_bridge_unit_throttles_restart_loops() -> None:
     assert "StartLimitIntervalSec=900" in unit
     assert "StartLimitBurst=30" in unit
     assert "RestartSec=30s" in unit
-    assert "ExecStartPre=/usr/bin/test -S %h/.codex/app-server-control/app-server-control.sock" in unit
     assert (
         "Environment=PATH=%h/.local/bin:%h/.linuxbrew/bin:"
         "/home/linuxbrew/.linuxbrew/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
@@ -432,7 +456,7 @@ def test_bridge_unit_waits_for_managed_daemon_when_present(tmp_path: Path) -> No
         """
 initialize_paths
 install -d -m 0700 "$USER_UNIT_DIR"
-EXTERNAL_APP_SERVER=1
+APP_SERVER_MODE=managed-daemon
 unit_exists() { [[ "$1" == codex-managed-daemon-bootstrap.service ]]; }
 write_bridge_unit
 grep -Fxq 'Wants=network-online.target codex-managed-daemon-bootstrap.service' \
@@ -452,7 +476,7 @@ def test_bridge_unit_keeps_installer_owned_app_server_dependency(tmp_path: Path)
         """
 initialize_paths
 install -d -m 0700 "$USER_UNIT_DIR"
-EXTERNAL_APP_SERVER=0
+APP_SERVER_MODE=installer-service
 unit_exists() { [[ "$1" == codex-telegram-app-server.service ]]; }
 write_bridge_unit
 grep -Fxq 'Wants=network-online.target' \
@@ -490,6 +514,48 @@ grep -Fxq 'RestartSec=30s' \
     "$USER_UNIT_DIR/codex-managed-daemon-bootstrap.service.d/codex-telegram-bridge-recovery.conf"
 ! grep -Fq 'EnvironmentFile=' \
     "$USER_UNIT_DIR/codex-managed-daemon-bootstrap.service.d/codex-telegram-bridge-recovery.conf"
+""",
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_managed_daemon_watchdog_units_are_idempotent_and_retry_bootstrap(tmp_path: Path) -> None:
+    result = run_installer_shell(
+        tmp_path,
+        """
+initialize_paths
+install -d -m 0700 "$USER_UNIT_DIR"
+unit_exists() { [[ -e "$USER_UNIT_DIR/$1" || -L "$USER_UNIT_DIR/$1" ]]; }
+write_managed_daemon_watchdog_units
+first=$(sha256sum \
+    "$USER_UNIT_DIR/codex-managed-daemon-watchdog.service" \
+    "$USER_UNIT_DIR/codex-managed-daemon-watchdog.timer")
+write_managed_daemon_watchdog_units
+second=$(sha256sum \
+    "$USER_UNIT_DIR/codex-managed-daemon-watchdog.service" \
+    "$USER_UNIT_DIR/codex-managed-daemon-watchdog.timer")
+[[ "$first" == "$second" ]]
+grep -Fxq 'Environment=CODEX_APP_SERVER_MODE=managed-daemon' \
+    "$USER_UNIT_DIR/codex-managed-daemon-watchdog.service"
+    grep -Fxq 'ExecStart=%h/.local/bin/codex-tg app-server-watchdog --recover' \
+        "$USER_UNIT_DIR/codex-managed-daemon-watchdog.service"
+grep -Fxq 'OnUnitActiveSec=60s' "$USER_UNIT_DIR/codex-managed-daemon-watchdog.timer"
+""",
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_app_server_strategy_prefers_managed_daemon(tmp_path: Path) -> None:
+    result = run_installer_shell(
+        tmp_path,
+        """
+initialize_paths
+install -d -m 0700 "$USER_UNIT_DIR"
+unit_exists() { [[ "$1" == codex-managed-daemon-bootstrap.service ]]; }
+select_app_server_strategy
+[[ "$APP_SERVER_MODE" == managed-daemon ]]
 """,
     )
 
@@ -568,7 +634,7 @@ REUSE_EXISTING_APP_SERVER=1
 unit_exists() { [[ "$1" == codex-telegram-app-server.service ]]; }
 unit_is_installer_owned() { return 1; }
 select_app_server_strategy
-[[ "$EXTERNAL_APP_SERVER" == 1 ]]
+[[ "$APP_SERVER_MODE" == external ]]
 """,
             extra_env={"TEST_SOCKET": str(socket_path)},
         )

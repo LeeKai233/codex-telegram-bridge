@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "codex-telegram-bridge"
-version = "0.2.8"
+version = "0.3.0"
 description = "Secure Telegram control and live status bridge for local Codex CLI sessions"
 readme = "README.md"
 requires-python = ">=3.14,<3.15"

@@ -14,6 +14,7 @@ import shlex
 import shutil
 import sqlite3
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -24,8 +25,10 @@ from typing import TextIO
 
 import segno
 from telegram import Bot
+from websockets.asyncio.client import unix_connect
 
-from .config import Config, ensure_private_directory, open_private_directory
+from .app_server import RecoveryLock
+from .config import AppServerMode, Config, ensure_private_directory, open_private_directory
 from .security import Enrollment, SecurityManager
 from .store import Store
 
@@ -1095,8 +1098,24 @@ async def _doctor(config: Config, *, offline: bool, output: TextIO) -> int:
     else:
         report("WARN", "TOTP 尚未配置，或密钥权限过宽")
 
+    report("OK", f"Codex app-server mode: {config.app_server_mode.value}")
     if _socket_is_private(config.codex_socket):
         report("OK", "Codex app-server Unix socket 可用且权限为私有")
+        if not offline:
+            try:
+                await _probe_app_server_protocol(config.codex_socket)
+            except Exception as exc:
+                report("FAIL", f"Codex app-server initialize 握手失败：{type(exc).__name__}")
+            else:
+                report("OK", "Codex app-server initialize 握手成功")
+            if config.app_server_mode is AppServerMode.MANAGED_DAEMON:
+                daemon_version_ok = _managed_daemon_version_available(config)
+                report(
+                    "OK" if daemon_version_ok else "FAIL",
+                    "Codex managed daemon version 查询成功"
+                    if daemon_version_ok
+                    else "Codex managed daemon version 查询失败",
+                )
     else:
         report("FAIL", f"Codex app-server socket 不可用或权限过宽：{config.codex_socket}")
 
@@ -1314,6 +1333,10 @@ def _status(config: Config, output: TextIO, *, as_json: bool = False) -> int:
     totp_status = "configured" if _mode_is_private(config.totp_secret_path) else "missing/insecure"
     socket_status = "ready" if _socket_is_private(config.codex_socket) else "unavailable/insecure"
     payload = {
+        "app_server": {
+            "mode": config.app_server_mode.value,
+            "socket": socket_status,
+        },
         "credentials": {
             "control_token": control_token_status,
             "forum_token": forum_token_status,
@@ -1380,8 +1403,126 @@ def _status(config: Config, output: TextIO, *, as_json: bool = False) -> int:
         f"{'pending' if database['pending_disconnect'] else 'none'}\n"
     )
     output.write(f"health snapshot: {health_state}\n")
+    output.write(f"app-server mode: {config.app_server_mode.value}\n")
     output.write(f"codex socket: {socket_status}\n")
     return 0
+
+
+async def _probe_app_server_protocol(socket_path: Path) -> None:
+    """Complete the harmless initialization handshake used by the bridge client."""
+    websocket = await unix_connect(
+        path=str(socket_path),
+        uri="ws://localhost/",
+        compression=None,
+        user_agent_header=None,
+        open_timeout=5,
+        ping_interval=None,
+        close_timeout=2,
+    )
+    try:
+        request_id = 1
+        await websocket.send(
+            json.dumps(
+                {
+                    "id": request_id,
+                    "method": "initialize",
+                    "params": {
+                        "clientInfo": {
+                            "name": "codex_telegram_bridge_watchdog",
+                            "title": "Codex Telegram Bridge Watchdog",
+                            "version": "1",
+                        },
+                        "capabilities": {"experimentalApi": True},
+                    },
+                },
+                separators=(",", ":"),
+            )
+        )
+        while True:
+            raw_message = await asyncio.wait_for(websocket.recv(), timeout=5)
+            message = json.loads(raw_message)
+            if message.get("id") != request_id:
+                continue
+            if not isinstance(message.get("result"), dict):
+                raise RuntimeError("app-server initialize did not return a result")
+            await websocket.send(json.dumps({"method": "initialized", "params": {}}))
+            return
+    finally:
+        await websocket.close(code=1000, reason="watchdog probe complete")
+
+
+def _managed_daemon_version_available(config: Config) -> bool:
+    environment = os.environ.copy()
+    environment["CODEX_HOME"] = str(config.codex_home)
+    try:
+        completed = subprocess.run(
+            [str(config.codex_binary), "app-server", "daemon", "version"],
+            check=False,
+            capture_output=True,
+            env=environment,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return completed.returncode == 0
+
+
+def _app_server_watchdog(config: Config, output: TextIO, *, recover: bool = False) -> int:
+    """Check only local app-server readiness; never opens Telegram state or credentials."""
+    if config.app_server_mode is AppServerMode.EXTERNAL:
+        output.write("app-server watchdog: external ownership; no action\n")
+        return 0
+    def healthy() -> bool:
+        if not _socket_is_private(config.codex_socket):
+            return False
+        if (
+            config.app_server_mode is AppServerMode.MANAGED_DAEMON
+            and not _managed_daemon_version_available(config)
+        ):
+            return False
+        try:
+            asyncio.run(_probe_app_server_protocol(config.codex_socket))
+        except Exception:
+            return False
+        return True
+
+    if healthy():
+        output.write(f"app-server watchdog: {config.app_server_mode.value} protocol ready\n")
+        return 0
+    if not recover or config.app_server_mode is not AppServerMode.MANAGED_DAEMON:
+        output.write(
+            f"app-server watchdog: {config.app_server_mode.value} protocol unavailable: "
+            f"{config.codex_socket}\n"
+        )
+        return 1
+    with RecoveryLock(config.state_dir / "app-server-recovery.lock") as acquired:
+        if not acquired:
+            output.write("app-server watchdog: recovery already in progress\n")
+            return 0
+        environment = os.environ.copy()
+        environment["CODEX_HOME"] = str(config.codex_home)
+        for command in (
+            [str(config.codex_binary), "app-server", "daemon", "restart"],
+            [str(config.codex_binary), "app-server", "daemon", "bootstrap"],
+        ):
+            try:
+                completed = subprocess.run(
+                    command,
+                    check=False,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    env=environment,
+                    timeout=30,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+            if completed.returncode == 0 and healthy():
+                output.write("app-server watchdog: daemon recovered and protocol verified\n")
+                return 0
+    output.write("app-server watchdog: recovery failed\n")
+    return 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1428,6 +1569,10 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.add_argument("--offline", action="store_true", help="不调用 Telegram getMe")
     status = commands.add_parser("status", help="显示本机桥接状态（不显示秘密）")
     status.add_argument("--json", action="store_true", help="输出机器可读 JSON")
+    watchdog = commands.add_parser(
+        "app-server-watchdog", help="检查并按 ownership 恢复 Codex app-server；不访问 Telegram"
+    )
+    watchdog.add_argument("--recover", action="store_true", help="允许 managed-daemon 自动恢复")
     return parser
 
 
@@ -1478,6 +1623,8 @@ def run(args: argparse.Namespace, *, output: TextIO = sys.stdout) -> int:
         return asyncio.run(_doctor(config, offline=args.offline, output=output))
     if args.command == "status":
         return _status(config, output, as_json=args.json)
+    if args.command == "app-server-watchdog":
+        return _app_server_watchdog(config, output, recover=args.recover)
 
     store = _with_store(config)
     try:

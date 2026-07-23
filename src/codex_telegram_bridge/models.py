@@ -138,6 +138,10 @@ class ThreadState:
     plan_revision: int = 0
     latest_activity: str = ""
     last_agent_message: str = ""
+    review_status: str = "idle"
+    review_target: str = ""
+    review_summary: str = ""
+    review_turn_id: str | None = None
     agents_active: int = 0
     agents_completed: int = 0
     agents_failed: int = 0

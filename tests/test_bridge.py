@@ -43,6 +43,46 @@ def make_bridge(tmp_path: Path) -> tuple[Bridge, Store]:
     return Bridge(config, store, object(), Messenger()), store  # type: ignore[arg-type]
 
 
+def test_review_target_prompts_match_codex_review_hints() -> None:
+    assert Bridge._review_target_prompt({"type": "uncommittedChanges"}) == "current changes"
+    assert Bridge._review_target_prompt(
+        {"type": "baseBranch", "branch": "main"}
+    ) == "changes against 'main'"
+    assert Bridge._review_target_prompt(
+        {"type": "commit", "sha": "abcdef0123456789", "title": "Fix"}
+    ) == "commit abcdef0"
+
+
+def test_review_history_match_separates_entry_target_from_exit_findings() -> None:
+    match = bridge_module._find_review_turn(
+        {
+            "turns": [
+                {
+                    "id": "review-turn",
+                    "status": "completed",
+                    "items": [
+                        {
+                            "type": "enteredReviewMode",
+                            "review": "commit abcdef0",
+                        },
+                        {
+                            "type": "exitedReviewMode",
+                            "review": "Finding: missing rollback guard",
+                        },
+                    ],
+                }
+            ]
+        },
+        frozenset(),
+        "commit abcdef0123456789",
+    )
+
+    assert match is not None
+    assert match.entered_item["review"] == "commit abcdef0"
+    assert match.exited_item is not None
+    assert match.exited_item["review"] == "Finding: missing rollback guard"
+
+
 async def cancel_queue_retries(bridge: Bridge) -> None:
     bridge._started = False
     tasks = list(bridge._queue_retry_tasks.values())
@@ -2654,6 +2694,602 @@ async def test_idle_reconciliation_retries_until_confirmed_release(
 
 
 @pytest.mark.asyncio
+async def test_review_rejects_invalid_target_before_creating_intent_or_gate(
+    tmp_path: Path,
+) -> None:
+    bridge, store = make_bridge(tmp_path)
+    store.save_session_space(
+        SessionSpace(space_id="space-review", lifecycle="active", thread_id="thread-review")
+    )
+
+    with pytest.raises(ValueError, match="Unsupported review target"):
+        await bridge.start_space_review(
+            "space-review",
+            {"type": "invalid"},
+            client_message_id="review-invalid",
+        )
+
+    assert store.get_prompt_intent("review-invalid") is None
+    assert bridge._turn_gates == {}
+    assert bridge._pending_reviews == {}
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_review_preflight_failure_marks_received_intent_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, store = make_bridge(tmp_path)
+    space_id = "space-review-busy"
+    thread_id = "thread-review-busy"
+    store.save_session_space(
+        SessionSpace(space_id=space_id, lifecycle="active", thread_id=thread_id)
+    )
+
+    async def snapshot(_thread_id: str) -> dict[str, Any]:
+        return {
+            "id": thread_id,
+            "cwd": str(tmp_path),
+            "status": {"type": "active"},
+            "turns": [],
+        }
+
+    monkeypatch.setattr(bridge, "_live_thread_snapshot", snapshot)
+
+    with pytest.raises(RuntimeError, match="turn 正在运行"):
+        await bridge.start_space_review(
+            space_id,
+            {"type": "uncommittedChanges"},
+            client_message_id="review-busy",
+        )
+
+    intent = store.get_prompt_intent("review-busy")
+    assert intent is not None and intent.state == "failed"
+    assert bridge._turn_gates == {}
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_review_timeout_reconciles_idle_rejection_and_releases_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, store = make_bridge(tmp_path)
+    space_id = "space-review-timeout"
+    thread_id = "thread-review-timeout"
+    store.save_session_space(
+        SessionSpace(space_id=space_id, lifecycle="active", thread_id=thread_id)
+    )
+    bridge.client._connected.set()
+
+    async def snapshot(_thread_id: str) -> dict[str, Any]:
+        return {
+            "id": thread_id,
+            "cwd": str(tmp_path),
+            "status": {"type": "idle"},
+            "turns": [],
+        }
+
+    async def start_review(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        raise TimeoutError("review response timed out")
+
+    async def read_thread(_thread_id: str, *, include_turns: bool) -> dict[str, Any]:
+        assert include_turns
+        return {"id": thread_id, "status": {"type": "idle"}, "turns": []}
+
+    monkeypatch.setattr(bridge, "_live_thread_snapshot", snapshot)
+    monkeypatch.setattr(bridge.client, "start_review", start_review)
+    monkeypatch.setattr(bridge.client, "read_thread", read_thread)
+    monkeypatch.setattr(bridge_module, "_REVIEW_RECONCILE_DELAYS", (0.0, 0.0))
+
+    with pytest.raises(TimeoutError):
+        await bridge.start_space_review(
+            space_id,
+            {"type": "uncommittedChanges"},
+            client_message_id="review-timeout",
+        )
+
+    tasks = tuple(bridge._review_reconcile_tasks.values())
+    assert tasks
+    await asyncio.gather(*tasks)
+
+    intent = store.get_prompt_intent("review-timeout")
+    assert intent is not None and intent.state == "failed"
+    assert thread_id not in bridge._turn_gates
+    assert thread_id not in bridge._pending_reviews
+    assert not bridge._turn_locks[thread_id].locked()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_review_timeout_binds_late_review_turn_from_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, store = make_bridge(tmp_path)
+    space_id = "space-review-late"
+    thread_id = "thread-review-late"
+    store.save_session_space(
+        SessionSpace(space_id=space_id, lifecycle="active", thread_id=thread_id)
+    )
+
+    async def snapshot(_thread_id: str) -> dict[str, Any]:
+        return {
+            "id": thread_id,
+            "cwd": str(tmp_path),
+            "status": {"type": "idle"},
+            "turns": [],
+        }
+
+    async def start_review(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        raise TimeoutError("review response timed out")
+
+    async def read_thread(_thread_id: str, *, include_turns: bool) -> dict[str, Any]:
+        assert include_turns
+        return {
+            "id": thread_id,
+            "status": {"type": "active"},
+            "turns": [
+                {
+                    "id": "review-late-turn",
+                    "status": "inProgress",
+                    "items": [
+                        {
+                            "id": "review-enter",
+                            "type": "enteredReviewMode",
+                            "review": "current changes",
+                        }
+                    ],
+                }
+            ],
+        }
+
+    monkeypatch.setattr(bridge, "_live_thread_snapshot", snapshot)
+    monkeypatch.setattr(bridge.client, "start_review", start_review)
+    monkeypatch.setattr(bridge.client, "read_thread", read_thread)
+    monkeypatch.setattr(bridge_module, "_REVIEW_RECONCILE_DELAYS", (0.0,))
+
+    with pytest.raises(TimeoutError):
+        await bridge.start_space_review(
+            space_id,
+            {"type": "uncommittedChanges"},
+            client_message_id="review-late",
+        )
+
+    tasks = tuple(bridge._review_reconcile_tasks.values())
+    assert tasks
+    await asyncio.gather(*tasks)
+
+    intent = store.get_prompt_intent("review-late")
+    assert intent is not None
+    assert (intent.state, intent.turn_id) == ("started", "review-late-turn")
+    assert bridge._turn_gates[thread_id].expected_turn_id == "review-late-turn"
+    assert bridge._pending_reviews == {}
+    bridge._release_turn_gate(thread_id, "review-late-turn")
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_review_timeout_reconciliation_reports_exit_findings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, store = make_bridge(tmp_path)
+    space_id = "space-review-findings"
+    thread_id = "thread-review-findings"
+    store.save_session_space(
+        SessionSpace(space_id=space_id, lifecycle="active", thread_id=thread_id)
+    )
+
+    async def snapshot(_thread_id: str) -> dict[str, Any]:
+        return {"id": thread_id, "cwd": str(tmp_path), "status": {"type": "idle"}, "turns": []}
+
+    async def start_review(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        raise TimeoutError("review response timed out")
+
+    async def read_thread(_thread_id: str, *, include_turns: bool) -> dict[str, Any]:
+        assert include_turns
+        return {
+            "id": thread_id,
+            "status": {"type": "idle"},
+            "turns": [
+                {
+                    "id": "review-findings-turn",
+                    "status": "completed",
+                    "items": [
+                        {"type": "enteredReviewMode", "review": "current changes"},
+                        {"type": "exitedReviewMode", "review": "Finding: missing guard"},
+                    ],
+                }
+            ],
+        }
+
+    notifications: list[dict[str, Any]] = []
+
+    async def on_review_completed(run: dict[str, Any]) -> None:
+        notifications.append(run)
+
+    bridge.on_review_completed = on_review_completed
+    monkeypatch.setattr(bridge, "_live_thread_snapshot", snapshot)
+    monkeypatch.setattr(bridge.client, "start_review", start_review)
+    monkeypatch.setattr(bridge.client, "read_thread", read_thread)
+    monkeypatch.setattr(bridge_module, "_REVIEW_RECONCILE_DELAYS", (0.0,))
+
+    with pytest.raises(TimeoutError):
+        await bridge.start_space_review(
+            space_id,
+            {"type": "uncommittedChanges"},
+            client_message_id="review-findings",
+        )
+
+    await asyncio.gather(*tuple(bridge._review_reconcile_tasks.values()))
+
+    assert notifications and notifications[0]["summary"] == "Finding: missing guard"
+    intent = store.get_prompt_intent("review-findings")
+    assert intent is not None and intent.state == "completed"
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_review_reconnect_recovers_stale_submitting_intent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, store = make_bridge(tmp_path)
+    thread_id = "thread-review-restart"
+    store.save_session_space(
+        SessionSpace(space_id="space-review-restart", lifecycle="active", thread_id=thread_id)
+    )
+    store.create_prompt_intent(
+        "review-restart",
+        "review",
+        "current changes",
+        "review",
+        thread_id=thread_id,
+        space_id="space-review-restart",
+        generation=0,
+    )
+    store.transition_prompt_intent(
+        "review-restart",
+        expected_states={"received"},
+        to_state="submitting",
+    )
+
+    async def resume_thread(_thread_id: str) -> dict[str, Any]:
+        return {
+            "id": thread_id,
+            "cwd": str(tmp_path),
+            "status": {"type": "idle"},
+            "turns": [],
+        }
+
+    async def get_goal(_thread_id: str) -> None:
+        return None
+
+    monkeypatch.setattr(bridge.client, "resume_thread", resume_thread)
+    monkeypatch.setattr(bridge.client, "get_goal", get_goal)
+
+    await bridge.resync()
+
+    intent = store.get_prompt_intent("review-restart")
+    assert intent is not None and intent.state == "failed"
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_review_reconnect_recovers_started_itemless_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, store = make_bridge(tmp_path)
+    thread_id = "thread-review-itemless"
+    store.save_session_space(
+        SessionSpace(space_id="space-review-itemless", lifecycle="active", thread_id=thread_id)
+    )
+    store.create_prompt_intent(
+        "review-itemless",
+        "review",
+        "current changes",
+        "review",
+        thread_id=thread_id,
+        space_id="space-review-itemless",
+        generation=0,
+    )
+    store.transition_prompt_intent(
+        "review-itemless",
+        expected_states={"received"},
+        to_state="submitting",
+    )
+    store.transition_prompt_intent(
+        "review-itemless",
+        expected_states={"submitting"},
+        to_state="started",
+        turn_id="review-running",
+    )
+
+    async def resume_thread(_thread_id: str) -> dict[str, Any]:
+        return {
+            "id": thread_id,
+            "cwd": str(tmp_path),
+            "status": {"type": "active"},
+            "turns": [{"id": "review-running", "status": "inProgress", "items": []}],
+        }
+
+    async def get_goal(_thread_id: str) -> None:
+        return None
+
+    monkeypatch.setattr(bridge.client, "resume_thread", resume_thread)
+    monkeypatch.setattr(bridge.client, "get_goal", get_goal)
+
+    await bridge.resync()
+
+    intent = store.get_prompt_intent("review-itemless")
+    state = store.get_thread(thread_id)
+    assert intent is not None and intent.state == "started"
+    assert state is not None
+    assert state.review_turn_id == "review-running"
+    assert state.review_status == "inProgress"
+    store.close()
+
+
+def test_review_pending_binding_isolated_from_v2_child_thread(tmp_path: Path) -> None:
+    bridge, store = make_bridge(tmp_path)
+    parent_id = "thread-review-parent"
+    child_id = "thread-review-child"
+    store.save_session_space(
+        SessionSpace(space_id="space-review-parent", lifecycle="active", thread_id=parent_id)
+    )
+    bridge._pending_reviews[parent_id] = bridge_module._PendingReview(
+        client_message_id="review-parent",
+        space_id="space-review-parent",
+        generation=0,
+        baseline_turn_ids=frozenset(),
+        review_prompt="current changes",
+    )
+
+    async def setup_gate() -> None:
+        assert await bridge._begin_turn_gate(parent_id, "review-parent")
+
+    asyncio.run(setup_gate())
+    bridge._bind_pending_review(
+        child_id,
+        "review-child",
+        {"type": "enteredReviewMode", "review": "current changes"},
+    )
+
+    assert parent_id in bridge._pending_reviews
+    assert bridge._turn_gates[parent_id].client_message_id == "review-parent"
+    bridge._settle_pending_review(
+        parent_id,
+        "review-parent",
+        to_state="cancelled",
+        error="test cleanup",
+    )
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_uncertain_review_intent_does_not_block_new_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, store = make_bridge(tmp_path)
+    space_id = "space-review-uncertain"
+    thread_id = "thread-review-uncertain"
+    store.save_session_space(SessionSpace(space_id=space_id, lifecycle="active", thread_id=thread_id))
+    store.create_prompt_intent(
+        "review-uncertain-old",
+        "review",
+        "current changes",
+        "review",
+        thread_id=thread_id,
+        space_id=space_id,
+        generation=0,
+    )
+    store.transition_prompt_intent(
+        "review-uncertain-old",
+        expected_states={"received"},
+        to_state="submitting",
+    )
+    store.transition_prompt_intent(
+        "review-uncertain-old",
+        expected_states={"submitting"},
+        to_state="uncertain",
+    )
+
+    async def snapshot(_thread_id: str) -> dict[str, Any]:
+        return {
+            "id": thread_id,
+            "cwd": str(tmp_path),
+            "status": {"type": "idle"},
+            "turns": [],
+        }
+
+    async def start_review(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return {"turn": {"id": "review-new-turn"}}
+
+    monkeypatch.setattr(bridge, "_live_thread_snapshot", snapshot)
+    monkeypatch.setattr(bridge.client, "start_review", start_review)
+
+    result = await bridge.start_space_review(
+        space_id,
+        {"type": "uncommittedChanges"},
+        client_message_id="review-new",
+    )
+
+    assert result["turn"]["id"] == "review-new-turn"
+    intent = store.get_prompt_intent("review-new")
+    assert intent is not None and intent.state == "started"
+    bridge._release_turn_gate(thread_id, "review-new-turn")
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_review_timeout_does_not_bind_competing_review_item(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, store = make_bridge(tmp_path)
+    space_id = "space-review-competing"
+    thread_id = "thread-review-competing"
+    store.save_session_space(SessionSpace(space_id=space_id, lifecycle="active", thread_id=thread_id))
+
+    async def snapshot(_thread_id: str) -> dict[str, Any]:
+        return {
+            "id": thread_id,
+            "cwd": str(tmp_path),
+            "status": {"type": "idle"},
+            "turns": [],
+        }
+
+    async def start_review(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        raise TimeoutError("review response timed out")
+
+    monkeypatch.setattr(bridge, "_live_thread_snapshot", snapshot)
+    monkeypatch.setattr(bridge.client, "start_review", start_review)
+    monkeypatch.setattr(bridge_module, "_REVIEW_RECONCILE_DELAYS", (1000.0,))
+
+    with pytest.raises(TimeoutError):
+        await bridge.start_space_review(
+            space_id,
+            {"type": "uncommittedChanges"},
+            client_message_id="review-competing",
+        )
+
+    bridge._bind_pending_review(
+        thread_id,
+        "foreign-review-turn",
+        {"type": "enteredReviewMode", "review": "commit abc123"},
+    )
+    intent = store.get_prompt_intent("review-competing")
+    assert intent is not None and intent.state == "submitting" and intent.turn_id is None
+    assert thread_id in bridge._pending_reviews
+
+    task = bridge._review_reconcile_tasks.pop(thread_id)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    bridge._settle_pending_review(
+        thread_id,
+        "review-competing",
+        to_state="cancelled",
+        error="test cleanup",
+    )
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_review_completion_skips_stale_space_generation(tmp_path: Path) -> None:
+    bridge, store = make_bridge(tmp_path)
+    store.save_session_space(
+        SessionSpace(
+            space_id="space-review-stale",
+            generation=2,
+            lifecycle="active",
+            thread_id="thread-review-stale",
+        )
+    )
+    store.create_prompt_intent(
+        "review-stale",
+        "review",
+        "current changes",
+        "review",
+        thread_id="thread-review-stale",
+        space_id="space-review-stale",
+        generation=1,
+    )
+    store.transition_prompt_intent(
+        "review-stale",
+        expected_states={"received"},
+        to_state="submitting",
+    )
+    store.transition_prompt_intent(
+        "review-stale",
+        expected_states={"submitting"},
+        to_state="started",
+        turn_id="review-stale-turn",
+    )
+    callbacks: list[dict[str, Any]] = []
+
+    async def callback(run: dict[str, Any]) -> None:
+        callbacks.append(run)
+
+    bridge.on_review_completed = callback
+    await bridge._notify_review_completed(
+        {
+            "thread_id": "thread-review-stale",
+            "turn_id": "review-stale-turn",
+            "status": "completed",
+            "summary": "stale",
+        }
+    )
+
+    assert callbacks == []
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_review_completion_forwards_exact_session_space_correlation(tmp_path: Path) -> None:
+    bridge, store = make_bridge(tmp_path)
+    thread_id = "thread-review-multiple-spaces"
+    store.save_session_space(
+        SessionSpace(
+            space_id="space-review-first",
+            generation=3,
+            lifecycle="active",
+            thread_id=thread_id,
+        )
+    )
+    store.save_session_space(
+        SessionSpace(
+            space_id="space-review-second",
+            generation=7,
+            lifecycle="active",
+            thread_id=thread_id,
+        )
+    )
+    store.create_prompt_intent(
+        "review-correlated",
+        "review",
+        "current changes",
+        "review",
+        thread_id=thread_id,
+        space_id="space-review-first",
+        generation=3,
+    )
+    store.transition_prompt_intent(
+        "review-correlated",
+        expected_states={"received"},
+        to_state="submitting",
+    )
+    store.transition_prompt_intent(
+        "review-correlated",
+        expected_states={"submitting"},
+        to_state="started",
+        turn_id="review-correlated-turn",
+    )
+    callbacks: list[dict[str, Any]] = []
+
+    async def callback(run: dict[str, Any]) -> None:
+        callbacks.append(run)
+
+    bridge.on_review_completed = callback
+    await bridge._notify_review_completed(
+        {
+            "thread_id": thread_id,
+            "turn_id": "review-correlated-turn",
+            "status": "completed",
+            "summary": "findings",
+        }
+    )
+
+    assert callbacks == [
+        {
+            "thread_id": thread_id,
+            "turn_id": "review-correlated-turn",
+            "space_id": "space-review-first",
+            "generation": 3,
+            "status": "completed",
+            "summary": "findings",
+            "error": "",
+        }
+    ]
+    store.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("connected", "expected"),
     ((True, "safe_to_submit"), (False, "uncertain")),
@@ -2744,4 +3380,61 @@ async def test_notification_effects_run_fifo_and_shutdown_accounts_for_dropped_i
     await asyncio.wait_for(bridge._notification_effects.join(), timeout=0.1)
     assert bridge._notification_effects.empty()
     assert second_ran is False
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_app_server_disconnect_and_recovery_notifications_are_latched(
+    tmp_path: Path,
+) -> None:
+    bridge, store = make_bridge(tmp_path)
+    bridge._started = True
+    notices: list[str] = []
+
+    async def notice(text: str, _markup: str | None) -> None:
+        notices.append(text)
+
+    async def resync() -> None:
+        return None
+
+    bridge.on_notice = notice
+    bridge.resync = resync  # type: ignore[method-assign]
+
+    await bridge._on_codex_connection(False, 0, "connection closed")
+    await bridge._on_codex_connection(False, 0, "connection refused")
+    await bridge._on_codex_connection(True, 1, None)
+    await bridge._on_codex_connection(True, 1, None)
+
+    assert notices[0] == "Codex app-server 已断开，正在自动恢复"
+    assert notices[1].startswith("Codex app-server 已恢复，连接与会话同步已完成（中断 ")
+    assert len(notices) == 2
+    incident = bridge._app_server_incident()
+    assert incident is not None
+    assert incident["state"] == "resolved"
+    assert incident["disconnect_notice_claimed"] is True
+    assert incident["recovery_notice_claimed"] is True
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_app_server_disconnect_latch_is_persisted_before_telegram_io(
+    tmp_path: Path,
+) -> None:
+    bridge, store = make_bridge(tmp_path)
+    bridge._started = True
+    observed: list[bool] = []
+
+    async def notice(_text: str, _markup: str | None) -> None:
+        incident = bridge._app_server_incident()
+        observed.append(bool(incident and incident.get("disconnect_notice_claimed")))
+        raise RuntimeError("telegram unavailable")
+
+    bridge.on_notice = notice
+    await bridge._on_codex_connection(False, 0, "connection closed")
+    await bridge._on_codex_connection(False, 0, "connection refused")
+
+    assert observed == [True]
+    incident = bridge._app_server_incident()
+    assert incident is not None
+    assert incident["disconnect_notice_outcome"] == "failed"
     store.close()

@@ -7,11 +7,14 @@ import stat
 from concurrent.futures import ThreadPoolExecutor
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+import codex_telegram_bridge.cli as cli
 from codex_telegram_bridge.cli import (
     CliError,
+    _app_server_watchdog,
     _assignment_value,
     _install_token_files,
     _read_bashrc_token,
@@ -24,7 +27,7 @@ from codex_telegram_bridge.cli import (
     onboard,
     run,
 )
-from codex_telegram_bridge.config import Config
+from codex_telegram_bridge.config import AppServerMode, Config
 from codex_telegram_bridge.models import Owner
 from codex_telegram_bridge.security import Enrollment, SecurityManager
 from codex_telegram_bridge.store import SCHEMA_VERSION, Store
@@ -370,6 +373,7 @@ def test_status_reports_dual_credentials_and_binding_without_secrets(tmp_path: P
     assert "forum token: configured/private" in rendered
     assert "status token: configured/private" in rendered
     assert "channel binding: ready" in rendered
+    assert "app-server mode: external" in rendered
     assert TOKEN not in rendered
     assert FORUM_TOKEN not in rendered
     assert STATUS_TOKEN not in rendered
@@ -402,6 +406,7 @@ def test_status_json_reports_persisted_health_without_secrets(tmp_path: Path) ->
     assert payload["runtime"]["health"]["polling"][0]["role"] == "control"
     assert payload["runtime"]["health"]["bridge"]["codex"]["generation"] == 3
     assert payload["credentials"]["status_token"] == "missing/insecure"
+    assert payload["app_server"] == {"mode": "external", "socket": "unavailable/insecure"}
     assert TOKEN not in output.getvalue()
     assert FORUM_TOKEN not in output.getvalue()
 
@@ -428,6 +433,92 @@ def test_status_does_not_create_or_migrate_database(tmp_path: Path) -> None:
         ).fetchone()[0] == 0
     finally:
         connection.close()
+
+
+def test_app_server_mode_accepts_only_supported_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = make_config(tmp_path)
+    assert config.app_server_mode is AppServerMode.EXTERNAL
+    managed = Config(
+        config_dir=config.config_dir,
+        state_dir=config.state_dir,
+        codex_home=config.codex_home,
+        codex_socket=config.codex_socket,
+        codex_binary=config.codex_binary,
+        allowed_root=config.allowed_root,
+        app_server_mode="managed-daemon",
+    )
+    assert managed.app_server_mode is AppServerMode.MANAGED_DAEMON
+    with pytest.raises(ValueError, match="app_server_mode"):
+        Config(
+            config_dir=config.config_dir,
+            state_dir=config.state_dir,
+            codex_home=config.codex_home,
+            codex_socket=config.codex_socket,
+            codex_binary=config.codex_binary,
+            allowed_root=config.allowed_root,
+            app_server_mode="unsafe",
+        )
+    monkeypatch.setenv("CODEX_APP_SERVER_MODE", "installer-service")
+    assert Config.default().app_server_mode is AppServerMode.INSTALLER_SERVICE
+
+
+def test_app_server_watchdog_avoids_telegram_and_database_side_effects(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    output = StringIO()
+    assert _app_server_watchdog(config, output) == 0
+    assert "external ownership" in output.getvalue()
+    assert not config.database_path.exists()
+
+
+def test_watchdog_command_routes_without_telegram_access(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = make_config(tmp_path)
+    monkeypatch.setattr(cli, "_config_from_args", lambda _args: config)
+    output = StringIO()
+    assert run(build_parser().parse_args(["app-server-watchdog"]), output=output) == 0
+    assert not config.database_path.exists()
+
+
+def test_managed_daemon_watchdog_restarts_and_rechecks_protocol(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = Config(
+        config_dir=tmp_path / "config",
+        state_dir=tmp_path / "state",
+        codex_home=tmp_path / ".codex",
+        codex_socket=tmp_path / ".codex" / "control.sock",
+        codex_binary=tmp_path / "codex",
+        allowed_root=tmp_path,
+        app_server_mode=AppServerMode.MANAGED_DAEMON,
+    )
+    protocol_ready = False
+    commands: list[tuple[str, ...]] = []
+
+    monkeypatch.setattr(cli, "_socket_is_private", lambda _path: True)
+    monkeypatch.setattr(cli, "_managed_daemon_version_available", lambda _config: True)
+
+    async def protocol_probe(_path: Path) -> bool:
+        if not protocol_ready:
+            raise RuntimeError("protocol unavailable")
+        return protocol_ready
+
+    def run(command: list[str], **_kwargs: object) -> SimpleNamespace:
+        nonlocal protocol_ready
+        commands.append(tuple(command))
+        if command[-1] == "restart":
+            protocol_ready = True
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(cli, "_probe_app_server_protocol", protocol_probe)
+    monkeypatch.setattr(cli.subprocess, "run", run)
+    output = StringIO()
+
+    assert _app_server_watchdog(config, output, recover=True) == 0
+    assert (str(config.codex_binary), "app-server", "daemon", "restart") in commands
+    assert "daemon recovered and protocol verified" in output.getvalue()
 
 
 @pytest.mark.asyncio
