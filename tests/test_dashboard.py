@@ -491,6 +491,24 @@ async def test_space_dashboard_passes_mode_profiles_tasks_and_advancing_animatio
     store.close()
 
 
+def test_complete_goal_does_not_freeze_moon_during_review() -> None:
+    manager = object.__new__(SpaceDashboardManager)
+    manager._animation_indices = {}
+    space = {"space_id": "space-review", "lifecycle": "active"}
+    state = ThreadState(
+        thread_id="thread-review",
+        status="idle",
+        turn_status="completed",
+        review_status="inProgress",
+        goal={"status": "complete", "objective": "Review changes"},
+    )
+
+    assert manager._is_terminal(space, state) is False
+    assert manager._is_animated(space, state) is True
+    assert manager._frame_for("space-review", terminal=False) == 0
+    assert manager._frame_for("space-review", terminal=True) == 4
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("performed_by_role", "expected_frame"),

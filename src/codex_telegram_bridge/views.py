@@ -176,10 +176,11 @@ def _status(state: object, lifecycle: str | None = None) -> tuple[str, str]:
         return "🟡", "等待回答"
     if "waitingOnApproval" in flags:
         return "🟡", "等待审批"
+    # A stale thread-level active flag must not hide the terminal turn state.
+    if turn in {"completed", "interrupted"} or raw == "idle":
+        return "⚪", "空闲"
     if raw == "active" or turn == "inProgress":
         return "🟢", "执行中"
-    if raw == "idle" or turn in {"completed", "interrupted"}:
-        return "⚪", "空闲"
     return "⚫", "未加载"
 
 
@@ -585,7 +586,8 @@ def _main_profile(space: object | None, state: object) -> tuple[str, str, str, s
     observed_mode = str(_value(space, "observed_mode", default="unknown") or "unknown")
     if observed_mode not in {"unknown", "default", "plan"}:
         observed_mode = "unknown"
-    if desired_mode == "plan":
+    profile_mode = observed_mode if observed_mode != "unknown" else desired_mode
+    if profile_mode == "plan":
         model = str(_value(space, "plan_model", default="") or "")
         effort = str(_value(space, "plan_effort", default="") or "")
     else:
@@ -597,13 +599,12 @@ def _main_profile(space: object | None, state: object) -> tuple[str, str, str, s
 
 
 def _mode_status(desired_mode: str, observed_mode: str) -> tuple[str, str]:
-    desired_label = "Plan mode" if desired_mode == "plan" else "Normal mode"
-    desired_icon = "🧭" if desired_mode == "plan" else "⚙️"
+    del desired_mode
     if observed_mode == "unknown":
-        return desired_icon, f"期望 {desired_label} · TUI 模式未确认"
+        return "⚪", "TUI mode 未确认"
     observed_label = "Plan mode" if observed_mode == "plan" else "Normal mode"
-    icon = desired_icon if desired_mode == observed_mode else "⚠️"
-    return icon, f"期望 {desired_label} · TUI {observed_label}"
+    icon = "🧭" if observed_mode == "plan" else "⚙️"
+    return icon, f"TUI {observed_label}"
 
 
 def _review_status(state: object) -> tuple[bool, str, str]:
@@ -641,7 +642,7 @@ def render_status_comment(
     progress = 100.0 * completed / plan_total if plan_total else 0.0
     markdown_lines: list[str] = []
     plain_lines: list[str] = []
-    if review_active or desired_mode:
+    if review_active or desired_mode or observed_mode != "unknown":
         mode_icon, mode_label = (
             (review_icon, review_label)
             if review_active

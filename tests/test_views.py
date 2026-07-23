@@ -238,21 +238,21 @@ def test_status_comment_shows_animated_mode_and_main_and_subagent_profiles() -> 
 
     rendered = render_status_comment(state, space=space, animation_frame=1)
 
-    assert rendered.markdown.startswith("🌒 *🧭 期望 Plan mode · TUI Plan mode*")
+    assert rendered.markdown.startswith("🌒 *🧭 TUI Plan mode*")
     assert "*🧠 Main*  `gpt-5.6-sol` · Effort `xhigh`" in rendered.markdown
     assert "`gpt-5.6-luna/max`" in rendered.markdown
-    assert rendered.plain.startswith("🌒 🧭 期望 Plan mode · TUI Plan mode")
+    assert rendered.plain.startswith("🌒 🧭 TUI Plan mode")
 
     channel = render_channel_post(state, space=space, animation_frame=1)
-    assert channel.markdown.startswith("🌒 *🧭 期望 Plan mode · TUI Plan mode*")
+    assert channel.markdown.startswith("🌒 *🧭 TUI Plan mode*")
     assert "*🧠 Main*  `gpt-5.6-sol` · Effort `xhigh`" in channel.markdown
 
     space["desired_mode"] = "default"
     space["current_mode"] = "default"
     space["observed_mode"] = "plan"
     normal = render_channel_post(state, space=space, animation_frame=2)
-    assert normal.markdown.startswith("🌓 *⚠️ 期望 Normal mode · TUI Plan mode*")
-    assert "*🧠 Main*  `gpt-5.6-luna` · Effort `max`" in normal.markdown
+    assert normal.markdown.startswith("🌓 *🧭 TUI Plan mode*")
+    assert "*🧠 Main*  `gpt-5.6-sol` · Effort `xhigh`" in normal.markdown
 
 
 def test_legacy_space_mode_is_desired_only_and_observed_remains_unknown() -> None:
@@ -271,10 +271,41 @@ def test_legacy_space_mode_is_desired_only_and_observed_remains_unknown() -> Non
     status = render_status_comment(state, space=legacy_space)
     channel = render_channel_post(state, space=legacy_space)
 
-    assert status.markdown.startswith("*🧭 期望 Plan mode · TUI 模式未确认*")
-    assert channel.markdown.startswith("*🧭 期望 Plan mode · TUI 模式未确认*")
+    assert status.markdown.startswith("*⚪ TUI mode 未确认*")
+    assert channel.markdown.startswith("*⚪ TUI mode 未确认*")
     assert "TUI Plan mode" not in status.plain
     assert "TUI Plan mode" not in channel.plain
+
+
+def test_completed_review_does_not_render_as_executing() -> None:
+    state = ThreadState(
+        thread_id="review-completed",
+        status="active",
+        turn_status="completed",
+        review_status="completed",
+        latest_activity="Review 已完成",
+    )
+
+    rendered = render_status_comment(state, now=1_700_000_120)
+
+    assert "⚪ 空闲" in rendered.plain
+    assert "Review · 执行中" not in rendered.plain
+
+
+def test_in_progress_review_stays_visible_when_last_turn_is_terminal() -> None:
+    state = ThreadState(
+        thread_id="review-running-after-turn",
+        status="idle",
+        turn_status="completed",
+        review_status="inProgress",
+        latest_activity="Review 正在执行",
+    )
+
+    status = render_status_comment(state, now=1_700_000_120)
+    channel = render_channel_post(state, now=1_700_000_120)
+
+    assert "Review · 执行中" in status.plain
+    assert "Review · 执行中" in channel.plain
 
 
 def test_status_comment_separates_interrupted_tasks_and_warns_on_goal_plan_mismatch() -> None:

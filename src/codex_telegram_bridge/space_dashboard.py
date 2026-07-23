@@ -361,7 +361,25 @@ class SpaceDashboardManager:
         if str(space.get("lifecycle") or "") == "closed":
             return True
         goal = state.goal if isinstance(state, ThreadState) else state.get("goal")
-        return isinstance(goal, dict) and str(goal.get("status") or "") == "complete"
+        if not isinstance(goal, dict) or str(goal.get("status") or "") != "complete":
+            return False
+        status = state.status if isinstance(state, ThreadState) else state.get("status")
+        turn_status = state.turn_status if isinstance(state, ThreadState) else state.get("turn_status")
+        review_status = state.review_status if isinstance(state, ThreadState) else state.get("review_status")
+        if str(status or "") == "active" and str(turn_status or "") not in {
+            "completed",
+            "failed",
+            "interrupted",
+        }:
+            return False
+        if str(turn_status or "") == "inProgress" or str(review_status or "") == "inProgress":
+            return False
+        tasks = state.tasks if isinstance(state, ThreadState) else state.get("tasks") or ()
+        return not any(
+            str(task.get("status") if isinstance(task, dict) else getattr(task, "status", ""))
+            in {"pending", "pendingInit", "active", "running", "inProgress"}
+            for task in tasks
+        )
 
     @staticmethod
     def _is_animated(space: dict[str, Any], state: ThreadState | dict[str, Any]) -> bool:
@@ -371,7 +389,17 @@ class SpaceDashboardManager:
         turn_status = (
             state.turn_status if isinstance(state, ThreadState) else state.get("turn_status")
         )
-        return str(status or "") == "active" or str(turn_status or "") == "inProgress"
+        review_status = (
+            state.review_status if isinstance(state, ThreadState) else state.get("review_status")
+        )
+        return (
+            str(turn_status or "") == "inProgress"
+            or str(review_status or "") == "inProgress"
+            or (
+                str(status or "") == "active"
+                and str(turn_status or "") not in {"completed", "failed", "interrupted"}
+            )
+        )
 
     @staticmethod
     def _fingerprint_key(key: DeliveryKey) -> str:
@@ -493,20 +521,9 @@ class SpaceDashboardManager:
         *,
         terminal: bool = False,
     ) -> InlineKeyboardMarkup | None:
-        post_id = space.get("channel_post_id")
-        channel_id = space.get("channel_chat_id")
         rows: list[list[InlineKeyboardButton]] = []
         if not terminal and space.get("lifecycle") in {"pending", "active", "repair_required"}:
-            rows.append(
-                [
-                    self._callback_button("刷新", "space_refresh", space),
-                    self._callback_button("取消关注", "space_unwatch", space),
-                ]
-            )
-        if post_id and channel_id:
-            rows.append(
-                [InlineKeyboardButton("返回帖子", url=private_message_link(int(channel_id), int(post_id)))]
-            )
+            rows.append([self._callback_button("取消关注", "space_unwatch", space)])
         return InlineKeyboardMarkup(rows) if rows else None
 
     async def _heartbeat_loop(self) -> None:

@@ -1561,8 +1561,6 @@ class Bridge:
             space.last_error = ""
             space.pending_cwd = ""
             space.pending_prompt = ""
-            if collaboration_mode is not None:
-                space.observed_mode = space.desired_mode
             self.store.save_session_space(space)
             await self._notify_state_change(state, "session/activated")
             return state
@@ -1632,7 +1630,6 @@ class Bridge:
                 current.normal_effort = profile.effort
             current.current_mode = mode
             current.desired_mode = mode
-            current.observed_mode = mode
             self.store.save_session_space(current)
             if state := self.store.get_thread(current.thread_id or ""):
                 await self._notify_state_change(state, "thread/settings/updated")
@@ -1803,7 +1800,6 @@ class Bridge:
                 raise RuntimeError("Session space generation is stale")
             current.current_mode = mode
             current.desired_mode = mode
-            current.observed_mode = mode
             if profile is not None:
                 if mode == "plan":
                     current.plan_model = profile.model
@@ -2008,7 +2004,6 @@ class Bridge:
         if delivered:
             space.current_mode = "default"
             space.desired_mode = "default"
-            space.observed_mode = "default"
             self.store.save_session_space(space)
             return "delivered"
         return "absent"

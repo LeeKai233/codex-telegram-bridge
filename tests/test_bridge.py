@@ -53,6 +53,38 @@ def test_review_target_prompts_match_codex_review_hints() -> None:
     ) == "commit abcdef0"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("review_status", ["completed", "failed", "interrupted"])
+async def test_terminal_review_status_does_not_bypass_later_item_debounce(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    review_status: str,
+) -> None:
+    bridge, store = make_bridge(tmp_path)
+    scheduled: list[bool] = []
+
+    async def schedule(_state: ThreadState, *, immediate: bool = False) -> None:
+        scheduled.append(immediate)
+
+    monkeypatch.setattr(bridge.dashboard, "schedule", schedule)
+    terminal_review = ThreadState(
+        thread_id="thread-review-debounce",
+        turn_id="review-turn",
+        turn_status="completed",
+        review_status=review_status,
+        latest_activity="Review 已完成",
+    )
+    await bridge._on_state_change(terminal_review, "item/completed")
+
+    terminal_review.turn_id = "normal-turn"
+    terminal_review.turn_status = "inProgress"
+    terminal_review.latest_activity = "命令执行 inProgress"
+    await bridge._on_state_change(terminal_review, "item/started")
+
+    assert scheduled == [True, False]
+    store.close()
+
+
 def test_review_history_match_separates_entry_target_from_exit_findings() -> None:
     match = bridge_module._find_review_turn(
         {
@@ -557,6 +589,7 @@ async def test_activate_pending_session_starts_with_explicit_plan_profile(
     }
     space = store.get_session_space("space-profiled")
     assert space is not None and (space.current_mode, space.lifecycle) == ("plan", "active")
+    assert space.observed_mode == "unknown"
     store.close()
 
 
@@ -606,6 +639,7 @@ async def test_change_space_model_updates_current_mode_for_subsequent_turns(
     assert (changed.plan_model, changed.plan_effort) == ("plan-old", "low")
     assert updates[0][0] == "thread-change"
     assert updates[0][1]["mode"] == "default"
+    assert changed.observed_mode == "unknown"
     store.close()
 
 

@@ -931,7 +931,7 @@ async def test_space_dashboard_keeps_channel_native_comments_and_status_controls
         for row in status_edit["reply_markup"].inline_keyboard
         for button in row
     ]
-    assert labels == ["刷新", "取消关注", "返回帖子"]
+    assert labels == ["取消关注"]
     await delivery.stop(drain_timeout=0)
 
 
@@ -1097,7 +1097,13 @@ async def test_unwatch_freezes_space_cancels_work_and_deletes_future_commands(ri
     button = rig.discussion._button("Refresh", "space_refresh", {}, space)
     nonce = str(button.callback_data)[3:]
 
-    await rig.discussion._dispatch_callback("unwatch_execute", {}, space)
+    await rig.discussion._dispatch_callback(
+        "unwatch_execute",
+        {},
+        space,
+        callback_message_id=900,
+        callback_chat_id=DISCUSSION_CHAT_ID,
+    )
 
     closed = rig.store.get_space("space-freeze")
     assert closed is not None
@@ -1111,6 +1117,13 @@ async def test_unwatch_freezes_space_cancels_work_and_deletes_future_commands(ri
         chat_id=DISCUSSION_CHAT_ID,
     ) is None
     assert rig.bridge.close_calls == [("space-freeze", 1)]
+    assert rig.discussion_endpoint.edited[-1] == {
+        "chat_id": DISCUSSION_CHAT_ID,
+        "message_id": 900,
+        "markdown": "已取消关注。评论历史已保留，此评论串现为只读。",
+        "reply_markup": None,
+        "priority": 5,
+    }
 
     command = update_for_message(
         "/prompt must not run",

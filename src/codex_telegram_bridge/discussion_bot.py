@@ -2255,6 +2255,29 @@ class DiscussionBotController:
             await self._send_space(space, "已取消操作。")
         elif action == "unwatch_execute":
             await self.coordinator.close(str(space["space_id"]), int(space["generation"]))
+            if callback_message_id is not None:
+                try:
+                    await self.discussion.edit_text(
+                        int(callback_chat_id or space["discussion_chat_id"]),
+                        callback_message_id,
+                        "已取消关注。评论历史已保留，此评论串现为只读。",
+                        reply_markup=None,
+                        priority=5,
+                    )
+                except TelegramError:
+                    try:
+                        await self.discussion.edit_reply_markup(
+                            int(callback_chat_id or space["discussion_chat_id"]),
+                            callback_message_id,
+                            reply_markup=None,
+                            priority=5,
+                        )
+                    except TelegramError:
+                        LOGGER.warning(
+                            "event=unwatch_confirmation_edit_failed space_id=%s message_id=%s",
+                            str(space["space_id"])[:12],
+                            callback_message_id,
+                        )
         elif action == "prompt_mode":
             self._ensure_unlocked(space)
             await self._send_prompt(

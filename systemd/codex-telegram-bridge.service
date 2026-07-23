@@ -1,5 +1,5 @@
 # X-CodexTelegramBridge-Installer: managed
-# X-CodexTelegramBridge-Installer-Version: v0.3.0
+# X-CodexTelegramBridge-Installer-Version: v0.3.1
 [Unit]
 Description=Codex Telegram Bridge
 Documentation=https://github.com/LeeKai233/codex-telegram-bridge
