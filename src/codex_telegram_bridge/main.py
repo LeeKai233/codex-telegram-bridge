@@ -708,6 +708,7 @@ def _build_runtime(config: Config) -> Runtime:
             config.codex_socket,
             config.codex_binary,
             config.state_dir,
+            codex_home=config.codex_home,
             installer_restart=_restart_installer_app_server,
             protocol_probe=_disabled_protocol_probe,
         )

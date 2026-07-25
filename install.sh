@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly INSTALLER_VERSION="0.3.1"
+readonly INSTALLER_VERSION="0.3.2"
 readonly UV_VERSION="0.11.28"
 readonly PROJECT="codex-telegram-bridge"
 readonly REPOSITORY="LeeKai233/codex-telegram-bridge"
@@ -947,11 +947,16 @@ $UNIT_MARKER
 $UNIT_VERSION
 [Unit]
 StartLimitIntervalSec=900
-StartLimitBurst=30
+StartLimitBurst=5
 
 [Service]
-Restart=on-failure
-RestartSec=30s
+# Reset any Restart= inherited from the Codex-owned base unit.  Bootstrap is
+# Type=oneshot, so retrying it on a
+# deterministic input failure (a stale pid record) replays the same error and only
+# burns the start limit.  codex-managed-daemon-watchdog.timer owns recovery: it
+# re-probes every 60s and now also reclaims stale pid records.
+Restart=
+RestartSec=60s
 EOF
     chmod 0644 "$temporary"
     mv "$temporary" "$destination"
@@ -1009,6 +1014,8 @@ write_bridge_unit() {
     local destination="$USER_UNIT_DIR/codex-telegram-bridge.service"
     local wants="network-online.target"
     local after="network-online.target"
+    local start_limit_interval=900
+    local start_limit_burst=30
     local temporary
     if [[ "$APP_SERVER_MODE" == "installer-service" ]]; then
         after="network-online.target codex-telegram-app-server.service"
@@ -1016,6 +1023,8 @@ write_bridge_unit() {
     if [[ "$APP_SERVER_MODE" == "managed-daemon" ]]; then
         wants+=" codex-managed-daemon-bootstrap.service"
         after+=" codex-managed-daemon-bootstrap.service"
+        start_limit_interval=300
+        start_limit_burst=5
     fi
     temporary="$(mktemp "$USER_UNIT_DIR/.codex-telegram-bridge.XXXXXX")"
     cat >"$temporary" <<EOF
@@ -1026,8 +1035,8 @@ Description=Codex Telegram Bridge
 Documentation=https://github.com/$REPOSITORY
 Wants=$wants
 After=$after
-StartLimitIntervalSec=900
-StartLimitBurst=30
+StartLimitIntervalSec=$start_limit_interval
+StartLimitBurst=$start_limit_burst
 
 [Service]
 Type=simple
@@ -1119,6 +1128,7 @@ install_and_start_units() {
         systemctl --user enable --now codex-managed-daemon-watchdog.timer
     fi
     systemctl --user enable codex-telegram-bridge.service
+    systemctl --user reset-failed codex-telegram-bridge.service || true
     systemctl --user restart codex-telegram-bridge.service
     wait_for_unit codex-telegram-bridge.service || die "Codex Telegram Bridge failed to start"
 }

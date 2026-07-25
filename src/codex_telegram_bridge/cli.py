@@ -27,7 +27,7 @@ import segno
 from telegram import Bot
 from websockets.asyncio.client import unix_connect
 
-from .app_server import RecoveryLock
+from .app_server import RecoveryLock, reclaim_stale_daemon_pid_records
 from .config import AppServerMode, Config, ensure_private_directory, open_private_directory
 from .security import Enrollment, SecurityManager
 from .store import Store
@@ -42,6 +42,9 @@ TOKEN_VARIABLES = (
     FORUM_TOKEN_VARIABLE,
     STATUS_TOKEN_VARIABLE,
 )
+BRIDGE_UNIT_NAME = "codex-telegram-bridge.service"
+BRIDGE_RESTART_MARKER_NAME = "app-server-bridge-restart.json"
+BRIDGE_RESTART_MARKER_MAX_BYTES = 4096
 _ASSIGNMENT = re.compile(rf"^[ \t]*(?:export[ \t]+)?{TOKEN_VARIABLE}[ \t]*=[ \t]*(?P<value>.*)$")
 _TOKEN_SHAPE = re.compile(r"^[0-9]{6,16}:[A-Za-z0-9_-]{20,}$")
 
@@ -227,6 +230,63 @@ def _atomic_write_text(path: Path, content: str, mode: int, *, expected: str | N
             os.close(descriptor)
         if not replaced:
             temporary.unlink(missing_ok=True)
+
+
+def _atomic_write_text_at(parent_descriptor: int, name: str, content: str, mode: int) -> None:
+    """Atomically write a private file through an already validated directory fd."""
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = -1
+    temporary_name: str | None = None
+    for _ in range(16):
+        candidate = f".{name}.{secrets.token_hex(12)}"
+        try:
+            descriptor = os.open(candidate, flags, mode, dir_fd=parent_descriptor)
+        except FileExistsError:
+            continue
+        temporary_name = candidate
+        break
+    if descriptor < 0 or temporary_name is None:
+        raise OSError(f"could not allocate a temporary file for {name}")
+
+    replaced = False
+    try:
+        os.fchmod(descriptor, mode)
+        payload = content.encode("utf-8")
+        remaining = memoryview(payload)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written <= 0:  # pragma: no cover - regular-file writes either progress or raise
+                raise OSError("marker write made no progress")
+            remaining = remaining[written:]
+        os.fsync(descriptor)
+        metadata = os.fstat(descriptor)
+        if metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != mode:
+            raise CliError(f"临时 marker 权限校验失败：{name}")
+        os.replace(
+            temporary_name,
+            name,
+            src_dir_fd=parent_descriptor,
+            dst_dir_fd=parent_descriptor,
+        )
+        temporary_name = None
+        replaced = True
+        os.fsync(parent_descriptor)
+    except BaseException:
+        if replaced:
+            raise _AtomicWriteCommittedError(f"marker 已替换，但目录写入未确认持久化：{name}") from None
+        raise
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
+        if temporary_name is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(temporary_name, dir_fd=parent_descriptor)
 
 
 def _credential_snapshot_at(path: Path, parent_descriptor: int) -> _CredentialSnapshot:
@@ -1468,6 +1528,246 @@ def _managed_daemon_version_available(config: Config) -> bool:
     return completed.returncode == 0
 
 
+@dataclass(frozen=True, slots=True)
+class _BridgeUnitState:
+    active_state: str
+    sub_state: str
+    result: str
+    unit_file_state: str
+
+
+def _bridge_restart_marker_path(config: Config) -> Path:
+    return config.state_dir / BRIDGE_RESTART_MARKER_NAME
+
+
+def _read_bridge_unit_state(config: Config) -> _BridgeUnitState | None:
+    try:
+        completed = subprocess.run(
+            [
+                "systemctl",
+                "--user",
+                "show",
+                BRIDGE_UNIT_NAME,
+                "--property=ActiveState,SubState,Result,UnitFileState",
+            ],
+            check=False,
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
+        return None
+    if completed.returncode != 0:
+        return None
+    if not isinstance(completed.stdout, str):
+        return None
+    properties: dict[str, str] = {}
+    for line in completed.stdout.splitlines():
+        name, separator, value = line.partition("=")
+        if separator and name in {"ActiveState", "SubState", "Result", "UnitFileState"}:
+            properties[name] = value.strip()
+    if not all(properties.get(name) for name in ("ActiveState", "SubState", "Result", "UnitFileState")):
+        return None
+    return _BridgeUnitState(
+        active_state=properties["ActiveState"],
+        sub_state=properties["SubState"],
+        result=properties["Result"],
+        unit_file_state=properties["UnitFileState"],
+    )
+
+
+def _bridge_was_expected_active(state: _BridgeUnitState | None) -> bool | str:
+    if state is None:
+        return "unknown"
+    return state.active_state in {"active", "failed"} and not _bridge_unit_is_unstartable(state)
+
+
+def _bridge_unit_is_unstartable(state: _BridgeUnitState) -> bool:
+    return state.unit_file_state in {"bad", "not-found"} or state.unit_file_state.startswith(
+        ("disabled", "masked")
+    )
+
+
+def _write_bridge_restart_marker(config: Config) -> bool:
+    state = _read_bridge_unit_state(config)
+    payload = {
+        "version": 1,
+        "bridge_expected_active": _bridge_was_expected_active(state),
+        "created_at": int(time.time()),
+    }
+    parent_descriptor = -1
+    try:
+        parent_descriptor = open_private_directory(config.state_dir)
+        _atomic_write_text_at(
+            parent_descriptor,
+            BRIDGE_RESTART_MARKER_NAME,
+            json.dumps(payload, separators=(",", ":")) + "\n",
+            0o600,
+        )
+    except (OSError, RuntimeError, CliError, _AtomicWriteCommittedError):
+        return False
+    finally:
+        if parent_descriptor >= 0:
+            os.close(parent_descriptor)
+    return True
+
+
+def _read_bridge_restart_marker(config: Config) -> bool | str | None:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    payload: object = None
+    parent_descriptor = -1
+    descriptor = -1
+    try:
+        parent_descriptor = open_private_directory(config.state_dir, create=False)
+        descriptor = os.open(BRIDGE_RESTART_MARKER_NAME, flags, dir_fd=parent_descriptor)
+        status = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(status.st_mode)
+            or status.st_uid != os.getuid()
+            or stat.S_IMODE(status.st_mode) & 0o077
+        ):
+            return None
+        raw = os.read(descriptor, BRIDGE_RESTART_MARKER_MAX_BYTES + 1)
+        if len(raw) > BRIDGE_RESTART_MARKER_MAX_BYTES:
+            return None
+        payload = json.loads(raw)
+    except (OSError, RuntimeError, UnicodeDecodeError, ValueError):
+        return None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if parent_descriptor >= 0:
+            os.close(parent_descriptor)
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        return None
+    expected_active = payload.get("bridge_expected_active")
+    if isinstance(expected_active, bool) or expected_active == "unknown":
+        return expected_active
+    return None
+
+
+def _clear_bridge_restart_marker(config: Config) -> bool:
+    parent_descriptor = -1
+    try:
+        parent_descriptor = open_private_directory(config.state_dir, create=False)
+        try:
+            status = os.stat(
+                BRIDGE_RESTART_MARKER_NAME,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+        if (
+            not stat.S_ISREG(status.st_mode)
+            or status.st_uid != os.getuid()
+            or stat.S_IMODE(status.st_mode) & 0o077
+        ):
+            return False
+        os.unlink(BRIDGE_RESTART_MARKER_NAME, dir_fd=parent_descriptor)
+    except FileNotFoundError:
+        return True
+    except (OSError, RuntimeError):
+        return False
+    finally:
+        if parent_descriptor >= 0:
+            os.close(parent_descriptor)
+    return True
+
+
+def _bridge_restart_marker_exists(config: Config) -> bool:
+    parent_descriptor = -1
+    try:
+        parent_descriptor = open_private_directory(config.state_dir, create=False)
+        os.stat(
+            BRIDGE_RESTART_MARKER_NAME,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return False
+    except (OSError, RuntimeError):
+        return True
+    finally:
+        if parent_descriptor >= 0:
+            os.close(parent_descriptor)
+    return True
+
+
+def _run_user_systemctl(*arguments: str) -> subprocess.CompletedProcess[str] | None:
+    try:
+        return subprocess.run(
+            ["systemctl", "--user", *arguments],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
+        return None
+
+
+def _reconcile_bridge_restart_marker(config: Config, output: TextIO) -> int:
+    expected_active = _read_bridge_restart_marker(config)
+    if expected_active is None:
+        if _bridge_restart_marker_exists(config):
+            output.write("app-server watchdog: invalid bridge recovery marker retained\n")
+            return 1
+        return 0
+    state = _read_bridge_unit_state(config)
+    if state is None:
+        output.write("app-server watchdog: bridge recovery marker retained; bridge state unavailable\n")
+        return 1
+    if state.active_state == "active" and state.sub_state == "running":
+        if _clear_bridge_restart_marker(config):
+            output.write("app-server watchdog: bridge is healthy; recovery marker cleared\n")
+            return 0
+        output.write("app-server watchdog: bridge is healthy; recovery marker could not be cleared\n")
+        return 1
+    if expected_active == "unknown":
+        output.write("app-server watchdog: bridge recovery marker retained; prior bridge state unknown\n")
+        return 1
+    if not expected_active:
+        output.write(
+            "app-server watchdog: bridge recovery marker retained; bridge was intentionally inactive\n"
+        )
+        return 0
+    if state.active_state != "failed" or _bridge_unit_is_unstartable(state):
+        output.write(
+            "app-server watchdog: bridge recovery marker retained; bridge is not a failed enabled unit\n"
+        )
+        return 0
+    reset = _run_user_systemctl("reset-failed", BRIDGE_UNIT_NAME)
+    start = _run_user_systemctl("start", BRIDGE_UNIT_NAME) if reset and reset.returncode == 0 else None
+    if start is None or start.returncode != 0:
+        output.write("app-server watchdog: bridge restart failed; recovery marker retained\n")
+        return 1
+    successor = _read_bridge_unit_state(config)
+    if (
+        successor is not None
+        and successor.active_state == "active"
+        and successor.sub_state == "running"
+        and _clear_bridge_restart_marker(config)
+    ):
+        output.write("app-server watchdog: bridge restarted after app-server recovery\n")
+        return 0
+    output.write("app-server watchdog: bridge restart did not become healthy; recovery marker retained\n")
+    return 1
+
+
+def _reconcile_bridge_restart_marker_with_lock(config: Config, output: TextIO) -> int:
+    with RecoveryLock(config.state_dir / "app-server-recovery.lock") as acquired:
+        if not acquired:
+            output.write("app-server watchdog: recovery already in progress\n")
+            return 0
+        return _reconcile_bridge_restart_marker(config, output)
+
+
 def _app_server_watchdog(config: Config, output: TextIO, *, recover: bool = False) -> int:
     """Check only local app-server readiness; never opens Telegram state or credentials."""
     if config.app_server_mode is AppServerMode.EXTERNAL:
@@ -1488,8 +1788,13 @@ def _app_server_watchdog(config: Config, output: TextIO, *, recover: bool = Fals
         return True
 
     if healthy():
+        bridge_status = (
+            _reconcile_bridge_restart_marker_with_lock(config, output)
+            if recover and config.app_server_mode is AppServerMode.MANAGED_DAEMON
+            else 0
+        )
         output.write(f"app-server watchdog: {config.app_server_mode.value} protocol ready\n")
-        return 0
+        return bridge_status
     if not recover or config.app_server_mode is not AppServerMode.MANAGED_DAEMON:
         output.write(
             f"app-server watchdog: {config.app_server_mode.value} protocol unavailable: "
@@ -1502,6 +1807,11 @@ def _app_server_watchdog(config: Config, output: TextIO, *, recover: bool = Fals
             return 0
         environment = os.environ.copy()
         environment["CODEX_HOME"] = str(config.codex_home)
+        for record in reclaim_stale_daemon_pid_records(config.codex_home):
+            output.write(
+                f"app-server watchdog: reclaimed stale pid record {record.path.name} "
+                f"pid={record.pid} ({record.verdict})\n"
+            )
         for command in (
             [str(config.codex_binary), "app-server", "daemon", "restart"],
             [str(config.codex_binary), "app-server", "daemon", "bootstrap"],
@@ -1519,10 +1829,14 @@ def _app_server_watchdog(config: Config, output: TextIO, *, recover: bool = Fals
             except (OSError, subprocess.TimeoutExpired):
                 continue
             if completed.returncode == 0 and healthy():
+                bridge_status = _reconcile_bridge_restart_marker(config, output)
                 output.write("app-server watchdog: daemon recovered and protocol verified\n")
-                return 0
-    output.write("app-server watchdog: recovery failed\n")
-    return 1
+                return bridge_status
+        marker_written = _write_bridge_restart_marker(config)
+        if not marker_written:
+            output.write("app-server watchdog: bridge recovery marker could not be written\n")
+        output.write("app-server watchdog: recovery failed\n")
+        return 1
 
 
 def build_parser() -> argparse.ArgumentParser:

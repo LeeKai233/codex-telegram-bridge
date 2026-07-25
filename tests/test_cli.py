@@ -11,7 +11,9 @@ from types import SimpleNamespace
 
 import pytest
 
+import codex_telegram_bridge.app_server as app_server
 import codex_telegram_bridge.cli as cli
+from codex_telegram_bridge.app_server import RecoveryLock
 from codex_telegram_bridge.cli import (
     CliError,
     _app_server_watchdog,
@@ -519,6 +521,389 @@ def test_managed_daemon_watchdog_restarts_and_rechecks_protocol(
     assert _app_server_watchdog(config, output, recover=True) == 0
     assert (str(config.codex_binary), "app-server", "daemon", "restart") in commands
     assert "daemon recovered and protocol verified" in output.getvalue()
+
+
+def make_managed_daemon_config(tmp_path: Path) -> Config:
+    return Config(
+        config_dir=tmp_path / "config",
+        state_dir=tmp_path / "state",
+        codex_home=tmp_path / ".codex",
+        codex_socket=tmp_path / ".codex" / "control.sock",
+        codex_binary=tmp_path / "codex",
+        allowed_root=tmp_path,
+        app_server_mode=AppServerMode.MANAGED_DAEMON,
+    )
+
+
+def test_bridge_unit_state_parses_systemd_property_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = make_managed_daemon_config(tmp_path)
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout="ActiveState=failed\n"
+            "SubState=failed\n"
+            "UnitFileState=enabled\n"
+            "Result=start-limit-hit\n",
+        ),
+    )
+
+    assert cli._read_bridge_unit_state(config) == cli._BridgeUnitState(
+        "failed", "failed", "start-limit-hit", "enabled"
+    )
+
+
+def write_stale_pid_record(config: Config) -> Path:
+    directory = config.codex_home / "app-server-daemon"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "app-server.pid"
+    path.write_text(
+        json.dumps({"pid": 416, "processStartTime": "Sat Jul 25 15:46:16 2026"}), encoding="utf-8"
+    )
+    return path
+
+
+def test_managed_daemon_watchdog_reclaims_stale_pid_record_before_recovery_commands(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = make_managed_daemon_config(tmp_path)
+    record = write_stale_pid_record(config)
+    protocol_ready = False
+    existed_at_command: list[bool] = []
+
+    monkeypatch.setattr(cli, "_socket_is_private", lambda _path: True)
+    monkeypatch.setattr(cli, "_managed_daemon_version_available", lambda _config: True)
+    monkeypatch.setattr(app_server, "_read_process_start_time", lambda _pid: (1, ""))
+
+    async def protocol_probe(_path: Path) -> bool:
+        if not protocol_ready:
+            raise RuntimeError("protocol unavailable")
+        return protocol_ready
+
+    def run(command: list[str], **_kwargs: object) -> SimpleNamespace:
+        nonlocal protocol_ready
+        existed_at_command.append(record.exists())
+        if command[-1] == "restart":
+            protocol_ready = True
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(cli, "_probe_app_server_protocol", protocol_probe)
+    monkeypatch.setattr(cli.subprocess, "run", run)
+    output = StringIO()
+
+    assert _app_server_watchdog(config, output, recover=True) == 0
+    assert not record.exists()
+    assert existed_at_command and existed_at_command[0] is False
+    assert "reclaimed stale pid record app-server.pid pid=416 (dead)" in output.getvalue()
+    assert "daemon recovered and protocol verified" in output.getvalue()
+
+
+def test_watchdog_without_recover_does_not_reclaim_pid_records(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = make_managed_daemon_config(tmp_path)
+    record = write_stale_pid_record(config)
+    monkeypatch.setattr(cli, "_socket_is_private", lambda _path: False)
+    monkeypatch.setattr(app_server, "_read_process_start_time", lambda _pid: (1, ""))
+    output = StringIO()
+
+    assert _app_server_watchdog(config, output) == 1
+    assert record.exists()
+    assert "reclaimed stale pid record" not in output.getvalue()
+
+
+def test_external_mode_watchdog_never_scans_pid_records(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = Config(
+        config_dir=tmp_path / "config",
+        state_dir=tmp_path / "state",
+        codex_home=tmp_path / ".codex",
+        codex_socket=tmp_path / ".codex" / "control.sock",
+        codex_binary=tmp_path / "codex",
+        allowed_root=tmp_path,
+        app_server_mode=AppServerMode.EXTERNAL,
+    )
+    record = write_stale_pid_record(config)
+    monkeypatch.setattr(app_server, "_read_process_start_time", lambda _pid: (1, ""))
+    output = StringIO()
+
+    assert _app_server_watchdog(config, output, recover=True) == 0
+    assert record.exists()
+
+
+def test_watchdog_skips_reclamation_when_recovery_lock_is_contended(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = make_managed_daemon_config(tmp_path)
+    record = write_stale_pid_record(config)
+    monkeypatch.setattr(cli, "_socket_is_private", lambda _path: True)
+    monkeypatch.setattr(cli, "_managed_daemon_version_available", lambda _config: True)
+    monkeypatch.setattr(app_server, "_read_process_start_time", lambda _pid: (1, ""))
+
+    async def protocol_probe(_path: Path) -> bool:
+        raise RuntimeError("protocol unavailable")
+
+    monkeypatch.setattr(cli, "_probe_app_server_protocol", protocol_probe)
+    output = StringIO()
+
+    with RecoveryLock(config.state_dir / "app-server-recovery.lock") as acquired:
+        assert acquired is True
+        assert _app_server_watchdog(config, output, recover=True) == 0
+
+    assert record.exists()
+    assert "recovery already in progress" in output.getvalue()
+
+
+def test_watchdog_failure_records_bridge_activity_for_later_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = make_managed_daemon_config(tmp_path)
+    failed = cli._BridgeUnitState("failed", "failed", "start-limit-hit", "enabled")
+    monkeypatch.setattr(cli, "_socket_is_private", lambda _path: True)
+    monkeypatch.setattr(cli, "_managed_daemon_version_available", lambda _config: True)
+    monkeypatch.setattr(cli, "_read_bridge_unit_state", lambda _config: failed)
+
+    async def protocol_probe(_path: Path) -> bool:
+        raise RuntimeError("protocol unavailable")
+
+    monkeypatch.setattr(cli, "_probe_app_server_protocol", protocol_probe)
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=1, stdout=""),
+    )
+
+    assert _app_server_watchdog(config, StringIO(), recover=True) == 1
+    marker = config.state_dir / cli.BRIDGE_RESTART_MARKER_NAME
+    assert json.loads(marker.read_text(encoding="utf-8"))["bridge_expected_active"] is True
+    assert stat.S_IMODE(marker.stat().st_mode) == 0o600
+
+
+def test_watchdog_failure_writes_marker_before_releasing_recovery_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = make_managed_daemon_config(tmp_path)
+    monkeypatch.setattr(cli, "_socket_is_private", lambda _path: True)
+    monkeypatch.setattr(cli, "_managed_daemon_version_available", lambda _config: True)
+
+    async def protocol_probe(_path: Path) -> bool:
+        raise RuntimeError("protocol unavailable")
+
+    monkeypatch.setattr(cli, "_probe_app_server_protocol", protocol_probe)
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=1, stdout=""),
+    )
+    lock_was_held = False
+
+    def write_marker(_config: Config) -> bool:
+        nonlocal lock_was_held
+        with RecoveryLock(config.state_dir / "app-server-recovery.lock") as acquired:
+            lock_was_held = acquired is False
+        return True
+
+    monkeypatch.setattr(cli, "_write_bridge_restart_marker", write_marker)
+
+    assert _app_server_watchdog(config, StringIO(), recover=True) == 1
+    assert lock_was_held is True
+    with RecoveryLock(config.state_dir / "app-server-recovery.lock") as acquired:
+        assert acquired is True
+
+
+@pytest.mark.parametrize("symlink_parent", [False, True])
+def test_bridge_restart_marker_rejects_symlinked_state_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, symlink_parent: bool
+) -> None:
+    real_state = tmp_path / "real-state"
+    real_state.mkdir()
+    if symlink_parent:
+        real_parent = tmp_path / "real-parent"
+        real_parent.mkdir()
+        linked_parent = tmp_path / "linked-parent"
+        linked_parent.symlink_to(real_parent, target_is_directory=True)
+        state_dir = linked_parent / "state"
+    else:
+        state_dir = tmp_path / "state"
+        state_dir.symlink_to(real_state, target_is_directory=True)
+    config = Config(
+        config_dir=tmp_path / "config",
+        state_dir=state_dir,
+        codex_home=tmp_path / ".codex",
+        codex_socket=tmp_path / ".codex" / "control.sock",
+        codex_binary=tmp_path / "codex",
+        allowed_root=tmp_path,
+        app_server_mode=AppServerMode.MANAGED_DAEMON,
+    )
+    monkeypatch.setattr(
+        cli,
+        "_read_bridge_unit_state",
+        lambda _config: cli._BridgeUnitState("failed", "failed", "start-limit-hit", "enabled"),
+    )
+
+    assert cli._write_bridge_restart_marker(config) is False
+    assert cli._read_bridge_restart_marker(config) is None
+    assert cli._bridge_restart_marker_exists(config) is True
+    assert cli._clear_bridge_restart_marker(config) is False
+    assert not (real_state / cli.BRIDGE_RESTART_MARKER_NAME).exists()
+    if symlink_parent:
+        assert not (real_parent / "state").exists()
+
+
+def test_bridge_recovery_does_not_start_a_runtime_masked_unit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = make_managed_daemon_config(tmp_path)
+    masked = cli._BridgeUnitState("failed", "failed", "start-limit-hit", "masked-runtime")
+    monkeypatch.setattr(cli, "_read_bridge_unit_state", lambda _config: masked)
+    assert cli._write_bridge_restart_marker(config) is True
+    monkeypatch.setattr(cli, "_socket_is_private", lambda _path: True)
+    monkeypatch.setattr(cli, "_managed_daemon_version_available", lambda _config: True)
+
+    async def protocol_probe(_path: Path) -> bool:
+        return True
+
+    monkeypatch.setattr(cli, "_probe_app_server_protocol", protocol_probe)
+    monkeypatch.setattr(
+        cli,
+        "_run_user_systemctl",
+        lambda *_args: pytest.fail("runtime-masked services must not be started"),
+    )
+
+    assert _app_server_watchdog(config, StringIO(), recover=True) == 0
+    assert (config.state_dir / cli.BRIDGE_RESTART_MARKER_NAME).exists()
+
+
+def test_healthy_watchdog_resets_failed_bridge_and_clears_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = make_managed_daemon_config(tmp_path)
+    failed = cli._BridgeUnitState("failed", "failed", "start-limit-hit", "enabled")
+    healthy = cli._BridgeUnitState("active", "running", "success", "enabled")
+    monkeypatch.setattr(cli, "_read_bridge_unit_state", lambda _config: failed)
+    assert cli._write_bridge_restart_marker(config) is True
+    commands: list[tuple[str, ...]] = []
+
+    monkeypatch.setattr(cli, "_socket_is_private", lambda _path: True)
+    monkeypatch.setattr(cli, "_managed_daemon_version_available", lambda _config: True)
+
+    async def protocol_probe(_path: Path) -> bool:
+        return True
+
+    monkeypatch.setattr(cli, "_probe_app_server_protocol", protocol_probe)
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda command, **_kwargs: commands.append(tuple(command))
+        or SimpleNamespace(returncode=0, stdout=""),
+    )
+    states = iter((failed, healthy))
+    monkeypatch.setattr(cli, "_read_bridge_unit_state", lambda _config: next(states))
+
+    output = StringIO()
+    assert _app_server_watchdog(config, output, recover=True) == 0
+    assert ("systemctl", "--user", "reset-failed", cli.BRIDGE_UNIT_NAME) in commands
+    assert ("systemctl", "--user", "start", cli.BRIDGE_UNIT_NAME) in commands
+    assert not (config.state_dir / cli.BRIDGE_RESTART_MARKER_NAME).exists()
+    assert "bridge restarted after app-server recovery" in output.getvalue()
+
+
+def test_watchdog_check_only_does_not_reconcile_bridge_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = make_managed_daemon_config(tmp_path)
+    failed = cli._BridgeUnitState("failed", "failed", "start-limit-hit", "enabled")
+    monkeypatch.setattr(cli, "_read_bridge_unit_state", lambda _config: failed)
+    assert cli._write_bridge_restart_marker(config) is True
+    monkeypatch.setattr(cli, "_socket_is_private", lambda _path: True)
+    monkeypatch.setattr(cli, "_managed_daemon_version_available", lambda _config: True)
+
+    async def protocol_probe(_path: Path) -> bool:
+        return True
+
+    monkeypatch.setattr(cli, "_probe_app_server_protocol", protocol_probe)
+    monkeypatch.setattr(
+        cli,
+        "_run_user_systemctl",
+        lambda *_args: pytest.fail("check-only watchdog must not mutate bridge state"),
+    )
+
+    assert _app_server_watchdog(config, StringIO(), recover=False) == 0
+    assert (config.state_dir / cli.BRIDGE_RESTART_MARKER_NAME).exists()
+
+
+def test_healthy_watchdog_does_not_start_intentionally_inactive_bridge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = make_managed_daemon_config(tmp_path)
+    failed = cli._BridgeUnitState("failed", "failed", "start-limit-hit", "enabled")
+    inactive = cli._BridgeUnitState("inactive", "dead", "success", "enabled")
+    monkeypatch.setattr(cli, "_read_bridge_unit_state", lambda _config: failed)
+    assert cli._write_bridge_restart_marker(config) is True
+    monkeypatch.setattr(cli, "_read_bridge_unit_state", lambda _config: inactive)
+    monkeypatch.setattr(cli, "_socket_is_private", lambda _path: True)
+    monkeypatch.setattr(cli, "_managed_daemon_version_available", lambda _config: True)
+
+    async def protocol_probe(_path: Path) -> bool:
+        return True
+
+    monkeypatch.setattr(cli, "_probe_app_server_protocol", protocol_probe)
+    monkeypatch.setattr(
+        cli,
+        "_run_user_systemctl",
+        lambda *_args: pytest.fail("inactive services must not be started"),
+    )
+
+    assert _app_server_watchdog(config, StringIO(), recover=True) == 0
+    assert (config.state_dir / cli.BRIDGE_RESTART_MARKER_NAME).exists()
+
+
+def test_failed_bridge_restart_keeps_marker_for_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = make_managed_daemon_config(tmp_path)
+    failed = cli._BridgeUnitState("failed", "failed", "start-limit-hit", "enabled")
+    monkeypatch.setattr(cli, "_read_bridge_unit_state", lambda _config: failed)
+    assert cli._write_bridge_restart_marker(config) is True
+    monkeypatch.setattr(cli, "_socket_is_private", lambda _path: True)
+    monkeypatch.setattr(cli, "_managed_daemon_version_available", lambda _config: True)
+
+    async def protocol_probe(_path: Path) -> bool:
+        return True
+
+    monkeypatch.setattr(cli, "_probe_app_server_protocol", protocol_probe)
+    calls: list[tuple[str, ...]] = []
+
+    def run_systemctl(*arguments: str) -> SimpleNamespace:
+        calls.append(arguments)
+        return SimpleNamespace(returncode=0 if arguments[0] == "reset-failed" else 1)
+
+    monkeypatch.setattr(cli, "_run_user_systemctl", run_systemctl)
+
+    assert _app_server_watchdog(config, StringIO(), recover=True) == 1
+    assert calls == [("reset-failed", cli.BRIDGE_UNIT_NAME), ("start", cli.BRIDGE_UNIT_NAME)]
+    assert (config.state_dir / cli.BRIDGE_RESTART_MARKER_NAME).exists()
+
+
+def test_malformed_bridge_marker_is_ignored_without_crashing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = make_managed_daemon_config(tmp_path)
+    config.state_dir.mkdir(parents=True)
+    (config.state_dir / cli.BRIDGE_RESTART_MARKER_NAME).write_text("not json", encoding="utf-8")
+    monkeypatch.setattr(cli, "_socket_is_private", lambda _path: True)
+    monkeypatch.setattr(cli, "_managed_daemon_version_available", lambda _config: True)
+
+    async def protocol_probe(_path: Path) -> bool:
+        return True
+
+    monkeypatch.setattr(cli, "_probe_app_server_protocol", protocol_probe)
+
+    assert _app_server_watchdog(config, StringIO(), recover=True) == 1
 
 
 @pytest.mark.asyncio

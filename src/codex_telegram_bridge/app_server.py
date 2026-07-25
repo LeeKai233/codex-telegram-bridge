@@ -4,13 +4,21 @@ import asyncio
 import contextlib
 import fcntl
 import json
+import logging
 import os
+import stat
+import subprocess
 import time
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
 from websockets.asyncio.client import unix_connect
+
+from .config import open_private_directory
+
+LOGGER = logging.getLogger(__name__)
 
 type AppServerMode = Literal["installer-service", "managed-daemon", "external"]
 type AppServerState = Literal[
@@ -25,9 +33,14 @@ type AppServerState = Literal[
 ]
 type Command = tuple[str, ...]
 type CommandResult = int | bool | None
+type PidRecordVerdict = Literal["live", "dead", "recycled", "unknown"]
 
 APP_SERVER_COMMAND_TIMEOUT = 30.0
 APP_SERVER_TERMINATE_TIMEOUT = 5.0
+DAEMON_PID_DIRECTORY = "app-server-daemon"
+DAEMON_PID_RECORD_NAMES = ("app-server.pid", "app-server-updater.pid")
+PID_START_TIME_TIMEOUT = 5.0
+MAX_PID_RECORD_BYTES = 4096
 
 
 class RecoveryLock:
@@ -38,14 +51,29 @@ class RecoveryLock:
         self._descriptor: int | None = None
 
     def __enter__(self) -> bool:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            os.close(descriptor)
+            parent_descriptor = open_private_directory(self.path.parent)
+        except (OSError, RuntimeError):
             return False
-        self._descriptor = descriptor
+        descriptor = -1
+        try:
+            flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(self.path.name, flags, 0o600, dir_fd=parent_descriptor)
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid():
+                return False
+            os.fchmod(descriptor, 0o600)
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._descriptor = descriptor
+            descriptor = -1
+        except BlockingIOError:
+            return False
+        except OSError:
+            return False
+        finally:
+            os.close(parent_descriptor)
+            if descriptor >= 0:
+                os.close(descriptor)
         return True
 
     def __exit__(self, *_exc: object) -> None:
@@ -56,6 +84,268 @@ class RecoveryLock:
         with contextlib.suppress(OSError):
             fcntl.flock(descriptor, fcntl.LOCK_UN)
         os.close(descriptor)
+
+
+@dataclass(frozen=True, slots=True)
+class ReclaimedPidRecord:
+    """One pid record removed because its recorded process no longer exists."""
+
+    path: Path
+    pid: int | None
+    verdict: PidRecordVerdict
+    recorded_start_time: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _PidRecordSnapshot:
+    device: int
+    inode: int
+    content: bytes
+    pid: int
+    recorded_start_time: str
+
+
+def _normalize_start_time(value: str) -> str:
+    """Collapse ``ps -o lstart=`` padding so single-digit days compare equal."""
+    return " ".join(value.split())
+
+
+def _parse_pid_record(raw: bytes) -> tuple[int, str] | None:
+    try:
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    pid = payload.get("pid")
+    start_time = payload.get("processStartTime")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return None
+    if not isinstance(start_time, str) or not start_time.strip():
+        return None
+    return pid, start_time
+
+
+def _read_pid_record_snapshot(path: Path) -> _PidRecordSnapshot | None:
+    """Read and identify a bounded, regular PID record without following symlinks."""
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    parent_descriptor = -1
+    descriptor = -1
+    try:
+        parent_descriptor = open_private_directory(path.parent, create=False)
+        descriptor = os.open(path.name, flags, dir_fd=parent_descriptor)
+        status = os.fstat(descriptor)
+        if not stat.S_ISREG(status.st_mode) or status.st_uid != os.getuid():
+            return None
+        raw = os.read(descriptor, MAX_PID_RECORD_BYTES + 1)
+        if len(raw) > MAX_PID_RECORD_BYTES:
+            return None
+        record = _parse_pid_record(raw)
+        if record is None:
+            return None
+        pid, recorded_start_time = record
+        return _PidRecordSnapshot(
+            device=status.st_dev,
+            inode=status.st_ino,
+            content=raw,
+            pid=pid,
+            recorded_start_time=recorded_start_time,
+        )
+    except (OSError, RuntimeError, UnicodeError, ValueError):
+        return None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if parent_descriptor >= 0:
+            os.close(parent_descriptor)
+
+
+def _read_pid_record(path: Path) -> tuple[int, str] | None:
+    """Parse ``{"pid": int, "processStartTime": str}``; return None when unusable."""
+    snapshot = _read_pid_record_snapshot(path)
+    if snapshot is None:
+        return None
+    return snapshot.pid, snapshot.recorded_start_time
+
+
+def _read_process_start_time(pid: int) -> tuple[int, str] | None:
+    """Ask ``ps`` for a pid's start time, matching the Codex daemon's own oracle."""
+    try:
+        completed = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "lstart="],
+            check=False,
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            timeout=PID_START_TIME_TIMEOUT,
+        )
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
+        return None
+    return completed.returncode, completed.stdout
+
+
+def _process_command_name(pid: int) -> str | None:
+    """Best-effort process identity used to reject false recycled verdicts."""
+    with contextlib.suppress(OSError):
+        return Path(f"/proc/{pid}/comm").read_text().strip()
+    try:
+        completed = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "comm="],
+            check=False,
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            timeout=PID_START_TIME_TIMEOUT,
+        )
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
+        return None
+    return completed.stdout.strip() if completed.returncode == 0 else None
+
+
+def _classify_pid_record(pid: int, recorded_start_time: str) -> PidRecordVerdict:
+    """Decide whether a recorded pid is still the process the daemon started."""
+    reading = _read_process_start_time(pid)
+    if reading is None:
+        return "unknown"
+    returncode, stdout = reading
+    if returncode != 0 or not stdout.strip():
+        return "dead"
+    if _normalize_start_time(stdout) == _normalize_start_time(recorded_start_time):
+        return "live"
+    # A start-time mismatch alone is not proof of recycling: a locale or procps
+    # formatting difference would look identical.  Codex tolerates a recycled pid
+    # without hard-failing, so only reclaim when the holder is not Codex at all.
+    command_name = _process_command_name(pid)
+    if command_name is None or "codex" in command_name.lower():
+        return "live"
+    return "recycled"
+
+
+@contextlib.contextmanager
+def _pid_record_lock(path: Path) -> Iterator[bool]:
+    """Hold the Codex sibling lock through PID classification and unlink."""
+    lock_path = path.with_name(f"{path.name}.lock")
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    parent_descriptor = -1
+    descriptor = -1
+    acquired = False
+    try:
+        try:
+            parent_descriptor = open_private_directory(path.parent, create=False)
+            descriptor = os.open(lock_path.name, flags, 0o600, dir_fd=parent_descriptor)
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid():
+                yield False
+                return
+            os.fchmod(descriptor, 0o600)
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (OSError, RuntimeError):
+            yield False
+            return
+        acquired = True
+        yield True
+    finally:
+        if descriptor >= 0:
+            if acquired:
+                with contextlib.suppress(OSError):
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+        if parent_descriptor >= 0:
+            os.close(parent_descriptor)
+
+
+def _unlink_pid_record_if_unchanged(path: Path, expected: _PidRecordSnapshot) -> bool:
+    """Unlink only the same regular record observed before classification."""
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    parent_descriptor = -1
+    descriptor = -1
+    try:
+        parent_descriptor = open_private_directory(path.parent, create=False)
+        descriptor = os.open(path.name, flags, dir_fd=parent_descriptor)
+        status = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(status.st_mode)
+            or status.st_uid != os.getuid()
+            or (status.st_dev, status.st_ino) != (expected.device, expected.inode)
+        ):
+            return False
+        raw = os.read(descriptor, MAX_PID_RECORD_BYTES + 1)
+        if len(raw) > MAX_PID_RECORD_BYTES or raw != expected.content:
+            return False
+        os.unlink(path.name, dir_fd=parent_descriptor)
+        return True
+    except (OSError, RuntimeError):
+        return False
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if parent_descriptor >= 0:
+            os.close(parent_descriptor)
+
+
+def _reclaim_one_pid_record(path: Path) -> ReclaimedPidRecord | None:
+    with _pid_record_lock(path) as acquired:
+        if not acquired:
+            LOGGER.info("event=app_server_pid_record_locked file=%s", path.name)
+            return None
+        snapshot = _read_pid_record_snapshot(path)
+        if snapshot is None:
+            # Leave unparsable, oversized, symlink, and non-regular records alone:
+            # recovery must never delete a record it cannot identify safely.
+            if path.exists():
+                LOGGER.warning("event=app_server_pid_record_unreadable file=%s", path.name)
+            return None
+        verdict = _classify_pid_record(snapshot.pid, snapshot.recorded_start_time)
+        if verdict not in {"dead", "recycled"}:
+            return None
+        current = _read_pid_record_snapshot(path)
+        if current is None or (
+            current.device,
+            current.inode,
+            current.content,
+        ) != (snapshot.device, snapshot.inode, snapshot.content):
+            LOGGER.info("event=app_server_pid_record_replaced file=%s", path.name)
+            return None
+        if not _unlink_pid_record_if_unchanged(path, snapshot):
+            return None
+        pid = snapshot.pid
+        recorded_start_time = snapshot.recorded_start_time
+    LOGGER.warning(
+        "event=app_server_pid_record_reclaimed file=%s pid=%s verdict=%s recorded_start_time=%s",
+        path.name,
+        pid,
+        verdict,
+        recorded_start_time,
+    )
+    return ReclaimedPidRecord(
+        path=path, pid=pid, verdict=verdict, recorded_start_time=recorded_start_time
+    )
+
+
+def reclaim_stale_daemon_pid_records(codex_home: Path | str) -> tuple[ReclaimedPidRecord, ...]:
+    """Delete pid records whose process is gone so ``daemon bootstrap`` starts clean.
+
+    Every WSL VM restart yields a fresh PID namespace, so the pid recorded in
+    ``$CODEX_HOME/app-server-daemon/*.pid`` outlives its process.  The Codex
+    binary then hard-fails with ``failed to read start time for pid-managed app
+    server N`` and both ``daemon restart`` and ``daemon bootstrap`` crash-loop.
+    Never removes a record whose process is still alive, and never raises.
+    """
+    directory = Path(codex_home) / DAEMON_PID_DIRECTORY
+    reclaimed: list[ReclaimedPidRecord] = []
+    for name in DAEMON_PID_RECORD_NAMES:
+        try:
+            record = _reclaim_one_pid_record(directory / name)
+        except Exception as exc:  # pragma: no cover - defensive: never break recovery
+            LOGGER.warning(
+                "event=app_server_pid_record_scan_failed file=%s error=%s",
+                name,
+                type(exc).__name__,
+            )
+            continue
+        if record is not None:
+            reclaimed.append(record)
+    return tuple(reclaimed)
 
 
 class CommandRunner(Protocol):
@@ -164,6 +454,7 @@ class AppServerSupervisor:
         codex_binary: Path | str,
         state_dir: Path,
         *,
+        codex_home: Path | str | None = None,
         command_runner: CommandRunner | None = None,
         installer_restart: AsyncAction | None = None,
         protocol_probe: ProtocolProbe | None = None,
@@ -181,6 +472,7 @@ class AppServerSupervisor:
         self.socket_path = Path(socket_path)
         self.codex_binary = str(codex_binary)
         self.state_dir = Path(state_dir)
+        self._codex_home = Path(codex_home) if codex_home is not None else None
         self._command_runner = command_runner or globals()["command_runner"]
         self._installer_restart = installer_restart
         self._protocol_probe = protocol_probe or globals()["protocol_probe"]
@@ -293,7 +585,15 @@ class AppServerSupervisor:
             return
         await self._verify_or_exhaust("installer restart")
 
+    async def _reclaim_stale_pid_records(self) -> None:
+        """Clear stale pid records before control commands that would hard-fail on them."""
+        if self._codex_home is None:
+            return
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(reclaim_stale_daemon_pid_records, self._codex_home)
+
     async def _recover_managed_daemon(self) -> None:
+        await self._reclaim_stale_pid_records()
         await self._set_state("recovering_start")
         self._start_attempts += 1
         if await self._run_command(

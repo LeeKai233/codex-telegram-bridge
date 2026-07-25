@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
+import json
+import os
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from codex_telegram_bridge import app_server as app_server_module
-from codex_telegram_bridge.app_server import AppServerSupervisor, RecoveryLock
+from codex_telegram_bridge.app_server import (
+    AppServerSupervisor,
+    RecoveryLock,
+    reclaim_stale_daemon_pid_records,
+)
 
 
 class FakeClient:
@@ -295,3 +302,305 @@ def test_recovery_lock_is_non_blocking_and_process_shared(tmp_path: Path) -> Non
         assert acquired is True
         with RecoveryLock(path) as contended:
             assert contended is False
+
+
+def test_recovery_lock_rejects_symlinked_parent(tmp_path: Path) -> None:
+    real = tmp_path / "real"
+    real.mkdir()
+    linked = tmp_path / "linked"
+    linked.symlink_to(real, target_is_directory=True)
+
+    with RecoveryLock(linked / "app-server-recovery.lock") as acquired:
+        assert acquired is False
+
+    assert not (real / "app-server-recovery.lock").exists()
+
+
+RECORDED_START_TIME = "Sat Jul 25 15:46:16 2026"
+
+
+def write_pid_record(
+    codex_home: Path,
+    name: str = "app-server.pid",
+    *,
+    pid: int = 416,
+    start_time: str = RECORDED_START_TIME,
+    raw: str | None = None,
+) -> Path:
+    directory = codex_home / "app-server-daemon"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / name
+    payload = raw if raw is not None else json.dumps({"pid": pid, "processStartTime": start_time})
+    path.write_text(payload, encoding="utf-8")
+    return path
+
+
+def stub_start_time(
+    monkeypatch: pytest.MonkeyPatch,
+    result: tuple[int, str] | None,
+    *,
+    command_name: str | None = "codex",
+) -> None:
+    monkeypatch.setattr(app_server_module, "_read_process_start_time", lambda _pid: result)
+    monkeypatch.setattr(app_server_module, "_process_command_name", lambda _pid: command_name)
+
+
+def test_live_pid_record_is_left_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = write_pid_record(tmp_path)
+    stub_start_time(monkeypatch, (0, f"{RECORDED_START_TIME}\n"))
+
+    assert reclaim_stale_daemon_pid_records(tmp_path) == ()
+    assert path.exists()
+
+
+def test_dead_pid_record_is_reclaimed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = write_pid_record(tmp_path)
+    stub_start_time(monkeypatch, (1, ""))
+
+    reclaimed = reclaim_stale_daemon_pid_records(tmp_path)
+
+    assert not path.exists()
+    assert [(record.pid, record.verdict) for record in reclaimed] == [(416, "dead")]
+    assert reclaimed[0].recorded_start_time == RECORDED_START_TIME
+
+
+def test_recycled_pid_record_is_reclaimed_when_holder_is_not_codex(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = write_pid_record(tmp_path)
+    stub_start_time(monkeypatch, (0, "Sat Jul 25 09:00:00 2026"), command_name="nginx")
+
+    reclaimed = reclaim_stale_daemon_pid_records(tmp_path)
+
+    assert not path.exists()
+    assert [record.verdict for record in reclaimed] == ["recycled"]
+
+
+def test_mismatched_start_time_on_a_codex_process_is_left_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = write_pid_record(tmp_path)
+    stub_start_time(monkeypatch, (0, "Sat Jul 25 09:00:00 2026"), command_name="codex")
+
+    assert reclaim_stale_daemon_pid_records(tmp_path) == ()
+    assert path.exists()
+
+
+def test_start_time_padding_variants_compare_equal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = write_pid_record(tmp_path, start_time="Sat Jul  5 09:00:00 2026")
+    stub_start_time(monkeypatch, (0, "  Sat Jul 5 09:00:00 2026\n"))
+
+    assert reclaim_stale_daemon_pid_records(tmp_path) == ()
+    assert path.exists()
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["", "not json", '{"pid":"x","processStartTime":"y"}', '{"pid":416}', '{"pid":0,"processStartTime":"y"}'],
+)
+def test_malformed_records_are_ignored_without_raising(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    path = write_pid_record(tmp_path, raw=raw)
+    stub_start_time(monkeypatch, (1, ""))
+
+    assert reclaim_stale_daemon_pid_records(tmp_path) == ()
+    assert path.exists()
+
+
+def test_oversized_pid_records_are_rejected_before_classification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = write_pid_record(tmp_path, raw="{" + "x" * 5000)
+
+    def classify(_pid: int, _start_time: str) -> str:
+        pytest.fail("oversized records must not reach process classification")
+
+    monkeypatch.setattr(app_server_module, "_classify_pid_record", classify)
+
+    assert reclaim_stale_daemon_pid_records(tmp_path) == ()
+    assert path.exists()
+
+
+def test_pid_lock_errors_defer_reclamation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = write_pid_record(tmp_path)
+
+    def fail_lock(*_args: object) -> None:
+        raise OSError("lock unavailable")
+
+    monkeypatch.setattr(app_server_module.fcntl, "flock", fail_lock)
+
+    assert reclaim_stale_daemon_pid_records(tmp_path) == ()
+    assert path.exists()
+
+
+def test_pid_record_replaced_after_classification_is_not_deleted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = write_pid_record(tmp_path, pid=416)
+    replacement = json.dumps({"pid": 999, "processStartTime": RECORDED_START_TIME})
+
+    def classify(_pid: int, _start_time: str) -> str:
+        path.write_text(replacement, encoding="utf-8")
+        return "dead"
+
+    monkeypatch.setattr(app_server_module, "_classify_pid_record", classify)
+
+    assert reclaim_stale_daemon_pid_records(tmp_path) == ()
+    assert json.loads(path.read_text(encoding="utf-8"))["pid"] == 999
+
+
+def test_missing_directory_is_ignored(tmp_path: Path) -> None:
+    assert reclaim_stale_daemon_pid_records(tmp_path / "absent") == ()
+
+
+def test_symlinked_pid_record_parent_is_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    target = tmp_path / "target-daemon"
+    target.mkdir()
+    linked = codex_home / "app-server-daemon"
+    linked.symlink_to(target, target_is_directory=True)
+    record = target / "app-server.pid"
+    record.write_text(
+        json.dumps({"pid": 416, "processStartTime": RECORDED_START_TIME}), encoding="utf-8"
+    )
+    stub_start_time(monkeypatch, (1, ""))
+
+    assert reclaim_stale_daemon_pid_records(codex_home) == ()
+    assert record.exists()
+
+
+def test_unavailable_ps_leaves_records_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = write_pid_record(tmp_path)
+    stub_start_time(monkeypatch, None)
+
+    assert reclaim_stale_daemon_pid_records(tmp_path) == ()
+    assert path.exists()
+
+
+def test_both_daemon_records_are_scanned_independently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dead = write_pid_record(tmp_path, "app-server.pid", pid=416)
+    live = write_pid_record(tmp_path, "app-server-updater.pid", pid=421)
+
+    def reader(pid: int) -> tuple[int, str]:
+        return (0, RECORDED_START_TIME) if pid == 421 else (1, "")
+
+    monkeypatch.setattr(app_server_module, "_read_process_start_time", reader)
+
+    reclaimed = reclaim_stale_daemon_pid_records(tmp_path)
+
+    assert not dead.exists()
+    assert live.exists()
+    assert [record.pid for record in reclaimed] == [416]
+
+
+def test_reclaim_never_touches_lock_or_log_siblings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = write_pid_record(tmp_path)
+    siblings = [
+        path.with_name("app-server.pid.lock"),
+        path.with_name("daemon.lock"),
+        path.with_name("settings.json"),
+        path.with_name("app-server.stderr.log"),
+    ]
+    for sibling in siblings:
+        sibling.touch()
+    stub_start_time(monkeypatch, (1, ""))
+
+    reclaim_stale_daemon_pid_records(tmp_path)
+
+    assert not path.exists()
+    assert all(sibling.exists() for sibling in siblings)
+
+
+def test_held_pid_lock_defers_reclamation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = write_pid_record(tmp_path)
+    lock_path = path.with_name("app-server.pid.lock")
+    lock_path.touch()
+    stub_start_time(monkeypatch, (1, ""))
+    descriptor = os.open(lock_path, os.O_RDWR)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert reclaim_stale_daemon_pid_records(tmp_path) == ()
+        assert path.exists()
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+@pytest.mark.asyncio
+async def test_managed_daemon_recovery_reclaims_stale_record_before_daemon_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = write_pid_record(tmp_path)
+    stub_start_time(monkeypatch, (1, ""))
+    existed_at_command: list[bool] = []
+
+    async def runner(command: tuple[str, ...]) -> int:
+        existed_at_command.append(path.exists())
+        return 0
+
+    async def probe(_command: tuple[str, ...]) -> bool:
+        return True
+
+    supervisor = build_supervisor(runner=runner, probe=probe, codex_home=tmp_path)
+    await supervisor._recover_managed_daemon()
+
+    assert not path.exists()
+    assert existed_at_command and existed_at_command[0] is False
+
+
+@pytest.mark.asyncio
+async def test_installer_service_recovery_does_not_touch_pid_records(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = write_pid_record(tmp_path)
+    stub_start_time(monkeypatch, (1, ""))
+
+    async def restart() -> int:
+        return 0
+
+    async def probe(_command: tuple[str, ...]) -> bool:
+        return True
+
+    supervisor = build_supervisor(
+        mode="installer-service", restart=restart, probe=probe, codex_home=tmp_path
+    )
+    await supervisor._recover_installer_service()
+
+    assert path.exists()
+
+
+@pytest.mark.asyncio
+async def test_supervisor_without_codex_home_skips_reclamation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = write_pid_record(tmp_path)
+    stub_start_time(monkeypatch, (1, ""))
+
+    async def runner(_command: tuple[str, ...]) -> int:
+        return 0
+
+    async def probe(_command: tuple[str, ...]) -> bool:
+        return True
+
+    supervisor = build_supervisor(runner=runner, probe=probe)
+    await supervisor._recover_managed_daemon()
+
+    assert path.exists()

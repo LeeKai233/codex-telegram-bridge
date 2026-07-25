@@ -13,7 +13,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "install.sh"
 UNIT_MARKER = "# X-CodexTelegramBridge-Installer: managed"
-UNIT_VERSION = "# X-CodexTelegramBridge-Installer-Version: v0.3.1"
+UNIT_VERSION = "# X-CodexTelegramBridge-Installer-Version: v0.3.2"
 
 
 def run_installer_shell(
@@ -431,6 +431,8 @@ write_bridge_unit
 grep -Fxq \
     'ExecStart=/usr/bin/env CODEX_HOME=%h/.codex %h/.local/bin/codex-telegram-bridge' \
     "$USER_UNIT_DIR/codex-telegram-bridge.service"
+grep -Fxq 'StartLimitIntervalSec=900' "$USER_UNIT_DIR/codex-telegram-bridge.service"
+grep -Fxq 'StartLimitBurst=30' "$USER_UNIT_DIR/codex-telegram-bridge.service"
 ! grep -Fq 'ExecStartPre=/usr/bin/test -S' "$USER_UNIT_DIR/codex-telegram-bridge.service"
 """,
     )
@@ -448,6 +450,23 @@ def test_bridge_unit_throttles_restart_loops() -> None:
         "Environment=PATH=%h/.local/bin:%h/.linuxbrew/bin:"
         "/home/linuxbrew/.linuxbrew/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
     ) in unit
+
+
+def test_managed_bridge_unit_uses_recovery_throttle(tmp_path: Path) -> None:
+    result = run_installer_shell(
+        tmp_path,
+        """
+initialize_paths
+install -d -m 0700 "$USER_UNIT_DIR"
+APP_SERVER_MODE=managed-daemon
+unit_exists() { return 1; }
+write_bridge_unit
+grep -Fxq 'StartLimitIntervalSec=300' "$USER_UNIT_DIR/codex-telegram-bridge.service"
+grep -Fxq 'StartLimitBurst=5' "$USER_UNIT_DIR/codex-telegram-bridge.service"
+""",
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_bridge_unit_waits_for_managed_daemon_when_present(tmp_path: Path) -> None:
@@ -506,11 +525,11 @@ second=$(sha256sum \
 [[ "$first" == "$second" ]]
 grep -Fxq 'StartLimitIntervalSec=900' \
     "$USER_UNIT_DIR/codex-managed-daemon-bootstrap.service.d/codex-telegram-bridge-recovery.conf"
-grep -Fxq 'StartLimitBurst=30' \
+grep -Fxq 'StartLimitBurst=5' \
     "$USER_UNIT_DIR/codex-managed-daemon-bootstrap.service.d/codex-telegram-bridge-recovery.conf"
-grep -Fxq 'Restart=on-failure' \
+grep -Fxq 'Restart=' \
     "$USER_UNIT_DIR/codex-managed-daemon-bootstrap.service.d/codex-telegram-bridge-recovery.conf"
-grep -Fxq 'RestartSec=30s' \
+grep -Fxq 'RestartSec=60s' \
     "$USER_UNIT_DIR/codex-managed-daemon-bootstrap.service.d/codex-telegram-bridge-recovery.conf"
 ! grep -Fq 'EnvironmentFile=' \
     "$USER_UNIT_DIR/codex-managed-daemon-bootstrap.service.d/codex-telegram-bridge-recovery.conf"

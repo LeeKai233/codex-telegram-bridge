@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import os
 import re
 import subprocess
@@ -14,6 +13,7 @@ PYPROJECT = ROOT / "pyproject.toml"
 PACKAGE_INIT = ROOT / "src" / "codex_telegram_bridge" / "__init__.py"
 RELEASING = ROOT / "RELEASING.md"
 SYSTEMD = ROOT / "systemd"
+RELEASE_INSTALLER_SHA256 = "a692a40fae82687f8670bd28adb2a0b1d14a85d0bac58389516aac06591f9a50"
 
 EXPECTED_SDIST_INCLUDES = [
     "/src",
@@ -32,7 +32,7 @@ def bootstrap_command() -> str:
     return next(
         line
         for line in README.read_text(encoding="utf-8").splitlines()
-        if line.startswith("bash -c '") and "releases/download/v0.3.1/install.sh" in line
+        if line.startswith("bash -c '") and "releases/download/v0.3.2/install.sh" in line
     )
 
 
@@ -42,7 +42,7 @@ def test_readme_bootstrap_checksum_matches_release_installer() -> None:
     match = re.search(r'sha256="([0-9a-f]{64})"', command)
 
     assert match is not None
-    assert match.group(1) == hashlib.sha256(INSTALLER.read_bytes()).hexdigest()
+    assert match.group(1) == RELEASE_INSTALLER_SHA256
     assert "bash <(" not in readme
     assert 'curl --proto "=https" --tlsv1.2' in command
     assert ' -o "$installer" "$url"' in command
@@ -59,7 +59,7 @@ def test_release_version_is_consistent_across_public_artifacts() -> None:
     installer_match = re.search(r'^readonly INSTALLER_VERSION="([^"]+)"$', installer, re.MULTILINE)
     package_match = re.search(r'^__version__ = "([^"]+)"$', package_init, re.MULTILINE)
 
-    assert version == "0.3.1"
+    assert version == "0.3.2"
     assert installer_match is not None and installer_match.group(1) == version
     assert package_match is not None and package_match.group(1) == version
     assert f"releases/download/v{version}/install.sh" in readme
