@@ -1,0 +1,9 @@
+[package]
+name = "codex-telegram-cli"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+codex-telegram-adapter = { path = "../telegram" }
+codex-telegram-credentials = { path = "../credentials" }
