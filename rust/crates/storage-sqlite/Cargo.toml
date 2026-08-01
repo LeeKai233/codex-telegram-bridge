@@ -1,0 +1,12 @@
+[package]
+name = "ctg-storage-sqlite"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ctg-domain = { path = "../domain" }
+ctg-ports = { path = "../ports" }
+rusqlite = { version = "0.39", features = ["bundled"] }
+serde_json.workspace = true
