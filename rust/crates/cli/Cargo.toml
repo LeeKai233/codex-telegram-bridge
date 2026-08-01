@@ -1,9 +1,14 @@
 [package]
 name = "codex-telegram-cli"
 version = "0.1.0"
-edition = "2021"
+edition.workspace = true
 license = "MIT"
 
 [dependencies]
 codex-telegram-adapter = { path = "../telegram" }
 codex-telegram-credentials = { path = "../credentials" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+rusqlite.workspace = true

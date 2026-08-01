@@ -20,6 +20,27 @@ Grafana installations. For Grafana, mount the dashboard JSON at
 `/etc/grafana/provisioning/dashboards/codex-telegram-bridge.json`; the provider config deliberately
 uses that same directory.
 
+The intended rootless launch flags keep the stack local and bound the retained series to the
+planned budget:
+
+```bash
+prometheus \
+  --config.file=monitoring/prometheus/prometheus.yml \
+  --storage.tsdb.path="$XDG_STATE_HOME/codex-telegram-bridge/prometheus" \
+  --storage.tsdb.retention.time=30d \
+  --storage.tsdb.retention.size=2GB \
+  --web.listen-address=127.0.0.1:9090
+
+alertmanager \
+  --config.file=monitoring/alertmanager/alertmanager.yml \
+  --storage.path="$XDG_STATE_HOME/codex-telegram-bridge/alertmanager" \
+  --web.listen-address=127.0.0.1:9093
+```
+
+Grafana should use `monitoring/grafana/grafana.ini`, which disables anonymous access and binds its
+HTTP listener to `127.0.0.1:3000`. These commands are operator-owned and are not executed by the
+bridge or by tests.
+
 The supplied target addresses are contracts, not an instruction to expose a port. A target is only
 enabled after the relevant Bridge implementation serves the documented `/metrics` endpoint on that
 loopback address. Delete a target stanza for an implementation that is not installed, otherwise the

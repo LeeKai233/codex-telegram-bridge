@@ -2,11 +2,17 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use codex_telegram_credentials::{BotToken, CredentialRole};
-use serde::Deserialize;
-use serde_json::{json, Value};
+use fs2::FileExt;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 pub const ALLOWED_UPDATES: &[&str] = &[
     "message",
@@ -15,11 +21,16 @@ pub const ALLOWED_UPDATES: &[&str] = &[
     "my_chat_member",
 ];
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum BotCapability {
     Control,
     Discussion,
     Status,
+    ProductionAlert,
+    CanaryAlert,
+    Approval,
+    Artifact,
 }
 
 impl BotCapability {
@@ -28,6 +39,10 @@ impl BotCapability {
             Self::Control => CredentialRole::Control,
             Self::Discussion => CredentialRole::Discussion,
             Self::Status => CredentialRole::Status,
+            Self::ProductionAlert => CredentialRole::ProductionAlert,
+            Self::CanaryAlert => CredentialRole::CanaryAlert,
+            Self::Approval => CredentialRole::Approval,
+            Self::Artifact => CredentialRole::Artifact,
         }
     }
 }
@@ -229,6 +244,7 @@ impl TokenLeaseRegistry {
             token: token.clone(),
             consumer,
             registry: self.active.clone(),
+            process_lock: None,
         })
     }
 }
@@ -237,11 +253,16 @@ pub struct TokenLease {
     token: BotToken,
     consumer: UpdateConsumerId,
     registry: Arc<Mutex<HashMap<BotToken, UpdateConsumerId>>>,
+    process_lock: Option<TokenLeaseLock>,
 }
 
 impl TokenLease {
     pub fn consumer(&self) -> &UpdateConsumerId {
         &self.consumer
+    }
+
+    pub fn process_lock_path(&self) -> Option<&Path> {
+        self.process_lock.as_ref().map(TokenLeaseLock::path)
     }
 
     fn token(&self) -> &BotToken {
@@ -261,12 +282,119 @@ impl Drop for TokenLease {
     }
 }
 
+impl TokenLeaseRegistry {
+    /// Acquire both the in-process lease and a cross-process advisory lock.
+    /// The lock filename contains only a SHA-256 digest, never the token.
+    pub fn acquire_with_lock(
+        &self,
+        token: &BotToken,
+        consumer: UpdateConsumerId,
+        lock_directory: impl AsRef<Path>,
+    ) -> Result<TokenLease, TokenLeaseError> {
+        let lease = self.acquire(token, consumer)?;
+        match TokenLeaseLock::acquire(lock_directory, token, lease.consumer.clone()) {
+            Ok(process_lock) => {
+                let mut lease = lease;
+                lease.process_lock = Some(process_lock);
+                Ok(lease)
+            }
+            Err(error) => {
+                drop(lease);
+                Err(error)
+            }
+        }
+    }
+}
+
+/// A portable advisory lock that prevents two bridge processes from polling
+/// the same Bot API token. `fs2` maps the lock to `flock` on Unix and the
+/// equivalent exclusive file lock on Windows.
+pub struct TokenLeaseLock {
+    file: File,
+    path: PathBuf,
+}
+
+impl TokenLeaseLock {
+    pub fn acquire(
+        directory: impl AsRef<Path>,
+        token: &BotToken,
+        consumer: UpdateConsumerId,
+    ) -> Result<Self, TokenLeaseError> {
+        let directory = directory.as_ref();
+        fs::create_dir_all(directory).map_err(|_| TokenLeaseError::LockUnavailable)?;
+        secure_directory_permissions(directory).map_err(|_| TokenLeaseError::LockUnavailable)?;
+        let mut digest = Sha256::new();
+        digest.update(token.as_str().as_bytes());
+        let digest = format!("{:x}", digest.finalize());
+        let path = directory.join(format!("telegram-{digest}.lock"));
+        let file = open_lock_file(&path).map_err(|_| TokenLeaseError::LockUnavailable)?;
+        secure_file_permissions(&file).map_err(|_| TokenLeaseError::LockUnavailable)?;
+        if file.try_lock_exclusive().is_err() {
+            return Err(TokenLeaseError::AlreadyLeased {
+                requested: consumer,
+                active: UpdateConsumerId::parse("external-process")
+                    .expect("constant consumer id is valid"),
+            });
+        }
+        let mut owner = format!("pid={} consumer={}\n", std::process::id(), consumer);
+        owner.truncate(256);
+        file.set_len(0)
+            .map_err(|_| TokenLeaseError::LockUnavailable)?;
+        (&file)
+            .write_all(owner.as_bytes())
+            .map_err(|_| TokenLeaseError::LockUnavailable)?;
+        Ok(Self { file, path })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+fn open_lock_file(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(false).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path)
+}
+
+impl Drop for TokenLeaseLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+#[cfg(unix)]
+fn secure_directory_permissions(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn secure_directory_permissions(_: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+fn secure_file_permissions(file: &File) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TokenLeaseError {
     AlreadyLeased {
         requested: UpdateConsumerId,
         active: UpdateConsumerId,
     },
+    LockUnavailable,
 }
 
 impl fmt::Display for TokenLeaseError {
@@ -278,6 +406,7 @@ impl fmt::Display for TokenLeaseError {
                     "update consumer {requested} cannot acquire a token leased by {active}"
                 )
             }
+            Self::LockUnavailable => formatter.write_str("token ownership lock is unavailable"),
         }
     }
 }
@@ -293,6 +422,62 @@ pub trait TelegramTransport {
         method: &'static str,
         payload: Value,
     ) -> Result<String, TelegramTransportError>;
+}
+
+/// Production Telegram Bot API transport. The client uses rustls only, a
+/// bounded timeout, and maps all network failures to token-free error kinds.
+#[derive(Clone)]
+pub struct ReqwestTransport {
+    client: reqwest::blocking::Client,
+}
+
+impl ReqwestTransport {
+    pub fn new(timeout: Duration) -> Result<Self, TelegramTransportError> {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(timeout)
+            .connect_timeout(timeout.min(Duration::from_secs(10)))
+            .https_only(true)
+            .build()
+            .map_err(|_| TelegramTransportError::new("client-build"))?;
+        Ok(Self { client })
+    }
+}
+
+impl TelegramTransport for ReqwestTransport {
+    fn post_json(
+        &self,
+        api_base: &str,
+        token: &BotToken,
+        method: &'static str,
+        payload: Value,
+    ) -> Result<String, TelegramTransportError> {
+        let url = format!(
+            "{}/bot{}/{}",
+            api_base.trim_end_matches('/'),
+            token.as_str(),
+            method
+        );
+        let response = self
+            .client
+            .post(url)
+            .json(&payload)
+            .send()
+            .map_err(|error| {
+                if error.is_timeout() {
+                    TelegramTransportError::new("timeout")
+                } else if error.is_connect() {
+                    TelegramTransportError::new("connect")
+                } else {
+                    TelegramTransportError::new("request")
+                }
+            })?;
+        if !response.status().is_success() {
+            return Err(TelegramTransportError::new("http-status"));
+        }
+        response
+            .text()
+            .map_err(|_| TelegramTransportError::new("response-body"))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -368,6 +553,23 @@ where
         self.call(token, "sendMessage", surface.send_message_payload(text))
     }
 
+    pub fn get_chat(&self, token: &BotToken, chat_id: i64) -> Result<ChatInfo, TelegramError> {
+        self.call(token, "getChat", json!({ "chat_id": chat_id }))
+    }
+
+    pub fn get_chat_member(
+        &self,
+        token: &BotToken,
+        chat_id: i64,
+        user_id: i64,
+    ) -> Result<ChatMemberInfo, TelegramError> {
+        self.call(
+            token,
+            "getChatMember",
+            json!({ "chat_id": chat_id, "user_id": user_id }),
+        )
+    }
+
     fn call<R: for<'de> Deserialize<'de>>(
         &self,
         token: &BotToken,
@@ -405,6 +607,21 @@ pub struct BotProfile {
     pub id: i64,
     pub is_bot: bool,
     pub username: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct ChatInfo {
+    pub id: i64,
+    #[serde(rename = "type")]
+    pub chat_type: String,
+    #[serde(default)]
+    pub is_forum: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct ChatMemberInfo {
+    pub status: String,
+    pub user: BotProfile,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -503,9 +720,11 @@ mod tests {
         };
         assert!(matches!(error, TokenLeaseError::AlreadyLeased { .. }));
         drop(first);
-        assert!(registry
-            .acquire(&token(), UpdateConsumerId::parse("bridge-b").unwrap())
-            .is_ok());
+        assert!(
+            registry
+                .acquire(&token(), UpdateConsumerId::parse("bridge-b").unwrap())
+                .is_ok()
+        );
     }
 
     #[test]
@@ -556,5 +775,39 @@ mod tests {
         let error = TelegramBotApi::new(transport).get_me(&token()).unwrap_err();
         assert!(!error.to_string().contains("very-secret-token"));
         assert!(!format!("{error:?}").contains("very-secret-token"));
+    }
+
+    #[test]
+    fn cross_process_lock_does_not_include_token_in_path() {
+        let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-tmp")
+            .join(format!("codex-telegram-lock-{}", std::process::id()));
+        let first_registry = TokenLeaseRegistry::default();
+        let second_registry = TokenLeaseRegistry::default();
+        let first = first_registry
+            .acquire_with_lock(
+                &token(),
+                UpdateConsumerId::parse("first").unwrap(),
+                &directory,
+            )
+            .unwrap();
+        let error = match second_registry.acquire_with_lock(
+            &token(),
+            UpdateConsumerId::parse("second").unwrap(),
+            &directory,
+        ) {
+            Ok(_) => panic!("second process must not acquire the lock"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, TokenLeaseError::AlreadyLeased { .. }));
+        assert!(
+            !first
+                .process_lock_path()
+                .unwrap()
+                .to_string_lossy()
+                .contains("very-secret-token")
+        );
+        drop(first);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

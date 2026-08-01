@@ -16,6 +16,7 @@ from typing import Any
 
 from .app_server import AppServerSupervisor
 from .config import Config, ensure_private_directory
+from .metrics_http import MetricsHttpServer
 from .outbound import TelegramOutcomeUncertain
 from .store import Store
 
@@ -842,6 +843,7 @@ async def run_service(config: Config, stop_event: asyncio.Event | None = None) -
     health_snapshot_task: asyncio.Task[None] | None = None
     app_server_health_task: asyncio.Task[None] | None = None
     stop_wait_task: asyncio.Task[bool] | None = None
+    metrics_server: MetricsHttpServer | None = None
     polling_supervisor = PollingSupervisor(
         applications,
         tuple(getattr(runtime, "polling_health", ())),
@@ -871,6 +873,15 @@ async def run_service(config: Config, stop_event: asyncio.Event | None = None) -
             application_started.append(application)
         await runtime.presence.runtime_started()
         presence_started = True
+        metrics_server = MetricsHttpServer(
+            config.metrics_bind,
+            lambda: _runtime_health_payload(
+                runtime,
+                polling_supervisor,
+                service_state="running",
+            ),
+        )
+        metrics_server.start()
         interval = max(5.0, min(15.0, config.disconnect_threshold_seconds / 2))
         health_task = asyncio.create_task(
             _health_monitor(runtime.presence, stop_event, interval),
@@ -975,6 +986,9 @@ async def run_service(config: Config, stop_event: asyncio.Event | None = None) -
         for signum in registered_signals:
             with contextlib.suppress(NotImplementedError, RuntimeError):
                 loop.remove_signal_handler(signum)
+        if metrics_server is not None:
+            with contextlib.suppress(Exception):
+                metrics_server.stop()
         with contextlib.suppress(Exception):
             runtime.store.write_health_snapshot(
                 _runtime_health_payload(runtime, polling_supervisor, service_state="stopped")

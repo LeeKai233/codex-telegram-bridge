@@ -1,0 +1,71 @@
+# Rust vNext is outbound-only for the control Bot during the Python bridge
+# compatibility phase. Keep `update_consumer` unique across processes.
+api_base = "https://api.telegram.org"
+credential_registry = "/home/USER/.tgrc"
+legacy_control_token = "/home/USER/.config/codex-telegram-bridge/telegram_9527_bot_token"
+lock_directory = "/home/USER/.local/state/codex-telegram-bridge/rust-vnext/leases"
+metrics_bind = "127.0.0.1:9465"
+request_timeout_seconds = 30
+
+[[bots]]
+instance_id = "control"
+capability = "control"
+credential_key = "rust_9527_bot_key"
+update_consumer = "rust-vnext-control-outbound"
+enabled = true
+
+[[bots]]
+instance_id = "discussion"
+capability = "discussion"
+credential_key = "rust_91_bot_key"
+update_consumer = "rust-vnext-discussion"
+enabled = true
+
+[[bots]]
+instance_id = "status"
+capability = "status"
+credential_key = "rust_818_bot_key"
+update_consumer = "rust-vnext-status"
+enabled = true
+
+[[bots]]
+instance_id = "production-alert"
+capability = "production_alert"
+credential_key = "rust_826_bot_key"
+update_consumer = "rust-vnext-production-alert"
+enabled = true
+
+[[bots]]
+instance_id = "canary-alert"
+capability = "canary_alert"
+credential_key = "rust_411_bot_key"
+update_consumer = "rust-vnext-canary-alert"
+enabled = true
+
+# Optional hardened logical ports. Enable only after their physical Bot is
+# provisioned and independently verified.
+[[bots]]
+instance_id = "approval"
+capability = "approval"
+credential_key = "rust_69_bot_key"
+update_consumer = "rust-vnext-approval"
+enabled = false
+
+[[bots]]
+instance_id = "artifact"
+capability = "artifact"
+credential_key = "rust_426_bot_key"
+update_consumer = "rust-vnext-artifact"
+enabled = false
+
+# Add real chat IDs and a positive message_thread_id after read-only probe:
+# [[surfaces]]
+# kind = "channel"
+# bot_instance_id = "control"
+# chat_id = -1000000000000
+#
+# [[surfaces]]
+# kind = "forum_topic"
+# bot_instance_id = "discussion"
+# chat_id = -1000000000000
+# message_thread_id = 1

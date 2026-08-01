@@ -1,10 +1,14 @@
 [package]
 name = "codex-telegram-adapter"
 version = "0.1.0"
-edition = "2021"
+edition.workspace = true
 license = "MIT"
 
 [dependencies]
 codex-telegram-credentials = { path = "../credentials" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+reqwest.workspace = true
+fs2.workspace = true
+sha2.workspace = true
+libc.workspace = true

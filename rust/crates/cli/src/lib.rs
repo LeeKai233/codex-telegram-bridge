@@ -1,9 +1,13 @@
 //! CLI-facing validation with no token rendering or process side effects.
 
 use codex_telegram_adapter::{
-    validate_bindings, BindingIssue, BotInstanceBinding, TelegramSurfaceBinding,
+    BindingIssue, BotInstanceBinding, TelegramSurfaceBinding, validate_bindings,
 };
-use codex_telegram_credentials::{CredentialFiles, CredentialRole};
+use codex_telegram_credentials::CredentialFiles;
+pub mod config;
+pub mod metrics;
+pub mod migration;
+pub mod replay;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CliValidationIssue {
@@ -31,17 +35,7 @@ pub fn validate_configuration(
         .map(CliValidationIssue::from_binding)
         .collect();
 
-    for role in CredentialRole::ALL {
-        if !credentials.path_for(role).is_file() {
-            issues.push(CliValidationIssue {
-                code: "missing-credential-file".to_owned(),
-                message: format!(
-                    "missing {role} credential file at {}",
-                    credentials.path_for(role).display()
-                ),
-            });
-        }
-    }
+    let _ = credentials;
 
     for surface in surfaces {
         if !bots
@@ -71,11 +65,13 @@ mod tests {
 
     #[test]
     fn validation_never_reads_token_contents() {
-        let directory = std::env::temp_dir().join(format!(
-            "codex-telegram-cli-{}-{}",
-            std::process::id(),
-            NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
-        ));
+        let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-tmp")
+            .join(format!(
+                "codex-telegram-cli-{}-{}",
+                std::process::id(),
+                NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+            ));
         fs::create_dir_all(&directory).unwrap();
         fs::write(directory.join("control.token"), "leak-me-never").unwrap();
         let credentials = CredentialFiles::discover(&directory);

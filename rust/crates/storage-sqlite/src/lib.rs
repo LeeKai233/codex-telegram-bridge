@@ -374,7 +374,10 @@ mod tests {
 
     #[test]
     fn opens_file_database_in_wal_mode() {
-        let path = std::env::temp_dir().join(format!("ctg-storage-{}.sqlite", std::process::id()));
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-tmp")
+            .join(format!("ctg-storage-{}.sqlite", std::process::id()));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
         let _ = fs::remove_file(&path);
         let store = SqliteStore::open(&path).unwrap();
         assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);

@@ -67,3 +67,41 @@ pub trait SessionIdGenerator: Send + Sync {
 pub trait DecisionValidator: Send + Sync {
     fn terminal_decision(&self, decision: ApprovalDecision) -> PortResult<()>;
 }
+
+/// Optional physical approval channel. The core remains usable when no
+/// Telegram approval Bot is configured, but high-risk callers must treat
+/// `Unavailable` as a hard deny rather than silently executing.
+pub trait ApprovalGateway: Send + Sync {
+    fn availability(&self) -> ApprovalAvailability;
+    fn publish(&self, approval: &ApprovalRequest) -> PortResult<ApprovalDelivery>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ApprovalAvailability {
+    Available,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApprovalDelivery {
+    pub external_reference: String,
+}
+
+/// Optional artifact transport. Durable storage is independent from delivery,
+/// so an unavailable Telegram/file adapter retains the artifact for retry.
+pub trait ArtifactTransport: Send + Sync {
+    fn availability(&self) -> ArtifactAvailability;
+    fn retain(&self, artifact: &Artifact) -> PortResult<()>;
+    fn transfer(&self, artifact: &Artifact) -> PortResult<ArtifactTransfer>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ArtifactAvailability {
+    Available,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactTransfer {
+    pub external_reference: String,
+}

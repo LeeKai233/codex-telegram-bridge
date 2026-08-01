@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import ipaddress
 import os
 import stat
 import tomllib
@@ -202,6 +203,7 @@ class Config:
     discussion_bot_label: str = "Discussion Bot"
     ask_model: str | None = "gpt-5.6-luna"
     ask_reasoning_effort: str | None = "medium"
+    metrics_bind: str = "127.0.0.1:9464"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "app_server_mode", AppServerMode.parse(self.app_server_mode))
@@ -238,6 +240,16 @@ class Config:
             raise ValueError("telegram_download_limit must not exceed inbox_quota_bytes")
         if not self.tmux_session.strip() or any(character in self.tmux_session for character in ":.\\/"):
             raise ValueError("tmux_session contains unsupported characters")
+        if not isinstance(self.metrics_bind, str):
+            raise ValueError("metrics_bind must be a loopback host:port")
+        try:
+            host, port_text = self.metrics_bind.rsplit(":", 1)
+            port = int(port_text)
+            address = ipaddress.ip_address(host)
+        except (ValueError, TypeError):
+            raise ValueError("metrics_bind must be a loopback host:port") from None
+        if not address.is_loopback or not 1 <= port <= 65535:
+            raise ValueError("metrics_bind must be a loopback host:port")
 
     @classmethod
     def default(cls) -> Config:

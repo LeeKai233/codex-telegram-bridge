@@ -5,8 +5,8 @@ use ctg_domain::{
     DomainEvent, DomainEventKind, ScheduledCommand, Session, SessionId, TimestampMs,
 };
 use ctg_ports::{
-    ApprovalIdGenerator, ApprovalStore, ArtifactStore, Clock, EventIdGenerator, Policy, PortError,
-    Scheduler, SessionIdGenerator, SessionRepository,
+    ApprovalAvailability, ApprovalGateway, ApprovalIdGenerator, ApprovalStore, ArtifactStore,
+    Clock, EventIdGenerator, Policy, PortError, Scheduler, SessionIdGenerator, SessionRepository,
 };
 use thiserror::Error;
 
@@ -83,6 +83,25 @@ impl<'a> Engine<'a> {
             },
         );
         self.approvals.insert_approval(&approval, &event)?;
+        Ok(approval)
+    }
+
+    /// High-risk actions require a configured physical approval gateway. The
+    /// absence of Bot 69 (or another adapter) is a deny, never an implicit
+    /// approval.
+    pub fn request_high_risk_approval(
+        &self,
+        session_id: &SessionId,
+        action: ApprovalAction,
+        gateway: &dyn ApprovalGateway,
+    ) -> EngineResult<ApprovalRequest> {
+        if gateway.availability() != ApprovalAvailability::Available {
+            return Err(EngineError::Port(PortError::Denied(
+                "high-risk approval gateway is unavailable".into(),
+            )));
+        }
+        let approval = self.request_approval(session_id, action)?;
+        gateway.publish(&approval)?;
         Ok(approval)
     }
 
