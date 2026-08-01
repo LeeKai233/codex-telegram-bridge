@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/LeeKai233/codex-telegram-bridge/replay/v1.schema.json",
+  "title": "Codex Telegram Bridge replay event v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "offset_ms", "kind", "subject"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "offset_ms": {"type": "integer", "minimum": 0, "maximum": 86400000},
+    "kind": {
+      "enum": [
+        "thread_started",
+        "turn_started",
+        "turn_completed",
+        "plan_published",
+        "plan_approved",
+        "prompt_enqueued",
+        "delivery_attempted",
+        "delivery_completed",
+        "poll_completed",
+        "component_health_changed",
+        "supervisor_restarted",
+        "shutdown_requested",
+        "shutdown_completed"
+      ]
+    },
+    "subject": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "session": {"$ref": "#/$defs/synthetic_id"},
+        "thread": {"$ref": "#/$defs/synthetic_id"},
+        "turn": {"$ref": "#/$defs/synthetic_id"},
+        "item": {"$ref": "#/$defs/synthetic_id"},
+        "component": {"enum": ["bridge", "telegram_polling", "app_server", "delivery"]},
+        "bot_role": {"enum": ["control", "discussion", "status"]},
+        "queue": {"enum": ["prompt", "delivery", "workload"]}
+      }
+    },
+    "result": {"enum": ["success", "failed", "cancelled", "rejected"]},
+    "attempt": {"type": "integer", "minimum": 1, "maximum": 1000},
+    "queue_depth": {"type": "integer", "minimum": 0, "maximum": 1000000},
+    "latency_ms": {"type": "integer", "minimum": 0, "maximum": 3600000},
+    "error_class": {
+      "enum": ["timeout", "transport", "rate_limited", "remote_rejected", "internal"]
+    }
+  },
+  "$defs": {
+    "synthetic_id": {
+      "type": "string",
+      "pattern": "^replay-[a-z0-9][a-z0-9_-]{0,62}$"
+    }
+  }
+}

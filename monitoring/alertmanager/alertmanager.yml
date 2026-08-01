@@ -1,0 +1,33 @@
+route:
+  receiver: discard
+  group_by:
+    - alertname
+    - instance
+    - implementation
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    - matchers:
+        - service="codex-telegram-bridge"
+        - severity="critical"
+      receiver: bridge-local-webhook
+
+inhibit_rules:
+  - source_matchers:
+      - alertname="CodexTelegramBridgeTargetDown"
+      - severity="critical"
+    target_matchers:
+      - service="codex-telegram-bridge"
+      - severity=~"warning|critical"
+    equal:
+      - instance
+      - implementation
+
+receivers:
+  # Safe default: no network destination is configured until an operator opts in.
+  - name: discard
+  - name: bridge-local-webhook
+    webhook_configs:
+      - url: http://127.0.0.1:18091/alerts
+        send_resolved: true

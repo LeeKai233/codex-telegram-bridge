@@ -1,0 +1,6 @@
+{"schema_version":1,"offset_ms":0,"kind":"thread_started","subject":{"session":"replay-session-a","thread":"replay-thread-a"}}
+{"schema_version":1,"offset_ms":10,"kind":"turn_started","subject":{"session":"replay-session-a","thread":"replay-thread-a","turn":"replay-turn-a"}}
+{"schema_version":1,"offset_ms":25,"kind":"prompt_enqueued","subject":{"session":"replay-session-a","thread":"replay-thread-a","turn":"replay-turn-a","queue":"prompt"},"queue_depth":1}
+{"schema_version":1,"offset_ms":50,"kind":"delivery_attempted","subject":{"thread":"replay-thread-a","bot_role":"discussion","queue":"delivery"},"attempt":1,"queue_depth":1}
+{"schema_version":1,"offset_ms":85,"kind":"delivery_completed","subject":{"thread":"replay-thread-a","bot_role":"discussion","queue":"delivery"},"result":"success","attempt":1,"queue_depth":0,"latency_ms":35}
+{"schema_version":1,"offset_ms":100,"kind":"turn_completed","subject":{"session":"replay-session-a","thread":"replay-thread-a","turn":"replay-turn-a"},"result":"success"}

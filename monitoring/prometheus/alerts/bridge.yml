@@ -1,0 +1,72 @@
+groups:
+  - name: codex-telegram-bridge
+    rules:
+      - alert: CodexTelegramBridgeTargetDown
+        expr: up{job="codex-telegram-bridge"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          service: codex-telegram-bridge
+        annotations:
+          summary: Codex Telegram Bridge metrics target is unreachable
+          description: "{{ $labels.implementation }} at {{ $labels.instance }} has not been scraped for two minutes."
+
+      - alert: CodexTelegramBridgeComponentUnhealthy
+        expr: codex_telegram_bridge_component_healthy == 0
+        for: 2m
+        labels:
+          severity: critical
+          service: codex-telegram-bridge
+        annotations:
+          summary: Codex Telegram Bridge component is unhealthy
+          description: "{{ $labels.component }} is unhealthy on {{ $labels.instance }}."
+
+      - alert: CodexTelegramBridgePollingStalled
+        expr: time() - codex_telegram_bridge_telegram_poll_last_success_unixtime > 120
+        for: 2m
+        labels:
+          severity: critical
+          service: codex-telegram-bridge
+        annotations:
+          summary: Telegram polling has stalled
+          description: "{{ $labels.bot_role }} has not completed a successful poll on {{ $labels.instance }} for over two minutes."
+
+      - alert: CodexTelegramBridgeDeliveryFailureRateHigh
+        expr: |
+          sum by (instance, implementation, bot_role) (
+            rate(codex_telegram_bridge_telegram_delivery_attempts_total{result="failed"}[5m])
+          )
+          /
+          clamp_min(
+            sum by (instance, implementation, bot_role) (
+              rate(codex_telegram_bridge_telegram_delivery_attempts_total[5m])
+            ),
+            0.01
+          ) > 0.10
+        for: 10m
+        labels:
+          severity: warning
+          service: codex-telegram-bridge
+        annotations:
+          summary: Telegram delivery failure rate is above 10 percent
+          description: "{{ $labels.bot_role }} delivery failures exceeded 10 percent on {{ $labels.instance }} for ten minutes."
+
+      - alert: CodexTelegramBridgeQueueBacklog
+        expr: codex_telegram_bridge_queue_depth > 100
+        for: 15m
+        labels:
+          severity: warning
+          service: codex-telegram-bridge
+        annotations:
+          summary: Codex Telegram Bridge queue backlog is high
+          description: "{{ $labels.queue }} has more than 100 pending items on {{ $labels.instance }}."
+
+      - alert: CodexTelegramBridgeEventLoopLagHigh
+        expr: codex_telegram_bridge_event_loop_lag_seconds > 0.5
+        for: 5m
+        labels:
+          severity: warning
+          service: codex-telegram-bridge
+        annotations:
+          summary: Codex Telegram Bridge event loop lag is high
+          description: "Event loop lag exceeded 500 ms on {{ $labels.instance }} for five minutes."

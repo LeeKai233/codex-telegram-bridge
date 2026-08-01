@@ -1,0 +1,6 @@
+{"schema_version":1,"offset_ms":0,"kind":"poll_completed","subject":{"component":"telegram_polling","bot_role":"discussion"},"result":"success","latency_ms":30}
+{"schema_version":1,"offset_ms":1000,"kind":"poll_completed","subject":{"component":"telegram_polling","bot_role":"discussion"},"result":"failed","error_class":"transport","latency_ms":200}
+{"schema_version":1,"offset_ms":1500,"kind":"component_health_changed","subject":{"component":"telegram_polling"},"result":"failed"}
+{"schema_version":1,"offset_ms":2000,"kind":"supervisor_restarted","subject":{"component":"telegram_polling"},"attempt":1}
+{"schema_version":1,"offset_ms":3000,"kind":"poll_completed","subject":{"component":"telegram_polling","bot_role":"discussion"},"result":"success","latency_ms":40}
+{"schema_version":1,"offset_ms":3100,"kind":"component_health_changed","subject":{"component":"telegram_polling"},"result":"success"}

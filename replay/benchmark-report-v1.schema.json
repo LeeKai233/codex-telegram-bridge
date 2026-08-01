@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/LeeKai233/codex-telegram-bridge/replay/benchmark-report-v1.schema.json",
+  "title": "Codex Telegram Bridge replay benchmark report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "scenario",
+    "implementation",
+    "repetitions",
+    "events_processed",
+    "elapsed_ms",
+    "outcome"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "scenario": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{0,62}$"},
+    "implementation": {"enum": ["python", "rust-vnext"]},
+    "repetitions": {"type": "integer", "minimum": 1, "maximum": 1000000},
+    "events_processed": {"type": "integer", "minimum": 0},
+    "elapsed_ms": {"type": "integer", "minimum": 0},
+    "p50_event_us": {"type": "integer", "minimum": 0},
+    "p95_event_us": {"type": "integer", "minimum": 0},
+    "peak_rss_bytes": {"type": "integer", "minimum": 0},
+    "outcome": {"enum": ["success", "failed"]},
+    "failure_class": {"enum": ["schema", "invariant", "runtime"]}
+  }
+}

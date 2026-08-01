@@ -1,0 +1,15 @@
+schema_version = 1
+
+[[scenario]]
+name = "steady_delivery"
+fixture = "fixtures/steady_delivery.ndjson"
+repetitions = 1000
+warmup_repetitions = 100
+assertions = ["ordered_offsets", "nonnegative_queue_depth", "terminal_delivery"]
+
+[[scenario]]
+name = "poll_recovery"
+fixture = "fixtures/poll_recovery.ndjson"
+repetitions = 1000
+warmup_repetitions = 100
+assertions = ["ordered_offsets", "poll_recovers", "terminal_delivery"]
