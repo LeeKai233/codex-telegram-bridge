@@ -41,6 +41,8 @@ identifier!(ApprovalId);
 identifier!(ArtifactId);
 identifier!(CommandId);
 identifier!(EventId);
+identifier!(ThreadId);
+identifier!(TurnId);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionStatus {
@@ -212,6 +214,62 @@ pub struct ScheduledCommand {
     pub session_id: SessionId,
     pub prompt: String,
     pub enqueued_at_ms: TimestampMs,
+}
+
+/// A prompt item accepted by Codex's app-server.  This deliberately models
+/// the cross-adapter contract rather than Telegram's presentation objects.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum PromptInput {
+    Text {
+        text: String,
+        #[serde(default)]
+        text_elements: Vec<serde_json::Value>,
+    },
+    LocalImage { path: String, detail: String },
+    Mention { name: String, path: String },
+}
+
+impl PromptInput {
+    pub fn text(value: impl Into<String>) -> Result<Self, DomainError> {
+        let text = value.into();
+        if text.trim().is_empty() {
+            return Err(DomainError::EmptyPrompt);
+        }
+        Ok(Self::Text {
+            text,
+            text_elements: Vec::new(),
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentThread {
+    pub id: ThreadId,
+    pub status: Option<String>,
+    pub ephemeral: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTurn {
+    pub id: TurnId,
+    pub thread_id: ThreadId,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AgentEvent {
+    pub method: String,
+    pub params: serde_json::Value,
+    pub generation: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AgentServerRequest {
+    pub id: serde_json::Value,
+    pub method: String,
+    pub params: serde_json::Value,
+    pub generation: u64,
 }
 
 impl ScheduledCommand {

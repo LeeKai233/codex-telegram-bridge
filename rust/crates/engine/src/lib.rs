@@ -22,6 +22,12 @@ pub struct Engine<'a> {
     event_ids: &'a dyn EventIdGenerator,
 }
 
+/// The engine intentionally holds no concrete Codex client.  Controllers can
+/// accept an `AgentBackend` alongside this durable business engine, keeping
+/// Telegram, Claude, and future transports outside the core.
+pub trait EngineAgentBackend: ctg_ports::AgentBackend {}
+impl<T: ctg_ports::AgentBackend + ?Sized> EngineAgentBackend for T {}
+
 pub struct EngineDependencies<'a> {
     pub clock: &'a dyn Clock,
     pub sessions: &'a dyn SessionRepository,

@@ -1,9 +1,12 @@
 //! Ports implemented by adapters such as SQLite, Telegram, and Codex.
 
+use async_trait::async_trait;
 use ctg_domain::{
-    ApprovalAction, ApprovalDecision, ApprovalId, ApprovalRequest, Artifact, DomainEvent, Session,
-    SessionId, TimestampMs,
+    AgentEvent, AgentServerRequest, AgentThread, AgentTurn, ApprovalAction, ApprovalDecision,
+    ApprovalId, ApprovalRequest, Artifact, DomainEvent, PromptInput, Session, SessionId, ThreadId,
+    TimestampMs, TurnId,
 };
+use serde_json::Value;
 use thiserror::Error;
 
 pub type PortResult<T> = Result<T, PortError>;
@@ -66,6 +69,39 @@ pub trait SessionIdGenerator: Send + Sync {
 
 pub trait DecisionValidator: Send + Sync {
     fn terminal_decision(&self, decision: ApprovalDecision) -> PortResult<()>;
+}
+
+/// Transport-neutral Codex boundary.  Telegram controllers depend on this
+/// trait, so they can use the managed Unix app-server on Linux/WSL or another
+/// implementation on Windows without importing transport details.
+#[async_trait]
+pub trait AgentBackend: Send + Sync {
+    async fn start_thread(
+        &self,
+        cwd: &str,
+        ephemeral: bool,
+        read_only: bool,
+    ) -> PortResult<AgentThread>;
+    async fn resume_thread(&self, thread_id: &ThreadId) -> PortResult<AgentThread>;
+    async fn read_thread(&self, thread_id: &ThreadId, include_turns: bool) -> PortResult<Value>;
+    async fn list_threads(&self, limit: u32, cursor: Option<&str>) -> PortResult<Value>;
+    async fn start_turn(
+        &self,
+        thread_id: &ThreadId,
+        input: Vec<PromptInput>,
+        client_message_id: Option<&str>,
+    ) -> PortResult<AgentTurn>;
+    async fn steer_turn(
+        &self,
+        thread_id: &ThreadId,
+        expected_turn_id: &TurnId,
+        input: Vec<PromptInput>,
+        client_message_id: Option<&str>,
+    ) -> PortResult<TurnId>;
+    async fn respond(&self, request_id: Value, result: Value) -> PortResult<()>;
+    async fn respond_error(&self, request_id: Value, code: i64, message: &str) -> PortResult<()>;
+    fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<AgentEvent>;
+    fn subscribe_server_requests(&self) -> tokio::sync::broadcast::Receiver<AgentServerRequest>;
 }
 
 /// Optional physical approval channel. The core remains usable when no
