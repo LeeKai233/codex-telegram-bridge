@@ -14,12 +14,319 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+pub mod controllers;
+
 pub const ALLOWED_UPDATES: &[&str] = &[
     "message",
     "edited_message",
     "callback_query",
     "my_chat_member",
 ];
+
+/// The four production identities have deliberately different update duties.
+/// The alert bot is send-only: acquiring a polling lease for it is a bug.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeBotRole {
+    Control,
+    Status,
+    Discussion,
+    Alert,
+}
+
+impl RuntimeBotRole {
+    pub const fn polls_updates(self) -> bool {
+        !matches!(self, Self::Alert)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LinkedDiscussion {
+    pub channel_chat_id: i64,
+    pub discussion_chat_id: i64,
+}
+
+impl LinkedDiscussion {
+    pub fn new(channel_chat_id: i64, discussion_chat_id: i64) -> Result<Self, RoutingError> {
+        if channel_chat_id >= 0 || discussion_chat_id >= 0 {
+            return Err(RoutingError::InvalidTopology);
+        }
+        Ok(Self {
+            channel_chat_id,
+            discussion_chat_id,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpdateRoutingPolicy {
+    pub control_owner_chat_id: i64,
+    pub linked_discussion: LinkedDiscussion,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TelegramMessage {
+    pub chat_id: i64,
+    pub message_id: i64,
+    pub text: Option<String>,
+    pub reply_to_message_id: Option<i64>,
+    /// The linked-discussion automatic forward from a channel post. Telegram's
+    /// `is_automatic_forward` is the source of truth; forum topics are optional.
+    pub automatic_forward_from_channel: Option<i64>,
+    pub automatic_forward_channel_post_id: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TelegramCallback {
+    pub id: String,
+    pub chat_id: i64,
+    pub message_id: i64,
+    pub data: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IncomingUpdate {
+    Message(TelegramMessage),
+    EditedMessage(TelegramMessage),
+    Callback(TelegramCallback),
+    Membership,
+    Unsupported,
+}
+
+impl IncomingUpdate {
+    pub fn from_update(update: &Update) -> Self {
+        if let Some(message) = update.payload.get("message").and_then(parse_message) {
+            return Self::Message(message);
+        }
+        if let Some(message) = update.payload.get("edited_message").and_then(parse_message) {
+            return Self::EditedMessage(message);
+        }
+        if let Some(callback) = update
+            .payload
+            .get("callback_query")
+            .and_then(parse_callback)
+        {
+            return Self::Callback(callback);
+        }
+        if update.payload.get("my_chat_member").is_some() {
+            return Self::Membership;
+        }
+        Self::Unsupported
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WorkflowCommand {
+    New,
+    Totp,
+    Status,
+    Perf,
+    Help,
+    PlanMode,
+    ChangeModel,
+    GetFile,
+    Review,
+    Cancel,
+    Unknown(String),
+}
+
+impl WorkflowCommand {
+    pub fn parse(text: &str) -> Option<Self> {
+        let command = text.split_whitespace().next()?.strip_prefix('/')?;
+        let command = command
+            .split('@')
+            .next()
+            .unwrap_or(command)
+            .to_ascii_lowercase();
+        Some(match command.as_str() {
+            "new" => Self::New,
+            "totp" => Self::Totp,
+            "status" => Self::Status,
+            "perf" => Self::Perf,
+            "help" | "start" => Self::Help,
+            "planmode" => Self::PlanMode,
+            "changemodel" => Self::ChangeModel,
+            "getfile" => Self::GetFile,
+            "review" => Self::Review,
+            "cancel" => Self::Cancel,
+            other => Self::Unknown(other.to_owned()),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WorkflowAction {
+    Command {
+        command: WorkflowCommand,
+        chat_id: i64,
+        message_id: i64,
+        text: String,
+    },
+    Prompt {
+        chat_id: i64,
+        message_id: i64,
+        text: String,
+        root_message_id: Option<i64>,
+    },
+    Callback(TelegramCallback),
+    NativeCommentPost {
+        channel_chat_id: i64,
+        channel_post_id: i64,
+        discussion_chat_id: i64,
+        discussion_root_message_id: i64,
+    },
+    MembershipChanged,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RoutedUpdate {
+    Dispatch(WorkflowAction),
+    Ignore,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RoutingError {
+    InvalidTopology,
+    AlertBotMustNotPoll,
+}
+
+impl fmt::Display for RoutingError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidTopology => {
+                formatter.write_str("linked channel and discussion must be Telegram supergroup ids")
+            }
+            Self::AlertBotMustNotPoll => {
+                formatter.write_str("the alert bot is send-only and must not poll updates")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RoutingError {}
+
+pub struct UpdateRouter {
+    role: RuntimeBotRole,
+    policy: UpdateRoutingPolicy,
+}
+
+impl UpdateRouter {
+    pub fn new(role: RuntimeBotRole, policy: UpdateRoutingPolicy) -> Result<Self, RoutingError> {
+        if !role.polls_updates() {
+            return Err(RoutingError::AlertBotMustNotPoll);
+        }
+        Ok(Self { role, policy })
+    }
+
+    pub fn route(&self, update: &Update) -> RoutedUpdate {
+        match (self.role, IncomingUpdate::from_update(update)) {
+            (RuntimeBotRole::Control, IncomingUpdate::Message(message))
+                if message.chat_id == self.policy.control_owner_chat_id =>
+            {
+                self.route_message(message, None)
+            }
+            (RuntimeBotRole::Control, IncomingUpdate::Callback(callback))
+                if callback.chat_id == self.policy.control_owner_chat_id =>
+            {
+                RoutedUpdate::Dispatch(WorkflowAction::Callback(callback))
+            }
+            (RuntimeBotRole::Status, IncomingUpdate::Callback(callback))
+                if callback.chat_id == self.policy.linked_discussion.discussion_chat_id =>
+            {
+                RoutedUpdate::Dispatch(WorkflowAction::Callback(callback))
+            }
+            (RuntimeBotRole::Discussion, IncomingUpdate::Message(message))
+                if message.chat_id == self.policy.linked_discussion.discussion_chat_id =>
+            {
+                if message.automatic_forward_from_channel
+                    == Some(self.policy.linked_discussion.channel_chat_id)
+                {
+                    RoutedUpdate::Dispatch(WorkflowAction::NativeCommentPost {
+                        channel_chat_id: self.policy.linked_discussion.channel_chat_id,
+                        channel_post_id: message
+                            .automatic_forward_channel_post_id
+                            .unwrap_or(message.message_id),
+                        discussion_chat_id: message.chat_id,
+                        discussion_root_message_id: message.message_id,
+                    })
+                } else {
+                    self.route_message(message.clone(), message.reply_to_message_id)
+                }
+            }
+            (RuntimeBotRole::Discussion, IncomingUpdate::Callback(callback))
+                if callback.chat_id == self.policy.linked_discussion.discussion_chat_id =>
+            {
+                RoutedUpdate::Dispatch(WorkflowAction::Callback(callback))
+            }
+            (_, IncomingUpdate::Membership) => {
+                RoutedUpdate::Dispatch(WorkflowAction::MembershipChanged)
+            }
+            _ => RoutedUpdate::Ignore,
+        }
+    }
+
+    fn route_message(
+        &self,
+        message: TelegramMessage,
+        root_message_id: Option<i64>,
+    ) -> RoutedUpdate {
+        let text = match message.text {
+            Some(text) if !text.trim().is_empty() => text,
+            _ => return RoutedUpdate::Ignore,
+        };
+        if let Some(command) = WorkflowCommand::parse(&text) {
+            RoutedUpdate::Dispatch(WorkflowAction::Command {
+                command,
+                chat_id: message.chat_id,
+                message_id: message.message_id,
+                text,
+            })
+        } else {
+            RoutedUpdate::Dispatch(WorkflowAction::Prompt {
+                chat_id: message.chat_id,
+                message_id: message.message_id,
+                text,
+                root_message_id,
+            })
+        }
+    }
+}
+
+fn parse_message(value: &Value) -> Option<TelegramMessage> {
+    let chat_id = value.pointer("/chat/id")?.as_i64()?;
+    let message_id = value.get("message_id")?.as_i64()?;
+    let automatic_forward_from_channel = value
+        .get("is_automatic_forward")
+        .filter(|flag| flag.as_bool() == Some(true))
+        .and_then(|_| {
+            value
+                .pointer("/sender_chat/id")
+                .or_else(|| value.pointer("/forward_from_chat/id"))
+                .and_then(Value::as_i64)
+        });
+    Some(TelegramMessage {
+        chat_id,
+        message_id,
+        text: value.get("text").and_then(Value::as_str).map(str::to_owned),
+        reply_to_message_id: value
+            .pointer("/reply_to_message/message_id")
+            .and_then(Value::as_i64),
+        automatic_forward_from_channel,
+        automatic_forward_channel_post_id: value
+            .get("is_automatic_forward")
+            .filter(|flag| flag.as_bool() == Some(true))
+            .and_then(|_| value.get("forward_from_message_id"))
+            .and_then(Value::as_i64),
+    })
+}
+
+fn parse_callback(value: &Value) -> Option<TelegramCallback> {
+    Some(TelegramCallback {
+        id: value.get("id")?.as_str()?.to_owned(),
+        chat_id: value.pointer("/message/chat/id")?.as_i64()?,
+        message_id: value.pointer("/message/message_id")?.as_i64()?,
+        data: value.get("data")?.as_str()?.to_owned(),
+    })
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -149,9 +456,38 @@ impl ForumTopicBinding {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeCommentBinding {
+    pub channel: ChannelBinding,
+    pub discussion_chat_id: String,
+    pub root_message_id: i64,
+}
+
+impl NativeCommentBinding {
+    pub fn new(
+        channel: ChannelBinding,
+        discussion_chat_id: impl Into<String>,
+        root_message_id: i64,
+    ) -> Result<Self, BindingIssue> {
+        let discussion_chat_id = discussion_chat_id.into();
+        if discussion_chat_id.trim().is_empty() || root_message_id <= 0 {
+            return Err(BindingIssue::new(
+                "invalid-native-comment-root",
+                "native comment binding needs a discussion chat and positive root message id",
+            ));
+        }
+        Ok(Self {
+            channel,
+            discussion_chat_id,
+            root_message_id,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TelegramSurfaceBinding {
     Channel(ChannelBinding),
     ForumTopic(ForumTopicBinding),
+    NativeCommentRoot(NativeCommentBinding),
 }
 
 impl TelegramSurfaceBinding {
@@ -159,6 +495,7 @@ impl TelegramSurfaceBinding {
         match self {
             Self::Channel(channel) => &channel.bot_instance_id,
             Self::ForumTopic(topic) => &topic.channel.bot_instance_id,
+            Self::NativeCommentRoot(comment) => &comment.channel.bot_instance_id,
         }
     }
 
@@ -169,6 +506,14 @@ impl TelegramSurfaceBinding {
                 "chat_id": topic.channel.chat_id,
                 "message_thread_id": topic.message_thread_id,
                 "text": text,
+            }),
+            Self::NativeCommentRoot(comment) => json!({
+                "chat_id": comment.discussion_chat_id,
+                "text": text,
+                "reply_parameters": {
+                    "message_id": comment.root_message_id,
+                    "allow_sending_without_reply": true,
+                },
             }),
         }
     }
@@ -768,6 +1113,23 @@ mod tests {
     }
 
     #[test]
+    fn native_comments_reply_to_the_linked_discussion_root_without_thread_id() {
+        let transport =
+            RecordingTransport::responds_with(r#"{"ok":true,"result":{"message_id":10}}"#);
+        let calls = transport.calls.clone();
+        let api = TelegramBotApi::new(transport);
+        let channel = ChannelBinding::new("discussion", "-1004446000549").unwrap();
+        let surface = TelegramSurfaceBinding::NativeCommentRoot(
+            NativeCommentBinding::new(channel, "-1004290500369", 700).unwrap(),
+        );
+        api.send_text(&token(), &surface, "reply").unwrap();
+        let payload = &calls.lock().unwrap()[0].1;
+        assert_eq!(payload["chat_id"], "-1004290500369");
+        assert_eq!(payload["reply_parameters"]["message_id"], 700);
+        assert!(payload.get("message_thread_id").is_none());
+    }
+
+    #[test]
     fn token_is_not_present_in_adapter_errors() {
         let transport = RecordingTransport::responds_with(
             r#"{"ok":false,"error_code":401,"description":"bad token"}"#,
@@ -809,5 +1171,69 @@ mod tests {
         );
         drop(first);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn policy() -> UpdateRoutingPolicy {
+        UpdateRoutingPolicy {
+            control_owner_chat_id: 42,
+            linked_discussion: LinkedDiscussion::new(-1004446000549, -1004290500369).unwrap(),
+        }
+    }
+
+    fn update(payload: Value) -> Update {
+        Update {
+            update_id: 12,
+            payload,
+        }
+    }
+
+    #[test]
+    fn linked_channel_automatic_forward_binds_native_comment_without_topic_id() {
+        let router = UpdateRouter::new(RuntimeBotRole::Discussion, policy()).unwrap();
+        let routed = router.route(&update(json!({
+            "message": {
+                "message_id": 700,
+                "chat": {"id": -1004290500369i64},
+                "is_automatic_forward": true,
+                "sender_chat": {"id": -1004446000549i64},
+                "forward_from_message_id": 81
+            }
+        })));
+        assert_eq!(
+            routed,
+            RoutedUpdate::Dispatch(WorkflowAction::NativeCommentPost {
+                channel_chat_id: -1004446000549,
+                channel_post_id: 81,
+                discussion_chat_id: -1004290500369,
+                discussion_root_message_id: 700,
+            })
+        );
+    }
+
+    #[test]
+    fn routes_commands_and_rejects_unrelated_chats() {
+        let router = UpdateRouter::new(RuntimeBotRole::Control, policy()).unwrap();
+        let command = router.route(&update(json!({
+            "message": {"message_id": 3, "chat": {"id": 42}, "text": "/perf@RustControlBot"}
+        })));
+        assert!(matches!(
+            command,
+            RoutedUpdate::Dispatch(WorkflowAction::Command {
+                command: WorkflowCommand::Perf,
+                ..
+            })
+        ));
+        let ignored = router.route(&update(json!({
+            "message": {"message_id": 4, "chat": {"id": 41}, "text": "/new"}
+        })));
+        assert_eq!(ignored, RoutedUpdate::Ignore);
+    }
+
+    #[test]
+    fn alert_role_cannot_create_an_update_router() {
+        assert!(matches!(
+            UpdateRouter::new(RuntimeBotRole::Alert, policy()),
+            Err(RoutingError::AlertBotMustNotPoll)
+        ));
     }
 }
