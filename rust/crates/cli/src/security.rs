@@ -82,17 +82,27 @@ impl TotpManager {
     }
 }
 
-fn read_secret(path: &Path) -> Result<String, TotpError> {
-    let metadata = fs::symlink_metadata(path).map_err(|_| TotpError::SecretUnavailable)?;
+pub fn is_private_regular_file(path: &Path) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
     if !metadata.is_file() {
-        return Err(TotpError::UnsafeSecret);
+        return false;
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         if metadata.permissions().mode() & 0o077 != 0 {
-            return Err(TotpError::UnsafeSecret);
+            return false;
         }
+    }
+    true
+}
+
+fn read_secret(path: &Path) -> Result<String, TotpError> {
+    fs::symlink_metadata(path).map_err(|_| TotpError::SecretUnavailable)?;
+    if !is_private_regular_file(path) {
+        return Err(TotpError::UnsafeSecret);
     }
     let secret = fs::read_to_string(path).map_err(|_| TotpError::SecretUnavailable)?;
     if secret.len() > 256 || secret.trim().is_empty() {
