@@ -48,7 +48,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{TelegramCallback, WorkflowAction};
+    use crate::{TelegramActor, TelegramCallback, TelegramChatKind, WorkflowAction};
 
     #[derive(Default)]
     struct RecordingController(Vec<WorkflowAction>);
@@ -73,8 +73,10 @@ mod tests {
                 RoutedUpdate::Dispatch(WorkflowAction::Callback(TelegramCallback {
                     id: "callback".into(),
                     chat_id: -1004290500369,
+                    chat_kind: TelegramChatKind::Supergroup,
                     message_id: 1,
                     data: "ds:status".into(),
+                    actor: TelegramActor::default(),
                 })),
             )
             .unwrap();
