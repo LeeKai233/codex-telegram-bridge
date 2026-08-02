@@ -11,7 +11,7 @@ use std::sync::Mutex;
 
 /// This is deliberately independent from the Python bridge schema. Rust
 /// deployments receive a new database path and never migrate Python state.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RustSessionSpace {
@@ -46,6 +46,14 @@ pub struct StoredCallback {
     pub generation: i64,
     pub action: String,
     pub expires_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TotpState {
+    pub last_timecode: i64,
+    pub unlocked_until_ms: i64,
+    pub force_locked: bool,
+    pub auth_epoch: i64,
 }
 
 pub struct SqliteStore {
@@ -174,6 +182,103 @@ impl SqliteStore {
             )
             .optional()
             .map_err(sql_error)
+    }
+
+    pub fn active_session_spaces(&self) -> PortResult<Vec<RustSessionSpace>> {
+        let connection = self.connection.lock().map_err(lock_error)?;
+        let mut statement = connection
+            .prepare(
+                "SELECT space_id, thread_id, lifecycle, generation, channel_chat_id, channel_post_id, discussion_chat_id, discussion_root_message_id, status_message_id, status_bot_instance, owner_chat_id, plan_mode, created_at_ms, updated_at_ms FROM rust_session_spaces WHERE lifecycle='active' ORDER BY updated_at_ms, space_id",
+            )
+            .map_err(sql_error)?;
+        let mut rows = statement.query([]).map_err(sql_error)?;
+        let mut spaces = Vec::new();
+        while let Some(row) = rows.next().map_err(sql_error)? {
+            spaces.push(row_to_space(row).map_err(sql_error)?);
+        }
+        Ok(spaces)
+    }
+
+    pub fn session_space_for_thread(
+        &self,
+        thread_id: &str,
+    ) -> PortResult<Option<RustSessionSpace>> {
+        let connection = self.connection.lock().map_err(lock_error)?;
+        connection
+            .query_row(
+                "SELECT space_id, thread_id, lifecycle, generation, channel_chat_id, channel_post_id, discussion_chat_id, discussion_root_message_id, status_message_id, status_bot_instance, owner_chat_id, plan_mode, created_at_ms, updated_at_ms FROM rust_session_spaces WHERE thread_id=?1 ORDER BY updated_at_ms DESC LIMIT 1",
+                params![thread_id],
+                row_to_space,
+            )
+            .optional()
+            .map_err(sql_error)
+    }
+
+    pub fn totp_state(&self) -> PortResult<TotpState> {
+        let connection = self.connection.lock().map_err(lock_error)?;
+        connection
+            .query_row(
+                "SELECT last_timecode, unlocked_until_ms, force_locked, auth_epoch FROM rust_security_state WHERE id=1",
+                [],
+                |row| {
+                    Ok(TotpState {
+                        last_timecode: row.get(0)?,
+                        unlocked_until_ms: row.get(1)?,
+                        force_locked: row.get::<_, i64>(2)? != 0,
+                        auth_epoch: row.get(3)?,
+                    })
+                },
+            )
+            .map_err(sql_error)
+    }
+
+    pub fn is_totp_unlocked(&self, now_ms: i64) -> PortResult<bool> {
+        let state = self.totp_state()?;
+        Ok(!state.force_locked && state.unlocked_until_ms > now_ms)
+    }
+
+    /// Accepts a timecode once and atomically opens the write lease.
+    pub fn accept_totp_timecode(
+        &self,
+        timecode: i64,
+        now_ms: i64,
+        unlock_seconds: i64,
+    ) -> PortResult<bool> {
+        if timecode < 0 || unlock_seconds <= 0 {
+            return Err(PortError::Adapter("invalid TOTP state input".into()));
+        }
+        let mut connection = self.connection.lock().map_err(lock_error)?;
+        let transaction = connection.transaction().map_err(sql_error)?;
+        let last: i64 = transaction
+            .query_row(
+                "SELECT last_timecode FROM rust_security_state WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?;
+        if timecode <= last {
+            transaction.commit().map_err(sql_error)?;
+            return Ok(false);
+        }
+        transaction
+            .execute(
+                "UPDATE rust_security_state SET last_timecode=?1, unlocked_until_ms=?2, force_locked=0 WHERE id=1",
+                params![timecode, now_ms.saturating_add(unlock_seconds.saturating_mul(1000))],
+            )
+            .map_err(sql_error)?;
+        transaction.commit().map_err(sql_error)?;
+        Ok(true)
+    }
+
+    pub fn lock_totp(&self) -> PortResult<()> {
+        let connection = self.connection.lock().map_err(lock_error)?;
+        connection
+            .execute(
+                "UPDATE rust_security_state SET unlocked_until_ms=0, force_locked=1, auth_epoch=auth_epoch+1 WHERE id=1",
+                [],
+            )
+            .map_err(sql_error)?;
+        Ok(())
     }
 
     /// Saves the immutable channel-post to discussion-root relationship. It
@@ -382,6 +487,23 @@ impl SqliteStore {
                     CREATE INDEX rust_callbacks_pending
                         ON rust_callbacks(space_id, generation, expires_at_ms)
                         WHERE consumed_at_ms IS NULL;
+                    ",
+                )
+                .map_err(sql_error)?;
+        }
+        if version < 3 {
+            transaction
+                .execute_batch(
+                    "
+                    CREATE TABLE rust_security_state (
+                        id INTEGER PRIMARY KEY CHECK(id = 1),
+                        last_timecode INTEGER NOT NULL,
+                        unlocked_until_ms INTEGER NOT NULL,
+                        force_locked INTEGER NOT NULL CHECK(force_locked IN (0, 1)),
+                        auth_epoch INTEGER NOT NULL
+                    ) STRICT;
+                    INSERT INTO rust_security_state(id, last_timecode, unlocked_until_ms, force_locked, auth_epoch)
+                        VALUES (1, -1, 0, 1, 0);
                     ",
                 )
                 .map_err(sql_error)?;
@@ -735,6 +857,7 @@ mod tests {
     fn rust_state_is_independent_and_binds_native_comment_roots() {
         let store = SqliteStore::in_memory().unwrap();
         store.upsert_session_space(&space()).unwrap();
+        assert_eq!(store.active_session_spaces().unwrap(), vec![space()]);
         let root = NativeCommentRoot {
             channel_chat_id: -1004446000549,
             channel_post_id: 81,

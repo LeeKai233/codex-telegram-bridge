@@ -118,9 +118,12 @@ impl IncomingUpdate {
 pub enum WorkflowCommand {
     New,
     Totp,
+    Lock,
     Status,
     Perf,
     Help,
+    Sessions,
+    Topics,
     PlanMode,
     ChangeModel,
     GetFile,
@@ -140,9 +143,12 @@ impl WorkflowCommand {
         Some(match command.as_str() {
             "new" => Self::New,
             "totp" => Self::Totp,
+            "lock" => Self::Lock,
             "status" => Self::Status,
             "perf" => Self::Perf,
             "help" | "start" => Self::Help,
+            "sessions" => Self::Sessions,
+            "topics" => Self::Topics,
             "planmode" => Self::PlanMode,
             "changemodel" => Self::ChangeModel,
             "getfile" => Self::GetFile,
@@ -150,6 +156,31 @@ impl WorkflowCommand {
             "cancel" => Self::Cancel,
             other => Self::Unknown(other.to_owned()),
         })
+    }
+
+    /// Keep the Python bridge's role-local command surface intact. A command
+    /// may be understood by the shared parser while still being ignored by a
+    /// bot that does not own that business surface.
+    pub const fn allowed_for_role(&self, role: RuntimeBotRole) -> bool {
+        match role {
+            RuntimeBotRole::Control => matches!(
+                self,
+                Self::New | Self::Perf | Self::Help | Self::Sessions | Self::Topics
+            ),
+            RuntimeBotRole::Discussion => matches!(
+                self,
+                Self::Status
+                    | Self::Totp
+                    | Self::Lock
+                    | Self::PlanMode
+                    | Self::ChangeModel
+                    | Self::GetFile
+                    | Self::Review
+                    | Self::Cancel
+                    | Self::Help
+            ),
+            RuntimeBotRole::Status | RuntimeBotRole::Alert => false,
+        }
     }
 }
 
@@ -274,6 +305,9 @@ impl UpdateRouter {
             _ => return RoutedUpdate::Ignore,
         };
         if let Some(command) = WorkflowCommand::parse(&text) {
+            if !command.allowed_for_role(self.role) {
+                return RoutedUpdate::Ignore;
+            }
             RoutedUpdate::Dispatch(WorkflowAction::Command {
                 command,
                 chat_id: message.chat_id,
@@ -515,6 +549,30 @@ impl TelegramSurfaceBinding {
                     "allow_sending_without_reply": true,
                 },
             }),
+        }
+    }
+
+    fn document_fields(&self) -> Vec<(String, String)> {
+        match self {
+            Self::Channel(channel) => vec![("chat_id".into(), channel.chat_id.clone())],
+            Self::ForumTopic(topic) => vec![
+                ("chat_id".into(), topic.channel.chat_id.clone()),
+                (
+                    "message_thread_id".into(),
+                    topic.message_thread_id.to_string(),
+                ),
+            ],
+            Self::NativeCommentRoot(comment) => vec![
+                ("chat_id".into(), comment.discussion_chat_id.clone()),
+                (
+                    "reply_parameters".into(),
+                    json!({
+                        "message_id": comment.root_message_id,
+                        "allow_sending_without_reply": true,
+                    })
+                    .to_string(),
+                ),
+            ],
         }
     }
 }
@@ -767,6 +825,21 @@ pub trait TelegramTransport {
         method: &'static str,
         payload: Value,
     ) -> Result<String, TelegramTransportError>;
+
+    /// Multipart is optional so test transports and non-file adapters remain
+    /// intentionally text-only. Production reqwest enables it for bounded
+    /// Telegram document uploads.
+    fn post_multipart(
+        &self,
+        _api_base: &str,
+        _token: &BotToken,
+        _method: &'static str,
+        _fields: Vec<(String, String)>,
+        _file_name: String,
+        _file_bytes: Vec<u8>,
+    ) -> Result<String, TelegramTransportError> {
+        Err(TelegramTransportError::new("multipart-unsupported"))
+    }
 }
 
 /// Production Telegram Bot API transport. The client uses rustls only, a
@@ -806,6 +879,49 @@ impl TelegramTransport for ReqwestTransport {
             .client
             .post(url)
             .json(&payload)
+            .send()
+            .map_err(|error| {
+                if error.is_timeout() {
+                    TelegramTransportError::new("timeout")
+                } else if error.is_connect() {
+                    TelegramTransportError::new("connect")
+                } else {
+                    TelegramTransportError::new("request")
+                }
+            })?;
+        if !response.status().is_success() {
+            return Err(TelegramTransportError::new("http-status"));
+        }
+        response
+            .text()
+            .map_err(|_| TelegramTransportError::new("response-body"))
+    }
+
+    fn post_multipart(
+        &self,
+        api_base: &str,
+        token: &BotToken,
+        method: &'static str,
+        fields: Vec<(String, String)>,
+        file_name: String,
+        file_bytes: Vec<u8>,
+    ) -> Result<String, TelegramTransportError> {
+        let url = format!(
+            "{}/bot{}/{}",
+            api_base.trim_end_matches('/'),
+            token.as_str(),
+            method
+        );
+        let mut form = reqwest::blocking::multipart::Form::new();
+        for (name, value) in fields {
+            form = form.text(name, value);
+        }
+        let part = reqwest::blocking::multipart::Part::bytes(file_bytes).file_name(file_name);
+        form = form.part("document", part);
+        let response = self
+            .client
+            .post(url)
+            .multipart(form)
             .send()
             .map_err(|error| {
                 if error.is_timeout() {
@@ -892,10 +1008,76 @@ where
         surface: &TelegramSurfaceBinding,
         text: &str,
     ) -> Result<SentMessage, TelegramError> {
+        self.send_text_with_markup(token, surface, text, None)
+    }
+
+    pub fn send_text_with_markup(
+        &self,
+        token: &BotToken,
+        surface: &TelegramSurfaceBinding,
+        text: &str,
+        reply_markup: Option<Value>,
+    ) -> Result<SentMessage, TelegramError> {
         if text.is_empty() {
             return Err(TelegramError::InvalidInput("message text cannot be empty"));
         }
-        self.call(token, "sendMessage", surface.send_message_payload(text))
+        let mut payload = surface.send_message_payload(text);
+        if let Some(reply_markup) = reply_markup {
+            payload["reply_markup"] = reply_markup;
+        }
+        self.call(token, "sendMessage", payload)
+    }
+
+    pub fn send_document(
+        &self,
+        token: &BotToken,
+        surface: &TelegramSurfaceBinding,
+        file_name: &str,
+        file_bytes: Vec<u8>,
+        caption: Option<&str>,
+    ) -> Result<SentMessage, TelegramError> {
+        if file_name.trim().is_empty() {
+            return Err(TelegramError::InvalidInput(
+                "document file name cannot be empty",
+            ));
+        }
+        if file_bytes.is_empty() {
+            return Err(TelegramError::InvalidInput("document cannot be empty"));
+        }
+        let mut fields = surface.document_fields();
+        if let Some(caption) = caption.filter(|caption| !caption.is_empty()) {
+            fields.push(("caption".into(), caption.to_owned()));
+        }
+        let body = self
+            .transport
+            .post_multipart(
+                &self.api_base,
+                token,
+                "sendDocument",
+                fields,
+                file_name.to_owned(),
+                file_bytes,
+            )
+            .map_err(TelegramError::Transport)?;
+        parse_api_response(&body, "sendDocument")
+    }
+
+    pub fn answer_callback_query(
+        &self,
+        token: &BotToken,
+        callback_query_id: &str,
+        text: Option<&str>,
+    ) -> Result<bool, TelegramError> {
+        if callback_query_id.trim().is_empty() {
+            return Err(TelegramError::InvalidInput(
+                "callback query id cannot be empty",
+            ));
+        }
+        let mut payload = json!({"callback_query_id": callback_query_id});
+        if let Some(text) = text.filter(|text| !text.is_empty()) {
+            payload["text"] = Value::String(text.to_owned());
+        }
+        self.call(token, "answerCallbackQuery", payload)
     }
 
     pub fn get_chat(&self, token: &BotToken, chat_id: i64) -> Result<ChatInfo, TelegramError> {
@@ -925,18 +1107,25 @@ where
             .transport
             .post_json(&self.api_base, token, method, payload)
             .map_err(TelegramError::Transport)?;
-        let response: BotApiResponse<R> =
-            serde_json::from_str(&body).map_err(|_| TelegramError::InvalidResponse { method })?;
-        if response.ok {
-            response
-                .result
-                .ok_or(TelegramError::InvalidResponse { method })
-        } else {
-            Err(TelegramError::ApiRejected {
-                method,
-                error_code: response.error_code,
-            })
-        }
+        parse_api_response(&body, method)
+    }
+}
+
+fn parse_api_response<R: for<'de> Deserialize<'de>>(
+    body: &str,
+    method: &'static str,
+) -> Result<R, TelegramError> {
+    let response: BotApiResponse<R> =
+        serde_json::from_str(body).map_err(|_| TelegramError::InvalidResponse { method })?;
+    if response.ok {
+        response
+            .result
+            .ok_or(TelegramError::InvalidResponse { method })
+    } else {
+        Err(TelegramError::ApiRejected {
+            method,
+            error_code: response.error_code,
+        })
     }
 }
 
@@ -1021,9 +1210,12 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
+    type MultipartCall = (&'static str, Vec<(String, String)>, String, Vec<u8>);
+
     #[derive(Clone, Default)]
     struct RecordingTransport {
         calls: Arc<Mutex<Vec<(&'static str, Value)>>>,
+        multipart_calls: Arc<Mutex<Vec<MultipartCall>>>,
         response: Arc<Mutex<String>>,
     }
 
@@ -1045,6 +1237,22 @@ mod tests {
             payload: Value,
         ) -> Result<String, TelegramTransportError> {
             self.calls.lock().unwrap().push((method, payload));
+            Ok(self.response.lock().unwrap().clone())
+        }
+
+        fn post_multipart(
+            &self,
+            _api_base: &str,
+            _token: &BotToken,
+            method: &'static str,
+            fields: Vec<(String, String)>,
+            file_name: String,
+            file_bytes: Vec<u8>,
+        ) -> Result<String, TelegramTransportError> {
+            self.multipart_calls
+                .lock()
+                .unwrap()
+                .push((method, fields, file_name, file_bytes));
             Ok(self.response.lock().unwrap().clone())
         }
     }
@@ -1127,6 +1335,38 @@ mod tests {
         assert_eq!(payload["chat_id"], "-1004290500369");
         assert_eq!(payload["reply_parameters"]["message_id"], 700);
         assert!(payload.get("message_thread_id").is_none());
+    }
+
+    #[test]
+    fn document_upload_preserves_native_comment_reply_parameters() {
+        let transport =
+            RecordingTransport::responds_with(r#"{"ok":true,"result":{"message_id":11}}"#);
+        let multipart_calls = transport.multipart_calls.clone();
+        let api = TelegramBotApi::new(transport);
+        let channel = ChannelBinding::new("discussion", "-1004446000549").unwrap();
+        let surface = TelegramSurfaceBinding::NativeCommentRoot(
+            NativeCommentBinding::new(channel, "-1004290500369", 700).unwrap(),
+        );
+        assert_eq!(
+            api.send_document(
+                &token(),
+                &surface,
+                "report.txt",
+                b"hello".to_vec(),
+                Some("sha256=x"),
+            )
+            .unwrap()
+            .message_id,
+            11
+        );
+        let calls = multipart_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "sendDocument");
+        assert_eq!(calls[0].2, "report.txt");
+        assert_eq!(calls[0].3, b"hello");
+        assert!(calls[0].1.iter().any(|(name, value)| {
+            name == "reply_parameters" && value.contains("\"message_id\":700")
+        }));
     }
 
     #[test]
@@ -1227,6 +1467,63 @@ mod tests {
             "message": {"message_id": 4, "chat": {"id": 41}, "text": "/new"}
         })));
         assert_eq!(ignored, RoutedUpdate::Ignore);
+    }
+
+    #[test]
+    fn preserves_python_role_local_command_surfaces() {
+        let control = UpdateRouter::new(RuntimeBotRole::Control, policy()).unwrap();
+        let discussion = UpdateRouter::new(RuntimeBotRole::Discussion, policy()).unwrap();
+
+        let sessions = control.route(&update(json!({
+            "message": {"message_id": 5, "chat": {"id": 42}, "text": "/sessions"}
+        })));
+        assert!(matches!(
+            sessions,
+            RoutedUpdate::Dispatch(WorkflowAction::Command {
+                command: WorkflowCommand::Sessions,
+                ..
+            })
+        ));
+
+        let topics = control.route(&update(json!({
+            "message": {"message_id": 51, "chat": {"id": 42}, "text": "/topics"}
+        })));
+        assert!(matches!(
+            topics,
+            RoutedUpdate::Dispatch(WorkflowAction::Command {
+                command: WorkflowCommand::Topics,
+                ..
+            })
+        ));
+
+        let control_getfile = control.route(&update(json!({
+            "message": {"message_id": 6, "chat": {"id": 42}, "text": "/getfile report.txt"}
+        })));
+        assert_eq!(control_getfile, RoutedUpdate::Ignore);
+
+        let discussion_getfile = discussion.route(&update(json!({
+            "message": {
+                "message_id": 7,
+                "chat": {"id": -1004290500369i64},
+                "text": "/getfile report.txt"
+            }
+        })));
+        assert!(matches!(
+            discussion_getfile,
+            RoutedUpdate::Dispatch(WorkflowAction::Command {
+                command: WorkflowCommand::GetFile,
+                ..
+            })
+        ));
+
+        let discussion_sessions = discussion.route(&update(json!({
+            "message": {
+                "message_id": 8,
+                "chat": {"id": -1004290500369i64},
+                "text": "/sessions"
+            }
+        })));
+        assert_eq!(discussion_sessions, RoutedUpdate::Ignore);
     }
 
     #[test]

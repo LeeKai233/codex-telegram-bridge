@@ -1,0 +1,43 @@
+# X-CodexTelegramBridge-Installer: managed
+# X-CodexTelegramBridge-Installer-Version: v0.3.2
+[Unit]
+Description=Codex Telegram Bridge (Rust full runtime live test)
+Documentation=file:///home/%u/PythonProjects/codex-telegram-bridge/docs/rust-vnext/full-testing.md
+Wants=network-online.target codex-managed-daemon-bootstrap.service
+After=network-online.target codex-managed-daemon-bootstrap.service
+StartLimitIntervalSec=900
+StartLimitBurst=10
+
+[Service]
+Type=simple
+WorkingDirectory=%h/PythonProjects/codex-telegram-bridge
+ExecStart=%h/.local/bin/codex-telegram-cli-rust-full daemon --config %h/.config/codex-telegram-bridge/rust-vnext.toml
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=90s
+KillSignal=SIGTERM
+KillMode=control-group
+Environment=CODEX_HOME=%h/.codex
+Environment=CODEX_APP_SERVER_MODE=managed-daemon
+EnvironmentFile=-%h/.config/codex-telegram-bridge/proxy.env
+UMask=0077
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+ProtectClock=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=%h/.local/state/codex-telegram-bridge/rust-vnext-full
+MemoryMax=512M
+TasksMax=128
+
+[Install]
+WantedBy=default.target

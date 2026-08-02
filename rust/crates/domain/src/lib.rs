@@ -226,8 +226,14 @@ pub enum PromptInput {
         #[serde(default)]
         text_elements: Vec<serde_json::Value>,
     },
-    LocalImage { path: String, detail: String },
-    Mention { name: String, path: String },
+    LocalImage {
+        path: String,
+        detail: String,
+    },
+    Mention {
+        name: String,
+        path: String,
+    },
 }
 
 impl PromptInput {

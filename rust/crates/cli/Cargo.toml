@@ -5,10 +5,19 @@ edition.workspace = true
 license = "MIT"
 
 [dependencies]
+ctg-app-server = { path = "../app-server" }
 codex-telegram-adapter = { path = "../telegram" }
 codex-telegram-credentials = { path = "../credentials" }
+ctg-domain = { path = "../domain" }
+ctg-ports = { path = "../ports" }
+ctg-storage-sqlite = { path = "../storage-sqlite" }
+async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+data-encoding.workspace = true
+sha1.workspace = true
+sha2.workspace = true
 toml.workspace = true
 rusqlite.workspace = true
+tokio.workspace = true

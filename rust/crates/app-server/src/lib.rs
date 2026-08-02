@@ -1,7 +1,7 @@
 //! Codex managed app-server adapter.
 //!
-//! The production daemon speaks newline-delimited JSON-RPC over a Unix socket.
-//! This crate owns that transport only; application code consumes the
+//! The production daemon speaks JSON-RPC over a WebSocket upgrade on a Unix
+//! socket. This crate owns that transport only; application code consumes the
 //! `ctg_ports::AgentBackend` trait instead.
 
 use async_trait::async_trait;
@@ -9,6 +9,7 @@ use ctg_domain::{
     AgentEvent, AgentServerRequest, AgentThread, AgentTurn, PromptInput, ThreadId, TurnId,
 };
 use ctg_ports::{AgentBackend, PortError, PortResult};
+use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
@@ -23,16 +24,24 @@ use thiserror::Error;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
+    process::{Child, ChildStdin, ChildStdout, Command},
     sync::{Mutex, Semaphore, broadcast, mpsc, oneshot, watch},
     task::JoinHandle,
     time::{sleep, timeout},
 };
+use tokio_tungstenite::{
+    WebSocketStream, client_async_with_config,
+    tungstenite::{Message, protocol::WebSocketConfig},
+};
+
+type AppSocket = WebSocketStream<UnixStream>;
 
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Debug)]
 pub struct AppServerConfig {
     pub socket_path: PathBuf,
+    pub transport: AppServerTransport,
     pub client_name: String,
     pub client_title: String,
     pub client_version: String,
@@ -43,10 +52,18 @@ pub struct AppServerConfig {
     pub reconnect_max: Duration,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AppServerTransport {
+    UnixSocket(PathBuf),
+    Stdio { program: PathBuf, args: Vec<String> },
+}
+
 impl AppServerConfig {
     pub fn managed(socket_path: impl Into<PathBuf>) -> Self {
+        let socket_path = socket_path.into();
         Self {
-            socket_path: socket_path.into(),
+            transport: AppServerTransport::UnixSocket(socket_path.clone()),
+            socket_path,
             client_name: "codex_telegram_bridge_rust".into(),
             client_title: "Codex Telegram Bridge (Rust)".into(),
             client_version: env!("CARGO_PKG_VERSION").into(),
@@ -58,8 +75,27 @@ impl AppServerConfig {
         }
     }
 
+    /// Use Codex's newline-delimited JSON protocol for native Windows,
+    /// sandboxed hosts, and any platform without Unix sockets.
+    pub fn stdio(program: impl Into<PathBuf>, args: impl IntoIterator<Item = String>) -> Self {
+        let mut config = Self::managed(PathBuf::from("stdio"));
+        config.transport = AppServerTransport::Stdio {
+            program: program.into(),
+            args: args.into_iter().collect(),
+        };
+        config
+    }
+
     fn validate(&self) -> Result<(), AppServerError> {
         if self.socket_path.as_os_str().is_empty()
+            || matches!(
+                &self.transport,
+                AppServerTransport::UnixSocket(path) if path.as_os_str().is_empty()
+            )
+            || matches!(
+                &self.transport,
+                AppServerTransport::Stdio { program, .. } if program.as_os_str().is_empty()
+            )
             || self.outbound_capacity == 0
             || self.pending_capacity == 0
             || self.notification_capacity == 0
@@ -252,25 +288,31 @@ impl AppServerClient {
                 break;
             }
             generation += 1;
-            match UnixStream::connect(&self.inner.config.socket_path).await {
-                Ok(stream) => {
-                    let result = self
-                        .run_connection(stream, generation, &mut outbound, &mut shutdown)
-                        .await;
-                    let _ = self.inner.state.send(ConnectionState {
-                        generation,
-                        connected: false,
-                    });
-                    if result.is_ok() {
-                        delay = self.inner.config.reconnect_initial;
+            let result = match &self.inner.config.transport {
+                AppServerTransport::UnixSocket(path) => match UnixStream::connect(path).await {
+                    Ok(stream) => {
+                        self.run_connection(stream, generation, &mut outbound, &mut shutdown)
+                            .await
                     }
-                }
-                Err(_) => {
-                    let _ = self.inner.state.send(ConnectionState {
+                    Err(error) => Err(AppServerError::Io(error)),
+                },
+                AppServerTransport::Stdio { program, args } => {
+                    self.run_stdio_connection(
+                        program,
+                        args,
                         generation,
-                        connected: false,
-                    });
+                        &mut outbound,
+                        &mut shutdown,
+                    )
+                    .await
                 }
+            };
+            let _ = self.inner.state.send(ConnectionState {
+                generation,
+                connected: false,
+            });
+            if result.is_ok() {
+                delay = self.inner.config.reconnect_initial;
             }
             if *shutdown.borrow() {
                 break;
@@ -299,12 +341,17 @@ impl AppServerClient {
         outbound: &mut mpsc::Receiver<Outbound>,
         shutdown: &mut watch::Receiver<bool>,
     ) -> Result<(), AppServerError> {
-        let (reader, mut writer) = stream.into_split();
-        let mut lines = BufReader::new(reader).lines();
+        let mut websocket_config = WebSocketConfig::default();
+        websocket_config.max_frame_size = Some(16 * 1024 * 1024);
+        websocket_config.max_message_size = Some(64 * 1024 * 1024);
+        let (mut socket, _) =
+            client_async_with_config("ws://localhost/", stream, Some(websocket_config))
+                .await
+                .map_err(websocket_error)?;
         let mut pending: HashMap<u64, Pending> = HashMap::new();
         let initialize_id = self.inner.ids.fetch_add(1, Ordering::Relaxed);
-        write_json(
-            &mut writer,
+        write_message(
+            &mut socket,
             &json!({
                 "id": initialize_id,
                 "method": "initialize",
@@ -327,19 +374,135 @@ impl AppServerClient {
                 }
                 outbound_message = outbound.recv() => {
                     match outbound_message {
-                        Some(message) => self.write_outbound(&mut writer, generation, &mut pending, message).await?,
+                        Some(message) => self.write_outbound(&mut socket, generation, &mut pending, message).await?,
                         None => return Ok(()),
                     }
                 }
-                line = lines.next_line() => {
-                    let Some(line) = line? else { return Err(AppServerError::Disconnected); };
-                    let message: Value = serde_json::from_str(&line)
-                        .map_err(|error| AppServerError::Protocol(format!("invalid JSON frame: {error}")))?;
+                inbound = socket.next() => {
+                    let Some(inbound) = inbound else { return Err(AppServerError::Disconnected); };
+                    let inbound = inbound.map_err(websocket_error)?;
+                    let message = match inbound {
+                        Message::Text(text) => serde_json::from_str(text.as_ref())
+                            .map_err(|error| AppServerError::Protocol(format!("invalid JSON frame: {error}")))?,
+                        Message::Binary(_) => return Err(AppServerError::Protocol("binary WebSocket frame is not supported".into())),
+                        Message::Ping(payload) => {
+                            socket.send(Message::Pong(payload)).await.map_err(websocket_error)?;
+                            continue;
+                        }
+                        Message::Pong(_) => continue,
+                        Message::Close(_) => return Err(AppServerError::Disconnected),
+                        _ => continue,
+                    };
                     if let Some(result) = handle_inbound(&self.inner, &mut pending, generation, initialize_id, &mut initialized, message).await? {
-                        write_json(&mut writer, &result).await?;
+                        write_message(&mut socket, &result).await?;
                     }
                     if initialized && !self.connection_state().connected {
-                        write_json(&mut writer, &json!({"method":"initialized", "params":{}})).await?;
+                        write_message(&mut socket, &json!({"method":"initialized", "params":{}})).await?;
+                        let _ = self.inner.state.send(ConnectionState { generation, connected: true });
+                    }
+                }
+            }
+        }
+    }
+
+    async fn run_stdio_connection(
+        &self,
+        program: &PathBuf,
+        args: &[String],
+        generation: u64,
+        outbound: &mut mpsc::Receiver<Outbound>,
+        shutdown: &mut watch::Receiver<bool>,
+    ) -> Result<(), AppServerError> {
+        let mut command = Command::new(program);
+        command
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        let mut child = command.spawn()?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| AppServerError::Protocol("stdio app-server has no stdin".into()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| AppServerError::Protocol("stdio app-server has no stdout".into()))?;
+        let result = self
+            .run_stdio_stream(stdin, stdout, generation, &mut child, outbound, shutdown)
+            .await;
+        if child.try_wait()?.is_none() {
+            let _ = child.kill().await;
+        }
+        result
+    }
+
+    async fn run_stdio_stream(
+        &self,
+        mut stdin: ChildStdin,
+        stdout: ChildStdout,
+        generation: u64,
+        child: &mut Child,
+        outbound: &mut mpsc::Receiver<Outbound>,
+        shutdown: &mut watch::Receiver<bool>,
+    ) -> Result<(), AppServerError> {
+        let mut reader = BufReader::new(stdout);
+        let mut pending: HashMap<u64, Pending> = HashMap::new();
+        let initialize_id = self.inner.ids.fetch_add(1, Ordering::Relaxed);
+        write_json_line(
+            &mut stdin,
+            &json!({
+                "id": initialize_id,
+                "method": "initialize",
+                "params": {
+                    "clientInfo": {
+                        "name": self.inner.config.client_name,
+                        "title": self.inner.config.client_title,
+                        "version": self.inner.config.client_version,
+                    },
+                    "capabilities": {"experimentalApi": true}
+                }
+            }),
+        )
+        .await?;
+        let mut initialized = false;
+        let mut line = String::new();
+        loop {
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        let _ = child.kill().await;
+                        return Ok(());
+                    }
+                }
+                outbound_message = outbound.recv() => {
+                    match outbound_message {
+                        Some(message) => self.write_stdio_outbound(&mut stdin, generation, &mut pending, message).await?,
+                        None => return Ok(()),
+                    }
+                }
+                read = reader.read_line(&mut line) => {
+                    let read = read?;
+                    if read == 0 {
+                        return Err(AppServerError::Disconnected);
+                    }
+                    let message = serde_json::from_str::<Value>(line.trim_end())
+                        .map_err(|error| AppServerError::Protocol(format!("invalid JSON line: {error}")))?;
+                    line.clear();
+                    if let Some(result) = handle_inbound(
+                        &self.inner,
+                        &mut pending,
+                        generation,
+                        initialize_id,
+                        &mut initialized,
+                        message,
+                    )
+                    .await?
+                    {
+                        write_json_line(&mut stdin, &result).await?;
+                    }
+                    if initialized && !self.connection_state().connected {
+                        write_json_line(&mut stdin, &json!({"method":"initialized", "params":{}})).await?;
                         let _ = self.inner.state.send(ConnectionState { generation, connected: true });
                     }
                 }
@@ -349,7 +512,7 @@ impl AppServerClient {
 
     async fn write_outbound(
         &self,
-        writer: &mut tokio::net::unix::OwnedWriteHalf,
+        socket: &mut AppSocket,
         generation: u64,
         pending: &mut HashMap<u64, Pending>,
         outbound: Outbound,
@@ -367,8 +530,8 @@ impl AppServerClient {
                     let _ = response.send(Err(AppServerError::Disconnected));
                     return Ok(());
                 }
-                write_json(
-                    writer,
+                write_message(
+                    socket,
                     &json!({"id": id, "method": method, "params": params}),
                 )
                 .await?;
@@ -385,7 +548,52 @@ impl AppServerClient {
                 message,
             } => {
                 if message_generation == generation && self.connection_state().connected {
-                    write_json(writer, &message).await?;
+                    write_message(socket, &message).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn write_stdio_outbound(
+        &self,
+        stdin: &mut ChildStdin,
+        generation: u64,
+        pending: &mut HashMap<u64, Pending>,
+        outbound: Outbound,
+    ) -> Result<(), AppServerError> {
+        match outbound {
+            Outbound::Request {
+                generation: request_generation,
+                id,
+                method,
+                params,
+                response,
+                permit,
+            } => {
+                if request_generation != generation || !self.connection_state().connected {
+                    let _ = response.send(Err(AppServerError::Disconnected));
+                    return Ok(());
+                }
+                write_json_line(
+                    stdin,
+                    &json!({"id": id, "method": method, "params": params}),
+                )
+                .await?;
+                pending.insert(
+                    id,
+                    Pending {
+                        response,
+                        _permit: permit,
+                    },
+                );
+            }
+            Outbound::Response {
+                generation: message_generation,
+                message,
+            } => {
+                if message_generation == generation && self.connection_state().connected {
+                    write_json_line(stdin, &message).await?;
                 }
             }
         }
@@ -459,16 +667,30 @@ async fn handle_inbound(
     }
 }
 
-async fn write_json(
-    writer: &mut tokio::net::unix::OwnedWriteHalf,
-    value: &Value,
-) -> Result<(), AppServerError> {
-    let encoded =
-        serde_json::to_vec(value).map_err(|error| AppServerError::Protocol(error.to_string()))?;
-    writer.write_all(&encoded).await?;
-    writer.write_all(b"\n").await?;
-    writer.flush().await?;
+async fn write_message(socket: &mut AppSocket, value: &Value) -> Result<(), AppServerError> {
+    let encoded = serde_json::to_string(value)
+        .map_err(|error| AppServerError::Protocol(error.to_string()))?;
+    socket
+        .send(Message::Text(encoded.into()))
+        .await
+        .map_err(websocket_error)?;
     Ok(())
+}
+
+async fn write_json_line(stdin: &mut ChildStdin, value: &Value) -> Result<(), AppServerError> {
+    let encoded = serde_json::to_string(value)
+        .map_err(|error| AppServerError::Protocol(error.to_string()))?;
+    stdin.write_all(encoded.as_bytes()).await?;
+    stdin.write_all(b"\n").await?;
+    stdin.flush().await?;
+    Ok(())
+}
+
+fn websocket_error(error: tokio_tungstenite::tungstenite::Error) -> AppServerError {
+    match error {
+        tokio_tungstenite::tungstenite::Error::Io(error) => AppServerError::Io(error),
+        other => AppServerError::Protocol(format!("WebSocket transport: {other}")),
+    }
 }
 
 fn fail_outbound(outbound: Outbound, error: AppServerError) {
@@ -631,7 +853,13 @@ impl AgentBackend for AppServerClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::{io::AsyncBufReadExt, net::UnixListener};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::net::UnixListener;
+    use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+    #[cfg(unix)]
+    static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
     fn test_socket(name: &str) -> PathBuf {
         static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -642,14 +870,82 @@ mod tests {
         ))
     }
 
-    async fn recv_json(
-        lines: &mut tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
-    ) -> Value {
-        serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap()
+    #[test]
+    fn stdio_transport_configuration_is_valid_without_unix_socket() {
+        let config = AppServerConfig::stdio(
+            "codex",
+            [
+                "app-server".to_owned(),
+                "--listen".to_owned(),
+                "stdio://".to_owned(),
+            ],
+        );
+        assert!(matches!(config.transport, AppServerTransport::Stdio { .. }));
+        assert!(config.validate().is_ok());
     }
 
-    async fn send_json(writer: &mut tokio::net::unix::OwnedWriteHalf, value: Value) {
-        write_json(writer, &value).await.unwrap();
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_transport_handshakes_with_a_mock_subprocess() {
+        let script = std::env::temp_dir().join(format!(
+            "ctg-stdio-fixture-{}-{}.sh",
+            std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(
+            &script,
+            br##"#!/bin/sh
+while IFS= read -r line; do
+    id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+    if [ -z "$id" ]; then
+        continue
+    fi
+    case "$line" in
+        *thread/start*)
+            printf '{"id":%s,"result":{"thread":{"id":"t-stdio","status":"idle","ephemeral":false}}}\n' "$id"
+            ;;
+        *)
+            printf '{"id":%s,"result":{}}\n' "$id"
+            ;;
+    esac
+done
+"##,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        let client = AppServerClient::connect(AppServerConfig {
+            reconnect_initial: Duration::from_millis(5),
+            reconnect_max: Duration::from_millis(10),
+            ..AppServerConfig::stdio(&script, Vec::<String>::new())
+        })
+        .await
+        .unwrap();
+        client.wait_connected(Duration::from_secs(1)).await.unwrap();
+        let thread = client.start_thread("/tmp", false, false).await.unwrap();
+        assert_eq!(thread.id.as_str(), "t-stdio");
+        client.shutdown().await;
+        let _ = std::fs::remove_file(script);
+    }
+
+    async fn recv_json(socket: &mut AppSocket) -> Value {
+        loop {
+            match socket.next().await.unwrap().unwrap() {
+                Message::Text(text) => return serde_json::from_str(text.as_ref()).unwrap(),
+                Message::Ping(payload) => socket.send(Message::Pong(payload)).await.unwrap(),
+                Message::Pong(_) => {}
+                Message::Close(_) => panic!("unexpected WebSocket close"),
+                Message::Binary(_) => panic!("unexpected binary frame"),
+                _ => {}
+            }
+        }
+    }
+
+    async fn send_json(socket: &mut AppSocket, value: Value) {
+        let encoded = serde_json::to_string(&value).unwrap();
+        socket.send(Message::Text(encoded.into())).await.unwrap();
     }
 
     #[tokio::test]
@@ -658,26 +954,25 @@ mod tests {
         let listener = UnixListener::bind(&path).unwrap();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let (reader, mut writer) = stream.into_split();
-            let mut lines = BufReader::new(reader).lines();
-            let initialize = recv_json(&mut lines).await;
+            let mut socket = accept_async(stream).await.unwrap();
+            let initialize = recv_json(&mut socket).await;
             assert_eq!(initialize["method"], "initialize");
             send_json(
-                &mut writer,
+                &mut socket,
                 json!({"id": initialize["id"], "result": {"serverInfo": {}}}),
             )
             .await;
-            assert_eq!(recv_json(&mut lines).await["method"], "initialized");
+            assert_eq!(recv_json(&mut socket).await["method"], "initialized");
             send_json(
-                &mut writer,
+                &mut socket,
                 json!({"method":"thread/started", "params":{"thread":{"id":"t-1"}}}),
             )
             .await;
-            send_json(&mut writer, json!({"id":"request-9", "method":"item/tool/requestUserInput", "params":{"threadId":"t-1"}})).await;
-            let request = recv_json(&mut lines).await;
+            send_json(&mut socket, json!({"id":"request-9", "method":"item/tool/requestUserInput", "params":{"threadId":"t-1"}})).await;
+            let request = recv_json(&mut socket).await;
             assert_eq!(request["method"], "thread/start");
-            send_json(&mut writer, json!({"id": request["id"], "result":{"thread":{"id":"t-1", "status":"idle", "ephemeral":false}}})).await;
-            let response = recv_json(&mut lines).await;
+            send_json(&mut socket, json!({"id": request["id"], "result":{"thread":{"id":"t-1", "status":"idle", "ephemeral":false}}})).await;
+            let response = recv_json(&mut socket).await;
             assert_eq!(response, json!({"id":"request-9", "result":{"answers":[]}}));
         });
         let client = AppServerClient::connect(AppServerConfig {
@@ -711,15 +1006,14 @@ mod tests {
         let server = tokio::spawn(async move {
             for attempt in 0..2 {
                 let (stream, _) = listener.accept().await.unwrap();
-                let (reader, mut writer) = stream.into_split();
-                let mut lines = BufReader::new(reader).lines();
-                let initialize = recv_json(&mut lines).await;
-                send_json(&mut writer, json!({"id": initialize["id"], "result": {}})).await;
-                assert_eq!(recv_json(&mut lines).await["method"], "initialized");
+                let mut socket = accept_async(stream).await.unwrap();
+                let initialize = recv_json(&mut socket).await;
+                send_json(&mut socket, json!({"id": initialize["id"], "result": {}})).await;
+                assert_eq!(recv_json(&mut socket).await["method"], "initialized");
                 if attempt == 1 {
-                    let request = recv_json(&mut lines).await;
+                    let request = recv_json(&mut socket).await;
                     send_json(
-                        &mut writer,
+                        &mut socket,
                         json!({"id": request["id"], "result":{"data":[]}}),
                     )
                     .await;

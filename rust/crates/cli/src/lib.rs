@@ -4,10 +4,13 @@ use codex_telegram_adapter::{
     BindingIssue, BotInstanceBinding, TelegramSurfaceBinding, validate_bindings,
 };
 use codex_telegram_credentials::CredentialFiles;
+pub mod alerts;
 pub mod config;
+pub mod daemon;
 pub mod metrics;
 pub mod migration;
 pub mod replay;
+pub mod security;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CliValidationIssue {

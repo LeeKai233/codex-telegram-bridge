@@ -1,0 +1,70 @@
+# Full Rust Bridge live-test configuration.
+# The placeholders are rendered by scripts/rust-vnext-full.sh and contain no
+# token values. Credentials are loaded from the existing mode-0600 ~/.tgrc.
+api_base = "https://api.telegram.org"
+credential_registry = "@HOME@/.tgrc"
+legacy_control_token = "/dev/null"
+lock_directory = "@HOME@/.local/state/codex-telegram-bridge/rust-vnext-full/leases"
+state_directory = "@HOME@/.local/state/codex-telegram-bridge/rust-vnext-full"
+codex_socket = "@HOME@/.codex/app-server-control/app-server-control.sock"
+workspace_root = "@PROJECT_ROOT@"
+metrics_bind = "127.0.0.1:9465"
+alert_webhook_bind = "127.0.0.1:18091"
+alert_chat_id = 5174236639
+totp_secret_path = "@HOME@/.config/codex-telegram-bridge/totp_secret"
+totp_unlock_seconds = 1800
+request_timeout_seconds = 30
+poll_timeout_seconds = 10
+max_backlog = 100
+poll_updates = true
+
+# Real test topology:
+#   Rust Cotton Field Channel -> Rust Cotton Field Forum
+channel_chat_id = -1004446000549
+discussion_chat_id = -1004290500369
+control_chat_id = 5174236639
+
+[[bots]]
+instance_id = "control"
+capability = "control"
+credential_key = "rust_91_bot_key"
+update_consumer = "rust-full-control"
+enabled = true
+
+[[bots]]
+instance_id = "status"
+capability = "status"
+credential_key = "rust_818_bot_key"
+update_consumer = "rust-full-status"
+enabled = true
+
+[[bots]]
+instance_id = "discussion"
+capability = "discussion"
+credential_key = "rust_411_bot_key"
+update_consumer = "rust-full-discussion"
+enabled = true
+
+[[bots]]
+instance_id = "monitoring"
+capability = "production_alert"
+credential_key = "rust_826_bot_key"
+update_consumer = "rust-full-monitoring-send-only"
+enabled = true
+
+# Read-only probe surfaces. The daemon routes by the topology above; these
+# entries only make `probe` verify Telegram membership before cutover.
+[[surfaces]]
+kind = "channel"
+bot_instance_id = "control"
+chat_id = -1004446000549
+
+[[surfaces]]
+kind = "channel"
+bot_instance_id = "discussion"
+chat_id = -1004290500369
+
+[[surfaces]]
+kind = "channel"
+bot_instance_id = "status"
+chat_id = -1004290500369

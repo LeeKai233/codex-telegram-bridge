@@ -1,0 +1,33 @@
+# X-CodexTelegramBridge-Installer: managed
+# X-CodexTelegramBridge-Installer-Version: v0.3.2
+[Unit]
+Description=Alertmanager for Codex Telegram Bridge (rootless local monitoring)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/opt/codex-telegram-bridge/monitoring/alertmanager-0.33.1/alertmanager --config.file=%h/.config/codex-telegram-bridge/monitoring/alertmanager/alertmanager.yml --storage.path=%h/.local/state/codex-telegram-bridge/monitoring/alertmanager --web.listen-address=127.0.0.1:9093 --cluster.listen-address=127.0.0.1:9094 --cluster.advertise-address=127.0.0.1:9094
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=45s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+ProtectClock=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=%h/.local/state/codex-telegram-bridge/monitoring/alertmanager
+MemoryMax=512M
+TasksMax=128
+
+[Install]
+WantedBy=default.target

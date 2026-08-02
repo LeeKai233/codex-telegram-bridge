@@ -18,7 +18,7 @@ Every metric emitted by a producer has these bounded labels where applicable:
 | Label | Allowed values | Meaning |
 | --- | --- | --- |
 | `implementation` | `python`, `rust-vnext` | Serving implementation. Prometheus supplies this label from the scrape target. |
-| `bot_role` | `control`, `discussion`, `status` | Telegram Bot role. |
+| `bot_role` | `control`, `discussion`, `status`, `alert` | Telegram Bot role. `alert` is send-only and never emits polling samples. |
 | `component` | `bridge`, `telegram_polling`, `app_server`, `delivery` | Independently health-checked component. |
 | `queue` | `prompt`, `delivery`, `workload` | Bounded queue name. |
 | `result` | `success`, `failed`, `cancelled`, `rejected` | Terminal operation result. |
@@ -65,7 +65,8 @@ staleness, delivery failure ratio, queue backlog, and event-loop lag. The alert 
 required metrics above are present for every configured implementation. Remove an absent target
 from `monitoring/prometheus/prometheus.yml`; do not suppress a target-down alert with a fake metric.
 
-The Alertmanager default receiver discards notifications. Configure a local authenticated receiver
-before using it for operations. The checked-in webhook destination is loopback-only and carries no
-secret; it exists to make the intended integration explicit rather than silently sending alerts to a
-public service.
+The Alertmanager default receiver discards notifications. Critical Bridge alerts use the Rust
+daemon's loopback-only webhook at `127.0.0.1:18091/alerts`; the daemon forwards them through the
+separate send-only monitoring Bot. The endpoint carries no secret and is intentionally bound to
+loopback, so it is not an Internet-facing webhook. Keep the monitoring Bot limited to the intended
+alert chat.

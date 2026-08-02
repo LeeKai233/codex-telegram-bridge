@@ -1,4 +1,6 @@
 .venv/
+.codex/agents/
+.codex/sessions/
 .gitnexus/
 .codegraph/
 .pytest_cache/
@@ -8,6 +10,7 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 dist/
+rust/target/
 /.release/
 *.sqlite3
 *.sqlite3-*

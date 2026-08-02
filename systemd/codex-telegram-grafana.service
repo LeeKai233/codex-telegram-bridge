@@ -1,0 +1,39 @@
+# X-CodexTelegramBridge-Installer: managed
+# X-CodexTelegramBridge-Installer-Version: v0.3.2
+[Unit]
+Description=Grafana OSS for Codex Telegram Bridge (rootless local monitoring)
+Wants=network-online.target
+After=network-online.target codex-telegram-prometheus.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/opt/codex-telegram-bridge/monitoring/grafana-13.1.1
+ExecStart=%h/.local/opt/codex-telegram-bridge/monitoring/grafana-13.1.1/bin/grafana server --config=%h/.config/codex-telegram-bridge/monitoring/grafana/grafana.ini --homepath=%h/.local/opt/codex-telegram-bridge/monitoring/grafana-13.1.1
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=45s
+Environment=HOME=%h
+Environment=GF_PATHS_DATA=%h/.local/share/codex-telegram-bridge/monitoring/grafana/grafana
+Environment=GF_PATHS_LOGS=%h/.local/state/codex-telegram-bridge/monitoring/grafana/log
+Environment=GF_PATHS_PLUGINS=%h/.local/share/codex-telegram-bridge/monitoring/grafana/plugins
+Environment=GF_PATHS_PROVISIONING=%h/.config/codex-telegram-bridge/monitoring/grafana/provisioning
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+ProtectClock=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=%h/.local/share/codex-telegram-bridge/monitoring/grafana %h/.local/state/codex-telegram-bridge/monitoring/grafana
+MemoryMax=1G
+TasksMax=256
+
+[Install]
+WantedBy=default.target

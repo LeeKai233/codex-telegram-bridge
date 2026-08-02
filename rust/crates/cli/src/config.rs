@@ -2,7 +2,8 @@
 //! the adapter never derives behaviour from Telegram numeric IDs.
 
 use codex_telegram_adapter::{
-    BotCapability, BotInstanceBinding, ChannelBinding, ForumTopicBinding, TelegramSurfaceBinding,
+    BotCapability, BotInstanceBinding, ChannelBinding, ForumTopicBinding, NativeCommentBinding,
+    TelegramSurfaceBinding,
 };
 use codex_telegram_credentials::{BotToken, CredentialError, CredentialFiles, TgrcCredentials};
 use serde::Deserialize;
@@ -21,10 +22,36 @@ pub struct RustConfig {
     pub legacy_control_token: PathBuf,
     #[serde(default = "default_lock_directory")]
     pub lock_directory: PathBuf,
+    #[serde(default = "default_state_directory")]
+    pub state_directory: PathBuf,
+    #[serde(default = "default_codex_socket")]
+    pub codex_socket: PathBuf,
+    #[serde(default = "default_workspace_root")]
+    pub workspace_root: PathBuf,
     #[serde(default = "default_metrics_bind")]
     pub metrics_bind: String,
+    #[serde(default = "default_alert_webhook_bind")]
+    pub alert_webhook_bind: String,
+    #[serde(default = "default_alert_chat_id")]
+    pub alert_chat_id: i64,
+    #[serde(default = "default_totp_secret_path")]
+    pub totp_secret_path: PathBuf,
+    #[serde(default = "default_totp_unlock_seconds")]
+    pub totp_unlock_seconds: u64,
     #[serde(default = "default_request_timeout_seconds")]
     pub request_timeout_seconds: u64,
+    #[serde(default = "default_poll_timeout_seconds")]
+    pub poll_timeout_seconds: u16,
+    #[serde(default = "default_max_backlog")]
+    pub max_backlog: usize,
+    #[serde(default)]
+    pub poll_updates: bool,
+    #[serde(default = "default_channel_chat_id")]
+    pub channel_chat_id: i64,
+    #[serde(default = "default_discussion_chat_id")]
+    pub discussion_chat_id: i64,
+    #[serde(default = "default_control_chat_id")]
+    pub control_chat_id: i64,
     #[serde(default = "default_bots")]
     pub bots: Vec<BotConfig>,
     #[serde(default)]
@@ -48,6 +75,10 @@ pub struct SurfaceConfig {
     pub chat_id: i64,
     #[serde(default)]
     pub message_thread_id: Option<i64>,
+    #[serde(default)]
+    pub discussion_chat_id: Option<i64>,
+    #[serde(default)]
+    pub root_message_id: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -55,6 +86,7 @@ pub struct SurfaceConfig {
 pub enum SurfaceKind {
     Channel,
     ForumTopic,
+    NativeComment,
 }
 
 impl Default for RustConfig {
@@ -64,8 +96,21 @@ impl Default for RustConfig {
             credential_registry: default_registry_path(),
             legacy_control_token: default_legacy_control_token(),
             lock_directory: default_lock_directory(),
+            state_directory: default_state_directory(),
+            codex_socket: default_codex_socket(),
+            workspace_root: default_workspace_root(),
             metrics_bind: default_metrics_bind(),
+            alert_webhook_bind: default_alert_webhook_bind(),
+            alert_chat_id: default_alert_chat_id(),
+            totp_secret_path: default_totp_secret_path(),
+            totp_unlock_seconds: default_totp_unlock_seconds(),
             request_timeout_seconds: default_request_timeout_seconds(),
+            poll_timeout_seconds: default_poll_timeout_seconds(),
+            max_backlog: default_max_backlog(),
+            poll_updates: false,
+            channel_chat_id: default_channel_chat_id(),
+            discussion_chat_id: default_discussion_chat_id(),
+            control_chat_id: default_control_chat_id(),
             bots: default_bots(),
             surfaces: Vec::new(),
         }
@@ -136,6 +181,28 @@ impl RustConfig {
                                 bot_instance_id: surface.bot_instance_id.clone(),
                             })
                     }
+                    SurfaceKind::NativeComment => {
+                        let discussion_chat_id = surface.discussion_chat_id.ok_or_else(|| {
+                            ConfigError::InvalidSurface {
+                                bot_instance_id: surface.bot_instance_id.clone(),
+                            }
+                        })?;
+                        let root_message_id =
+                            surface
+                                .root_message_id
+                                .ok_or_else(|| ConfigError::InvalidSurface {
+                                    bot_instance_id: surface.bot_instance_id.clone(),
+                                })?;
+                        NativeCommentBinding::new(
+                            channel,
+                            discussion_chat_id.to_string(),
+                            root_message_id,
+                        )
+                        .map(TelegramSurfaceBinding::NativeCommentRoot)
+                        .map_err(|_| ConfigError::InvalidSurface {
+                            bot_instance_id: surface.bot_instance_id.clone(),
+                        })
+                    }
                 }
             })
             .collect()
@@ -175,14 +242,44 @@ impl RustConfig {
         if self.request_timeout_seconds == 0 || self.request_timeout_seconds > 300 {
             return Err(ConfigError::InvalidTimeout);
         }
+        if self.poll_timeout_seconds == 0 || self.poll_timeout_seconds > 50 {
+            return Err(ConfigError::InvalidPollTimeout);
+        }
+        if self.max_backlog == 0 || self.max_backlog > 1000 {
+            return Err(ConfigError::InvalidBacklog);
+        }
         if !self.metrics_bind.starts_with("127.0.0.1:") {
             return Err(ConfigError::MetricsMustBeLoopback);
+        }
+        if !self.alert_webhook_bind.starts_with("127.0.0.1:") {
+            return Err(ConfigError::AlertWebhookMustBeLoopback);
+        }
+        if self.alert_chat_id == 0 {
+            return Err(ConfigError::InvalidAlertChat);
+        }
+        if self.totp_unlock_seconds == 0 || self.totp_unlock_seconds > 86_400 {
+            return Err(ConfigError::InvalidTotpUnlockSeconds);
         }
         if self.credential_registry.is_relative() {
             self.credential_registry = base.join(&self.credential_registry);
         }
         if self.lock_directory.is_relative() {
             self.lock_directory = base.join(&self.lock_directory);
+        }
+        if self.state_directory.is_relative() {
+            self.state_directory = base.join(&self.state_directory);
+        }
+        if self.codex_socket.is_relative() {
+            self.codex_socket = base.join(&self.codex_socket);
+        }
+        if self.workspace_root.is_relative() {
+            self.workspace_root = base.join(&self.workspace_root);
+        }
+        if self.totp_secret_path.is_relative() {
+            self.totp_secret_path = base.join(&self.totp_secret_path);
+        }
+        if self.channel_chat_id >= 0 || self.discussion_chat_id >= 0 || self.control_chat_id == 0 {
+            return Err(ConfigError::InvalidTopology);
         }
         if self.legacy_control_token.is_relative() {
             self.legacy_control_token = base.join(&self.legacy_control_token);
@@ -212,6 +309,42 @@ fn default_metrics_bind() -> String {
     "127.0.0.1:9465".into()
 }
 
+fn default_alert_webhook_bind() -> String {
+    "127.0.0.1:18091".into()
+}
+
+fn default_poll_timeout_seconds() -> u16 {
+    30
+}
+
+fn default_max_backlog() -> usize {
+    100
+}
+
+fn default_channel_chat_id() -> i64 {
+    -1004446000549
+}
+
+fn default_discussion_chat_id() -> i64 {
+    -1004290500369
+}
+
+fn default_control_chat_id() -> i64 {
+    default_discussion_chat_id()
+}
+
+fn default_alert_chat_id() -> i64 {
+    default_control_chat_id()
+}
+
+fn default_totp_secret_path() -> PathBuf {
+    home_directory().join(".config/codex-telegram-bridge/totp_secret")
+}
+
+fn default_totp_unlock_seconds() -> u64 {
+    1800
+}
+
 fn default_request_timeout_seconds() -> u64 {
     30
 }
@@ -235,6 +368,21 @@ fn default_lock_directory() -> PathBuf {
     home_directory().join(".local/state/codex-telegram-bridge/rust-vnext/leases")
 }
 
+fn default_state_directory() -> PathBuf {
+    home_directory().join(".local/state/codex-telegram-bridge/rust-vnext-full")
+}
+
+fn default_codex_socket() -> PathBuf {
+    let codex_home = env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_directory().join(".codex"));
+    codex_home.join("app-server-control/app-server-control.sock")
+}
+
+fn default_workspace_root() -> PathBuf {
+    home_directory()
+}
+
 fn default_config_path() -> PathBuf {
     home_directory().join(".config/codex-telegram-bridge/rust-vnext.toml")
 }
@@ -244,51 +392,30 @@ fn default_bots() -> Vec<BotConfig> {
         BotConfig {
             instance_id: "control".into(),
             capability: BotCapability::Control,
-            credential_key: "rust_9527_bot_key".into(),
-            update_consumer: "rust-vnext-control-outbound".into(),
-            enabled: true,
-        },
-        BotConfig {
-            instance_id: "discussion".into(),
-            capability: BotCapability::Discussion,
             credential_key: "rust_91_bot_key".into(),
-            update_consumer: "rust-vnext-discussion".into(),
+            update_consumer: "rust-full-control".into(),
             enabled: true,
         },
         BotConfig {
             instance_id: "status".into(),
             capability: BotCapability::Status,
             credential_key: "rust_818_bot_key".into(),
-            update_consumer: "rust-vnext-status".into(),
+            update_consumer: "rust-full-status".into(),
             enabled: true,
         },
         BotConfig {
-            instance_id: "production-alert".into(),
+            instance_id: "discussion".into(),
+            capability: BotCapability::Discussion,
+            credential_key: "rust_411_bot_key".into(),
+            update_consumer: "rust-full-discussion".into(),
+            enabled: true,
+        },
+        BotConfig {
+            instance_id: "monitoring".into(),
             capability: BotCapability::ProductionAlert,
             credential_key: "rust_826_bot_key".into(),
-            update_consumer: "rust-vnext-production-alert".into(),
+            update_consumer: "rust-full-monitoring-send-only".into(),
             enabled: true,
-        },
-        BotConfig {
-            instance_id: "canary-alert".into(),
-            capability: BotCapability::CanaryAlert,
-            credential_key: "rust_411_bot_key".into(),
-            update_consumer: "rust-vnext-canary-alert".into(),
-            enabled: true,
-        },
-        BotConfig {
-            instance_id: "approval".into(),
-            capability: BotCapability::Approval,
-            credential_key: "rust_69_bot_key".into(),
-            update_consumer: "rust-vnext-approval".into(),
-            enabled: false,
-        },
-        BotConfig {
-            instance_id: "artifact".into(),
-            capability: BotCapability::Artifact,
-            credential_key: "rust_426_bot_key".into(),
-            update_consumer: "rust-vnext-artifact".into(),
-            enabled: false,
         },
     ]
 }
@@ -305,8 +432,20 @@ pub enum ConfigError {
     InsecureApiBase,
     #[error("metrics listener must bind to loopback")]
     MetricsMustBeLoopback,
+    #[error("Alertmanager webhook must bind to loopback")]
+    AlertWebhookMustBeLoopback,
+    #[error("alert chat id must be nonzero")]
+    InvalidAlertChat,
+    #[error("TOTP unlock duration must be between 1 and 86400 seconds")]
+    InvalidTotpUnlockSeconds,
     #[error("request timeout must be between 1 and 300 seconds")]
     InvalidTimeout,
+    #[error("poll timeout must be between 1 and 50 seconds")]
+    InvalidPollTimeout,
+    #[error("poll backlog must be between 1 and 1000 updates")]
+    InvalidBacklog,
+    #[error("channel and discussion chat ids must be negative; control chat id must be nonzero")]
+    InvalidTopology,
     #[error("invalid bot instance: {instance_id}")]
     InvalidBot { instance_id: String },
     #[error("invalid Telegram surface for bot instance: {bot_instance_id}")]
@@ -323,13 +462,26 @@ impl serde::Serialize for RustConfig {
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("RustConfig", 8)?;
+        let mut state = serializer.serialize_struct("RustConfig", 21)?;
         state.serialize_field("api_base", &self.api_base)?;
         state.serialize_field("credential_registry", &self.credential_registry)?;
         state.serialize_field("legacy_control_token", &self.legacy_control_token)?;
         state.serialize_field("lock_directory", &self.lock_directory)?;
+        state.serialize_field("state_directory", &self.state_directory)?;
+        state.serialize_field("codex_socket", &self.codex_socket)?;
+        state.serialize_field("workspace_root", &self.workspace_root)?;
         state.serialize_field("metrics_bind", &self.metrics_bind)?;
+        state.serialize_field("alert_webhook_bind", &self.alert_webhook_bind)?;
+        state.serialize_field("alert_chat_id", &self.alert_chat_id)?;
+        state.serialize_field("totp_secret_path", &self.totp_secret_path)?;
+        state.serialize_field("totp_unlock_seconds", &self.totp_unlock_seconds)?;
         state.serialize_field("request_timeout_seconds", &self.request_timeout_seconds)?;
+        state.serialize_field("poll_timeout_seconds", &self.poll_timeout_seconds)?;
+        state.serialize_field("max_backlog", &self.max_backlog)?;
+        state.serialize_field("poll_updates", &self.poll_updates)?;
+        state.serialize_field("channel_chat_id", &self.channel_chat_id)?;
+        state.serialize_field("discussion_chat_id", &self.discussion_chat_id)?;
+        state.serialize_field("control_chat_id", &self.control_chat_id)?;
         state.serialize_field(
             "bots",
             &self
@@ -376,11 +528,14 @@ impl serde::Serialize for SurfaceConfig {
             match self.kind {
                 SurfaceKind::Channel => "channel",
                 SurfaceKind::ForumTopic => "forum_topic",
+                SurfaceKind::NativeComment => "native_comment",
             },
         )?;
         state.serialize_field("bot_instance_id", &self.bot_instance_id)?;
         state.serialize_field("chat_id", &self.chat_id)?;
         state.serialize_field("message_thread_id", &self.message_thread_id)?;
+        state.serialize_field("discussion_chat_id", &self.discussion_chat_id)?;
+        state.serialize_field("root_message_id", &self.root_message_id)?;
         state.end()
     }
 }

@@ -30,16 +30,23 @@ fn run(arguments: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         }
         "probe" => probe(),
         "metrics" => serve_metrics(),
+        "daemon" => daemon(&arguments[1..]),
         "migration-inspect" => migration_inspect(&arguments[1..]),
         "replay" => replay(&arguments[1..]),
         "help" | "--help" | "-h" => {
             println!(
-                "commands: validate, generate-config [path], probe, metrics, migration-inspect DB, replay --fixture PATH [--scenario NAME] [--repetitions N] [--warmup N]"
+                "commands: validate, generate-config [path], probe, metrics, daemon [--config PATH], migration-inspect DB, replay --fixture PATH [--scenario NAME] [--repetitions N] [--warmup N]"
             );
             Ok(())
         }
         other => Err(format!("unknown command: {other}").into()),
     }
+}
+
+fn daemon(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let config = value_after(arguments, "--config").map(PathBuf::from);
+    codex_telegram_cli::daemon::run(config.as_deref())?;
+    Ok(())
 }
 
 fn validate() -> Result<(), Box<dyn std::error::Error>> {

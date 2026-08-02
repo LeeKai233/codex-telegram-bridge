@@ -1,5 +1,5 @@
-model = "gpt-5.6-sol"
-model_reasoning_effort = "high"
+model = "gpt-5.6-luna"
+model_reasoning_effort = "max"
 developer_instructions = """
 Work only in the assigned worktree, branch, files, and behavioral contract.
 Run GitNexus impact analysis before editing every existing symbol and report HIGH or CRITICAL risk.

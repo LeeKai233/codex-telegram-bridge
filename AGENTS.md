@@ -1,7 +1,7 @@
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **codex-telegram-bridge** (3433 symbols, 7764 relationships, 265 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **codex-telegram-bridge** (4068 symbols, 9496 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > Index stale? Run `node .gitnexus/run.cjs analyze` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? `npx gitnexus analyze` (npm 11 crash → `npm i -g gitnexus`; #1939).
 
@@ -57,5 +57,5 @@ This project is indexed by GitNexus as **codex-telegram-bridge** (3433 symbols, 
 - Before completing a Goal, the root must mark every Plan item `completed` and verify the visible counter is `N/N`. A complete Goal with pending or in-progress Plan items is an invalid final state.
 - Before completing a Goal, the root must confirm every subagent is completed, interrupted, or closed and that no child remains active.
 - Before spawning any lane, the root must select and record its agent role, model, effort, and routing reason. Do not treat implicit parent inheritance as a routing decision.
-- Default routing is `bridge-explorer`=`gpt-5.6-terra/high`, `bridge-worker`=`gpt-5.6-sol/high`, and `bridge-reviewer`=`gpt-5.6-luna/max`; keep architecture, CRITICAL paths, and final integration with the root at `gpt-5.6-sol/xhigh` unless the user overrides it.
+- Default routing uses `gpt-5.6-luna/max` for `bridge-explorer`, `bridge-worker`, and `bridge-reviewer`; keep architecture, CRITICAL paths, and final integration with the root at `gpt-5.6-sol/xhigh` unless the user overrides it.
 - Keep the existing untracked `assets/` directory outside agent scope unless the user explicitly assigns it.

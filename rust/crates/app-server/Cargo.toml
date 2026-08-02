@@ -9,8 +9,9 @@ repository.workspace = true
 async-trait.workspace = true
 ctg-domain = { path = "../domain" }
 ctg-ports = { path = "../ports" }
+futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
-
+tokio-tungstenite.workspace = true

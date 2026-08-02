@@ -2,7 +2,10 @@ groups:
   - name: codex-telegram-bridge
     rules:
       - alert: CodexTelegramBridgeTargetDown
-        expr: up{job="codex-telegram-bridge"} == 0
+        # The Rust vNext target is the active production owner during the
+        # reversible live test. The Python target remains scrapeable for
+        # rollback comparison, but is intentionally stopped in this mode.
+        expr: up{job="codex-telegram-bridge", implementation="rust-vnext"} == 0
         for: 2m
         labels:
           severity: critical

@@ -9,10 +9,10 @@ Use this workflow when a task has at least two independent implementation or aud
 
 1. Freeze the baseline SHA and complete the task contract in `references/task-contract.md`.
 2. Route every lane before spawning it. Record the selected agent role, model, effort, and a short selection reason in the task contract.
-3. Use `bridge-explorer` (`gpt-5.6-terra/high`) for bounded read-heavy work, `bridge-worker` (`gpt-5.6-sol/high`) for scoped implementation, and `bridge-reviewer` (`gpt-5.6-luna/max`) for independent final review. Keep architecture, CRITICAL paths, and final integration with the root coordinator (`gpt-5.6-sol/xhigh`) unless the user overrides the routing policy.
+3. Use `bridge-explorer`, `bridge-worker`, and `bridge-reviewer` with `gpt-5.6-luna/max`. Keep architecture, CRITICAL paths, and final integration with the root coordinator (`gpt-5.6-sol/xhigh`) unless the user overrides the routing policy.
 4. The root agent owns user communication, architecture decisions, model/effort routing, integration, deployment, and remote Git state.
 5. Create one `agent/<goal>/<lane>` branch and isolated worktree per writer. Never run two writers on the same file in the same phase.
-6. Spawn no more than three direct subagents. Keep `agents.max_depth = 1`.
+6. Spawn no more than three direct subagents. Subagents must not spawn descendants; the root coordinator enforces this behavioral contract.
 7. Assign exploration and review as no-write work. Full Access is inherited, so this is a behavioral rule rather than a sandbox boundary.
 8. Before editing an existing function, class, or method, run GitNexus upstream impact. Report HIGH or CRITICAL results before editing.
 9. Children must not control systemd, install packages, edit credentials, touch other worktrees, push, publish releases, or operate on unrelated user files.
