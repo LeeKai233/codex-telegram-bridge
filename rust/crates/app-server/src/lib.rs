@@ -12,11 +12,11 @@ use ctg_ports::{AgentBackend, PortError, PortResult};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -120,6 +120,8 @@ pub enum AppServerError {
     QueueFull,
     #[error("app-server request timed out")]
     Timeout,
+    #[error("app-server generation is stale (expected {expected}, got {actual})")]
+    StaleGeneration { expected: u64, actual: u64 },
     #[error("app-server protocol error: {0}")]
     Protocol(String),
     #[error("app-server I/O error: {0}")]
@@ -138,6 +140,416 @@ pub struct ConnectionState {
     pub connected: bool,
 }
 
+/// A normalized interactive request.  The daemon and Telegram adapter own
+/// delivery, but they must use this contract before persisting or replying to
+/// a Codex server request.  Keeping the protocol rules at the transport
+/// boundary prevents legacy request shapes from leaking into business state.
+#[derive(Clone, Debug, PartialEq)]
+pub enum InteractiveServerRequest {
+    UserInput(UserInputRequest),
+    Approval(InteractiveApprovalRequest),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct UserInputRequest {
+    pub request: AgentServerRequest,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub item_id: String,
+    pub questions: Vec<UserInputQuestion>,
+    pub auto_resolution_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UserInputQuestion {
+    pub id: String,
+    pub question: String,
+    pub is_secret: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct InteractiveApprovalRequest {
+    pub request: AgentServerRequest,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub item_id: String,
+    pub method: String,
+    pub params: Value,
+    /// Values are retained verbatim because Codex supports structured policy
+    /// amendments in addition to the simple accept/decline decisions.
+    pub available_decisions: Vec<Value>,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum InteractiveRequestError {
+    #[error("unsupported interactive server request: {0}")]
+    UnsupportedMethod(String),
+    #[error("interactive server request is missing threadId")]
+    MissingThreadId,
+    #[error("requestUserInput question is missing a stable id")]
+    MissingQuestionId,
+    #[error("requestUserInput contains a secret question")]
+    SecretInput,
+    #[error("requestUserInput answer does not match a pending question: {0}")]
+    UnknownQuestion(String),
+    #[error("approval decision is not available for this request")]
+    UnavailableApprovalDecision,
+    #[error("approval decision has an invalid protocol shape")]
+    InvalidApprovalDecision,
+}
+
+impl InteractiveServerRequest {
+    pub fn parse(request: AgentServerRequest) -> Result<Self, InteractiveRequestError> {
+        if request.method == "item/tool/requestUserInput" {
+            return UserInputRequest::parse(request).map(Self::UserInput);
+        }
+        InteractiveApprovalRequest::parse(request).map(Self::Approval)
+    }
+}
+
+impl UserInputRequest {
+    fn parse(request: AgentServerRequest) -> Result<Self, InteractiveRequestError> {
+        let thread_id = required_thread_id(&request.params)?;
+        let questions = request
+            .params
+            .get("questions")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_object)
+                    .map(|question| {
+                        let id = question
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .filter(|value| !value.trim().is_empty())
+                            .ok_or(InteractiveRequestError::MissingQuestionId)?;
+                        Ok(UserInputQuestion {
+                            id: id.to_owned(),
+                            question: question
+                                .get("question")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_owned(),
+                            is_secret: question
+                                .get("isSecret")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, InteractiveRequestError>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+        Ok(Self {
+            turn_id: string_field(&request.params, "turnId"),
+            item_id: string_field(&request.params, "itemId"),
+            auto_resolution_ms: request
+                .params
+                .get("autoResolutionMs")
+                .and_then(Value::as_u64),
+            request,
+            thread_id,
+            questions,
+        })
+    }
+
+    pub fn contains_secret(&self) -> bool {
+        self.questions.iter().any(|question| question.is_secret)
+    }
+
+    /// Encode the exact `item/tool/requestUserInput` JSON-RPC result payload.
+    /// Unknown answers are refused so a stale Telegram callback cannot answer a
+    /// different request after recovery.
+    pub fn response(
+        &self,
+        answers: &BTreeMap<String, Vec<String>>,
+    ) -> Result<Value, InteractiveRequestError> {
+        if self.contains_secret() {
+            return Err(InteractiveRequestError::SecretInput);
+        }
+        let known = self
+            .questions
+            .iter()
+            .map(|question| question.id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut encoded = serde_json::Map::new();
+        for (id, values) in answers {
+            if !known.contains(id.as_str()) {
+                return Err(InteractiveRequestError::UnknownQuestion(id.clone()));
+            }
+            encoded.insert(id.clone(), json!({"answers": values}));
+        }
+        Ok(json!({"answers": Value::Object(encoded)}))
+    }
+}
+
+impl InteractiveApprovalRequest {
+    fn parse(request: AgentServerRequest) -> Result<Self, InteractiveRequestError> {
+        let method = request.method.clone();
+        if !is_approval_method(&method) {
+            return Err(InteractiveRequestError::UnsupportedMethod(method));
+        }
+        let params = normalize_interactive_approval_params(&method, &request.params);
+        let thread_id = required_thread_id(&params)?;
+        let available_decisions = interactive_approval_decisions(&method, &params);
+        Ok(Self {
+            turn_id: string_field(&params, "turnId"),
+            item_id: string_field(&params, "itemId"),
+            request,
+            thread_id,
+            method,
+            params,
+            available_decisions,
+        })
+    }
+
+    /// Encode an approval response only after checking it against the exact
+    /// decisions Codex advertised for this request.
+    pub fn response(&self, decision: &Value) -> Result<Value, InteractiveRequestError> {
+        if !interactive_approval_is_available(&self.method, decision, &self.available_decisions) {
+            return Err(InteractiveRequestError::UnavailableApprovalDecision);
+        }
+        approval_response_payload(&self.method, decision)
+    }
+}
+
+fn string_field(params: &Value, name: &str) -> String {
+    params
+        .get(name)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn required_thread_id(params: &Value) -> Result<String, InteractiveRequestError> {
+    let direct = string_field(params, "threadId");
+    if !direct.trim().is_empty() {
+        return Ok(direct);
+    }
+    let nested = params
+        .get("thread")
+        .and_then(Value::as_object)
+        .and_then(|thread| thread.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    if nested.is_empty() {
+        Err(InteractiveRequestError::MissingThreadId)
+    } else {
+        Ok(nested)
+    }
+}
+
+fn is_approval_method(method: &str) -> bool {
+    matches!(
+        method,
+        "item/commandExecution/requestApproval"
+            | "item/fileChange/requestApproval"
+            | "item/permissions/requestApproval"
+            | "execCommandApproval"
+            | "applyPatchApproval"
+    )
+}
+
+/// Normalize legacy RPC names into the thread/turn/item shape used by all
+/// durable workflow records.
+pub fn normalize_interactive_approval_params(method: &str, params: &Value) -> Value {
+    let mut normalized = params.clone();
+    let Some(values) = normalized.as_object_mut() else {
+        return normalized;
+    };
+    if matches!(method, "execCommandApproval" | "applyPatchApproval") {
+        let thread_id = values
+            .get("conversationId")
+            .cloned()
+            .or_else(|| values.get("threadId").cloned())
+            .unwrap_or_else(|| Value::String(String::new()));
+        let turn_id = values
+            .get("turnId")
+            .cloned()
+            .unwrap_or_else(|| Value::String(String::new()));
+        let item_id = values
+            .get("callId")
+            .cloned()
+            .or_else(|| values.get("itemId").cloned())
+            .unwrap_or_else(|| Value::String(String::new()));
+        values.insert("threadId".into(), thread_id);
+        values.insert("turnId".into(), turn_id);
+        values.insert("itemId".into(), item_id);
+    }
+    normalized
+}
+
+fn approval_decision_kind(decision: &Value) -> Option<&'static str> {
+    if let Some(value) = decision.as_str() {
+        return match value {
+            "accept" => Some("accept"),
+            "acceptForSession" => Some("acceptForSession"),
+            "decline" => Some("decline"),
+            "cancel" => Some("cancel"),
+            _ => None,
+        };
+    }
+    let values = decision.as_object()?;
+    if values.len() != 1 {
+        return None;
+    }
+    if let Some(detail) = values
+        .get("acceptWithExecpolicyAmendment")
+        .and_then(Value::as_object)
+    {
+        let amendment = detail.get("execpolicy_amendment")?.as_array()?;
+        return amendment
+            .iter()
+            .all(Value::is_string)
+            .then_some("acceptWithExecpolicyAmendment");
+    }
+    if let Some(detail) = values
+        .get("applyNetworkPolicyAmendment")
+        .and_then(Value::as_object)
+    {
+        let amendment = detail.get("network_policy_amendment")?.as_object()?;
+        let valid_action = matches!(
+            amendment.get("action").and_then(Value::as_str),
+            Some("allow" | "deny")
+        );
+        let valid_host = amendment
+            .get("host")
+            .and_then(Value::as_str)
+            .is_some_and(|host| !host.trim().is_empty());
+        return (valid_action && valid_host).then_some("applyNetworkPolicyAmendment");
+    }
+    None
+}
+
+fn simple_approval(value: &Value) -> bool {
+    matches!(
+        approval_decision_kind(value),
+        Some("accept" | "acceptForSession" | "decline" | "cancel")
+    )
+}
+
+/// Return the Telegram-safe approval choices without rewriting structured
+/// amendments or permissions.  Callers persist these values verbatim.
+pub fn interactive_approval_decisions(method: &str, params: &Value) -> Vec<Value> {
+    const MODERN_DEFAULT: [&str; 3] = ["accept", "acceptForSession", "decline"];
+    const LEGACY_DEFAULT: [&str; 4] = ["accept", "acceptForSession", "decline", "cancel"];
+    let defaults = |values: &[&str]| {
+        values
+            .iter()
+            .map(|value| Value::String((*value).to_owned()))
+            .collect::<Vec<_>>()
+    };
+    match method {
+        "item/commandExecution/requestApproval" => match params.get("availableDecisions") {
+            None => defaults(&MODERN_DEFAULT),
+            Some(Value::Array(values)) => values
+                .iter()
+                .filter(|value| approval_decision_kind(value).is_some())
+                .cloned()
+                .collect(),
+            Some(_) => Vec::new(),
+        },
+        "execCommandApproval" => defaults(&LEGACY_DEFAULT),
+        "item/fileChange/requestApproval" | "applyPatchApproval" => {
+            match params.get("availableDecisions") {
+                None => defaults(&LEGACY_DEFAULT),
+                Some(Value::Array(values)) => values
+                    .iter()
+                    .filter(|value| simple_approval(value))
+                    .cloned()
+                    .collect(),
+                Some(_) => Vec::new(),
+            }
+        }
+        "item/permissions/requestApproval" => {
+            let Some(permissions) = params
+                .get("permissions")
+                .or_else(|| params.get("requestedPermissions"))
+                .filter(|value| value.is_object())
+            else {
+                return Vec::new();
+            };
+            let turn = json!({"permissions": permissions, "scope": "turn"});
+            if permissions
+                .as_object()
+                .is_some_and(serde_json::Map::is_empty)
+            {
+                vec![turn]
+            } else {
+                vec![
+                    turn,
+                    json!({"permissions": permissions, "scope": "session"}),
+                    json!({"permissions": {}, "scope": "turn"}),
+                ]
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+pub fn interactive_approval_is_available(
+    method: &str,
+    decision: &Value,
+    available: &[Value],
+) -> bool {
+    if method == "item/permissions/requestApproval" {
+        return decision.is_object() && available.iter().any(|candidate| candidate == decision);
+    }
+    approval_decision_kind(decision).is_some()
+        && available.iter().any(|candidate| candidate == decision)
+}
+
+/// Build an exact JSON-RPC result for the current Codex approval method.
+pub fn approval_response_payload(
+    method: &str,
+    decision: &Value,
+) -> Result<Value, InteractiveRequestError> {
+    if method == "item/permissions/requestApproval" {
+        let Some(values) = decision.as_object() else {
+            return Err(InteractiveRequestError::InvalidApprovalDecision);
+        };
+        let valid_permissions = values.get("permissions").is_some_and(Value::is_object);
+        let scope = values.get("scope").and_then(Value::as_str);
+        let strict = values.get("strictAutoReview");
+        let valid_strict = strict.is_none_or(Value::is_boolean);
+        if !valid_permissions
+            || !matches!(scope, Some("turn" | "session"))
+            || !valid_strict
+            || (scope == Some("session") && strict == Some(&Value::Bool(true)))
+        {
+            return Err(InteractiveRequestError::InvalidApprovalDecision);
+        }
+        return Ok(decision.clone());
+    }
+    if approval_decision_kind(decision).is_none() {
+        return Err(InteractiveRequestError::InvalidApprovalDecision);
+    }
+    match method {
+        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
+            Ok(json!({"decision": decision}))
+        }
+        "execCommandApproval" | "applyPatchApproval" => {
+            let Some(value) = decision.as_str() else {
+                return Err(InteractiveRequestError::InvalidApprovalDecision);
+            };
+            let mapped = match value {
+                "accept" => "approved",
+                "acceptForSession" => "approved_for_session",
+                "decline" => "denied",
+                "cancel" => "abort",
+                _ => return Err(InteractiveRequestError::InvalidApprovalDecision),
+            };
+            Ok(json!({"decision": mapped}))
+        }
+        _ => Err(InteractiveRequestError::UnsupportedMethod(
+            method.to_owned(),
+        )),
+    }
+}
+
 enum Outbound {
     Request {
         generation: u64,
@@ -150,6 +562,7 @@ enum Outbound {
     Response {
         generation: u64,
         message: Value,
+        sent: oneshot::Sender<Result<(), AppServerError>>,
     },
 }
 
@@ -166,6 +579,8 @@ struct Inner {
     state: watch::Sender<ConnectionState>,
     shutdown: watch::Sender<bool>,
     ids: AtomicU64,
+    transport_generation: AtomicU64,
+    transport_active: AtomicBool,
     permits: Arc<Semaphore>,
     task: Mutex<Option<JoinHandle<()>>>,
 }
@@ -192,6 +607,8 @@ impl AppServerClient {
             state,
             shutdown,
             ids: AtomicU64::new(1),
+            transport_generation: AtomicU64::new(0),
+            transport_active: AtomicBool::new(false),
             task: Mutex::new(None),
         });
         let client = Self { inner };
@@ -264,19 +681,75 @@ impl AppServerClient {
     }
 
     async fn send_response(&self, id: Value, payload: Value) -> Result<(), AppServerError> {
-        let state = self.wait_connected(INITIALIZE_TIMEOUT).await?;
+        let generation = self.inner.transport_generation.load(Ordering::Acquire);
+        self.send_response_for_generation(generation, id, payload)
+            .await
+    }
+
+    async fn send_response_for_generation(
+        &self,
+        generation: u64,
+        id: Value,
+        payload: Value,
+    ) -> Result<(), AppServerError> {
+        let active_generation = self.inner.transport_generation.load(Ordering::Acquire);
+        if !self.inner.transport_active.load(Ordering::Acquire) {
+            return Err(AppServerError::Disconnected);
+        }
+        if generation == 0 || active_generation != generation {
+            return Err(AppServerError::StaleGeneration {
+                expected: active_generation,
+                actual: generation,
+            });
+        }
         let mut message = payload.as_object().cloned().unwrap_or_default();
         message.insert("id".into(), id);
+        let (sent, acknowledged) = oneshot::channel();
         self.inner
             .outbound
             .try_send(Outbound::Response {
-                generation: state.generation,
+                generation,
                 message: Value::Object(message),
+                sent,
             })
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(_) => AppServerError::QueueFull,
                 mpsc::error::TrySendError::Closed(_) => AppServerError::Shutdown,
-            })
+            })?;
+        timeout(INITIALIZE_TIMEOUT, acknowledged)
+            .await
+            .map_err(|_| AppServerError::Timeout)?
+            .map_err(|_| AppServerError::Disconnected)?
+    }
+
+    /// Reply only on the same transport generation that delivered a server
+    /// request.  A reconnect must retire the old Telegram callback instead of
+    /// sending its decision to a new Codex connection.
+    pub async fn respond_to_server_request(
+        &self,
+        request: &AgentServerRequest,
+        result: Value,
+    ) -> Result<(), AppServerError> {
+        self.send_response_for_generation(
+            request.generation,
+            request.id.clone(),
+            json!({"result": result}),
+        )
+        .await
+    }
+
+    pub async fn respond_error_to_server_request(
+        &self,
+        request: &AgentServerRequest,
+        code: i64,
+        message: &str,
+    ) -> Result<(), AppServerError> {
+        self.send_response_for_generation(
+            request.generation,
+            request.id.clone(),
+            json!({"error": {"code": code, "message": message}}),
+        )
+        .await
     }
 
     async fn supervise(&self, mut outbound: mpsc::Receiver<Outbound>) {
@@ -307,6 +780,9 @@ impl AppServerClient {
                     .await
                 }
             };
+            if self.inner.transport_generation.load(Ordering::Acquire) == generation {
+                self.inner.transport_active.store(false, Ordering::Release);
+            }
             let _ = self.inner.state.send(ConnectionState {
                 generation,
                 connected: false,
@@ -348,6 +824,14 @@ impl AppServerClient {
             client_async_with_config("ws://localhost/", stream, Some(websocket_config))
                 .await
                 .map_err(websocket_error)?;
+        self.inner
+            .transport_generation
+            .store(generation, Ordering::Release);
+        self.inner.transport_active.store(true, Ordering::Release);
+        let _ = self.inner.state.send(ConnectionState {
+            generation,
+            connected: false,
+        });
         let mut pending: HashMap<u64, Pending> = HashMap::new();
         let initialize_id = self.inner.ids.fetch_add(1, Ordering::Relaxed);
         write_message(
@@ -447,6 +931,14 @@ impl AppServerClient {
         shutdown: &mut watch::Receiver<bool>,
     ) -> Result<(), AppServerError> {
         let mut reader = BufReader::new(stdout);
+        self.inner
+            .transport_generation
+            .store(generation, Ordering::Release);
+        self.inner.transport_active.store(true, Ordering::Release);
+        let _ = self.inner.state.send(ConnectionState {
+            generation,
+            connected: false,
+        });
         let mut pending: HashMap<u64, Pending> = HashMap::new();
         let initialize_id = self.inner.ids.fetch_add(1, Ordering::Relaxed);
         write_json_line(
@@ -546,9 +1038,28 @@ impl AppServerClient {
             Outbound::Response {
                 generation: message_generation,
                 message,
+                sent,
             } => {
-                if message_generation == generation && self.connection_state().connected {
-                    write_message(socket, &message).await?;
+                let active_generation = self.inner.transport_generation.load(Ordering::Acquire);
+                if !self.inner.transport_active.load(Ordering::Acquire) {
+                    let _ = sent.send(Err(AppServerError::Disconnected));
+                    return Ok(());
+                }
+                if message_generation != generation || active_generation != message_generation {
+                    let _ = sent.send(Err(AppServerError::StaleGeneration {
+                        expected: active_generation,
+                        actual: message_generation,
+                    }));
+                    return Ok(());
+                }
+                match write_message(socket, &message).await {
+                    Ok(()) => {
+                        let _ = sent.send(Ok(()));
+                    }
+                    Err(error) => {
+                        let _ = sent.send(Err(AppServerError::Disconnected));
+                        return Err(error);
+                    }
                 }
             }
         }
@@ -591,9 +1102,28 @@ impl AppServerClient {
             Outbound::Response {
                 generation: message_generation,
                 message,
+                sent,
             } => {
-                if message_generation == generation && self.connection_state().connected {
-                    write_json_line(stdin, &message).await?;
+                let active_generation = self.inner.transport_generation.load(Ordering::Acquire);
+                if !self.inner.transport_active.load(Ordering::Acquire) {
+                    let _ = sent.send(Err(AppServerError::Disconnected));
+                    return Ok(());
+                }
+                if message_generation != generation || active_generation != message_generation {
+                    let _ = sent.send(Err(AppServerError::StaleGeneration {
+                        expected: active_generation,
+                        actual: message_generation,
+                    }));
+                    return Ok(());
+                }
+                match write_json_line(stdin, &message).await {
+                    Ok(()) => {
+                        let _ = sent.send(Ok(()));
+                    }
+                    Err(error) => {
+                        let _ = sent.send(Err(AppServerError::Disconnected));
+                        return Err(error);
+                    }
                 }
             }
         }
@@ -694,8 +1224,13 @@ fn websocket_error(error: tokio_tungstenite::tungstenite::Error) -> AppServerErr
 }
 
 fn fail_outbound(outbound: Outbound, error: AppServerError) {
-    if let Outbound::Request { response, .. } = outbound {
-        let _ = response.send(Err(error));
+    match outbound {
+        Outbound::Request { response, .. } => {
+            let _ = response.send(Err(error));
+        }
+        Outbound::Response { sent, .. } => {
+            let _ = sent.send(Err(error));
+        }
     }
 }
 
@@ -1056,5 +1591,179 @@ done
             panic!("zero queue capacity must be rejected");
         };
         assert!(matches!(error, AppServerError::InvalidConfig));
+    }
+
+    #[test]
+    fn interactive_contract_preserves_modern_amendments_and_legacy_wire_shapes() {
+        let amendment = json!({
+            "acceptWithExecpolicyAmendment": {
+                "execpolicy_amendment": ["allow git status"]
+            }
+        });
+        let request = AgentServerRequest {
+            id: json!(11),
+            method: "item/commandExecution/requestApproval".into(),
+            params: json!({
+                "threadId": "thread-modern",
+                "turnId": "turn-modern",
+                "itemId": "item-modern",
+                "availableDecisions": [amendment, "decline"]
+            }),
+            generation: 4,
+        };
+        let InteractiveServerRequest::Approval(modern) =
+            InteractiveServerRequest::parse(request).unwrap()
+        else {
+            panic!("modern approval must be normalized");
+        };
+        assert_eq!(modern.thread_id, "thread-modern");
+        assert_eq!(modern.available_decisions.len(), 2);
+        assert_eq!(
+            modern.response(&modern.available_decisions[0]).unwrap(),
+            json!({"decision": modern.available_decisions[0].clone()})
+        );
+
+        let legacy = AgentServerRequest {
+            id: json!("legacy-id"),
+            method: "execCommandApproval".into(),
+            params: json!({
+                "conversationId": "thread-legacy",
+                "turnId": "turn-legacy",
+                "callId": "call-legacy"
+            }),
+            generation: 4,
+        };
+        let InteractiveServerRequest::Approval(legacy) =
+            InteractiveServerRequest::parse(legacy).unwrap()
+        else {
+            panic!("legacy approval must be normalized");
+        };
+        assert_eq!(legacy.thread_id, "thread-legacy");
+        assert_eq!(legacy.item_id, "call-legacy");
+        assert_eq!(
+            legacy.response(&json!("acceptForSession")).unwrap(),
+            json!({"decision": "approved_for_session"})
+        );
+    }
+
+    #[test]
+    fn request_user_input_uses_exact_wire_shape_and_rejects_secret_or_stale_answers() {
+        let request = AgentServerRequest {
+            id: json!(12),
+            method: "item/tool/requestUserInput".into(),
+            params: json!({
+                "threadId": "thread-question",
+                "turnId": "turn-question",
+                "itemId": "item-question",
+                "autoResolutionMs": 5000,
+                "questions": [{"id": "choice", "question": "Continue?"}]
+            }),
+            generation: 5,
+        };
+        let InteractiveServerRequest::UserInput(input) =
+            InteractiveServerRequest::parse(request).unwrap()
+        else {
+            panic!("requestUserInput must be normalized");
+        };
+        let mut answers = BTreeMap::new();
+        answers.insert("choice".into(), vec!["continue".into()]);
+        assert_eq!(
+            input.response(&answers).unwrap(),
+            json!({"answers": {"choice": {"answers": ["continue"]}}})
+        );
+        answers.insert("stale".into(), vec!["no".into()]);
+        assert_eq!(
+            input.response(&answers),
+            Err(InteractiveRequestError::UnknownQuestion("stale".into()))
+        );
+
+        let secret = AgentServerRequest {
+            id: json!(13),
+            method: "item/tool/requestUserInput".into(),
+            params: json!({
+                "threadId": "thread-question",
+                "questions": [{"id": "secret", "isSecret": true}]
+            }),
+            generation: 5,
+        };
+        let InteractiveServerRequest::UserInput(secret) =
+            InteractiveServerRequest::parse(secret).unwrap()
+        else {
+            panic!("secret question must still be detectable");
+        };
+        assert_eq!(
+            secret.response(&BTreeMap::new()),
+            Err(InteractiveRequestError::SecretInput)
+        );
+    }
+
+    #[tokio::test]
+    async fn server_request_reply_cannot_cross_a_reconnect_generation() {
+        let path = test_socket("stale-server-request");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = accept_async(stream).await.unwrap();
+                let initialize = recv_json(&mut socket).await;
+                send_json(&mut socket, json!({"id": initialize["id"], "result": {}})).await;
+                assert_eq!(recv_json(&mut socket).await["method"], "initialized");
+                send_json(
+                    &mut socket,
+                    json!({
+                        "id": "old-request",
+                        "method": "item/tool/requestUserInput",
+                        "params": {"threadId": "thread-old"}
+                    }),
+                )
+                .await;
+            }
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            let initialize = recv_json(&mut socket).await;
+            send_json(&mut socket, json!({"id": initialize["id"], "result": {}})).await;
+            assert_eq!(recv_json(&mut socket).await["method"], "initialized");
+            assert!(
+                timeout(Duration::from_millis(150), socket.next())
+                    .await
+                    .is_err()
+            );
+        });
+        let client = AppServerClient::connect(AppServerConfig {
+            reconnect_initial: Duration::from_millis(5),
+            reconnect_max: Duration::from_millis(10),
+            ..AppServerConfig::managed(&path)
+        })
+        .await
+        .unwrap();
+        let mut requests = client.subscribe_server_requests();
+        client.wait_connected(Duration::from_secs(1)).await.unwrap();
+        let request = timeout(Duration::from_secs(1), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut state = client.inner.state.subscribe();
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let current = *state.borrow_and_update();
+                if current.connected && current.generation > request.generation {
+                    return;
+                }
+                state.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+
+        let result = client
+            .respond_to_server_request(&request, json!({"answers": {}}))
+            .await;
+        assert!(matches!(
+            result,
+            Err(AppServerError::StaleGeneration { actual: 1, .. })
+        ));
+        server.await.unwrap();
+        client.shutdown().await;
+        let _ = std::fs::remove_file(path);
     }
 }
