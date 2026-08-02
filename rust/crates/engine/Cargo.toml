@@ -8,4 +8,6 @@ repository.workspace = true
 [dependencies]
 ctg-domain = { path = "../domain" }
 ctg-ports = { path = "../ports" }
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true

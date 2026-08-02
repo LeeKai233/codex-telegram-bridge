@@ -150,6 +150,7 @@ dependencies = [
  "codex-telegram-credentials",
  "ctg-app-server",
  "ctg-domain",
+ "ctg-engine",
  "ctg-ports",
  "ctg-storage-sqlite",
  "data-encoding",
@@ -266,6 +267,8 @@ version = "0.1.0"
 dependencies = [
  "ctg-domain",
  "ctg-ports",
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 
@@ -288,6 +291,7 @@ dependencies = [
  "ctg-ports",
  "rusqlite",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

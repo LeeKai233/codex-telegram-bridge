@@ -3,13 +3,38 @@
 use async_trait::async_trait;
 use ctg_domain::{
     AgentEvent, AgentServerRequest, AgentThread, AgentTurn, ApprovalAction, ApprovalDecision,
-    ApprovalId, ApprovalRequest, Artifact, DomainEvent, PromptInput, Session, SessionId, ThreadId,
-    TimestampMs, TurnId,
+    ApprovalId, ApprovalRequest, Artifact, DomainEvent, PromptInput, Session, SessionId,
+    TelegramEffect, ThreadId, TimestampMs, TurnId,
 };
 use serde_json::Value;
 use thiserror::Error;
 
 pub type PortResult<T> = Result<T, PortError>;
+
+#[async_trait]
+pub trait TelegramGateway: Send + Sync {
+    async fn apply(&self, effect: TelegramEffect) -> PortResult<Option<ctg_domain::MessageRef>>;
+}
+
+pub trait PromptIntentStore: Send + Sync {
+    fn insert_prompt_intent(&self, intent: &ctg_domain::PromptIntent) -> PortResult<()>;
+    fn update_prompt_intent(&self, intent: &ctg_domain::PromptIntent) -> PortResult<()>;
+    fn find_by_client_message_id(
+        &self,
+        client_message_id: &str,
+    ) -> PortResult<Option<ctg_domain::PromptIntent>>;
+}
+
+pub trait QuestionStore: Send + Sync {
+    fn insert_question(&self, request: &ctg_domain::QuestionRequest) -> PortResult<()>;
+    fn resolve_question(
+        &self,
+        request_key: &str,
+        response: Value,
+        source: &str,
+        resolved_at_ms: TimestampMs,
+    ) -> PortResult<()>;
+}
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum PortError {

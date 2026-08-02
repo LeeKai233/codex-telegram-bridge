@@ -278,6 +278,164 @@ pub struct AgentServerRequest {
     pub generation: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BotRole {
+    Control,
+    Discussion,
+    Status,
+    Alert,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageRef {
+    pub bot_role: BotRole,
+    pub chat_id: i64,
+    pub message_id: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InlineButton {
+    pub text: String,
+    pub callback_data: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct InlineKeyboard {
+    pub rows: Vec<Vec<InlineButton>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TelegramEffect {
+    SendText {
+        bot_role: BotRole,
+        chat_id: i64,
+        text: String,
+        parse_mode: Option<String>,
+        reply_to_message_id: Option<i64>,
+        thread_id: Option<i64>,
+        reply_markup: Option<InlineKeyboard>,
+    },
+    EditText {
+        message: MessageRef,
+        text: String,
+        parse_mode: Option<String>,
+        reply_markup: Option<InlineKeyboard>,
+    },
+    EditMarkup {
+        message: MessageRef,
+        reply_markup: Option<InlineKeyboard>,
+    },
+    DeleteMessage {
+        message: MessageRef,
+    },
+    AnswerCallback {
+        bot_role: BotRole,
+        callback_id: String,
+        text: Option<String>,
+        show_alert: bool,
+    },
+    SendDocument {
+        bot_role: BotRole,
+        chat_id: i64,
+        file_name: String,
+        bytes: Vec<u8>,
+        caption: Option<String>,
+        reply_to_message_id: Option<i64>,
+        thread_id: Option<i64>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptIntentState {
+    Received,
+    AwaitingChoice,
+    Queued,
+    Submitting,
+    Started,
+    Steered,
+    Completed,
+    Failed,
+    Uncertain,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptIntent {
+    pub intent_id: String,
+    pub client_message_id: String,
+    pub source: String,
+    pub prompt: String,
+    pub mode: String,
+    pub thread_id: Option<ThreadId>,
+    pub space_id: Option<String>,
+    pub generation: u64,
+    pub state: PromptIntentState,
+    pub turn_id: Option<TurnId>,
+    pub queue_id: Option<i64>,
+    pub error: Option<String>,
+    pub created_at_ms: TimestampMs,
+    pub updated_at_ms: TimestampMs,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionRequest {
+    pub request_key: String,
+    pub request_id: serde_json::Value,
+    pub generation: u64,
+    pub thread_id: ThreadId,
+    pub turn_id: TurnId,
+    pub item_id: String,
+    pub questions: serde_json::Value,
+    pub expires_at_ms: Option<TimestampMs>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanPublicationState {
+    Published,
+    Executing,
+    Revising,
+    RevisionStarted,
+    Executed,
+    Failed,
+    Dismissed,
+    Superseded,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanPublication {
+    pub space_id: String,
+    pub generation: u64,
+    pub item_id: String,
+    pub revision_key: String,
+    pub thread_id: ThreadId,
+    pub turn_id: TurnId,
+    pub status: PlanPublicationState,
+    pub plan_text: String,
+    pub message_ids: Vec<i64>,
+    pub action_message_ids: Vec<i64>,
+    #[serde(default)]
+    pub revision_prompt_message_id: Option<i64>,
+    pub decision_turn_id: Option<TurnId>,
+    pub updated_at_ms: TimestampMs,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryStatus {
+    Pending,
+    Sent,
+    Edited,
+    Deleted,
+    Uncertain,
+    Failed,
+}
+
 impl ScheduledCommand {
     pub fn new(
         id: CommandId,

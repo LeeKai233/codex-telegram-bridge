@@ -1270,6 +1270,32 @@ fn parse_turn(thread_id: &ThreadId, value: Value) -> PortResult<AgentTurn> {
     })
 }
 
+impl AppServerClient {
+    /// Starts a turn while preserving the optional collaboration-mode payload
+    /// used by the Python bridge for the first prompt of a new Session.
+    pub async fn start_turn_with_collaboration_mode(
+        &self,
+        thread_id: &ThreadId,
+        input: Vec<PromptInput>,
+        client_message_id: Option<&str>,
+        collaboration_mode: Option<Value>,
+    ) -> PortResult<AgentTurn> {
+        let mut params = json!({"threadId": thread_id.as_str(), "input": input});
+        if let Some(id) = client_message_id.filter(|value| !value.is_empty()) {
+            params["clientUserMessageId"] = Value::String(id.to_owned());
+        }
+        if let Some(mode) = collaboration_mode {
+            params["collaborationMode"] = mode;
+        }
+        parse_turn(
+            thread_id,
+            self.request("turn/start", params, Duration::from_secs(60))
+                .await
+                .map_err(PortError::from)?,
+        )
+    }
+}
+
 #[async_trait]
 impl AgentBackend for AppServerClient {
     async fn start_thread(
@@ -1328,16 +1354,8 @@ impl AgentBackend for AppServerClient {
         input: Vec<PromptInput>,
         client_message_id: Option<&str>,
     ) -> PortResult<AgentTurn> {
-        let mut params = json!({"threadId": thread_id.as_str(), "input": input});
-        if let Some(id) = client_message_id.filter(|value| !value.is_empty()) {
-            params["clientUserMessageId"] = Value::String(id.to_owned());
-        }
-        parse_turn(
-            thread_id,
-            self.request("turn/start", params, Duration::from_secs(60))
-                .await
-                .map_err(PortError::from)?,
-        )
+        self.start_turn_with_collaboration_mode(thread_id, input, client_message_id, None)
+            .await
     }
 
     async fn steer_turn(
@@ -1509,6 +1527,25 @@ done
             send_json(&mut socket, json!({"id": request["id"], "result":{"thread":{"id":"t-1", "status":"idle", "ephemeral":false}}})).await;
             let response = recv_json(&mut socket).await;
             assert_eq!(response, json!({"id":"request-9", "result":{"answers":[]}}));
+            let turn = recv_json(&mut socket).await;
+            assert_eq!(turn["method"], "turn/start");
+            assert_eq!(turn["params"]["clientUserMessageId"], "client-1");
+            assert_eq!(
+                turn["params"]["collaborationMode"],
+                json!({
+                    "mode": "plan",
+                    "settings": {
+                        "model": "gpt-test",
+                        "reasoning_effort": "low",
+                        "developer_instructions": null
+                    }
+                })
+            );
+            send_json(
+                &mut socket,
+                json!({"id": turn["id"], "result":{"turn":{"id":"turn-1", "status":"inProgress"}}}),
+            )
+            .await;
         });
         let client = AppServerClient::connect(AppServerConfig {
             reconnect_initial: Duration::from_millis(5),
@@ -1529,6 +1566,23 @@ done
             .respond(request.id, json!({"answers":[]}))
             .await
             .unwrap();
+        let turn = client
+            .start_turn_with_collaboration_mode(
+                &thread.id,
+                vec![PromptInput::text("hello").unwrap()],
+                Some("client-1"),
+                Some(json!({
+                    "mode": "plan",
+                    "settings": {
+                        "model": "gpt-test",
+                        "reasoning_effort": "low",
+                        "developer_instructions": null
+                    }
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(turn.id.as_str(), "turn-1");
         server.await.unwrap();
         client.shutdown().await;
         let _ = std::fs::remove_file(path);

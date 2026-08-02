@@ -3,6 +3,15 @@ name = "codex-telegram-cli"
 version = "0.1.0"
 edition.workspace = true
 license = "MIT"
+autobins = false
+
+[[bin]]
+name = "codex-telegram-cli"
+path = "src/main.rs"
+
+[[bin]]
+name = "codex-tg"
+path = "src/main.rs"
 
 [dependencies]
 ctg-app-server = { path = "../app-server" }
@@ -11,6 +20,7 @@ codex-telegram-credentials = { path = "../credentials" }
 ctg-domain = { path = "../domain" }
 ctg-ports = { path = "../ports" }
 ctg-storage-sqlite = { path = "../storage-sqlite" }
+ctg-engine = { path = "../engine" }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true

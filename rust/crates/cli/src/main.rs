@@ -1,17 +1,18 @@
 use codex_telegram_adapter::{ReqwestTransport, TelegramBotApi};
 use codex_telegram_cli::config::RustConfig;
 use codex_telegram_cli::metrics::{MetricsRegistry, MetricsServer};
-use codex_telegram_cli::migration::inspect_legacy_database;
+use codex_telegram_cli::migration::{import_python_database, inspect_legacy_database};
 use codex_telegram_cli::replay::run_fixture;
 use codex_telegram_cli::security::{TotpManager, is_private_regular_file};
 use ctg_storage_sqlite::SqliteStore;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 const UNSUPPORTED_ONBOARDING: &str = "pairing, binding, and onboarding require the Rust runtime state protocol; this CLI does not emulate Python state";
@@ -59,15 +60,20 @@ fn run(arguments: Vec<String>, output: &mut dyn Write) -> Result<i32, CliError> 
         "metrics" => serve_metrics(config_path.as_deref(), rest, output),
         "daemon" => daemon(config_path.as_deref(), rest),
         "migration-inspect" => migration_inspect(rest, output),
+        "import-python-state" => import_python_state(rest, output),
         "replay" => replay(rest, output),
         "doctor" => doctor(config_path.as_deref(), rest, output),
         "status" => status(config_path.as_deref(), rest, output),
         "app-server-watchdog" => watchdog(config_path.as_deref(), rest, output),
-        "pair-code" | "bind-code" | "onboard" => unsupported_onboarding(command, rest),
-        "configure-token" | "migrate-token" | "configure-tokens" | "totp-enroll" | "totp-reset"
-        | "owner-reset" => Err(CliError::Unsupported(format!(
-            "{command} is unavailable: {UNSUPPORTED_ONBOARDING}"
-        ))),
+        "pair-code" => print_one_time_code("pair", config_path.as_deref(), output),
+        "bind-code" => print_one_time_code("bind", config_path.as_deref(), output),
+        "onboard" => onboard(config_path.as_deref(), rest, output),
+        "configure-token" | "migrate-token" | "configure-tokens" | "totp-enroll" | "totp-reset" => {
+            Err(CliError::Unsupported(format!(
+                "{command} is unavailable: {UNSUPPORTED_ONBOARDING}"
+            )))
+        }
+        "owner-reset" => owner_reset(config_path.as_deref(), rest, output),
         "lock" => lock(config_path.as_deref(), rest, output),
         "help" | "--help" | "-h" => {
             print_help(output)?;
@@ -259,6 +265,91 @@ fn migration_inspect(arguments: &[String], output: &mut dyn Write) -> Result<i32
     Ok(0)
 }
 
+fn import_python_state(arguments: &[String], output: &mut dyn Write) -> Result<i32, CliError> {
+    let source = value_after(arguments, "--source")
+        .ok_or_else(|| CliError::Usage("import-python-state requires --source PATH".into()))?;
+    let target = value_after(arguments, "--target")
+        .ok_or_else(|| CliError::Usage("import-python-state requires --target PATH".into()))?;
+    let report = value_after(arguments, "--report")
+        .ok_or_else(|| CliError::Usage("import-python-state requires --report PATH".into()))?;
+    let dry_run = arguments.iter().any(|argument| argument == "--dry-run");
+    if arguments.iter().any(|argument| {
+        argument.starts_with('-')
+            && !matches!(
+                argument.as_str(),
+                "--source" | "--target" | "--report" | "--dry-run"
+            )
+    }) {
+        return Err(CliError::Usage(
+            "usage: import-python-state --source PATH --target PATH --report PATH [--dry-run]"
+                .into(),
+        ));
+    }
+    let report = import_python_database(source, target, report, dry_run)
+        .map_err(|error| CliError::Runtime(error.to_string()))?;
+    let json = serde_json::to_string_pretty(&report)
+        .map_err(|error| CliError::Runtime(error.to_string()))?;
+    writeln!(output, "{json}")?;
+    Ok(0)
+}
+
+fn print_one_time_code(
+    kind: &str,
+    config_path: Option<&Path>,
+    output: &mut dyn Write,
+) -> Result<i32, CliError> {
+    let config = load_config(config_path)?;
+    fs::create_dir_all(&config.state_directory)
+        .map_err(|error| CliError::Runtime(error.to_string()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&config.state_directory, fs::Permissions::from_mode(0o700))
+            .map_err(|error| CliError::Runtime(error.to_string()))?;
+    }
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| CliError::Runtime(error.to_string()))?
+        .as_millis() as i64;
+    let entropy = format!("{kind}:{now_ms}:{}", std::process::id());
+    let digest = Sha256::digest(entropy.as_bytes());
+    let code = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]) % 1_000_000;
+    let code = format!("{code:06}");
+    let digest = Sha256::digest(code.as_bytes());
+    let store = SqliteStore::open(config.state_directory.join("state.sqlite3"))
+        .map_err(|error| CliError::Runtime(error.to_string()))?;
+    store
+        .upsert_workflow_record(
+            "onboarding_code",
+            kind,
+            &json!({
+                "sha256": format!("{:x}", digest),
+                "expires_at_ms": now_ms.saturating_add(600_000),
+                "failures": 0,
+            }),
+            now_ms,
+        )
+        .map_err(|error| CliError::Runtime(error.to_string()))?;
+    writeln!(output, "{kind}-code: {code}")?;
+    Ok(0)
+}
+
+fn onboard(
+    config_path: Option<&Path>,
+    arguments: &[String],
+    output: &mut dyn Write,
+) -> Result<i32, CliError> {
+    let code = doctor(config_path, arguments, output)?;
+    if code != 0 {
+        return Ok(code);
+    }
+    writeln!(
+        output,
+        "onboard: runtime checks complete; generate pair-code, send it to Control Bot, then generate bind-code and send it to Discussion Bot"
+    )?;
+    Ok(0)
+}
+
 fn doctor(
     config_path: Option<&Path>,
     arguments: &[String],
@@ -409,33 +500,6 @@ fn watchdog(
     Ok(1)
 }
 
-fn unsupported_onboarding(command: &str, arguments: &[String]) -> Result<i32, CliError> {
-    match command {
-        "onboard" => {
-            if !arguments.is_empty()
-                && (arguments.len() != 2
-                    || arguments.first().is_none_or(|flag| flag != "--timeout"))
-            {
-                return Err(CliError::Usage("usage: onboard [--timeout SECONDS]".into()));
-            }
-            let timeout = value_after(arguments, "--timeout").unwrap_or_else(|| "600".into());
-            if timeout
-                .parse::<u64>()
-                .ok()
-                .filter(|value| *value > 0)
-                .is_none()
-                || arguments.len() > 2
-            {
-                return Err(CliError::Usage("usage: onboard [--timeout SECONDS]".into()));
-            }
-        }
-        _ => ensure_empty(arguments, &format!("usage: {command}"))?,
-    }
-    Err(CliError::Unsupported(format!(
-        "{command} is unavailable: {UNSUPPORTED_ONBOARDING}"
-    )))
-}
-
 fn lock(
     config_path: Option<&Path>,
     arguments: &[String],
@@ -453,6 +517,38 @@ fn lock(
         .lock()
         .map_err(|error| CliError::Runtime(error.to_string()))?;
     writeln!(output, "Telegram write access is locked.")?;
+    Ok(0)
+}
+
+fn owner_reset(
+    config_path: Option<&Path>,
+    arguments: &[String],
+    output: &mut dyn Write,
+) -> Result<i32, CliError> {
+    if !arguments.is_empty() && arguments != ["--yes"] {
+        return Err(CliError::Usage("usage: owner-reset [--yes]".into()));
+    }
+    if !arguments.iter().any(|argument| argument == "--yes") {
+        return Err(CliError::Usage(
+            "owner-reset requires --yes to remove the Rust owner binding".into(),
+        ));
+    }
+    let config = load_config(config_path)?;
+    let store = SqliteStore::open(config.state_directory.join("state.sqlite3"))
+        .map_err(|error| CliError::Runtime(error.to_string()))?;
+    store
+        .delete_workflow_record("onboarding", "owner")
+        .map_err(|error| CliError::Runtime(error.to_string()))?;
+    store
+        .delete_workflow_record("onboarding", "binding")
+        .map_err(|error| CliError::Runtime(error.to_string()))?;
+    store
+        .lock_totp()
+        .map_err(|error| CliError::Runtime(error.to_string()))?;
+    writeln!(
+        output,
+        "owner-reset: owner and Telegram binding removed; Rust writes locked"
+    )?;
     Ok(0)
 }
 
@@ -565,7 +661,7 @@ fn write_json(output: &mut dyn Write, value: serde_json::Value) -> Result<(), Cl
 fn print_help(output: &mut dyn Write) -> Result<(), CliError> {
     writeln!(
         output,
-        "commands: validate [--json], generate-config [PATH], probe, metrics, daemon, migration-inspect SQLITE_PATH, replay --fixture PATH [--scenario NAME] [--implementation NAME] [--repetitions N] [--warmup N] [--output PATH], doctor [--offline] [--json], status [--json], app-server-watchdog [--recover], pair-code, bind-code, onboard [--timeout SECONDS], lock"
+        "commands: validate [--json], generate-config [PATH], probe, metrics, daemon, migration-inspect SQLITE_PATH, import-python-state --source PATH --target PATH --report PATH [--dry-run], replay --fixture PATH [--scenario NAME] [--implementation NAME] [--repetitions N] [--warmup N] [--output PATH], doctor [--offline] [--json], status [--json], app-server-watchdog [--recover], pair-code, bind-code, onboard [--timeout SECONDS], lock"
     )?;
     Ok(())
 }
@@ -601,17 +697,46 @@ mod tests {
     }
 
     #[test]
-    fn pairing_and_recovery_are_explicitly_unsupported() {
+    fn pairing_code_is_persisted_and_recovery_stays_explicit() {
+        let root = std::env::temp_dir().join(format!("ctg-cli-pair-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let config = root.join("rust-vnext.toml");
+        fs::write(
+            &config,
+            format!(
+                "credential_registry = \"{}\"\nstate_directory = \"{}\"\ntotp_secret_path = \"{}\"\ncodex_socket = \"{}\"\n",
+                root.join("registry").display(),
+                root.join("state").display(),
+                root.join("totp").display(),
+                root.join("socket").display()
+            ),
+        )
+        .unwrap();
         let mut output = Vec::new();
-        let pair = run(vec!["pair-code".into()], &mut output).unwrap_err();
-        assert_eq!(pair.exit_code(), 2);
-        assert!(pair.to_string().contains("runtime state protocol"));
+        assert_eq!(
+            run(
+                vec![
+                    "--config".into(),
+                    config.display().to_string(),
+                    "pair-code".into()
+                ],
+                &mut output
+            )
+            .unwrap(),
+            0
+        );
+        assert!(
+            String::from_utf8(output.clone())
+                .unwrap()
+                .contains("pair-code: ")
+        );
         let recover = run(
             vec!["app-server-watchdog".into(), "--recover".into()],
             &mut output,
         )
         .unwrap_err();
         assert_eq!(recover.exit_code(), 2);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

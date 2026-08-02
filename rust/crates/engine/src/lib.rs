@@ -11,6 +11,10 @@ use ctg_ports::{
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use thiserror::Error;
 
+pub mod projector;
+
+pub use projector::{EventProjector, ProjectionEffect, ThreadProjection};
+
 pub struct Engine<'a> {
     clock: &'a dyn Clock,
     sessions: &'a dyn SessionRepository,

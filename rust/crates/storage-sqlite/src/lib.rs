@@ -1,17 +1,18 @@
 //! SQLite adapter with WAL mode and transactional business-record/event writes.
 
 use ctg_domain::{
-    ApprovalDecision, ApprovalId, ApprovalRequest, Artifact, ArtifactId, DomainEvent, Session,
-    SessionId, SessionStatus,
+    ApprovalDecision, ApprovalId, ApprovalRequest, Artifact, ArtifactId, DomainEvent,
+    PlanPublication, PromptIntent, QuestionRequest, Session, SessionId, SessionStatus,
 };
 use ctg_ports::{ApprovalStore, ArtifactStore, EventLog, PortError, PortResult, SessionRepository};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// This is deliberately independent from the Python bridge schema. Rust
 /// deployments receive a new database path and never migrate Python state.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RustSessionSpace {
@@ -73,7 +74,7 @@ impl SqliteStore {
             .pragma_update(None, "foreign_keys", "ON")
             .map_err(sql_error)?;
         connection
-            .pragma_update(None, "synchronous", "NORMAL")
+            .pragma_update(None, "synchronous", "FULL")
             .map_err(sql_error)?;
         let store = Self {
             connection: Mutex::new(connection),
@@ -99,6 +100,191 @@ impl SqliteStore {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(sql_error)
+    }
+
+    pub fn upsert_prompt_intent(&self, intent: &PromptIntent) -> PortResult<()> {
+        let payload =
+            serde_json::to_string(intent).map_err(|error| PortError::Adapter(error.to_string()))?;
+        let connection = self.connection.lock().map_err(lock_error)?;
+        connection
+            .execute(
+                "INSERT INTO rust_prompt_intents(intent_id, client_message_id, state, payload_json, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(intent_id) DO UPDATE SET state=excluded.state, payload_json=excluded.payload_json, updated_at_ms=excluded.updated_at_ms",
+                params![intent.intent_id, intent.client_message_id, format!("{:?}", intent.state).to_ascii_lowercase(), payload, intent.created_at_ms, intent.updated_at_ms],
+            )
+            .map_err(sql_error)?;
+        Ok(())
+    }
+
+    pub fn prompt_intent_by_client_message_id(
+        &self,
+        client_message_id: &str,
+    ) -> PortResult<Option<PromptIntent>> {
+        let connection = self.connection.lock().map_err(lock_error)?;
+        let payload = connection
+            .query_row(
+                "SELECT payload_json FROM rust_prompt_intents WHERE client_message_id=?1",
+                params![client_message_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        payload
+            .map(|value| {
+                serde_json::from_str(&value).map_err(|error| PortError::Adapter(error.to_string()))
+            })
+            .transpose()
+    }
+
+    pub fn upsert_question(&self, request: &QuestionRequest) -> PortResult<()> {
+        let payload = serde_json::to_string(request)
+            .map_err(|error| PortError::Adapter(error.to_string()))?;
+        let generation = i64::try_from(request.generation)
+            .map_err(|_| PortError::Adapter("question generation exceeds SQLite range".into()))?;
+        let connection = self.connection.lock().map_err(lock_error)?;
+        connection
+            .execute(
+                "INSERT INTO rust_pending_questions(request_key, generation, status, payload_json, response_json, created_at_ms, updated_at_ms) VALUES (?1, ?2, 'pending', ?3, NULL, ?4, ?5) ON CONFLICT(request_key) DO UPDATE SET generation=excluded.generation, payload_json=excluded.payload_json, updated_at_ms=excluded.updated_at_ms",
+                params![request.request_key, generation, payload, now_ms(), now_ms()],
+            )
+            .map_err(sql_error)?;
+        Ok(())
+    }
+
+    pub fn resolve_question(
+        &self,
+        request_key: &str,
+        response: &serde_json::Value,
+        resolved_at_ms: i64,
+    ) -> PortResult<()> {
+        let payload = serde_json::to_string(response)
+            .map_err(|error| PortError::Adapter(error.to_string()))?;
+        let connection = self.connection.lock().map_err(lock_error)?;
+        let changed = connection
+            .execute(
+                "UPDATE rust_pending_questions SET status='resolved', response_json=?2, updated_at_ms=?3 WHERE request_key=?1 AND status='pending'",
+                params![request_key, payload, resolved_at_ms],
+            )
+            .map_err(sql_error)?;
+        if changed == 0 {
+            return Err(PortError::Conflict(
+                "question is missing or already resolved".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn upsert_plan_publication(&self, publication: &PlanPublication) -> PortResult<()> {
+        let payload = serde_json::to_string(publication)
+            .map_err(|error| PortError::Adapter(error.to_string()))?;
+        let generation = i64::try_from(publication.generation)
+            .map_err(|_| PortError::Adapter("plan generation exceeds SQLite range".into()))?;
+        let connection = self.connection.lock().map_err(lock_error)?;
+        connection
+            .execute(
+                "INSERT INTO rust_plan_publications(space_id, generation, item_id, revision_key, status, payload_json, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT(space_id, generation, item_id, revision_key) DO UPDATE SET status=excluded.status, payload_json=excluded.payload_json, updated_at_ms=excluded.updated_at_ms",
+                params![publication.space_id, generation, publication.item_id, publication.revision_key, format!("{:?}", publication.status).to_ascii_lowercase(), payload, publication.updated_at_ms],
+            )
+            .map_err(sql_error)?;
+        Ok(())
+    }
+
+    /// Stores controller-owned state without coupling the SQLite adapter to
+    /// Telegram presentation types.  The v4 legacy-record table is also the
+    /// durable handoff boundary used by the Python importer, so workflow
+    /// records remain recoverable across a daemon restart without a schema
+    /// fork.
+    pub fn upsert_workflow_record(
+        &self,
+        kind: &str,
+        key: &str,
+        payload: &serde_json::Value,
+        updated_at_ms: i64,
+    ) -> PortResult<()> {
+        if kind.trim().is_empty() || key.trim().is_empty() {
+            return Err(PortError::Adapter(
+                "workflow record key cannot be empty".into(),
+            ));
+        }
+        let row_json = serde_json::to_string(payload)
+            .map_err(|error| PortError::Adapter(format!("serialize workflow record: {error}")))?;
+        let mut digest = sha2::Sha256::new();
+        use sha2::Digest;
+        digest.update(row_json.as_bytes());
+        let row_sha256 = format!("{:x}", digest.finalize());
+        let connection = self.connection.lock().map_err(lock_error)?;
+        connection
+            .execute(
+                "INSERT INTO rust_legacy_records(table_name, row_key, source_schema_version, row_json, row_sha256, imported_at_ms) VALUES (?1, ?2, -1, ?3, ?4, ?5) ON CONFLICT(table_name, row_key) DO UPDATE SET row_json=excluded.row_json, row_sha256=excluded.row_sha256, imported_at_ms=excluded.imported_at_ms",
+                params![format!("rust_workflow:{kind}"), key, row_json, row_sha256, updated_at_ms],
+            )
+            .map_err(sql_error)?;
+        Ok(())
+    }
+
+    pub fn workflow_record(&self, kind: &str, key: &str) -> PortResult<Option<serde_json::Value>> {
+        let connection = self.connection.lock().map_err(lock_error)?;
+        let row_json = connection
+            .query_row(
+                "SELECT row_json FROM rust_legacy_records WHERE table_name=?1 AND row_key=?2",
+                params![format!("rust_workflow:{kind}"), key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        row_json
+            .map(|value| {
+                serde_json::from_str(&value).map_err(|error| PortError::Adapter(error.to_string()))
+            })
+            .transpose()
+    }
+
+    pub fn workflow_records(&self, kind: &str) -> PortResult<Vec<(String, serde_json::Value)>> {
+        let connection = self.connection.lock().map_err(lock_error)?;
+        let mut statement = connection
+            .prepare(
+                "SELECT row_key, row_json FROM rust_legacy_records WHERE table_name=?1 ORDER BY imported_at_ms, row_key",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map(params![format!("rust_workflow:{kind}")], |row| {
+                let key: String = row.get(0)?;
+                let payload: String = row.get(1)?;
+                Ok((key, payload))
+            })
+            .map_err(sql_error)?;
+        let mut records = Vec::new();
+        for row in rows {
+            let (key, payload) = row.map_err(sql_error)?;
+            let payload = serde_json::from_str(&payload)
+                .map_err(|error| PortError::Adapter(error.to_string()))?;
+            records.push((key, payload));
+        }
+        Ok(records)
+    }
+
+    pub fn delete_workflow_record(&self, kind: &str, key: &str) -> PortResult<bool> {
+        let connection = self.connection.lock().map_err(lock_error)?;
+        let changed = connection
+            .execute(
+                "DELETE FROM rust_legacy_records WHERE table_name=?1 AND row_key=?2",
+                params![format!("rust_workflow:{kind}"), key],
+            )
+            .map_err(sql_error)?;
+        Ok(changed == 1)
+    }
+
+    /// Returns paths retained by durable artifact records so maintenance can
+    /// avoid deleting files that are still addressable from a Session.
+    pub fn artifact_paths(&self) -> PortResult<Vec<PathBuf>> {
+        let connection = self.connection.lock().map_err(lock_error)?;
+        let mut statement = connection
+            .prepare("SELECT path FROM artifacts ORDER BY created_at_ms, id")
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(sql_error)?;
+        rows.map(|row| row.map(PathBuf::from).map_err(sql_error))
+            .collect()
     }
 
     /// Idempotently records an update before it reaches a controller. The
@@ -199,6 +385,41 @@ impl SqliteStore {
         Ok(spaces)
     }
 
+    /// Returns every non-closed Telegram SessionSpace, including pending
+    /// spaces waiting for discussion-thread TOTP activation.
+    pub fn session_spaces(&self) -> PortResult<Vec<RustSessionSpace>> {
+        let connection = self.connection.lock().map_err(lock_error)?;
+        let mut statement = connection
+            .prepare(
+                "SELECT space_id, thread_id, lifecycle, generation, channel_chat_id, channel_post_id, discussion_chat_id, discussion_root_message_id, status_message_id, status_bot_instance, owner_chat_id, plan_mode, created_at_ms, updated_at_ms FROM rust_session_spaces WHERE lifecycle != 'closed' ORDER BY updated_at_ms, space_id",
+            )
+            .map_err(sql_error)?;
+        let mut rows = statement.query([]).map_err(sql_error)?;
+        let mut spaces = Vec::new();
+        while let Some(row) = rows.next().map_err(sql_error)? {
+            spaces.push(row_to_space(row).map_err(sql_error)?);
+        }
+        Ok(spaces)
+    }
+
+    /// Finds the newest pending space in a linked discussion chat.  The
+    /// command router supplies the precise comment root when available; this
+    /// fallback keeps pending activation recoverable after a process restart.
+    pub fn pending_session_space_for_discussion(
+        &self,
+        discussion_chat_id: i64,
+    ) -> PortResult<Option<RustSessionSpace>> {
+        let connection = self.connection.lock().map_err(lock_error)?;
+        connection
+            .query_row(
+                "SELECT space_id, thread_id, lifecycle, generation, channel_chat_id, channel_post_id, discussion_chat_id, discussion_root_message_id, status_message_id, status_bot_instance, owner_chat_id, plan_mode, created_at_ms, updated_at_ms FROM rust_session_spaces WHERE discussion_chat_id=?1 AND lifecycle IN ('pending', 'repair_required') ORDER BY updated_at_ms DESC, space_id DESC LIMIT 1",
+                params![discussion_chat_id],
+                row_to_space,
+            )
+            .optional()
+            .map_err(sql_error)
+    }
+
     pub fn session_space_for_thread(
         &self,
         thread_id: &str,
@@ -264,6 +485,36 @@ impl SqliteStore {
             .execute(
                 "UPDATE rust_security_state SET last_timecode=?1, unlocked_until_ms=?2, force_locked=0 WHERE id=1",
                 params![timecode, now_ms.saturating_add(unlock_seconds.saturating_mul(1000))],
+            )
+            .map_err(sql_error)?;
+        transaction.commit().map_err(sql_error)?;
+        Ok(true)
+    }
+
+    /// Accepts a timecode for a process-local Session lease.  The durable
+    /// state only records single-use/revocation metadata; it deliberately does
+    /// not open the legacy global lease.
+    pub fn accept_totp_timecode_for_space(&self, timecode: i64) -> PortResult<bool> {
+        if timecode < 0 {
+            return Err(PortError::Adapter("invalid TOTP timecode".into()));
+        }
+        let mut connection = self.connection.lock().map_err(lock_error)?;
+        let transaction = connection.transaction().map_err(sql_error)?;
+        let last: i64 = transaction
+            .query_row(
+                "SELECT last_timecode FROM rust_security_state WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?;
+        if timecode <= last {
+            transaction.commit().map_err(sql_error)?;
+            return Ok(false);
+        }
+        transaction
+            .execute(
+                "UPDATE rust_security_state SET last_timecode=?1, unlocked_until_ms=0, force_locked=0 WHERE id=1",
+                params![timecode],
             )
             .map_err(sql_error)?;
         transaction.commit().map_err(sql_error)?;
@@ -354,19 +605,130 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// Atomically consumes a callback once. A stale generation or expired nonce
-    /// is treated as absent so it can never affect a rebuilt comment thread.
-    pub fn take_callback(&self, nonce: &str, now_ms: i64) -> PortResult<Option<StoredCallback>> {
+    /// Retire only the status-surface callbacks for one SessionSpace before a
+    /// fresh keyboard is rendered. Plan, question, and approval callbacks use
+    /// different JSON payloads and remain valid until their own scope expires.
+    pub fn retire_status_callbacks(&self, space_id: &str, generation: i64) -> PortResult<usize> {
         let mut connection = self.connection.lock().map_err(lock_error)?;
         let transaction = connection.transaction().map_err(sql_error)?;
-        let callback = transaction
+        let mut statement = transaction
+            .prepare(
+                "SELECT nonce, action FROM rust_callbacks WHERE space_id=?1 AND generation=?2 AND consumed_at_ms IS NULL",
+            )
+            .map_err(sql_error)?;
+        let callbacks = statement
+            .query_map(params![space_id, generation], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(sql_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sql_error)?;
+        drop(statement);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
+        let mut retired = 0usize;
+        for (nonce, action) in callbacks {
+            let is_status = serde_json::from_str::<serde_json::Value>(&action)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("action")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .is_some_and(|value| {
+                    matches!(
+                        value.as_str(),
+                        "space_refresh"
+                            | "space_unwatch"
+                            | "status_unwatch_execute"
+                            | "status_unwatch_cancel"
+                    )
+                });
+            if is_status {
+                retired += transaction
+                    .execute(
+                        "UPDATE rust_callbacks SET consumed_at_ms=?1 WHERE nonce=?2 AND consumed_at_ms IS NULL",
+                        params![now, nonce],
+                    )
+                    .map_err(sql_error)?;
+            }
+        }
+        transaction.commit().map_err(sql_error)?;
+        Ok(retired)
+    }
+
+    pub fn peek_callback(&self, nonce: &str, now_ms: i64) -> PortResult<Option<StoredCallback>> {
+        let connection = self.connection.lock().map_err(lock_error)?;
+        connection
             .query_row(
                 "SELECT nonce, space_id, generation, action, expires_at_ms FROM rust_callbacks WHERE nonce=?1 AND consumed_at_ms IS NULL AND expires_at_ms>=?2",
                 params![nonce, now_ms],
                 |row| Ok(StoredCallback { nonce: row.get(0)?, space_id: row.get(1)?, generation: row.get(2)?, action: row.get(3)?, expires_at_ms: row.get(4)? }),
             )
             .optional()
+            .map_err(sql_error)
+    }
+
+    /// Atomically consumes a callback once. A stale generation or expired nonce
+    /// is treated as absent so it can never affect a rebuilt comment thread.
+    pub fn take_callback(&self, nonce: &str, now_ms: i64) -> PortResult<Option<StoredCallback>> {
+        self.take_callback_scoped(nonce, now_ms, None, None)
+    }
+
+    /// Consumes a callback only when its persisted space and generation still
+    /// match the caller.  The scope is part of the SQL predicate so a callback
+    /// arriving from another chat cannot be burned before validation.
+    pub fn take_callback_scoped(
+        &self,
+        nonce: &str,
+        now_ms: i64,
+        expected_space_id: Option<&str>,
+        expected_generation: Option<i64>,
+    ) -> PortResult<Option<StoredCallback>> {
+        let mut connection = self.connection.lock().map_err(lock_error)?;
+        let transaction = connection.transaction().map_err(sql_error)?;
+        let mut query = String::from(
+            "SELECT nonce, space_id, generation, action, expires_at_ms FROM rust_callbacks WHERE nonce=?1 AND consumed_at_ms IS NULL AND expires_at_ms>=?2",
+        );
+        if expected_space_id.is_some() {
+            query.push_str(" AND space_id=?3");
+        }
+        if expected_generation.is_some() {
+            query.push_str(if expected_space_id.is_some() {
+                " AND generation=?4"
+            } else {
+                " AND generation=?3"
+            });
+        }
+        let mut statement = transaction.prepare(&query).map_err(sql_error)?;
+        let mut values: Vec<Box<dyn rusqlite::ToSql>> =
+            vec![Box::new(nonce.to_owned()), Box::new(now_ms)];
+        if let Some(space_id) = expected_space_id {
+            values.push(Box::new(space_id.to_owned()));
+        }
+        if let Some(generation) = expected_generation {
+            values.push(Box::new(generation));
+        }
+        let callback = statement
+            .query_row(
+                rusqlite::params_from_iter(values.iter().map(|value| value.as_ref())),
+                |row| {
+                    Ok(StoredCallback {
+                        nonce: row.get(0)?,
+                        space_id: row.get(1)?,
+                        generation: row.get(2)?,
+                        action: row.get(3)?,
+                        expires_at_ms: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
             .map_err(sql_error)?;
+        drop(statement);
         let Some(callback) = callback else {
             transaction.commit().map_err(sql_error)?;
             return Ok(None);
@@ -504,6 +866,61 @@ impl SqliteStore {
                     ) STRICT;
                     INSERT INTO rust_security_state(id, last_timecode, unlocked_until_ms, force_locked, auth_epoch)
                         VALUES (1, -1, 0, 1, 0);
+                    ",
+                )
+                .map_err(sql_error)?;
+        }
+        if version < 4 {
+            transaction
+                .execute_batch(
+                    "
+                    CREATE TABLE rust_legacy_records (
+                        table_name TEXT NOT NULL,
+                        row_key TEXT NOT NULL,
+                        source_schema_version INTEGER NOT NULL,
+                        row_json TEXT NOT NULL,
+                        row_sha256 TEXT NOT NULL,
+                        imported_at_ms INTEGER NOT NULL,
+                        PRIMARY KEY(table_name, row_key)
+                    ) STRICT;
+                    CREATE INDEX rust_legacy_records_by_table
+                        ON rust_legacy_records(table_name, row_key);
+                    CREATE TABLE rust_import_metadata (
+                        singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                        source_schema_version INTEGER NOT NULL,
+                        source_path_sha256 TEXT NOT NULL,
+                        imported_at_ms INTEGER NOT NULL,
+                        report_json TEXT NOT NULL
+                    ) STRICT;
+                    CREATE TABLE rust_prompt_intents (
+                        intent_id TEXT PRIMARY KEY NOT NULL,
+                        client_message_id TEXT NOT NULL UNIQUE,
+                        state TEXT NOT NULL,
+                        payload_json TEXT NOT NULL,
+                        created_at_ms INTEGER NOT NULL,
+                        updated_at_ms INTEGER NOT NULL
+                    ) STRICT;
+                    CREATE INDEX rust_prompt_intents_by_state
+                        ON rust_prompt_intents(state, updated_at_ms);
+                    CREATE TABLE rust_pending_questions (
+                        request_key TEXT PRIMARY KEY NOT NULL,
+                        generation INTEGER NOT NULL,
+                        status TEXT NOT NULL,
+                        payload_json TEXT NOT NULL,
+                        response_json TEXT,
+                        created_at_ms INTEGER NOT NULL,
+                        updated_at_ms INTEGER NOT NULL
+                    ) STRICT;
+                    CREATE TABLE rust_plan_publications (
+                        space_id TEXT NOT NULL,
+                        generation INTEGER NOT NULL,
+                        item_id TEXT NOT NULL,
+                        revision_key TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        payload_json TEXT NOT NULL,
+                        updated_at_ms INTEGER NOT NULL,
+                        PRIMARY KEY(space_id, generation, item_id, revision_key)
+                    ) STRICT;
                     ",
                 )
                 .map_err(sql_error)?;
@@ -753,6 +1170,14 @@ fn sql_error(error: rusqlite::Error) -> PortError {
     }
 }
 
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -881,6 +1306,32 @@ mod tests {
     }
 
     #[test]
+    fn pending_spaces_are_listed_and_resolved_by_discussion_chat() {
+        let store = SqliteStore::in_memory().unwrap();
+        store.upsert_session_space(&space()).unwrap();
+        let mut pending = space();
+        pending.space_id = "pending-1".into();
+        pending.thread_id = None;
+        pending.lifecycle = "pending".into();
+        pending.channel_post_id = 82;
+        pending.discussion_chat_id = Some(-1004290500369);
+        pending.discussion_root_message_id = Some(700);
+        pending.updated_at_ms = 20;
+        store.upsert_session_space(&pending).unwrap();
+
+        let spaces = store.session_spaces().unwrap();
+        assert_eq!(spaces.len(), 2);
+        assert_eq!(
+            store
+                .pending_session_space_for_discussion(-1004290500369)
+                .unwrap()
+                .unwrap()
+                .space_id,
+            "pending-1"
+        );
+    }
+
+    #[test]
     fn update_deduplication_advances_a_per_bot_offset_once() {
         let store = SqliteStore::in_memory().unwrap();
         assert!(store.record_processed_update("control", 99, 10).unwrap());
@@ -904,5 +1355,31 @@ mod tests {
         store.create_callback(&callback).unwrap();
         assert_eq!(store.take_callback("nonce-1", 15).unwrap(), Some(callback));
         assert_eq!(store.take_callback("nonce-1", 16).unwrap(), None);
+    }
+
+    #[test]
+    fn status_callback_retirement_preserves_plan_callbacks() {
+        let store = SqliteStore::in_memory().unwrap();
+        store.upsert_session_space(&space()).unwrap();
+        let status = StoredCallback {
+            nonce: "status-1".into(),
+            space_id: "space-1".into(),
+            generation: 0,
+            action: serde_json::json!({"action":"space_refresh"}).to_string(),
+            expires_at_ms: i64::MAX,
+        };
+        let plan = StoredCallback {
+            nonce: "plan-1".into(),
+            space_id: "space-1".into(),
+            generation: 0,
+            action: serde_json::json!({"decision":"execute"}).to_string(),
+            expires_at_ms: i64::MAX,
+        };
+        store.create_callback(&status).unwrap();
+        store.create_callback(&plan).unwrap();
+
+        assert_eq!(store.retire_status_callbacks("space-1", 0).unwrap(), 1);
+        assert_eq!(store.peek_callback("status-1", i64::MAX).unwrap(), None);
+        assert_eq!(store.peek_callback("plan-1", i64::MAX).unwrap(), Some(plan));
     }
 }

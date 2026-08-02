@@ -109,6 +109,16 @@ pub struct TelegramMessage {
     /// Text is normalized from either Bot API `text` or `caption`, matching
     /// the Python command helpers.
     pub text: Option<String>,
+    /// The raw caption is retained so media messages can preserve their
+    /// Python attachment semantics while `text` remains the command surface.
+    pub caption: Option<String>,
+    pub document_file_id: Option<String>,
+    pub document_file_name: Option<String>,
+    pub photo_file_id: Option<String>,
+    /// True when the attachment came from Telegram's `photo` array.  Python
+    /// treats photos as Codex local-image inputs, while documents remain
+    /// ordinary file artifacts.
+    pub is_photo: bool,
     pub actor: TelegramActor,
     pub reply_to_message_id: Option<i64>,
     pub message_thread_id: Option<i64>,
@@ -441,6 +451,8 @@ impl TelegramCommand {
 
     fn into_legacy(self) -> WorkflowCommand {
         match self {
+            Self::Pair => WorkflowCommand::Pair,
+            Self::Bind => WorkflowCommand::Bind,
             Self::New => WorkflowCommand::New,
             Self::Totp => WorkflowCommand::Totp,
             Self::Lock => WorkflowCommand::Lock,
@@ -449,9 +461,17 @@ impl TelegramCommand {
             Self::Help => WorkflowCommand::Help,
             Self::Sessions => WorkflowCommand::Sessions,
             Self::Topics => WorkflowCommand::Topics,
+            Self::Prompt => WorkflowCommand::Prompt,
+            Self::Ask => WorkflowCommand::Ask,
+            Self::Queue => WorkflowCommand::Queue,
             Self::PlanMode => WorkflowCommand::PlanMode,
             Self::ChangeModel => WorkflowCommand::ChangeModel,
+            Self::Plan => WorkflowCommand::Plan,
+            Self::Timeline => WorkflowCommand::Timeline,
+            Self::Attach => WorkflowCommand::Attach,
             Self::GetFile => WorkflowCommand::GetFile,
+            Self::Unwatch => WorkflowCommand::Unwatch,
+            Self::Answer => WorkflowCommand::Answer,
             Self::Review => WorkflowCommand::Review,
             Self::Cancel => WorkflowCommand::Cancel,
             command => WorkflowCommand::Unknown(command.name().to_owned()),
@@ -486,6 +506,8 @@ impl ParsedTelegramCommand {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WorkflowCommand {
+    Pair,
+    Bind,
     New,
     Totp,
     Lock,
@@ -494,9 +516,17 @@ pub enum WorkflowCommand {
     Help,
     Sessions,
     Topics,
+    Prompt,
+    Ask,
+    Queue,
     PlanMode,
     ChangeModel,
+    Plan,
+    Timeline,
+    Attach,
     GetFile,
+    Unwatch,
+    Answer,
     Review,
     Cancel,
     Unknown(String),
@@ -514,7 +544,8 @@ impl WorkflowCommand {
         match role {
             RuntimeBotRole::Control => matches!(
                 self,
-                Self::New
+                Self::Pair
+                    | Self::New
                     | Self::Perf
                     | Self::Help
                     | Self::Sessions
@@ -523,12 +554,21 @@ impl WorkflowCommand {
             ),
             RuntimeBotRole::Discussion => matches!(
                 self,
-                Self::Status
+                Self::Bind
+                    | Self::Status
                     | Self::Totp
                     | Self::Lock
+                    | Self::Prompt
+                    | Self::Ask
+                    | Self::Queue
                     | Self::PlanMode
                     | Self::ChangeModel
+                    | Self::Plan
+                    | Self::Timeline
+                    | Self::Attach
                     | Self::GetFile
+                    | Self::Unwatch
+                    | Self::Answer
                     | Self::Review
                     | Self::Cancel
                     | Self::Help
@@ -549,6 +589,7 @@ pub enum WorkflowEffect {
         chat_id: i64,
         message_id: i64,
         message_thread_id: Option<i64>,
+        root_message_id: Option<i64>,
         text: String,
         actor: TelegramActor,
     },
@@ -557,6 +598,17 @@ pub enum WorkflowEffect {
         message_id: i64,
         message_thread_id: Option<i64>,
         text: String,
+        root_message_id: Option<i64>,
+        actor: TelegramActor,
+    },
+    Attachment {
+        chat_id: i64,
+        message_id: i64,
+        message_thread_id: Option<i64>,
+        caption: Option<String>,
+        file_id: String,
+        file_name: Option<String>,
+        is_photo: bool,
         root_message_id: Option<i64>,
         actor: TelegramActor,
     },
@@ -585,12 +637,14 @@ impl RoutedEffect {
                     command,
                     chat_id,
                     message_id,
+                    root_message_id,
                     text,
                     ..
                 } => WorkflowAction::Command {
                     command: command.into_legacy(),
                     chat_id,
                     message_id,
+                    root_message_id,
                     text,
                 },
                 WorkflowEffect::Prompt {
@@ -603,6 +657,24 @@ impl RoutedEffect {
                     chat_id,
                     message_id,
                     text,
+                    root_message_id,
+                },
+                WorkflowEffect::Attachment {
+                    chat_id,
+                    message_id,
+                    caption,
+                    file_id,
+                    file_name,
+                    is_photo,
+                    root_message_id,
+                    ..
+                } => WorkflowAction::Attachment {
+                    chat_id,
+                    message_id,
+                    caption,
+                    file_id,
+                    file_name,
+                    is_photo,
                     root_message_id,
                 },
                 WorkflowEffect::Callback(callback) => WorkflowAction::Callback(callback),
@@ -629,12 +701,22 @@ pub enum WorkflowAction {
         command: WorkflowCommand,
         chat_id: i64,
         message_id: i64,
+        root_message_id: Option<i64>,
         text: String,
     },
     Prompt {
         chat_id: i64,
         message_id: i64,
         text: String,
+        root_message_id: Option<i64>,
+    },
+    Attachment {
+        chat_id: i64,
+        message_id: i64,
+        caption: Option<String>,
+        file_id: String,
+        file_name: Option<String>,
+        is_photo: bool,
         root_message_id: Option<i64>,
     },
     Callback(TelegramCallback),
@@ -805,9 +887,26 @@ impl UpdateRouter {
         message: TelegramMessage,
         root_message_id: Option<i64>,
     ) -> RoutedEffect {
-        let text = match message.text {
-            Some(text) if !text.trim().is_empty() => text,
-            _ => return RoutedEffect::Ignore,
+        let text = message.text.clone().or_else(|| message.caption.clone());
+        let file_id = message
+            .document_file_id
+            .clone()
+            .or_else(|| message.photo_file_id.clone());
+        if let Some(file_id) = file_id {
+            return RoutedEffect::Dispatch(WorkflowEffect::Attachment {
+                chat_id: message.chat_id,
+                message_id: message.message_id,
+                message_thread_id: message.message_thread_id,
+                caption: message.caption.clone().or(text.clone()),
+                file_id,
+                file_name: message.document_file_name.clone(),
+                is_photo: message.is_photo,
+                root_message_id,
+                actor: message.actor.clone(),
+            });
+        }
+        let Some(text) = text.filter(|text| !text.trim().is_empty()) else {
+            return RoutedEffect::Ignore;
         };
         if let Some(parsed) = ParsedTelegramCommand::parse(&text) {
             if !self
@@ -822,6 +921,7 @@ impl UpdateRouter {
                 chat_id: message.chat_id,
                 message_id: message.message_id,
                 message_thread_id: message.message_thread_id,
+                root_message_id,
                 text,
                 actor: message.actor,
             })
@@ -905,6 +1005,29 @@ fn parse_message(value: &Value) -> Option<TelegramMessage> {
             .or_else(|| value.get("caption"))
             .and_then(Value::as_str)
             .map(str::to_owned),
+        caption: value
+            .get("caption")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        document_file_id: value
+            .pointer("/document/file_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        document_file_name: value
+            .pointer("/document/file_name")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        photo_file_id: value
+            .get("photo")
+            .and_then(Value::as_array)
+            .and_then(|photos| photos.last())
+            .and_then(|photo| photo.get("file_id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        is_photo: value
+            .get("photo")
+            .and_then(Value::as_array)
+            .is_some_and(|photos| !photos.is_empty()),
         actor: TelegramActor {
             user_id: value.pointer("/from/id").and_then(Value::as_i64),
             sender_chat_id: value.pointer("/sender_chat/id").and_then(Value::as_i64),
@@ -1806,6 +1929,15 @@ pub trait TelegramTransport {
     ) -> Result<String, TelegramTransportError> {
         Err(TelegramTransportError::new("multipart-unsupported"))
     }
+
+    fn get_bytes(
+        &self,
+        _api_base: &str,
+        _token: &BotToken,
+        _file_path: &str,
+    ) -> Result<Vec<u8>, TelegramTransportError> {
+        Err(TelegramTransportError::new("download-unsupported"))
+    }
 }
 
 /// Production Telegram Bot API transport. The client uses rustls only, a
@@ -1905,6 +2037,36 @@ impl TelegramTransport for ReqwestTransport {
             .text()
             .map_err(|_| TelegramTransportError::new("response-body"))
     }
+
+    fn get_bytes(
+        &self,
+        api_base: &str,
+        token: &BotToken,
+        file_path: &str,
+    ) -> Result<Vec<u8>, TelegramTransportError> {
+        let url = format!(
+            "{}/file/bot{}/{}",
+            api_base.trim_end_matches('/'),
+            token.as_str(),
+            file_path.trim_start_matches('/')
+        );
+        let response = self.client.get(url).send().map_err(|error| {
+            if error.is_timeout() {
+                TelegramTransportError::new("timeout")
+            } else if error.is_connect() {
+                TelegramTransportError::new("connect")
+            } else {
+                TelegramTransportError::new("request")
+            }
+        })?;
+        if !response.status().is_success() {
+            return Err(TelegramTransportError::new("http-status"));
+        }
+        response
+            .bytes()
+            .map(|bytes| bytes.to_vec())
+            .map_err(|_| TelegramTransportError::new("response-body"))
+    }
 }
 
 fn should_parse_bot_api_response(status: reqwest::StatusCode) -> bool {
@@ -1952,6 +2114,37 @@ where
 
     pub fn get_me(&self, token: &BotToken) -> Result<BotProfile, TelegramError> {
         self.call(token, "getMe", json!({}))
+    }
+
+    pub fn get_file(&self, token: &BotToken, file_id: &str) -> Result<TelegramFile, TelegramError> {
+        if file_id.trim().is_empty() {
+            return Err(TelegramError::InvalidInput("file id cannot be empty"));
+        }
+        self.call(token, "getFile", json!({"file_id": file_id}))
+    }
+
+    pub fn download_file(
+        &self,
+        token: &BotToken,
+        file_path: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, TelegramError> {
+        if file_path.trim().is_empty() {
+            return Err(TelegramError::InvalidInput("file path cannot be empty"));
+        }
+        if max_bytes == 0 {
+            return Err(TelegramError::InvalidInput("download limit cannot be zero"));
+        }
+        let bytes = self
+            .transport
+            .get_bytes(&self.api_base, token, file_path)
+            .map_err(TelegramError::Transport)?;
+        if bytes.len() > max_bytes {
+            return Err(TelegramError::InvalidInput(
+                "download exceeds configured limit",
+            ));
+        }
+        Ok(bytes)
     }
 
     /// `TokenLease` proves this process is the only active long-poll consumer for the token.
@@ -2021,6 +2214,32 @@ where
         self.call_rendered(token, "editMessageText", request, |request| {
             render_edit_text_payload(message, request)
         })
+    }
+
+    /// Edit text while preserving the daemon's JSON keyboard contract.  The
+    /// typed `edit_text` API remains available for callers that already use
+    /// `InlineKeyboardMarkup`; this value-based sibling is used by durable
+    /// callback projections whose markup is stored as JSON alongside state.
+    pub fn edit_text_with_markup(
+        &self,
+        token: &BotToken,
+        message: &TelegramMessageReference,
+        text: &str,
+        reply_markup: Option<Value>,
+    ) -> Result<SentMessage, TelegramError> {
+        if text.is_empty() {
+            return Err(TelegramError::InvalidInput("message text cannot be empty"));
+        }
+        let mut payload = json!({
+            "chat_id": message.chat_id,
+            "message_id": message.message_id,
+            "text": text,
+            "link_preview_options": {"is_disabled": true},
+        });
+        if let Some(reply_markup) = reply_markup {
+            payload["reply_markup"] = reply_markup;
+        }
+        self.call(token, "editMessageText", payload)
     }
 
     pub fn edit_reply_markup(
@@ -2253,18 +2472,36 @@ pub struct BotProfile {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct TelegramFile {
+    pub file_id: String,
+    pub file_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct ChatInfo {
     pub id: i64,
     #[serde(rename = "type")]
     pub chat_type: String,
     #[serde(default)]
     pub is_forum: bool,
+    #[serde(default)]
+    pub linked_chat_id: Option<i64>,
+    #[serde(default)]
+    pub username: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct ChatMemberInfo {
     pub status: String,
     pub user: BotProfile,
+    #[serde(default)]
+    pub can_post_messages: bool,
+    #[serde(default)]
+    pub can_edit_messages: bool,
+    #[serde(default)]
+    pub can_delete_messages: bool,
+    #[serde(default)]
+    pub is_anonymous: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -2974,6 +3211,11 @@ mod tests {
                 chat_kind: TelegramChatKind::Supergroup,
                 message_id: 13,
                 text: Some("/status now".into()),
+                caption: Some("/status now".into()),
+                document_file_id: None,
+                document_file_name: None,
+                photo_file_id: None,
+                is_photo: false,
                 actor: TelegramActor {
                     user_id: Some(77),
                     sender_chat_id: None,

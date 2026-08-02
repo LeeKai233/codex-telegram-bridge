@@ -3,9 +3,10 @@
 use ctg_storage_sqlite::SqliteStore;
 use data_encoding::BASE32_NOPAD_NOCASE;
 use sha1::{Digest, Sha1};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
 const TOTP_INTERVAL_SECONDS: i64 = 30;
@@ -27,6 +28,7 @@ pub struct TotpManager {
     store: Arc<SqliteStore>,
     secret_path: PathBuf,
     unlock_seconds: i64,
+    leases: Mutex<HashMap<String, (i64, i64)>>,
 }
 
 impl TotpManager {
@@ -39,6 +41,7 @@ impl TotpManager {
             store,
             secret_path: secret_path.into(),
             unlock_seconds: i64::try_from(unlock_seconds).unwrap_or(i64::MAX),
+            leases: Mutex::new(HashMap::new()),
         }
     }
 
@@ -49,12 +52,108 @@ impl TotpManager {
     }
 
     pub fn lock(&self) -> Result<(), TotpError> {
+        self.leases
+            .lock()
+            .map_err(|_| TotpError::State("TOTP lease lock poisoned".into()))?
+            .clear();
         self.store
             .lock_totp()
             .map_err(|error| TotpError::State(error.to_string()))
     }
 
+    pub fn lock_space(&self, space_id: &str) -> Result<(), TotpError> {
+        if space_id.trim().is_empty() {
+            return Ok(());
+        }
+        self.leases
+            .lock()
+            .map_err(|_| TotpError::State("TOTP lease lock poisoned".into()))?
+            .remove(space_id);
+        Ok(())
+    }
+
+    pub fn is_unlocked_for_space(&self, space_id: &str, now_ms: i64) -> Result<bool, TotpError> {
+        if space_id.trim().is_empty() {
+            return self.is_unlocked(now_ms);
+        }
+        let state = self
+            .store
+            .totp_state()
+            .map_err(|error| TotpError::State(error.to_string()))?;
+        if state.force_locked {
+            return Ok(false);
+        }
+        let mut leases = self
+            .leases
+            .lock()
+            .map_err(|_| TotpError::State("TOTP lease lock poisoned".into()))?;
+        let Some((unlocked_until_ms, auth_epoch)) = leases.get(space_id).copied() else {
+            return Ok(false);
+        };
+        if auth_epoch != state.auth_epoch || unlocked_until_ms <= now_ms {
+            leases.remove(space_id);
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    pub fn space_unlock_remaining_ms(&self, space_id: &str, now_ms: i64) -> Result<i64, TotpError> {
+        if space_id.trim().is_empty() {
+            let state = self
+                .store
+                .totp_state()
+                .map_err(|error| TotpError::State(error.to_string()))?;
+            let remaining = if state.force_locked {
+                0
+            } else {
+                state.unlocked_until_ms.saturating_sub(now_ms)
+            };
+            return Ok(remaining.max(0));
+        }
+        let state = self
+            .store
+            .totp_state()
+            .map_err(|error| TotpError::State(error.to_string()))?;
+        if state.force_locked {
+            return Ok(0);
+        }
+        let mut leases = self
+            .leases
+            .lock()
+            .map_err(|_| TotpError::State("TOTP lease lock poisoned".into()))?;
+        let Some((unlocked_until_ms, auth_epoch)) = leases.get(space_id).copied() else {
+            return Ok(0);
+        };
+        if auth_epoch != state.auth_epoch || unlocked_until_ms <= now_ms {
+            leases.remove(space_id);
+            return Ok(0);
+        }
+        Ok(unlocked_until_ms.saturating_sub(now_ms))
+    }
+
     pub fn verify_and_unlock(&self, value: &str, now_ms: i64) -> Result<bool, TotpError> {
+        self.verify_and_unlock_inner("__legacy__", value, now_ms, true)
+    }
+
+    pub fn verify_and_unlock_for_space(
+        &self,
+        space_id: &str,
+        value: &str,
+        now_ms: i64,
+    ) -> Result<bool, TotpError> {
+        self.verify_and_unlock_inner(space_id, value, now_ms, false)
+    }
+
+    fn verify_and_unlock_inner(
+        &self,
+        space_id: &str,
+        value: &str,
+        now_ms: i64,
+        global: bool,
+    ) -> Result<bool, TotpError> {
+        if space_id.trim().is_empty() {
+            return Ok(false);
+        }
         let value = value.trim();
         if value.len() != TOTP_DIGITS as usize || !value.bytes().all(|byte| byte.is_ascii_digit()) {
             return Ok(false);
@@ -72,10 +171,32 @@ impl TotpManager {
             }
             let candidate = hotp(&key, candidate_timecode as u64);
             if candidate.as_bytes() == value.as_bytes() {
-                return self
-                    .store
-                    .accept_totp_timecode(candidate_timecode, now_ms, self.unlock_seconds)
-                    .map_err(|error| TotpError::State(error.to_string()));
+                let accepted = if global {
+                    self.store
+                        .accept_totp_timecode(candidate_timecode, now_ms, self.unlock_seconds)
+                } else {
+                    self.store
+                        .accept_totp_timecode_for_space(candidate_timecode)
+                }
+                .map_err(|error| TotpError::State(error.to_string()))?;
+                if accepted {
+                    let auth_epoch = self
+                        .store
+                        .totp_state()
+                        .map_err(|error| TotpError::State(error.to_string()))?
+                        .auth_epoch;
+                    self.leases
+                        .lock()
+                        .map_err(|_| TotpError::State("TOTP lease lock poisoned".into()))?
+                        .insert(
+                            space_id.to_owned(),
+                            (
+                                now_ms.saturating_add(self.unlock_seconds.saturating_mul(1000)),
+                                auth_epoch,
+                            ),
+                        );
+                }
+                return Ok(accepted);
             }
         }
         Ok(false)
@@ -179,6 +300,33 @@ mod tests {
         assert!(manager.verify_and_unlock(&code, now).unwrap());
         assert!(!manager.verify_and_unlock(&code, now).unwrap());
         assert!(manager.is_unlocked(now + 1000).unwrap());
+        assert!(
+            !manager
+                .is_unlocked_for_space("space-a", now + 1000)
+                .unwrap()
+        );
+        let next_now = now + 31_000;
+        let next_code = hotp(
+            &BASE32_NOPAD_NOCASE.decode(b"JBSWY3DPEHPK3PXP").unwrap(),
+            (next_now / 1000) as u64 / 30,
+        );
+        assert!(
+            manager
+                .verify_and_unlock_for_space("space-a", &next_code, next_now)
+                .unwrap()
+        );
+        assert!(
+            manager
+                .is_unlocked_for_space("space-a", next_now + 1000)
+                .unwrap()
+        );
+        assert!(!manager.is_unlocked(next_now + 1000).unwrap());
+        manager.lock_space("space-a").unwrap();
+        assert!(
+            !manager
+                .is_unlocked_for_space("space-a", next_now + 1000)
+                .unwrap()
+        );
         manager.lock().unwrap();
         assert!(!manager.is_unlocked(now + 1000).unwrap());
         let _ = fs::remove_file(path);
