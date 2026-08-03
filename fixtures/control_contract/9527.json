@@ -1,0 +1,66 @@
+[
+  {
+    "name": "help_paired_markdown_and_plain",
+    "request": {"kind": "help", "label": "9527", "paired": true},
+    "effects": [
+      {"type": "render", "operation": "send", "markdown": "*🤖 9527*\n`/sessions [关键词]`  查找 Codex sessions\n`/topics`  查看 Session 帖子\n`/new [model | effort | ...]`  交互或参数化创建 Session\n`/perf`  动态查看 30 秒 WSL 性能\n`/help`  显示帮助", "plain": "🤖 9527\n/sessions [关键词]  查找 Codex sessions\n/topics  查看 Session 帖子\n/new [model | effort | ...]  交互或参数化创建 Session\n/perf  动态查看 30 秒 WSL 性能\n/help  显示帮助", "keyboard": null}
+    ]
+  },
+  {
+    "name": "sessions_search_deadline_and_logical_callbacks",
+    "request": {"kind": "sessions", "query": "release", "page": 1, "now": 1700000000, "utc_offset_seconds": 28800, "sessions": [{"thread_id": "thread-alpha", "title": "Build release", "status": "active", "turn_status": "inProgress", "lifecycle": "", "active_flags": [], "error": "", "created_at": 1700000000, "updated_at": 1699999880, "cwd": "/workspace/release"}]},
+    "effects": [
+      {"type": "delete_deadline", "targets": ["command", "reply"], "deadline_seconds": 900, "group_key": "sessions"},
+      {"type": "render", "operation": "send", "markdown": "*🤖 Codex Sessions · 1/1*\n搜索 `release`\n\n① 🟢 `thread-alpha`\n📝 Build release\n🗓 Created `11-15 06:13` · Updated `2m ago`\n📁 `/workspace/release`", "plain": "🤖 Codex Sessions · 1/1\n搜索 release\n\n① 🟢 thread-alpha\n📝 Build release\n🗓 Created 11-15 06:13 · Updated 2m ago\n📁 /workspace/release", "keyboard": [[{"label": "①", "target": {"kind": "callback", "action": "session_detail", "payload": {"thread_id": "thread-alpha"}}}], [{"label": "1", "target": {"kind": "callback", "action": "sessions_current", "payload": {"page": "1", "query": "release"}}}]]},
+      {"type": "session_refresh", "after_seconds": 5}
+    ]
+  },
+  {
+    "name": "topics_markdown_and_url_buttons",
+    "request": {"kind": "topics", "topics": [{"title": "Release status", "lifecycle": "active", "url": "https://example.invalid/posts/1"}]},
+    "effects": [
+      {"type": "render", "operation": "send", "markdown": "*🤖 Session 帖子*\n1\\. Release status · `active`", "plain": null, "keyboard": [[{"label": "打开 1", "target": {"kind": "url", "url": "https://example.invalid/posts/1"}}]]}
+    ]
+  },
+  {
+    "name": "new_model_choices_deadline_and_rows",
+    "request": {"kind": "new", "draft": {"phase": "normal_model"}, "models": [{"model": "gpt-5.6-luna", "display_name": "GPT 5.6 Luna", "supported_efforts": ["low", "max"]}, {"model": "gpt-5.6-sol", "display_name": "GPT 5.6 Sol", "supported_efforts": ["high", "xhigh"]}]},
+    "effects": [
+      {"type": "interaction_deadline", "phase": "normal_model", "deadline_seconds": 300},
+      {"type": "render", "operation": "send", "markdown": "请选择 当前模式 使用的模型：", "plain": null, "keyboard": [[{"label": "GPT 5.6 Luna", "target": {"kind": "callback", "action": "normal_model", "payload": {"value": "gpt-5.6-luna"}}}, {"label": "GPT 5.6 Sol", "target": {"kind": "callback", "action": "normal_model", "payload": {"value": "gpt-5.6-sol"}}}], [{"label": "退出", "target": {"kind": "callback", "action": "cancel", "payload": {}}}]]}
+    ]
+  },
+  {
+    "name": "new_callback_model_selection_marks_old_choice_and_shows_efforts",
+    "request": {"kind": "new_callback", "draft": {"phase": "normal_model"}, "event": "normal_model", "value": "gpt-5.6-luna", "models": [{"model": "gpt-5.6-luna", "display_name": "GPT 5.6 Luna", "supported_efforts": ["low", "max"]}]},
+    "effects": [
+      {"type": "callback_answer", "text": null, "show_alert": false},
+      {"type": "render", "operation": "edit", "markdown": "已选择模型 `gpt-5.6-luna`。", "plain": "已选择模型 gpt-5.6-luna。", "keyboard": null},
+      {"type": "interaction_deadline", "phase": "normal_effort", "deadline_seconds": 300},
+      {"type": "render", "operation": "send", "markdown": "模型 `gpt-5.6-luna` 支持以下 effort：", "plain": null, "keyboard": [[{"label": "low", "target": {"kind": "callback", "action": "normal_effort", "payload": {"value": "low"}}}, {"label": "max", "target": {"kind": "callback", "action": "normal_effort", "payload": {"value": "max"}}}], [{"label": "退出", "target": {"kind": "callback", "action": "cancel", "payload": {}}}]]}
+    ]
+  },
+  {
+    "name": "perf_markdown_plain_and_deadlines",
+    "request": {"kind": "perf", "frame": 0, "markdown_body": "CPU `12.0%`", "plain_body": "CPU 12.0%"},
+    "effects": [
+      {"type": "render", "operation": "send", "markdown": "*🕛 动态性能*\nCPU `12.0%`", "plain": "🕛 动态性能\nCPU 12.0%", "keyboard": null},
+      {"type": "delete_deadline", "targets": ["command", "reply"], "deadline_seconds": 30, "group_key": "perf"},
+      {"type": "perf_ticker", "deadline_seconds": 30, "update_seconds": 5}
+    ]
+  },
+  {
+    "name": "expired_callback_alert",
+    "request": {"kind": "callback", "disposition": "missing"},
+    "effects": [
+      {"type": "callback_answer", "text": "按钮已使用或过期，请重新执行命令。", "show_alert": true}
+    ]
+  },
+  {
+    "name": "queue_full_callback_alert",
+    "request": {"kind": "callback", "disposition": "queue_full"},
+    "effects": [
+      {"type": "callback_answer", "text": "请求队列已满，请稍后重试。", "show_alert": true}
+    ]
+  }
+]

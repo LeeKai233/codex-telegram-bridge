@@ -125,8 +125,12 @@ pub trait AgentBackend: Send + Sync {
     ) -> PortResult<TurnId>;
     async fn respond(&self, request_id: Value, result: Value) -> PortResult<()>;
     async fn respond_error(&self, request_id: Value, code: i64, message: &str) -> PortResult<()>;
-    fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<AgentEvent>;
-    fn subscribe_server_requests(&self) -> tokio::sync::broadcast::Receiver<AgentServerRequest>;
+    /// The transport owns one bounded delivery queue for each stream.  A
+    /// receiver must be taken by the runtime before processing updates; the
+    /// bounded queue applies backpressure to the JSON-RPC reader instead of
+    /// dropping notifications when the controller is busy.
+    fn subscribe_events(&self) -> tokio::sync::mpsc::Receiver<AgentEvent>;
+    fn subscribe_server_requests(&self) -> tokio::sync::mpsc::Receiver<AgentServerRequest>;
 }
 
 /// Optional physical approval channel. The core remains usable when no

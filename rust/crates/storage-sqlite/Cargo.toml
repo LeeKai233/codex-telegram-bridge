@@ -9,5 +9,6 @@ repository.workspace = true
 ctg-domain = { path = "../domain" }
 ctg-ports = { path = "../ports" }
 rusqlite = { version = "0.39", features = ["bundled"] }
+serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

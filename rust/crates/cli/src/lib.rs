@@ -6,9 +6,11 @@ use codex_telegram_adapter::{
 use codex_telegram_credentials::CredentialFiles;
 pub mod alerts;
 pub mod config;
+pub mod control;
 pub mod daemon;
 pub mod metrics;
 pub mod migration;
+pub mod perf;
 pub mod replay;
 pub mod security;
 

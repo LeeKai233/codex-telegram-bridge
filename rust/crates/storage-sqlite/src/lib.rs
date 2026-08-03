@@ -6,13 +6,17 @@ use ctg_domain::{
 };
 use ctg_ports::{ApprovalStore, ArtifactStore, EventLog, PortError, PortResult, SessionRepository};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// This is deliberately independent from the Python bridge schema. Rust
 /// deployments receive a new database path and never migrate Python state.
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
+const DELETION_CLAIM_LEASE_MS: i64 = 60_000;
+const CONTROL_CLAIM_LEASE_MS: i64 = 60_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RustSessionSpace {
@@ -55,6 +59,49 @@ pub struct TotpState {
     pub unlocked_until_ms: i64,
     pub force_locked: bool,
     pub auth_epoch: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ControlInteraction {
+    pub scope_key: String,
+    pub kind: String,
+    pub revision: i64,
+    pub phase: String,
+    pub payload: Value,
+    pub user_id: i64,
+    pub chat_id: i64,
+    pub message_id: Option<i64>,
+    pub expires_at_ms: i64,
+    pub claimed_at_ms: Option<i64>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ControlCallback {
+    pub nonce: String,
+    pub scope_key: Option<String>,
+    pub revision: Option<i64>,
+    pub user_id: i64,
+    pub chat_id: i64,
+    pub action: String,
+    pub payload: Value,
+    pub expires_at_ms: i64,
+    pub consumed_at_ms: Option<i64>,
+    pub invalidated_at_ms: Option<i64>,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScheduledDeletion {
+    pub bot_instance_id: String,
+    pub chat_id: i64,
+    pub message_id: i64,
+    pub group_key: String,
+    pub delete_at_ms: i64,
+    pub attempts: i64,
+    pub claimed_at_ms: Option<i64>,
+    pub last_error_class: Option<String>,
 }
 
 pub struct SqliteStore {
@@ -273,6 +320,461 @@ impl SqliteStore {
         Ok(changed == 1)
     }
 
+    /// Replaces one control interaction and invalidates callbacks issued by
+    /// its previous revision in the same transaction.  This is the durable
+    /// race boundary for `/new`: a timeout, text message, and callback can all
+    /// observe the same revision, but only one conditional claim succeeds.
+    #[allow(clippy::too_many_arguments)]
+    pub fn replace_control_interaction(
+        &self,
+        scope_key: &str,
+        kind: &str,
+        phase: &str,
+        payload: &Value,
+        user_id: i64,
+        chat_id: i64,
+        message_id: Option<i64>,
+        expires_at_ms: i64,
+        now_ms: i64,
+    ) -> PortResult<ControlInteraction> {
+        if scope_key.trim().is_empty() || kind.trim().is_empty() || phase.trim().is_empty() {
+            return Err(PortError::Adapter(
+                "control interaction keys cannot be empty".into(),
+            ));
+        }
+        let payload_json = serde_json::to_string(payload).map_err(|error| {
+            PortError::Adapter(format!("serialize control interaction: {error}"))
+        })?;
+        let mut connection = self.connection.lock().map_err(lock_error)?;
+        let transaction = connection.transaction().map_err(sql_error)?;
+        transaction
+            .execute(
+                "UPDATE rust_control_callbacks SET invalidated_at_ms=?1 WHERE scope_key=?2 AND consumed_at_ms IS NULL AND invalidated_at_ms IS NULL",
+                params![now_ms, scope_key],
+            )
+            .map_err(sql_error)?;
+        let existing = transaction
+            .query_row(
+                "SELECT revision, created_at_ms FROM rust_control_interactions WHERE scope_key=?1",
+                params![scope_key],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        let revision = existing.map_or(1, |(revision, _)| revision.saturating_add(1));
+        let created_at_ms = existing.map_or(now_ms, |(_, created_at_ms)| created_at_ms);
+        transaction
+            .execute(
+                "INSERT INTO rust_control_interactions(scope_key, kind, revision, phase, payload_json, user_id, chat_id, message_id, expires_at_ms, claimed_at_ms, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?10) ON CONFLICT(scope_key) DO UPDATE SET kind=excluded.kind, revision=excluded.revision, phase=excluded.phase, payload_json=excluded.payload_json, user_id=excluded.user_id, chat_id=excluded.chat_id, message_id=excluded.message_id, expires_at_ms=excluded.expires_at_ms, claimed_at_ms=NULL, updated_at_ms=excluded.updated_at_ms",
+                params![
+                    scope_key,
+                    kind,
+                    revision,
+                    phase,
+                    payload_json,
+                    user_id,
+                    chat_id,
+                    message_id,
+                    expires_at_ms,
+                    created_at_ms,
+                ],
+            )
+            .map_err(sql_error)?;
+        transaction.commit().map_err(sql_error)?;
+        Ok(ControlInteraction {
+            scope_key: scope_key.to_owned(),
+            kind: kind.to_owned(),
+            revision,
+            phase: phase.to_owned(),
+            payload: payload.clone(),
+            user_id,
+            chat_id,
+            message_id,
+            expires_at_ms,
+            claimed_at_ms: None,
+            created_at_ms,
+            updated_at_ms: now_ms,
+        })
+    }
+
+    /// Advances an interaction only when the caller still owns the revision it
+    /// read.  Callback rows from that revision are invalidated in the same
+    /// transaction, so two concurrent `/new` choices cannot overwrite one
+    /// another.
+    #[allow(clippy::too_many_arguments)]
+    pub fn advance_control_interaction(
+        &self,
+        scope_key: &str,
+        expected_revision: i64,
+        phase: &str,
+        payload: &Value,
+        user_id: i64,
+        chat_id: i64,
+        message_id: Option<i64>,
+        expires_at_ms: i64,
+        now_ms: i64,
+    ) -> PortResult<Option<ControlInteraction>> {
+        if scope_key.trim().is_empty() || phase.trim().is_empty() {
+            return Err(PortError::Adapter(
+                "control interaction keys cannot be empty".into(),
+            ));
+        }
+        let payload_json = serde_json::to_string(payload).map_err(|error| {
+            PortError::Adapter(format!("serialize control interaction: {error}"))
+        })?;
+        let mut connection = self.connection.lock().map_err(lock_error)?;
+        let transaction = connection.transaction().map_err(sql_error)?;
+        let changed = transaction
+            .execute(
+                "UPDATE rust_control_interactions SET revision=revision+1, phase=?1, payload_json=?2, user_id=?3, chat_id=?4, message_id=?5, expires_at_ms=?6, claimed_at_ms=NULL, updated_at_ms=?7 WHERE scope_key=?8 AND revision=?9 AND user_id=?3 AND chat_id=?4 AND claimed_at_ms IS NULL AND expires_at_ms>?7",
+                params![
+                    phase,
+                    payload_json,
+                    user_id,
+                    chat_id,
+                    message_id,
+                    expires_at_ms,
+                    now_ms,
+                    scope_key,
+                    expected_revision,
+                ],
+            )
+            .map_err(sql_error)?;
+        if changed == 0 {
+            transaction.commit().map_err(sql_error)?;
+            return Ok(None);
+        }
+        transaction
+            .execute(
+                "UPDATE rust_control_callbacks SET invalidated_at_ms=?1 WHERE scope_key=?2 AND revision=?3 AND consumed_at_ms IS NULL AND invalidated_at_ms IS NULL",
+                params![now_ms, scope_key, expected_revision],
+            )
+            .map_err(sql_error)?;
+        let interaction = transaction
+            .query_row(
+                "SELECT scope_key, kind, revision, phase, payload_json, user_id, chat_id, message_id, expires_at_ms, claimed_at_ms, created_at_ms, updated_at_ms FROM rust_control_interactions WHERE scope_key=?1",
+                params![scope_key],
+                control_interaction_from_row,
+            )
+            .map_err(sql_error)?;
+        transaction.commit().map_err(sql_error)?;
+        Ok(Some(interaction))
+    }
+
+    pub fn control_interaction(&self, scope_key: &str) -> PortResult<Option<ControlInteraction>> {
+        let connection = self.connection.lock().map_err(lock_error)?;
+        connection
+            .query_row(
+                "SELECT scope_key, kind, revision, phase, payload_json, user_id, chat_id, message_id, expires_at_ms, claimed_at_ms, created_at_ms, updated_at_ms FROM rust_control_interactions WHERE scope_key=?1",
+                params![scope_key],
+                control_interaction_from_row,
+            )
+            .optional()
+            .map_err(sql_error)
+    }
+
+    pub fn control_interactions(&self, kind: &str) -> PortResult<Vec<ControlInteraction>> {
+        let connection = self.connection.lock().map_err(lock_error)?;
+        let mut statement = connection
+            .prepare(
+                "SELECT scope_key, kind, revision, phase, payload_json, user_id, chat_id, message_id, expires_at_ms, claimed_at_ms, created_at_ms, updated_at_ms FROM rust_control_interactions WHERE kind=?1 ORDER BY updated_at_ms, scope_key",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map(params![kind], control_interaction_from_row)
+            .map_err(sql_error)?;
+        rows.map(|row| row.map_err(sql_error)).collect()
+    }
+
+    pub fn claim_control_interaction(
+        &self,
+        scope_key: &str,
+        user_id: i64,
+        chat_id: i64,
+        revision: i64,
+        now_ms: i64,
+    ) -> PortResult<Option<ControlInteraction>> {
+        self.claim_control_interaction_with_expiry(
+            scope_key, user_id, chat_id, revision, now_ms, true,
+        )
+    }
+
+    pub fn claim_expired_control_interaction(
+        &self,
+        scope_key: &str,
+        user_id: i64,
+        chat_id: i64,
+        revision: i64,
+        now_ms: i64,
+    ) -> PortResult<Option<ControlInteraction>> {
+        self.claim_control_interaction_with_expiry(
+            scope_key, user_id, chat_id, revision, now_ms, false,
+        )
+    }
+
+    fn claim_control_interaction_with_expiry(
+        &self,
+        scope_key: &str,
+        user_id: i64,
+        chat_id: i64,
+        revision: i64,
+        now_ms: i64,
+        live: bool,
+    ) -> PortResult<Option<ControlInteraction>> {
+        let expiry_operator = if live { ">" } else { "<=" };
+        let stale_before_ms = now_ms.saturating_sub(CONTROL_CLAIM_LEASE_MS);
+        let connection = self.connection.lock().map_err(lock_error)?;
+        let changed = connection
+            .execute(&format!(
+                "UPDATE rust_control_interactions SET claimed_at_ms=?1, updated_at_ms=?1 WHERE scope_key=?2 AND user_id=?3 AND chat_id=?4 AND revision=?5 AND (claimed_at_ms IS NULL OR claimed_at_ms<=?6) AND expires_at_ms{expiry_operator}?1"
+            ), params![now_ms, scope_key, user_id, chat_id, revision, stale_before_ms])
+            .map_err(sql_error)?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        connection
+            .query_row(
+                "SELECT scope_key, kind, revision, phase, payload_json, user_id, chat_id, message_id, expires_at_ms, claimed_at_ms, created_at_ms, updated_at_ms FROM rust_control_interactions WHERE scope_key=?1",
+                params![scope_key],
+                control_interaction_from_row,
+            )
+            .optional()
+            .map_err(sql_error)
+    }
+
+    pub fn delete_control_interaction(&self, scope_key: &str, now_ms: i64) -> PortResult<bool> {
+        let mut connection = self.connection.lock().map_err(lock_error)?;
+        let transaction = connection.transaction().map_err(sql_error)?;
+        transaction
+            .execute(
+                "UPDATE rust_control_callbacks SET invalidated_at_ms=?1 WHERE scope_key=?2 AND consumed_at_ms IS NULL AND invalidated_at_ms IS NULL",
+                params![now_ms, scope_key],
+            )
+            .map_err(sql_error)?;
+        let changed = transaction
+            .execute(
+                "DELETE FROM rust_control_interactions WHERE scope_key=?1",
+                params![scope_key],
+            )
+            .map_err(sql_error)?;
+        transaction.commit().map_err(sql_error)?;
+        Ok(changed == 1)
+    }
+
+    pub fn release_control_interaction_claim(
+        &self,
+        scope_key: &str,
+        revision: i64,
+        claim_started_ms: i64,
+        now_ms: i64,
+    ) -> PortResult<bool> {
+        let connection = self.connection.lock().map_err(lock_error)?;
+        let changed = connection
+            .execute(
+                "UPDATE rust_control_interactions SET claimed_at_ms=NULL, updated_at_ms=?1 WHERE scope_key=?2 AND revision=?3 AND claimed_at_ms=?4",
+                params![now_ms, scope_key, revision, claim_started_ms],
+            )
+            .map_err(sql_error)?;
+        Ok(changed == 1)
+    }
+
+    /// Restores a callback that was claimed before an external side effect
+    /// failed.  The callback remains scoped and expires normally, allowing a
+    /// later Telegram click to retry without opening a second action.
+    pub fn restore_callback(&self, nonce: &str) -> PortResult<bool> {
+        let connection = self.connection.lock().map_err(lock_error)?;
+        let changed = connection
+            .execute(
+                "UPDATE rust_callbacks SET consumed_at_ms=NULL WHERE nonce=?1 AND consumed_at_ms IS NOT NULL",
+                params![nonce],
+            )
+            .map_err(sql_error)?;
+        Ok(changed == 1)
+    }
+
+    pub fn upsert_control_callback(&self, callback: &ControlCallback) -> PortResult<()> {
+        if callback.nonce.trim().is_empty()
+            || callback.action.trim().is_empty()
+            || callback
+                .scope_key
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err(PortError::Adapter(
+                "control callback fields cannot be empty".into(),
+            ));
+        }
+        let payload_json = serde_json::to_string(&callback.payload)
+            .map_err(|error| PortError::Adapter(format!("serialize control callback: {error}")))?;
+        let connection = self.connection.lock().map_err(lock_error)?;
+        connection
+            .execute(
+                "INSERT INTO rust_control_callbacks(nonce, scope_key, revision, user_id, chat_id, action, payload_json, expires_at_ms, consumed_at_ms, invalidated_at_ms, created_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) ON CONFLICT(nonce) DO UPDATE SET scope_key=excluded.scope_key, revision=excluded.revision, user_id=excluded.user_id, chat_id=excluded.chat_id, action=excluded.action, payload_json=excluded.payload_json, expires_at_ms=excluded.expires_at_ms, consumed_at_ms=excluded.consumed_at_ms, invalidated_at_ms=excluded.invalidated_at_ms",
+                params![
+                    callback.nonce,
+                    callback.scope_key,
+                    callback.revision,
+                    callback.user_id,
+                    callback.chat_id,
+                    callback.action,
+                    payload_json,
+                    callback.expires_at_ms,
+                    callback.consumed_at_ms,
+                    callback.invalidated_at_ms,
+                    callback.created_at_ms,
+                ],
+            )
+            .map_err(sql_error)?;
+        Ok(())
+    }
+
+    pub fn consume_control_callback(
+        &self,
+        nonce: &str,
+        user_id: i64,
+        chat_id: i64,
+        now_ms: i64,
+    ) -> PortResult<Option<ControlCallback>> {
+        let mut connection = self.connection.lock().map_err(lock_error)?;
+        let transaction = connection.transaction().map_err(sql_error)?;
+        let callback = transaction
+            .query_row(
+                "SELECT nonce, scope_key, revision, user_id, chat_id, action, payload_json, expires_at_ms, consumed_at_ms, invalidated_at_ms, created_at_ms FROM rust_control_callbacks WHERE nonce=?1 AND user_id=?2 AND chat_id=?3 AND expires_at_ms>=?4 AND consumed_at_ms IS NULL AND invalidated_at_ms IS NULL",
+                params![nonce, user_id, chat_id, now_ms],
+                control_callback_from_row,
+            )
+            .optional()
+            .map_err(sql_error)?;
+        let Some(callback) = callback else {
+            transaction.commit().map_err(sql_error)?;
+            return Ok(None);
+        };
+        if let (Some(scope_key), Some(revision)) =
+            (callback.scope_key.as_deref(), callback.revision)
+        {
+            let current_revision = transaction
+                .query_row(
+                    "SELECT revision FROM rust_control_interactions WHERE scope_key=?1",
+                    params![scope_key],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(sql_error)?;
+            if current_revision != Some(revision) {
+                transaction.commit().map_err(sql_error)?;
+                return Ok(None);
+            }
+        }
+        let changed = transaction
+            .execute(
+                "UPDATE rust_control_callbacks SET consumed_at_ms=?1 WHERE nonce=?2 AND consumed_at_ms IS NULL AND invalidated_at_ms IS NULL",
+                params![now_ms, nonce],
+            )
+            .map_err(sql_error)?;
+        transaction.commit().map_err(sql_error)?;
+        Ok((changed == 1).then_some(ControlCallback {
+            consumed_at_ms: Some(now_ms),
+            ..callback
+        }))
+    }
+
+    pub fn schedule_deletion(&self, deletion: &ScheduledDeletion) -> PortResult<()> {
+        if deletion.bot_instance_id.trim().is_empty()
+            || deletion.group_key.trim().is_empty()
+            || deletion.message_id <= 0
+        {
+            return Err(PortError::Adapter(
+                "scheduled deletion fields are invalid".into(),
+            ));
+        }
+        let connection = self.connection.lock().map_err(lock_error)?;
+        connection
+            .execute(
+                "INSERT INTO rust_scheduled_deletions(bot_instance_id, chat_id, message_id, group_key, delete_at_ms, attempts, claimed_at_ms, last_error_class) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT(bot_instance_id, chat_id, message_id) DO UPDATE SET group_key=excluded.group_key, delete_at_ms=excluded.delete_at_ms, attempts=excluded.attempts, claimed_at_ms=excluded.claimed_at_ms, last_error_class=excluded.last_error_class",
+                params![deletion.bot_instance_id, deletion.chat_id, deletion.message_id, deletion.group_key, deletion.delete_at_ms, deletion.attempts, deletion.claimed_at_ms, deletion.last_error_class],
+            )
+            .map_err(sql_error)?;
+        Ok(())
+    }
+
+    pub fn claim_due_deletions(
+        &self,
+        now_ms: i64,
+        limit: usize,
+    ) -> PortResult<Vec<ScheduledDeletion>> {
+        let limit = i64::try_from(limit)
+            .map_err(|_| PortError::Adapter("deletion limit exceeds SQLite range".into()))?;
+        let stale_before_ms = now_ms.saturating_sub(DELETION_CLAIM_LEASE_MS);
+        let mut connection = self.connection.lock().map_err(lock_error)?;
+        let transaction = connection.transaction().map_err(sql_error)?;
+        let mut statement = transaction
+            .prepare(
+                "SELECT bot_instance_id, chat_id, message_id, group_key, delete_at_ms, attempts, claimed_at_ms, last_error_class FROM rust_scheduled_deletions WHERE delete_at_ms<=?1 AND (claimed_at_ms IS NULL OR claimed_at_ms<=?2) ORDER BY delete_at_ms, bot_instance_id, chat_id, message_id LIMIT ?3",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map(
+                params![now_ms, stale_before_ms, limit],
+                scheduled_deletion_from_row,
+            )
+            .map_err(sql_error)?;
+        let mut due = Vec::new();
+        for row in rows {
+            due.push(row.map_err(sql_error)?);
+        }
+        drop(statement);
+        let mut claimed = Vec::with_capacity(due.len());
+        for deletion in due {
+            let changed = transaction
+                .execute(
+                    "UPDATE rust_scheduled_deletions SET claimed_at_ms=?1 WHERE bot_instance_id=?2 AND chat_id=?3 AND message_id=?4 AND (claimed_at_ms IS NULL OR claimed_at_ms<=?5)",
+                    params![now_ms, deletion.bot_instance_id, deletion.chat_id, deletion.message_id, stale_before_ms],
+                )
+                .map_err(sql_error)?;
+            if changed == 1 {
+                claimed.push(ScheduledDeletion {
+                    claimed_at_ms: Some(now_ms),
+                    ..deletion
+                });
+            }
+        }
+        transaction.commit().map_err(sql_error)?;
+        Ok(claimed)
+    }
+
+    pub fn complete_deletion(
+        &self,
+        bot_instance_id: &str,
+        chat_id: i64,
+        message_id: i64,
+    ) -> PortResult<bool> {
+        let connection = self.connection.lock().map_err(lock_error)?;
+        let changed = connection
+            .execute(
+                "DELETE FROM rust_scheduled_deletions WHERE bot_instance_id=?1 AND chat_id=?2 AND message_id=?3",
+                params![bot_instance_id, chat_id, message_id],
+            )
+            .map_err(sql_error)?;
+        Ok(changed == 1)
+    }
+
+    pub fn retry_deletion(
+        &self,
+        bot_instance_id: &str,
+        chat_id: i64,
+        message_id: i64,
+        error_class: &str,
+    ) -> PortResult<bool> {
+        let connection = self.connection.lock().map_err(lock_error)?;
+        let changed = connection
+            .execute(
+                "UPDATE rust_scheduled_deletions SET attempts=attempts+1, claimed_at_ms=NULL, last_error_class=?4 WHERE bot_instance_id=?1 AND chat_id=?2 AND message_id=?3",
+                params![bot_instance_id, chat_id, message_id, error_class],
+            )
+            .map_err(sql_error)?;
+        Ok(changed == 1)
+    }
+
     /// Returns paths retained by durable artifact records so maintenance can
     /// avoid deleting files that are still addressable from a Session.
     pub fn artifact_paths(&self) -> PortResult<Vec<PathBuf>> {
@@ -285,6 +787,28 @@ impl SqliteStore {
             .map_err(sql_error)?;
         rows.map(|row| row.map(PathBuf::from).map_err(sql_error))
             .collect()
+    }
+
+    pub fn update_control_interaction_message(
+        &self,
+        scope_key: &str,
+        revision: i64,
+        message_id: i64,
+        now_ms: i64,
+    ) -> PortResult<bool> {
+        if message_id <= 0 {
+            return Err(PortError::Adapter(
+                "control interaction message id must be positive".into(),
+            ));
+        }
+        let connection = self.connection.lock().map_err(lock_error)?;
+        let changed = connection
+            .execute(
+                "UPDATE rust_control_interactions SET message_id=?1, updated_at_ms=?2 WHERE scope_key=?3 AND revision=?4",
+                params![message_id, now_ms, scope_key, revision],
+            )
+            .map_err(sql_error)?;
+        Ok(changed == 1)
     }
 
     /// Idempotently records an update before it reaches a controller. The
@@ -317,6 +841,21 @@ impl SqliteStore {
         }
         transaction.commit().map_err(sql_error)?;
         Ok(inserted)
+    }
+
+    pub fn processed_update_exists(
+        &self,
+        bot_instance_id: &str,
+        update_id: i64,
+    ) -> PortResult<bool> {
+        let connection = self.connection.lock().map_err(lock_error)?;
+        connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM rust_processed_updates WHERE bot_instance_id=?1 AND update_id=?2)",
+                params![bot_instance_id, update_id],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)
     }
 
     pub fn next_update_offset(&self, bot_instance_id: &str) -> PortResult<Option<i64>> {
@@ -925,6 +1464,59 @@ impl SqliteStore {
                 )
                 .map_err(sql_error)?;
         }
+        if version < 5 {
+            transaction
+                .execute_batch(
+                    "
+                    CREATE TABLE rust_control_interactions (
+                        scope_key TEXT PRIMARY KEY NOT NULL,
+                        kind TEXT NOT NULL,
+                        revision INTEGER NOT NULL,
+                        phase TEXT NOT NULL,
+                        payload_json TEXT NOT NULL,
+                        user_id INTEGER NOT NULL,
+                        chat_id INTEGER NOT NULL,
+                        message_id INTEGER,
+                        expires_at_ms INTEGER NOT NULL,
+                        claimed_at_ms INTEGER,
+                        created_at_ms INTEGER NOT NULL,
+                        updated_at_ms INTEGER NOT NULL
+                    ) STRICT;
+                    CREATE INDEX rust_control_interactions_by_expiry
+                        ON rust_control_interactions(expires_at_ms, updated_at_ms);
+                    CREATE TABLE rust_control_callbacks (
+                        nonce TEXT PRIMARY KEY NOT NULL,
+                        scope_key TEXT,
+                        revision INTEGER,
+                        user_id INTEGER NOT NULL,
+                        chat_id INTEGER NOT NULL,
+                        action TEXT NOT NULL,
+                        payload_json TEXT NOT NULL,
+                        expires_at_ms INTEGER NOT NULL,
+                        consumed_at_ms INTEGER,
+                        invalidated_at_ms INTEGER,
+                        created_at_ms INTEGER NOT NULL
+                    ) STRICT;
+                    CREATE INDEX rust_control_callbacks_pending
+                        ON rust_control_callbacks(scope_key, revision, expires_at_ms)
+                        WHERE consumed_at_ms IS NULL AND invalidated_at_ms IS NULL;
+                    CREATE TABLE rust_scheduled_deletions (
+                        bot_instance_id TEXT NOT NULL,
+                        chat_id INTEGER NOT NULL,
+                        message_id INTEGER NOT NULL,
+                        group_key TEXT NOT NULL,
+                        delete_at_ms INTEGER NOT NULL,
+                        attempts INTEGER NOT NULL DEFAULT 0,
+                        claimed_at_ms INTEGER,
+                        last_error_class TEXT,
+                        PRIMARY KEY(bot_instance_id, chat_id, message_id)
+                    ) STRICT;
+                    CREATE INDEX rust_scheduled_deletions_due
+                        ON rust_scheduled_deletions(delete_at_ms, claimed_at_ms);
+                    ",
+                )
+                .map_err(sql_error)?;
+        }
         transaction
             .pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(sql_error)?;
@@ -1085,6 +1677,60 @@ impl EventLog for SqliteStore {
         Self::append_event(&transaction, event)?;
         transaction.commit().map_err(sql_error)
     }
+}
+
+fn control_interaction_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ControlInteraction> {
+    let payload_json: String = row.get(4)?;
+    let payload = serde_json::from_str(&payload_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(ControlInteraction {
+        scope_key: row.get(0)?,
+        kind: row.get(1)?,
+        revision: row.get(2)?,
+        phase: row.get(3)?,
+        payload,
+        user_id: row.get(5)?,
+        chat_id: row.get(6)?,
+        message_id: row.get(7)?,
+        expires_at_ms: row.get(8)?,
+        claimed_at_ms: row.get(9)?,
+        created_at_ms: row.get(10)?,
+        updated_at_ms: row.get(11)?,
+    })
+}
+
+fn control_callback_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ControlCallback> {
+    let payload_json: String = row.get(6)?;
+    let payload = serde_json::from_str(&payload_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(ControlCallback {
+        nonce: row.get(0)?,
+        scope_key: row.get(1)?,
+        revision: row.get(2)?,
+        user_id: row.get(3)?,
+        chat_id: row.get(4)?,
+        action: row.get(5)?,
+        payload,
+        expires_at_ms: row.get(7)?,
+        consumed_at_ms: row.get(8)?,
+        invalidated_at_ms: row.get(9)?,
+        created_at_ms: row.get(10)?,
+    })
+}
+
+fn scheduled_deletion_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduledDeletion> {
+    Ok(ScheduledDeletion {
+        bot_instance_id: row.get(0)?,
+        chat_id: row.get(1)?,
+        message_id: row.get(2)?,
+        group_key: row.get(3)?,
+        delete_at_ms: row.get(4)?,
+        attempts: row.get(5)?,
+        claimed_at_ms: row.get(6)?,
+        last_error_class: row.get(7)?,
+    })
 }
 
 fn parse_status(value: &str) -> Result<SessionStatus, String> {
@@ -1335,10 +1981,201 @@ mod tests {
     fn update_deduplication_advances_a_per_bot_offset_once() {
         let store = SqliteStore::in_memory().unwrap();
         assert!(store.record_processed_update("control", 99, 10).unwrap());
+        assert!(store.processed_update_exists("control", 99).unwrap());
+        assert!(!store.processed_update_exists("control", 100).unwrap());
         assert!(!store.record_processed_update("control", 99, 11).unwrap());
         assert!(store.record_processed_update("discussion", 4, 12).unwrap());
         assert_eq!(store.next_update_offset("control").unwrap(), Some(100));
         assert_eq!(store.next_update_offset("discussion").unwrap(), Some(5));
+    }
+
+    #[test]
+    fn control_revisions_invalidate_old_callbacks_and_claim_once() {
+        let store = SqliteStore::in_memory().unwrap();
+        let first = store
+            .replace_control_interaction(
+                "control:42:7:new",
+                "control_new",
+                "normal_model",
+                &serde_json::json!({"choices": ["gpt"]}),
+                7,
+                42,
+                Some(100),
+                5_000,
+                1_000,
+            )
+            .unwrap();
+        assert_eq!(first.revision, 1);
+        store
+            .upsert_control_callback(&ControlCallback {
+                nonce: "old".into(),
+                scope_key: Some(first.scope_key.clone()),
+                revision: Some(first.revision),
+                user_id: 7,
+                chat_id: 42,
+                action: "normal_model".into(),
+                payload: serde_json::json!({"value": "gpt"}),
+                expires_at_ms: 5_000,
+                consumed_at_ms: None,
+                invalidated_at_ms: None,
+                created_at_ms: 1_000,
+            })
+            .unwrap();
+        let second = store
+            .replace_control_interaction(
+                &first.scope_key,
+                "control_new",
+                "normal_effort",
+                &serde_json::json!({"choices": ["high"]}),
+                7,
+                42,
+                Some(101),
+                6_000,
+                1_100,
+            )
+            .unwrap();
+        assert_eq!(second.revision, 2);
+        assert_eq!(
+            store.consume_control_callback("old", 7, 42, 1_101).unwrap(),
+            None
+        );
+        assert!(
+            store
+                .claim_control_interaction(&first.scope_key, 7, 42, 1, 1_101)
+                .unwrap()
+                .is_none()
+        );
+        let claimed = store
+            .claim_control_interaction(&first.scope_key, 7, 42, 2, 1_101)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.claimed_at_ms, Some(1_101));
+        assert!(
+            store
+                .claim_control_interaction(&first.scope_key, 7, 42, 2, 1_102)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn control_advance_is_compare_and_swap_and_expiry_claim_is_exclusive() {
+        let store = SqliteStore::in_memory().unwrap();
+        let first = store
+            .replace_control_interaction(
+                "control:42:7:new",
+                "control_new",
+                "normal_model",
+                &serde_json::json!({"choices": ["gpt"]}),
+                7,
+                42,
+                Some(100),
+                5_000,
+                1_000,
+            )
+            .unwrap();
+        let advanced = store
+            .advance_control_interaction(
+                &first.scope_key,
+                first.revision,
+                "normal_effort",
+                &serde_json::json!({"normal_model": "gpt"}),
+                7,
+                42,
+                Some(101),
+                6_000,
+                1_100,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(advanced.revision, 2);
+        assert!(
+            store
+                .advance_control_interaction(
+                    &first.scope_key,
+                    first.revision,
+                    "stale",
+                    &serde_json::json!({}),
+                    7,
+                    42,
+                    Some(102),
+                    7_000,
+                    1_101,
+                )
+                .unwrap()
+                .is_none()
+        );
+
+        let expired = store
+            .replace_control_interaction(
+                "control:42:7:expired",
+                "control_new",
+                "prompt",
+                &serde_json::json!({}),
+                7,
+                42,
+                None,
+                2_000,
+                1_000,
+            )
+            .unwrap();
+        assert!(
+            store
+                .claim_control_interaction(&expired.scope_key, 7, 42, expired.revision, 2_001,)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .claim_expired_control_interaction(
+                    &expired.scope_key,
+                    7,
+                    42,
+                    expired.revision,
+                    2_001,
+                )
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .claim_expired_control_interaction(
+                    &expired.scope_key,
+                    7,
+                    42,
+                    expired.revision,
+                    2_002,
+                )
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn scheduled_deletions_have_fixed_deadlines_and_restart_claims() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .schedule_deletion(&ScheduledDeletion {
+                bot_instance_id: "control".into(),
+                chat_id: 42,
+                message_id: 101,
+                group_key: "sessions:1".into(),
+                delete_at_ms: 1_500,
+                attempts: 0,
+                claimed_at_ms: None,
+                last_error_class: None,
+            })
+            .unwrap();
+        assert!(store.claim_due_deletions(1_499, 10).unwrap().is_empty());
+        let due = store.claim_due_deletions(1_500, 10).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].delete_at_ms, 1_500);
+        assert!(store.claim_due_deletions(1_501, 10).unwrap().is_empty());
+        assert_eq!(store.claim_due_deletions(61_501, 10).unwrap().len(), 1);
+        assert!(store.retry_deletion("control", 42, 101, "timeout").unwrap());
+        assert_eq!(store.claim_due_deletions(1_501, 10).unwrap().len(), 1);
+        assert!(store.complete_deletion("control", 42, 101).unwrap());
+        assert!(store.claim_due_deletions(2_000, 10).unwrap().is_empty());
     }
 
     #[test]
@@ -1355,6 +2192,8 @@ mod tests {
         store.create_callback(&callback).unwrap();
         assert_eq!(store.take_callback("nonce-1", 15).unwrap(), Some(callback));
         assert_eq!(store.take_callback("nonce-1", 16).unwrap(), None);
+        assert!(store.restore_callback("nonce-1").unwrap());
+        assert!(store.take_callback("nonce-1", 17).unwrap().is_some());
     }
 
     #[test]

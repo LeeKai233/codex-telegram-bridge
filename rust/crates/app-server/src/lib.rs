@@ -15,7 +15,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
@@ -25,7 +25,7 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
     process::{Child, ChildStdin, ChildStdout, Command},
-    sync::{Mutex, Semaphore, broadcast, mpsc, oneshot, watch},
+    sync::{Mutex, Semaphore, mpsc, oneshot, watch},
     task::JoinHandle,
     time::{sleep, timeout},
 };
@@ -574,8 +574,10 @@ struct Pending {
 struct Inner {
     config: AppServerConfig,
     outbound: mpsc::Sender<Outbound>,
-    events: broadcast::Sender<AgentEvent>,
-    server_requests: broadcast::Sender<AgentServerRequest>,
+    events: mpsc::Sender<AgentEvent>,
+    server_requests: mpsc::Sender<AgentServerRequest>,
+    event_receiver: StdMutex<Option<mpsc::Receiver<AgentEvent>>>,
+    server_request_receiver: StdMutex<Option<mpsc::Receiver<AgentServerRequest>>>,
     state: watch::Sender<ConnectionState>,
     shutdown: watch::Sender<bool>,
     ids: AtomicU64,
@@ -594,8 +596,9 @@ impl AppServerClient {
     pub async fn connect(config: AppServerConfig) -> Result<Self, AppServerError> {
         config.validate()?;
         let (outbound, receiver) = mpsc::channel(config.outbound_capacity);
-        let (events, _) = broadcast::channel(config.notification_capacity);
-        let (server_requests, _) = broadcast::channel(config.notification_capacity);
+        let (events, event_receiver) = mpsc::channel(config.notification_capacity);
+        let (server_requests, server_request_receiver) =
+            mpsc::channel(config.notification_capacity);
         let (state, _) = watch::channel(ConnectionState::default());
         let (shutdown, _) = watch::channel(false);
         let inner = Arc::new(Inner {
@@ -604,6 +607,8 @@ impl AppServerClient {
             outbound,
             events,
             server_requests,
+            event_receiver: StdMutex::new(Some(event_receiver)),
+            server_request_receiver: StdMutex::new(Some(server_request_receiver)),
             state,
             shutdown,
             ids: AtomicU64::new(1),
@@ -1175,20 +1180,28 @@ async fn handle_inbound(
             Ok(None)
         }
         (Some(id), Some(method)) => {
-            let _ = inner.server_requests.send(AgentServerRequest {
-                id,
-                method: method.to_owned(),
-                params: object.get("params").cloned().unwrap_or_else(|| json!({})),
-                generation,
-            });
+            inner
+                .server_requests
+                .send(AgentServerRequest {
+                    id,
+                    method: method.to_owned(),
+                    params: object.get("params").cloned().unwrap_or_else(|| json!({})),
+                    generation,
+                })
+                .await
+                .map_err(|_| AppServerError::Shutdown)?;
             Ok(None)
         }
         (None, Some(method)) => {
-            let _ = inner.events.send(AgentEvent {
-                method: method.to_owned(),
-                params: object.get("params").cloned().unwrap_or_else(|| json!({})),
-                generation,
-            });
+            inner
+                .events
+                .send(AgentEvent {
+                    method: method.to_owned(),
+                    params: object.get("params").cloned().unwrap_or_else(|| json!({})),
+                    generation,
+                })
+                .await
+                .map_err(|_| AppServerError::Shutdown)?;
             Ok(None)
         }
         (None, None) => Err(AppServerError::Protocol(
@@ -1395,11 +1408,27 @@ impl AgentBackend for AppServerClient {
         .map_err(PortError::from)
     }
 
-    fn subscribe_events(&self) -> broadcast::Receiver<AgentEvent> {
-        self.inner.events.subscribe()
+    fn subscribe_events(&self) -> mpsc::Receiver<AgentEvent> {
+        self.inner
+            .event_receiver
+            .lock()
+            .expect("event receiver mutex must not be poisoned")
+            .take()
+            .unwrap_or_else(|| {
+                let (_sender, receiver) = mpsc::channel(1);
+                receiver
+            })
     }
-    fn subscribe_server_requests(&self) -> broadcast::Receiver<AgentServerRequest> {
-        self.inner.server_requests.subscribe()
+    fn subscribe_server_requests(&self) -> mpsc::Receiver<AgentServerRequest> {
+        self.inner
+            .server_request_receiver
+            .lock()
+            .expect("server request receiver mutex must not be poisoned")
+            .take()
+            .unwrap_or_else(|| {
+                let (_sender, receiver) = mpsc::channel(1);
+                receiver
+            })
     }
 }
 

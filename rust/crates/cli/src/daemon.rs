@@ -6,13 +6,20 @@
 
 use crate::alerts::AlertWebhookServer;
 use crate::config::{BotConfig, RustConfig};
+use crate::control::{
+    ButtonTarget, ControlController, ControlEffect, ControlRequest, DeleteTarget,
+    ModelOption as ControlModelOption, RenderOperation, RenderedEffect, Session as ControlSession,
+    SessionsRequest, Topic as ControlTopic,
+};
 use crate::metrics::{MetricsRegistry, MetricsServer};
 use crate::security::TotpManager;
 use codex_telegram_adapter::{
-    BotCapability, ChannelBinding, IncomingUpdate, LinkedDiscussion, NativeCommentBinding,
+    BotCapability, BotCommandScope, ChannelBinding, CommandMenuScope, IncomingUpdate,
+    InlineKeyboardButton, InlineKeyboardMarkup, LinkedDiscussion, NativeCommentBinding,
     ReqwestTransport, RoutedUpdate, RuntimeBotRole, SentMessage, TelegramBotApi,
     TelegramMessageReference, TelegramMessageRequest, TelegramSurfaceBinding, TokenLeaseRegistry,
     UpdateAuthorization, UpdateRouter, UpdateRoutingPolicy, WorkflowAction, WorkflowCommand,
+    command_menu,
 };
 use codex_telegram_credentials::BotToken;
 use ctg_app_server::{AppServerClient, AppServerConfig};
@@ -24,7 +31,10 @@ use ctg_domain::{
 };
 use ctg_engine::{EventProjector, ProjectionEffect, ThreadProjection};
 use ctg_ports::{AgentBackend, ApprovalStore, ArtifactStore, SessionRepository};
-use ctg_storage_sqlite::{NativeCommentRoot, RustSessionSpace, SqliteStore, StoredCallback};
+use ctg_storage_sqlite::{
+    ControlCallback, NativeCommentRoot, RustSessionSpace, ScheduledDeletion, SqliteStore,
+    StoredCallback,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -45,6 +55,19 @@ const NEW_PROMPT_TTL_MS: i64 = 30 * 1000;
 const MAX_ARTIFACT_BYTES: u64 = 10 * 1024 * 1024;
 const UPLOAD_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 static NEXT_APPROVAL_NONCE: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone)]
+struct ControlRuntime {
+    perf: Arc<crate::perf::PerfSampler>,
+}
+
+impl Default for ControlRuntime {
+    fn default() -> Self {
+        Self {
+            perf: Arc::new(crate::perf::PerfSampler::new()),
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum DaemonError {
@@ -79,6 +102,7 @@ struct RuntimeBot {
 struct InboundUpdate {
     bot_instance_id: String,
     update: codex_telegram_adapter::Update,
+    completion: std::sync::mpsc::SyncSender<bool>,
 }
 
 #[derive(Clone, Debug)]
@@ -297,6 +321,8 @@ async fn run_async(
         .cloned()
         .map(|bot| (bot.config.instance_id.clone(), bot))
         .collect::<HashMap<_, _>>();
+    let control_runtime = Arc::new(ControlRuntime::default());
+    refresh_command_menus(&bots_by_id, &config, &store).await;
     restore_active_sessions(&sessions, &store, &config, &bots_by_id)?;
     let totp = Arc::new(TotpManager::new(
         store.clone(),
@@ -354,7 +380,7 @@ async fn run_async(
 
     let leases = TokenLeaseRegistry::default();
     let shutdown = Arc::new(AtomicBool::new(false));
-    let (updates_tx, mut updates_rx) = mpsc::unbounded_channel();
+    let (updates_tx, mut updates_rx) = mpsc::channel(config.max_backlog.max(1));
     let mut pollers = Vec::new();
     for bot in bots.iter().filter(|bot| bot.role.polls_updates()) {
         pollers.push(spawn_poller(
@@ -401,10 +427,16 @@ async fn run_async(
                 metrics.clone(),
             ))
         });
+    let deletion_task = tokio::spawn(run_scheduled_deletion_worker(
+        store.clone(),
+        bots_by_id.clone(),
+    ));
     let dispatch_agent = agent.clone();
+    let dispatch_control_runtime = control_runtime.clone();
     let dispatch_task = tokio::spawn(async move {
         while let Some(inbound) = updates_rx.recv().await {
             let Some(bot) = bots_by_id.get(&inbound.bot_instance_id).cloned() else {
+                let _ = inbound.completion.send(false);
                 continue;
             };
             let owner_user_id = store
@@ -417,6 +449,10 @@ async fn run_async(
                 bot_username: None,
                 enforce_chat_kind: true,
                 reject_sender_chat: true,
+                // Before `/pair`, only the Control Bot's private bootstrap
+                // commands are reachable. Discussion/Status updates must not
+                // interpret a missing owner as an unrestricted actor.
+                bootstrap_only: owner_user_id.is_none(),
             };
             let actor_user_id = match IncomingUpdate::from_update(&inbound.update) {
                 IncomingUpdate::Message(message) | IncomingUpdate::EditedMessage(message) => {
@@ -432,11 +468,12 @@ async fn run_async(
                     Ok(router) => router,
                     Err(error) => {
                         eprintln!("rust bridge routing disabled: {error}");
+                        let _ = inbound.completion.send(false);
                         continue;
                     }
                 };
             let routed = router.route(&inbound.update);
-            if let Err(error) = handle_action(
+            let result = handle_action(
                 routed,
                 actor_user_id,
                 bot,
@@ -447,11 +484,13 @@ async fn run_async(
                 &sessions,
                 &metrics,
                 &totp,
+                &dispatch_control_runtime,
             )
-            .await
-            {
+            .await;
+            if let Err(error) = &result {
                 eprintln!("rust bridge action failed: {error}");
             }
+            let _ = inbound.completion.send(result.is_ok());
         }
     });
 
@@ -464,6 +503,7 @@ async fn run_async(
             if let Some(task) = &new_expiry_task {
                 task.abort();
             }
+            deletion_task.abort();
         }
         result = &mut dispatch_task => {
             result.map_err(|error| DaemonError::Task(error.to_string()))?;
@@ -471,6 +511,7 @@ async fn run_async(
             if let Some(task) = &new_expiry_task {
                 task.abort();
             }
+            deletion_task.abort();
         }
     }
     let _ = tokio::task::spawn_blocking(move || {
@@ -558,7 +599,7 @@ fn spawn_poller(
     store: Arc<SqliteStore>,
     metrics: MetricsRegistry,
     leases: TokenLeaseRegistry,
-    updates_tx: mpsc::UnboundedSender<InboundUpdate>,
+    updates_tx: mpsc::Sender<InboundUpdate>,
     shutdown: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     std::thread::Builder::new()
@@ -613,26 +654,56 @@ fn spawn_poller(
                 let processing_started = Instant::now();
                 metrics.set_queue_depth(updates.len() as u64);
                 for update in updates.into_iter().take(config.max_backlog) {
-                    offset = Some(update.update_id.saturating_add(1));
+                    let update_id = update.update_id;
+                    if store
+                        .processed_update_exists(&bot.config.instance_id, update_id)
+                        .unwrap_or(false)
+                    {
+                        offset = Some(update_id.saturating_add(1));
+                        continue;
+                    }
+                    let (completion_tx, completion_rx) = std::sync::mpsc::sync_channel(0);
+                    let mut inbound = InboundUpdate {
+                        bot_instance_id: bot.config.instance_id.clone(),
+                        update,
+                        completion: completion_tx,
+                    };
+                    loop {
+                        match updates_tx.try_send(inbound) {
+                            Ok(()) => break,
+                            Err(mpsc::error::TrySendError::Full(returned)) => {
+                                inbound = returned;
+                                if shutdown.load(Ordering::Acquire) {
+                                    return;
+                                }
+                                std::thread::sleep(Duration::from_millis(25));
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => return,
+                        }
+                    }
+                    let handled = loop {
+                        match completion_rx.recv_timeout(Duration::from_millis(250)) {
+                            Ok(handled) => break handled,
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                if shutdown.load(Ordering::Acquire) {
+                                    return;
+                                }
+                            }
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                        }
+                    };
+                    if !handled {
+                        break;
+                    }
                     match store.record_processed_update(
                         &bot.config.instance_id,
-                        update.update_id,
+                        update_id,
                         now_ms(),
                     ) {
-                        Ok(true) => {
-                            if updates_tx
-                                .send(InboundUpdate {
-                                    bot_instance_id: bot.config.instance_id.clone(),
-                                    update,
-                                })
-                                .is_err()
-                            {
-                                return;
-                            }
-                        }
-                        Ok(false) => {}
+                        Ok(true) | Ok(false) => offset = Some(update_id.saturating_add(1)),
                         Err(error) => {
                             eprintln!("rust bridge update state failed: {error}");
+                            break;
                         }
                     }
                 }
@@ -654,6 +725,7 @@ async fn handle_action(
     sessions: &Arc<SessionRegistry>,
     metrics: &MetricsRegistry,
     totp: &Arc<TotpManager>,
+    control_runtime: &Arc<ControlRuntime>,
 ) -> Result<(), String> {
     let RoutedUpdate::Dispatch(action) = routed else {
         return Ok(());
@@ -684,6 +756,7 @@ async fn handle_action(
                 sessions,
                 metrics,
                 totp,
+                control_runtime,
             )
             .await
         }
@@ -1009,6 +1082,7 @@ async fn handle_action(
                 sessions,
                 metrics,
                 totp,
+                control_runtime,
             )
             .await
         }
@@ -1032,6 +1106,7 @@ async fn handle_command(
     sessions: &Arc<SessionRegistry>,
     metrics: &MetricsRegistry,
     totp: &Arc<TotpManager>,
+    control_runtime: &Arc<ControlRuntime>,
 ) -> Result<(), String> {
     let surface = surface_for(&inbound_bot, config, chat_id, None);
     let bound_space = if inbound_bot.role == RuntimeBotRole::Discussion {
@@ -1114,43 +1189,67 @@ async fn handle_command(
             .await
         }
         WorkflowCommand::Perf => {
-            let state = agent.connection_state();
-            send_text(
+            handle_control_perf(
+                control_runtime,
                 &inbound_bot,
-                &surface,
-                &format!(
-                    "Rust Bridge /perf\napp-server_connected={}\ngeneration={}\nmetrics=127.0.0.1:9465",
-                    state.connected, state.generation
-                ),
+                config,
+                store,
                 metrics,
+                chat_id,
+                actor_user_id,
+                message_id,
             )
             .await
         }
         WorkflowCommand::Sessions => {
-            let query = text
-                .split_whitespace()
-                .skip(1)
-                .collect::<Vec<_>>()
-                .join(" ");
-            let rendered = render_sessions_list(agent, &query).await?;
-            send_text(&inbound_bot, &surface, &rendered, metrics).await
+            handle_control_sessions(
+                agent,
+                &inbound_bot,
+                config,
+                store,
+                metrics,
+                chat_id,
+                actor_user_id,
+                message_id,
+                &text,
+            )
+            .await
         }
         WorkflowCommand::Topics => {
-            let spaces = store
-                .active_session_spaces()
-                .map_err(|error| error.to_string())?;
-            let rendered = render_topics_list(&spaces);
-            send_text(&inbound_bot, &surface, &rendered, metrics).await
+            handle_control_topics(
+                &inbound_bot,
+                config,
+                store,
+                metrics,
+                chat_id,
+                actor_user_id,
+                message_id,
+            )
+            .await
         }
         WorkflowCommand::Help => {
+            if inbound_bot.role == RuntimeBotRole::Control {
+                let paired = store
+                    .workflow_record("onboarding", "owner")
+                    .map_err(|error| error.to_string())?
+                    .is_some();
+                return handle_control_help(
+                    &inbound_bot,
+                    config,
+                    metrics,
+                    chat_id,
+                    actor_user_id,
+                    message_id,
+                    paired,
+                )
+                .await;
+            }
             let help = match inbound_bot.role {
-                RuntimeBotRole::Control => {
-                    "/sessions [关键词]  查找 Codex sessions\n/topics  查看 Session 帖子\n/new  创建 Session\n/perf  查看 WSL 与 GPU 性能\n/help  显示帮助"
-                }
                 RuntimeBotRole::Discussion => {
                     "/status  查看当前 Session 状态\n/totp <code>  认证当前 Session\n/lock  锁定当前 Session\n/planmode on|off  切换 Plan Mode\n/changemodel <model> [effort]  切换模型\n/review [target]  启动 Review\n/cancel  取消当前 turn\n/getfile <relative-path>  发送 workspace 文件\n/help  查看命令\n直接发送文本  提交 Codex Prompt"
                 }
                 RuntimeBotRole::Status | RuntimeBotRole::Alert => "当前 Bot 没有可用命令。",
+                RuntimeBotRole::Control => unreachable!(),
             };
             send_text(&inbound_bot, &surface, help, metrics).await
         }
@@ -1207,6 +1306,7 @@ async fn handle_command(
                 chat_id,
                 actor_user_id,
                 &inbound_bot,
+                bots_by_id,
                 config,
                 store,
                 metrics,
@@ -1659,6 +1759,1091 @@ async fn handle_command(
     }
 }
 
+const CONTROL_UTC_OFFSET_SECONDS: i64 = 8 * 60 * 60;
+
+async fn refresh_command_menus(
+    bots_by_id: &HashMap<String, RuntimeBot>,
+    config: &RustConfig,
+    store: &SqliteStore,
+) {
+    let paired = store
+        .workflow_record("onboarding", "owner")
+        .ok()
+        .flatten()
+        .is_some();
+    let discussion_bound = store
+        .workflow_record("onboarding", "binding")
+        .ok()
+        .flatten()
+        .is_some();
+    let mut tasks = Vec::new();
+    for bot in bots_by_id.values().filter(|bot| bot.role.polls_updates()) {
+        let bot = bot.clone();
+        let control_chat_id = config.control_chat_id;
+        let discussion_chat_id = config.discussion_chat_id;
+        tasks.push(tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                let install = |scope: BotCommandScope,
+                               commands: &'static [codex_telegram_adapter::CommandMenuEntry]| {
+                    if commands.is_empty() {
+                        bot.api.delete_my_commands(&bot.token, scope).map(|_| ())
+                    } else {
+                        bot.api
+                            .set_my_commands(&bot.token, commands, scope)
+                            .map(|_| ())
+                    }
+                };
+                match bot.role {
+                    RuntimeBotRole::Control => {
+                        install(BotCommandScope::Default, &[])?;
+                        install(
+                            BotCommandScope::AllPrivateChats,
+                            command_menu(RuntimeBotRole::Control, CommandMenuScope::Bootstrap),
+                        )?;
+                        if paired {
+                            install(
+                                BotCommandScope::Chat {
+                                    chat_id: control_chat_id,
+                                },
+                                command_menu(RuntimeBotRole::Control, CommandMenuScope::Owner),
+                            )?;
+                        } else {
+                            install(
+                                BotCommandScope::Chat {
+                                    chat_id: control_chat_id,
+                                },
+                                &[],
+                            )?;
+                        }
+                    }
+                    RuntimeBotRole::Discussion => {
+                        install(BotCommandScope::Default, &[])?;
+                        install(
+                            BotCommandScope::AllGroupChats,
+                            command_menu(RuntimeBotRole::Discussion, CommandMenuScope::Bootstrap),
+                        )?;
+                        if paired && discussion_bound {
+                            install(
+                                BotCommandScope::Chat {
+                                    chat_id: discussion_chat_id,
+                                },
+                                command_menu(RuntimeBotRole::Discussion, CommandMenuScope::Owner),
+                            )?;
+                        } else {
+                            install(
+                                BotCommandScope::Chat {
+                                    chat_id: discussion_chat_id,
+                                },
+                                &[],
+                            )?;
+                        }
+                    }
+                    RuntimeBotRole::Status | RuntimeBotRole::Alert => {
+                        install(BotCommandScope::Default, &[])?;
+                    }
+                }
+                Ok::<(), codex_telegram_adapter::TelegramError>(())
+            })
+            .await;
+            match result {
+                Ok(Ok(())) => Ok::<(), String>(()),
+                Ok(Err(error)) => Err(error.to_string()),
+                Err(error) => Err(error.to_string()),
+            }
+        }));
+    }
+    for task in tasks {
+        match task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                eprintln!("rust bridge command menu refresh failed: {error}");
+            }
+            Err(error) => {
+                eprintln!("rust bridge command menu refresh task failed: {error}");
+            }
+        }
+    }
+}
+
+async fn run_scheduled_deletion_worker(
+    store: Arc<SqliteStore>,
+    bots_by_id: HashMap<String, RuntimeBot>,
+) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let due = match store.claim_due_deletions(now_ms(), 32) {
+            Ok(due) => due,
+            Err(error) => {
+                eprintln!("rust bridge scheduled deletion claim failed: {error}");
+                continue;
+            }
+        };
+        for deletion in due {
+            let result = delete_scheduled_message(&bots_by_id, &deletion).await;
+            match result {
+                Ok(()) => {
+                    let _ = store.complete_deletion(
+                        &deletion.bot_instance_id,
+                        deletion.chat_id,
+                        deletion.message_id,
+                    );
+                }
+                Err(error) => {
+                    let _ = store.retry_deletion(
+                        &deletion.bot_instance_id,
+                        deletion.chat_id,
+                        deletion.message_id,
+                        &error,
+                    );
+                    eprintln!(
+                        "rust bridge scheduled deletion retry bot={} chat={} message={} class={error}",
+                        deletion.bot_instance_id, deletion.chat_id, deletion.message_id
+                    );
+                }
+            }
+        }
+    }
+}
+
+async fn delete_scheduled_message(
+    bots_by_id: &HashMap<String, RuntimeBot>,
+    deletion: &ScheduledDeletion,
+) -> Result<(), String> {
+    let Some(bot) = bots_by_id.get(&deletion.bot_instance_id) else {
+        return Err("bot_unavailable".to_owned());
+    };
+    let reference =
+        TelegramMessageReference::new(deletion.chat_id.to_string(), deletion.message_id)
+            .map_err(|_| "invalid_reference".to_owned())?;
+    let api = bot.api.clone();
+    let token = bot.token.clone();
+    let result = tokio::task::spawn_blocking(move || api.delete_message(&token, &reference))
+        .await
+        .map_err(|_| "delete_join".to_owned())?;
+    match result {
+        Ok(_) => Ok(()),
+        Err(codex_telegram_adapter::TelegramError::ApiRejected {
+            error_code: Some(400),
+            ..
+        }) => Ok(()),
+        Err(_error) => Err("telegram_delete_failed".to_owned()),
+    }
+}
+
+fn control_user(actor_user_id: Option<i64>) -> Result<i64, String> {
+    actor_user_id.ok_or_else(|| "无法确认个人发送身份；请关闭匿名管理员后重试。".to_owned())
+}
+
+fn control_now_seconds() -> i64 {
+    now_ms().saturating_div(1000)
+}
+
+fn control_models(models: &ModelChoices) -> Vec<ControlModelOption> {
+    models
+        .entries
+        .iter()
+        .map(|model| ControlModelOption {
+            model: model.model.clone(),
+            display_name: model.display_name.clone(),
+            supported_efforts: model.efforts.clone(),
+        })
+        .collect()
+}
+
+fn control_session_from_value(value: &Value) -> Option<ControlSession> {
+    let thread_id = value.get("id").and_then(Value::as_str)?.trim();
+    if thread_id.is_empty() || value.get("ephemeral").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    let title = ["naturalSummary", "summary", "title", "name", "preview"]
+        .iter()
+        .find_map(|field| value.get(*field).and_then(Value::as_str))
+        .unwrap_or("Codex session")
+        .to_owned();
+    let epoch = |field: &str| {
+        value.get(field).and_then(Value::as_i64).map(|raw| {
+            if raw > 100_000_000_000 {
+                raw / 1000
+            } else {
+                raw
+            }
+        })
+    };
+    Some(ControlSession {
+        thread_id: thread_id.to_owned(),
+        title,
+        status: value
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_owned(),
+        turn_status: value
+            .get("turnStatus")
+            .or_else(|| value.get("turn_status"))
+            .and_then(Value::as_str)
+            .unwrap_or("idle")
+            .to_owned(),
+        lifecycle: value
+            .get("lifecycle")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        active_flags: value
+            .get("activeFlags")
+            .or_else(|| value.get("active_flags"))
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        error: value
+            .get("error")
+            .and_then(|error| error.get("message").or(Some(error)))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        created_at: epoch("createdAt").or_else(|| epoch("created_at")),
+        updated_at: epoch("updatedAt").or_else(|| epoch("updated_at")),
+        cwd: value
+            .get("cwd")
+            .or_else(|| value.get("path"))
+            .and_then(Value::as_str)
+            .unwrap_or("-")
+            .to_owned(),
+    })
+}
+
+async fn list_control_sessions(agent: &AppServerClient) -> Result<Vec<ControlSession>, String> {
+    let response = agent
+        .list_threads(1000, None)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(response
+        .get("data")
+        .or_else(|| response.get("threads"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(control_session_from_value)
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+fn control_topic_from_space(store: &SqliteStore, space: &RustSessionSpace) -> ControlTopic {
+    let url = space
+        .discussion_chat_id
+        .zip(space.discussion_root_message_id)
+        .map(|(chat_id, message_id)| telegram_message_link(chat_id, message_id))
+        .or_else(|| {
+            Some(telegram_message_link(
+                space.channel_chat_id,
+                space.channel_post_id,
+            ))
+        });
+    ControlTopic {
+        title: store
+            .workflow_record("pending_space", &space.space_id)
+            .ok()
+            .flatten()
+            .and_then(|payload| {
+                payload
+                    .get("pending_prompt")
+                    .or_else(|| payload.get("title"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .or_else(|| space.thread_id.clone())
+            .unwrap_or_else(|| "Pending".to_owned()),
+        lifecycle: space.lifecycle.clone(),
+        url,
+    }
+}
+
+fn control_button_markup(
+    store: &SqliteStore,
+    scope_key: &str,
+    revision: i64,
+    user_id: i64,
+    chat_id: i64,
+    keyboard: &[Vec<crate::control::ControlButton>],
+    expires_at_ms: i64,
+) -> Result<Option<InlineKeyboardMarkup>, String> {
+    if keyboard.is_empty() {
+        return Ok(None);
+    }
+    let mut rows = Vec::new();
+    for row in keyboard {
+        let mut buttons = Vec::new();
+        for button in row {
+            let value = match &button.target {
+                ButtonTarget::Callback { action, payload } => {
+                    let nonce = next_approval_nonce();
+                    store
+                        .upsert_control_callback(&ControlCallback {
+                            nonce: nonce.clone(),
+                            scope_key: Some(scope_key.to_owned()),
+                            revision: Some(revision),
+                            user_id,
+                            chat_id,
+                            action: action.clone(),
+                            payload: serde_json::to_value(payload)
+                                .map_err(|error| error.to_string())?,
+                            expires_at_ms,
+                            consumed_at_ms: None,
+                            invalidated_at_ms: None,
+                            created_at_ms: now_ms(),
+                        })
+                        .map_err(|error| error.to_string())?;
+                    InlineKeyboardButton::callback(&button.label, format!("ctl:{nonce}"))
+                        .map_err(|error| error.to_string())?
+                }
+                ButtonTarget::Url { url } => InlineKeyboardButton::url(&button.label, url)
+                    .map_err(|error| error.to_string())?,
+            };
+            buttons.push(value);
+        }
+        if !buttons.is_empty() {
+            rows.push(buttons);
+        }
+    }
+    (!rows.is_empty())
+        .then(|| InlineKeyboardMarkup::new(rows).map_err(|error| error.to_string()))
+        .transpose()
+}
+
+fn typed_markup_from_json(value: Option<Value>) -> Result<Option<InlineKeyboardMarkup>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let Some(rows) = value.get("inline_keyboard").and_then(Value::as_array) else {
+        return Ok(None);
+    };
+    let mut typed_rows = Vec::new();
+    for row in rows {
+        let Some(buttons) = row.as_array() else {
+            continue;
+        };
+        let mut typed_buttons = Vec::new();
+        for button in buttons {
+            let label = button
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if let Some(data) = button.get("callback_data").and_then(Value::as_str) {
+                typed_buttons.push(
+                    InlineKeyboardButton::callback(label, data)
+                        .map_err(|error| error.to_string())?,
+                );
+            } else if let Some(url) = button.get("url").and_then(Value::as_str) {
+                typed_buttons.push(
+                    InlineKeyboardButton::url(label, url).map_err(|error| error.to_string())?,
+                );
+            }
+        }
+        if !typed_buttons.is_empty() {
+            typed_rows.push(typed_buttons);
+        }
+    }
+    (!typed_rows.is_empty())
+        .then(|| InlineKeyboardMarkup::new(typed_rows).map_err(|error| error.to_string()))
+        .transpose()
+}
+
+async fn send_control_text_with_json_markup(
+    bot: &RuntimeBot,
+    surface: &TelegramSurfaceBinding,
+    markdown: &str,
+    plain: &str,
+    markup: Option<Value>,
+    metrics: &MetricsRegistry,
+) -> Result<SentMessage, String> {
+    send_control_rendered(
+        bot,
+        surface,
+        &RenderedEffect {
+            operation: RenderOperation::Send,
+            markdown: markdown.to_owned(),
+            plain: Some(plain.to_owned()),
+            keyboard: None,
+        },
+        typed_markup_from_json(markup)?,
+        metrics,
+    )
+    .await
+}
+
+async fn send_control_rendered(
+    bot: &RuntimeBot,
+    surface: &TelegramSurfaceBinding,
+    rendered: &RenderedEffect,
+    markup: Option<InlineKeyboardMarkup>,
+    metrics: &MetricsRegistry,
+) -> Result<SentMessage, String> {
+    let plain = rendered
+        .plain
+        .clone()
+        .unwrap_or_else(|| rendered.markdown.clone());
+    let request = TelegramMessageRequest::markdown_v2(rendered.markdown.clone(), plain)
+        .with_reply_markup_option(markup);
+    let api = bot.api.clone();
+    let token = bot.token.clone();
+    let surface = surface.clone();
+    let started = Instant::now();
+    let result = tokio::task::spawn_blocking(move || api.send_rendered(&token, &surface, &request))
+        .await
+        .map_err(|error| error.to_string())?;
+    match result {
+        Ok(message) => {
+            metrics.observe_delivery_duration_for(
+                role_label(bot.role),
+                true,
+                started.elapsed().as_micros() as u64,
+            );
+            Ok(message)
+        }
+        Err(error) => {
+            metrics.observe_delivery_duration_for(
+                role_label(bot.role),
+                false,
+                started.elapsed().as_micros() as u64,
+            );
+            Err(error.to_string())
+        }
+    }
+}
+
+async fn edit_control_rendered(
+    bot: &RuntimeBot,
+    reference: &TelegramMessageReference,
+    rendered: &RenderedEffect,
+    markup: Option<InlineKeyboardMarkup>,
+    metrics: &MetricsRegistry,
+) -> Result<(), String> {
+    let plain = rendered
+        .plain
+        .clone()
+        .unwrap_or_else(|| rendered.markdown.clone());
+    let request = TelegramMessageRequest::markdown_v2(rendered.markdown.clone(), plain)
+        .with_reply_markup_option(markup);
+    let api = bot.api.clone();
+    let token = bot.token.clone();
+    let reference = reference.clone();
+    let started = Instant::now();
+    let result = tokio::task::spawn_blocking(move || api.edit_text(&token, &reference, &request))
+        .await
+        .map_err(|error| error.to_string())?;
+    match result {
+        Ok(_) => {
+            metrics.observe_delivery_duration_for(
+                role_label(bot.role),
+                true,
+                started.elapsed().as_micros() as u64,
+            );
+            Ok(())
+        }
+        Err(error) => {
+            metrics.observe_delivery_duration_for(
+                role_label(bot.role),
+                false,
+                started.elapsed().as_micros() as u64,
+            );
+            Err(error.to_string())
+        }
+    }
+}
+
+fn schedule_control_deletions(
+    store: &SqliteStore,
+    bot: &RuntimeBot,
+    chat_id: i64,
+    command_id: i64,
+    reply_id: i64,
+    effect: &ControlEffect,
+) -> Result<(), String> {
+    let ControlEffect::DeleteDeadline {
+        targets,
+        deadline_seconds,
+        group_key,
+    } = effect
+    else {
+        return Ok(());
+    };
+    let delete_at_ms = now_ms().saturating_add((*deadline_seconds as i64).saturating_mul(1000));
+    for (target, message_id) in [
+        (DeleteTarget::Command, command_id),
+        (DeleteTarget::Reply, reply_id),
+    ] {
+        if targets.contains(&target) {
+            store
+                .schedule_deletion(&ScheduledDeletion {
+                    bot_instance_id: bot.config.instance_id.clone(),
+                    chat_id,
+                    message_id,
+                    group_key: group_key.clone(),
+                    delete_at_ms,
+                    attempts: 0,
+                    claimed_at_ms: None,
+                    last_error_class: None,
+                })
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+async fn handle_control_help(
+    bot: &RuntimeBot,
+    config: &RustConfig,
+    metrics: &MetricsRegistry,
+    chat_id: i64,
+    actor_user_id: Option<i64>,
+    _message_id: i64,
+    paired: bool,
+) -> Result<(), String> {
+    let user_id = control_user(actor_user_id)?;
+    let effects = ControlController
+        .dispatch(ControlRequest::Help {
+            label: bot.config.instance_id.clone(),
+            paired,
+        })
+        .map_err(|error| format!("control help failed: {error:?}"))?;
+    for effect in effects {
+        if let ControlEffect::Render(rendered) = effect {
+            let surface = surface_for(bot, config, chat_id, None);
+            let _ = user_id;
+            send_control_rendered(bot, &surface, &rendered, None, metrics).await?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_control_sessions(
+    agent: &AppServerClient,
+    bot: &RuntimeBot,
+    config: &RustConfig,
+    store: &Arc<SqliteStore>,
+    metrics: &MetricsRegistry,
+    chat_id: i64,
+    actor_user_id: Option<i64>,
+    command_id: i64,
+    text: &str,
+) -> Result<(), String> {
+    let user_id = control_user(actor_user_id)?;
+    let query = text
+        .split_whitespace()
+        .skip(1)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let sessions = list_control_sessions(agent).await?;
+    let scope_key = format!("sessions:{chat_id}");
+    let interaction = store
+        .replace_control_interaction(
+            &scope_key,
+            "sessions",
+            "list",
+            &json!({"query": query, "page": 1}),
+            user_id,
+            chat_id,
+            Some(command_id),
+            now_ms().saturating_add(15 * 60 * 1000),
+            now_ms(),
+        )
+        .map_err(|error| error.to_string())?;
+    let effects = ControlController
+        .dispatch(ControlRequest::Sessions(SessionsRequest {
+            query: query.clone(),
+            page: 1,
+            now: control_now_seconds(),
+            utc_offset_seconds: CONTROL_UTC_OFFSET_SECONDS,
+            sessions,
+        }))
+        .map_err(|error| format!("control sessions failed: {error:?}"))?;
+    let surface = surface_for(bot, config, chat_id, None);
+    let mut reply_id = None;
+    for effect in &effects {
+        if let ControlEffect::Render(rendered) = effect {
+            let markup = control_button_markup(
+                store,
+                &scope_key,
+                interaction.revision,
+                user_id,
+                chat_id,
+                rendered.keyboard.as_deref().unwrap_or_default(),
+                interaction.expires_at_ms,
+            )?;
+            let message = send_control_rendered(bot, &surface, rendered, markup, metrics).await?;
+            reply_id = Some(message.message_id);
+            store
+                .update_control_interaction_message(
+                    &scope_key,
+                    interaction.revision,
+                    message.message_id,
+                    now_ms(),
+                )
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    if let Some(reply_id) = reply_id {
+        for effect in &effects {
+            schedule_control_deletions(store, bot, chat_id, command_id, reply_id, effect)?;
+        }
+        if let Some(refresh_seconds) = effects.iter().find_map(|effect| match effect {
+            ControlEffect::SessionRefresh { after_seconds } => Some(*after_seconds),
+            _ => None,
+        }) {
+            tokio::spawn(run_sessions_refresh(
+                agent.clone(),
+                store.clone(),
+                bot.clone(),
+                metrics.clone(),
+                scope_key,
+                query,
+                reply_id,
+                refresh_seconds,
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_sessions_refresh(
+    agent: AppServerClient,
+    store: Arc<SqliteStore>,
+    bot: RuntimeBot,
+    metrics: MetricsRegistry,
+    scope_key: String,
+    query: String,
+    reply_id: i64,
+    refresh_seconds: u64,
+) {
+    let mut revision = match store.control_interaction(&scope_key).ok().flatten() {
+        Some(interaction) => interaction.revision,
+        None => return,
+    };
+    loop {
+        tokio::time::sleep(Duration::from_secs(refresh_seconds)).await;
+        let Some(current) = store.control_interaction(&scope_key).ok().flatten() else {
+            return;
+        };
+        if current.revision != revision || current.expires_at_ms <= now_ms() {
+            return;
+        }
+        let sessions = match list_control_sessions(&agent).await {
+            Ok(sessions) => sessions,
+            Err(_) => return,
+        };
+        let next = match store.advance_control_interaction(
+            &scope_key,
+            current.revision,
+            "list",
+            &json!({"query": query.clone(), "page": 1}),
+            current.user_id,
+            current.chat_id,
+            Some(reply_id),
+            current.expires_at_ms,
+            now_ms(),
+        ) {
+            Ok(Some(next)) => next,
+            Ok(None) | Err(_) => return,
+        };
+        revision = next.revision;
+        let Ok(effects) = ControlController.dispatch(ControlRequest::Sessions(SessionsRequest {
+            query: query.clone(),
+            page: 1,
+            now: control_now_seconds(),
+            utc_offset_seconds: CONTROL_UTC_OFFSET_SECONDS,
+            sessions,
+        })) else {
+            return;
+        };
+        let Some(rendered) = effects.iter().find_map(|effect| match effect {
+            ControlEffect::Render(rendered) => Some(rendered),
+            _ => None,
+        }) else {
+            return;
+        };
+        let markup = match control_button_markup(
+            &store,
+            &scope_key,
+            next.revision,
+            next.user_id,
+            next.chat_id,
+            rendered.keyboard.as_deref().unwrap_or_default(),
+            next.expires_at_ms,
+        ) {
+            Ok(markup) => markup,
+            Err(_) => return,
+        };
+        let reference = match TelegramMessageReference::new(next.chat_id.to_string(), reply_id) {
+            Ok(reference) => reference,
+            Err(_) => return,
+        };
+        if edit_control_rendered(&bot, &reference, rendered, markup, &metrics)
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+async fn handle_control_topics(
+    bot: &RuntimeBot,
+    config: &RustConfig,
+    store: &Arc<SqliteStore>,
+    metrics: &MetricsRegistry,
+    chat_id: i64,
+    actor_user_id: Option<i64>,
+    command_id: i64,
+) -> Result<(), String> {
+    let user_id = control_user(actor_user_id)?;
+    let topics = store
+        .session_spaces()
+        .map_err(|error| error.to_string())?
+        .iter()
+        .filter(|space| space.lifecycle != "closed")
+        .take(30)
+        .map(|space| control_topic_from_space(store, space))
+        .collect::<Vec<_>>();
+    let scope_key = format!("topics:{chat_id}");
+    let interaction = store
+        .replace_control_interaction(
+            &scope_key,
+            "topics",
+            "list",
+            &json!({"count": topics.len()}),
+            user_id,
+            chat_id,
+            Some(command_id),
+            now_ms().saturating_add(15 * 60 * 1000),
+            now_ms(),
+        )
+        .map_err(|error| error.to_string())?;
+    let effects = ControlController
+        .dispatch(ControlRequest::Topics { topics })
+        .map_err(|error| format!("control topics failed: {error:?}"))?;
+    let surface = surface_for(bot, config, chat_id, None);
+    for effect in effects {
+        if let ControlEffect::Render(rendered) = effect {
+            let markup = control_button_markup(
+                store,
+                &scope_key,
+                interaction.revision,
+                user_id,
+                chat_id,
+                rendered.keyboard.as_deref().unwrap_or_default(),
+                interaction.expires_at_ms,
+            )?;
+            let _ = send_control_rendered(bot, &surface, &rendered, markup, metrics).await?;
+        }
+    }
+    Ok(())
+}
+
+fn format_perf_snapshot(snapshot: &crate::perf::PerfSnapshot) -> (String, String) {
+    let mib = |value: u64| value as f64 / (1024.0 * 1024.0);
+    let markdown = format!(
+        "CPU `{:.1}%`\nMemory `{:.0}/{:.0} MiB`\nSwap `{:.0}/{:.0} MiB`\nDisk `{:.1}/{:.1} GiB`\nCodex `{}` proc / `{:.1}%` / `{:.0} MiB`{}",
+        snapshot.cpu_percent,
+        mib(snapshot.memory_used_bytes),
+        mib(snapshot.memory_total_bytes),
+        mib(snapshot.swap_used_bytes),
+        mib(snapshot.swap_total_bytes),
+        snapshot.disk_used_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        snapshot.disk_total_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        snapshot.codex_process_count,
+        snapshot.codex_cpu_percent,
+        mib(snapshot.codex_memory_bytes),
+        snapshot
+            .gpu
+            .as_deref()
+            .map(|gpu| format!("\nGPU `{gpu}`"))
+            .unwrap_or_default(),
+    );
+    let plain = format!(
+        "CPU {:.1}%\nMemory {:.0}/{:.0} MiB\nSwap {:.0}/{:.0} MiB\nDisk {:.1}/{:.1} GiB\nCodex {} proc / {:.1}% / {:.0} MiB{}",
+        snapshot.cpu_percent,
+        mib(snapshot.memory_used_bytes),
+        mib(snapshot.memory_total_bytes),
+        mib(snapshot.swap_used_bytes),
+        mib(snapshot.swap_total_bytes),
+        snapshot.disk_used_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        snapshot.disk_total_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        snapshot.codex_process_count,
+        snapshot.codex_cpu_percent,
+        mib(snapshot.codex_memory_bytes),
+        snapshot
+            .gpu
+            .as_deref()
+            .map(|gpu| format!("\nGPU {gpu}"))
+            .unwrap_or_default(),
+    );
+    (markdown, plain)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_control_perf(
+    control_runtime: &Arc<ControlRuntime>,
+    bot: &RuntimeBot,
+    config: &RustConfig,
+    store: &Arc<SqliteStore>,
+    metrics: &MetricsRegistry,
+    chat_id: i64,
+    actor_user_id: Option<i64>,
+    command_id: i64,
+) -> Result<(), String> {
+    let user_id = control_user(actor_user_id)?;
+    let sampler = control_runtime.perf.clone();
+    let snapshot = tokio::task::spawn_blocking(move || sampler.sample(true))
+        .await
+        .map_err(|error| error.to_string())?;
+    let (markdown_body, plain_body) = format_perf_snapshot(&snapshot);
+    let effects = ControlController
+        .dispatch(ControlRequest::Perf {
+            frame: 0,
+            markdown_body,
+            plain_body,
+        })
+        .map_err(|error| format!("control perf failed: {error:?}"))?;
+    let scope_key = format!("perf:{chat_id}");
+    let interaction = store
+        .replace_control_interaction(
+            &scope_key,
+            "perf",
+            "running",
+            &json!({"command_id": command_id}),
+            user_id,
+            chat_id,
+            Some(command_id),
+            now_ms().saturating_add(30 * 1000),
+            now_ms(),
+        )
+        .map_err(|error| error.to_string())?;
+    let surface = surface_for(bot, config, chat_id, None);
+    let mut reply_id = None;
+    for effect in &effects {
+        if let ControlEffect::Render(rendered) = effect {
+            let message = send_control_rendered(bot, &surface, rendered, None, metrics).await?;
+            reply_id = Some(message.message_id);
+            store
+                .update_control_interaction_message(
+                    &scope_key,
+                    interaction.revision,
+                    message.message_id,
+                    now_ms(),
+                )
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    let Some(reply_id) = reply_id else {
+        return Ok(());
+    };
+    for effect in &effects {
+        schedule_control_deletions(store, bot, chat_id, command_id, reply_id, effect)?;
+    }
+    tokio::spawn(run_perf_ticker(
+        control_runtime.perf.clone(),
+        store.clone(),
+        bot.clone(),
+        metrics.clone(),
+        scope_key,
+        interaction.revision,
+        chat_id,
+        reply_id,
+    ));
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_perf_ticker(
+    sampler: Arc<crate::perf::PerfSampler>,
+    store: Arc<SqliteStore>,
+    bot: RuntimeBot,
+    metrics: MetricsRegistry,
+    scope_key: String,
+    revision: i64,
+    chat_id: i64,
+    reply_id: i64,
+) {
+    for frame in 1..6 {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let Some(interaction) = store.control_interaction(&scope_key).ok().flatten() else {
+            return;
+        };
+        if interaction.revision != revision || interaction.expires_at_ms <= now_ms() {
+            return;
+        }
+        let snapshot = match tokio::task::spawn_blocking({
+            let sampler = sampler.clone();
+            move || sampler.sample(true)
+        })
+        .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(_) => return,
+        };
+        let (markdown_body, plain_body) = format_perf_snapshot(&snapshot);
+        let Ok(effects) = ControlController.dispatch(ControlRequest::Perf {
+            frame,
+            markdown_body,
+            plain_body,
+        }) else {
+            return;
+        };
+        let Some(rendered) = effects.iter().find_map(|effect| match effect {
+            ControlEffect::Render(rendered) => Some(rendered),
+            _ => None,
+        }) else {
+            return;
+        };
+        let Ok(reference) = TelegramMessageReference::new(chat_id.to_string(), reply_id) else {
+            return;
+        };
+        if edit_control_rendered(&bot, &reference, rendered, None, &metrics)
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_control_callback(
+    callback: codex_telegram_adapter::TelegramCallback,
+    bot: RuntimeBot,
+    _bots_by_id: &HashMap<String, RuntimeBot>,
+    config: &RustConfig,
+    store: &Arc<SqliteStore>,
+    agent: &AppServerClient,
+    _sessions: &Arc<SessionRegistry>,
+    metrics: &MetricsRegistry,
+    _totp: &Arc<TotpManager>,
+    _control_runtime: &Arc<ControlRuntime>,
+) -> Result<(), String> {
+    let Some(user_id) = callback.actor.user_id else {
+        acknowledge_callback(&bot, &callback, Some("无法确认发送者")).await;
+        return Ok(());
+    };
+    let nonce = callback.data.strip_prefix("ctl:").unwrap_or_default();
+    let Some(stored) = store
+        .consume_control_callback(nonce, user_id, callback.chat_id, now_ms())
+        .map_err(|error| error.to_string())?
+    else {
+        acknowledge_callback(&bot, &callback, Some("按钮已使用或过期，请重新执行命令。")).await;
+        return Ok(());
+    };
+    let action = stored.action.as_str();
+    if !matches!(
+        action,
+        "session_detail" | "sessions_current" | "sessions_page"
+    ) {
+        acknowledge_callback(&bot, &callback, Some("按钮已处理")).await;
+        return Ok(());
+    }
+    acknowledge_callback(&bot, &callback, None).await;
+    if action == "sessions_current" {
+        return Ok(());
+    }
+    let Some(scope_key) = stored.scope_key.as_deref() else {
+        return Ok(());
+    };
+    let query = stored
+        .payload
+        .get("query")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    if action == "session_detail" {
+        let thread_id = stored
+            .payload
+            .get("thread_id")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let sessions = list_control_sessions(agent).await?;
+        let detail = sessions
+            .iter()
+            .find(|session| session.thread_id == thread_id)
+            .map(|session| {
+                format!(
+                    "🤖 {}\n📝 {}\n📁 {}\n状态 {}",
+                    session.thread_id, session.title, session.cwd, session.status
+                )
+            })
+            .unwrap_or_else(|| format!("Session {thread_id} 不存在或已关闭。"));
+        return send_text(
+            &bot,
+            &surface_for(&bot, config, callback.chat_id, None),
+            &detail,
+            metrics,
+        )
+        .await
+        .map(|_| ());
+    }
+    let page = stored
+        .payload
+        .get("page")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1);
+    let sessions = list_control_sessions(agent).await?;
+    let interaction = store
+        .control_interaction(scope_key)
+        .map_err(|error| error.to_string())?;
+    let Some(interaction) = interaction else {
+        return Ok(());
+    };
+    let next = store
+        .replace_control_interaction(
+            scope_key,
+            "sessions",
+            "list",
+            &json!({"query": query, "page": page}),
+            user_id,
+            callback.chat_id,
+            Some(callback.message_id),
+            now_ms().saturating_add(15 * 60 * 1000),
+            now_ms(),
+        )
+        .map_err(|error| error.to_string())?;
+    let effects = ControlController
+        .dispatch(ControlRequest::Sessions(SessionsRequest {
+            query,
+            page,
+            now: control_now_seconds(),
+            utc_offset_seconds: CONTROL_UTC_OFFSET_SECONDS,
+            sessions,
+        }))
+        .map_err(|error| format!("control sessions callback failed: {error:?}"))?;
+    let reference =
+        TelegramMessageReference::new(callback.chat_id.to_string(), callback.message_id)
+            .map_err(|error| error.to_string())?;
+    for effect in effects {
+        if let ControlEffect::Render(rendered) = effect {
+            let markup = control_button_markup(
+                store,
+                scope_key,
+                next.revision,
+                user_id,
+                callback.chat_id,
+                rendered.keyboard.as_deref().unwrap_or_default(),
+                next.expires_at_ms,
+            )?;
+            edit_control_rendered(&bot, &reference, &rendered, markup, metrics).await?;
+        }
+    }
+    let _ = interaction;
+    Ok(())
+}
+
 fn new_draft_key(chat_id: i64) -> String {
     format!("{chat_id}")
 }
@@ -1772,6 +2957,69 @@ fn new_draft_expired(draft: &Value) -> bool {
         .is_some_and(|expires| expires < now_ms())
 }
 
+fn persist_new_draft(store: &SqliteStore, key: &str, draft: &Value) -> Result<(), String> {
+    let chat_id = draft
+        .get("chat_id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| "new draft chat_id missing".to_owned())?;
+    let user_id = draft
+        .get("user_id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| "new draft user_id missing".to_owned())?;
+    let phase = draft
+        .get("phase")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let expires_at_ms = draft
+        .get("expires_at_ms")
+        .and_then(Value::as_i64)
+        .unwrap_or_else(|| now_ms().saturating_add(NEW_INTERACTION_TTL_MS));
+    let interaction = store
+        .replace_control_interaction(
+            key,
+            "new",
+            phase,
+            draft.get("payload").unwrap_or(&Value::Null),
+            user_id,
+            chat_id,
+            None,
+            expires_at_ms,
+            now_ms(),
+        )
+        .map_err(|error| error.to_string())?;
+    let mut persisted = draft.clone();
+    persisted["revision"] = Value::from(interaction.revision);
+    store
+        .upsert_workflow_record("new", key, &persisted, now_ms())
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn new_interaction_revision(
+    store: &SqliteStore,
+    key: &str,
+    draft: &Value,
+) -> Result<(ctg_storage_sqlite::ControlInteraction, i64), String> {
+    let interaction = store
+        .control_interaction(key)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "new interaction is no longer active".to_owned())?;
+    let draft_revision = draft
+        .get("revision")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    if draft_revision != interaction.revision {
+        let legacy_snapshot_matches = draft_revision.saturating_add(1) == interaction.revision
+            && draft.get("phase").and_then(Value::as_str) == Some(interaction.phase.as_str())
+            && draft.get("payload") == Some(&interaction.payload);
+        if !legacy_snapshot_matches {
+            return Err("new interaction changed; selection was already handled".to_owned());
+        }
+    }
+    let revision = interaction.revision;
+    Ok((interaction, revision))
+}
+
 fn advance_new_draft(
     store: &SqliteStore,
     key: &str,
@@ -1796,6 +3044,22 @@ fn advance_new_draft(
     } else {
         NEW_INTERACTION_TTL_MS
     }));
+    let (current, expected_revision) = new_interaction_revision(store, key, draft)?;
+    let next = store
+        .advance_control_interaction(
+            key,
+            expected_revision,
+            phase,
+            updated.get("payload").unwrap_or(&Value::Null),
+            current.user_id,
+            current.chat_id,
+            current.message_id,
+            updated["expires_at_ms"].as_i64().unwrap_or(now_ms()),
+            now_ms(),
+        )
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "new interaction changed; selection was already handled".to_owned())?;
+    updated["revision"] = Value::from(next.revision);
     store
         .upsert_workflow_record("new", key, &updated, now_ms())
         .map_err(|error| error.to_string())?;
@@ -1808,21 +3072,93 @@ fn new_choice_markup(
     draft: &mut Value,
     choices: &[(String, String, String)],
 ) -> Result<Option<Value>, String> {
+    let chat_id = draft
+        .get("chat_id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| "new draft chat_id missing".to_owned())?;
+    let user_id = draft
+        .get("user_id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| "new draft user_id missing".to_owned())?;
+    let revision = store
+        .control_interaction(key)
+        .map_err(|error| error.to_string())?
+        .map(|interaction| interaction.revision)
+        .or_else(|| draft.get("revision").and_then(Value::as_i64))
+        .unwrap_or_default();
+    let expires_at_ms = draft
+        .get("expires_at_ms")
+        .and_then(Value::as_i64)
+        .unwrap_or_else(|| now_ms().saturating_add(NEW_INTERACTION_TTL_MS));
     let mut stored = serde_json::Map::new();
-    let mut rows = Vec::new();
+    let mut buttons = Vec::new();
     for (event, value, label) in choices {
         let nonce = next_approval_nonce();
         stored.insert(nonce.clone(), json!({"event": event, "value": value}));
-        rows.push(vec![json!({
+        store
+            .upsert_control_callback(&ControlCallback {
+                nonce: nonce.clone(),
+                scope_key: Some(key.to_owned()),
+                revision: Some(revision),
+                user_id,
+                chat_id,
+                action: event.clone(),
+                payload: json!({"value": value}),
+                expires_at_ms,
+                consumed_at_ms: None,
+                invalidated_at_ms: None,
+                created_at_ms: now_ms(),
+            })
+            .map_err(|error| error.to_string())?;
+        buttons.push(json!({
             "text": truncate_text(label),
             "callback_data": format!("new:{nonce}"),
-        })]);
+        }));
     }
+    let cancel_nonce = next_approval_nonce();
+    store
+        .upsert_control_callback(&ControlCallback {
+            nonce: cancel_nonce.clone(),
+            scope_key: Some(key.to_owned()),
+            revision: Some(revision),
+            user_id,
+            chat_id,
+            action: "cancel".to_owned(),
+            payload: json!({"value": ""}),
+            expires_at_ms,
+            consumed_at_ms: None,
+            invalidated_at_ms: None,
+            created_at_ms: now_ms(),
+        })
+        .map_err(|error| error.to_string())?;
+    stored.insert(
+        cancel_nonce.clone(),
+        json!({"event": "cancel", "value": ""}),
+    );
     draft["choices"] = Value::Object(stored);
     store
         .upsert_workflow_record("new", key, draft, now_ms())
         .map_err(|error| error.to_string())?;
-    Ok((!rows.is_empty()).then(|| json!({"inline_keyboard": rows})))
+    let event = choices
+        .first()
+        .map(|choice| choice.0.as_str())
+        .unwrap_or_default();
+    let columns = if event.contains("model") {
+        2
+    } else if event.contains("effort") {
+        3
+    } else {
+        1
+    };
+    let mut rows = buttons
+        .chunks(columns)
+        .map(|row| Value::Array(row.to_vec()))
+        .collect::<Vec<_>>();
+    rows.push(json!([{
+        "text": "退出",
+        "callback_data": format!("new:{cancel_nonce}"),
+    }]));
+    Ok(Some(json!({"inline_keyboard": rows})))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1869,16 +3205,29 @@ async fn begin_new_interaction(
         && new_draft_expired(&existing)
     {
         let _ = store.delete_workflow_record("new", &key);
+        let _ = store.delete_control_interaction(&key, now_ms());
     }
     let args = new_command_arguments(text);
     if args.is_empty() {
         let models = list_model_choices(agent).await?;
+        let contract_models = control_models(&models);
+        let _ = ControlController
+            .dispatch(ControlRequest::New {
+                draft: crate::control::NewDraft {
+                    phase: crate::control::NewPhase::NormalModel,
+                    normal_model: None,
+                    plan_model: None,
+                },
+                models: contract_models,
+            })
+            .map_err(|error| format!("control /new contract failed: {error:?}"))?;
         let mut draft = new_draft(
             chat_id,
             user_id,
             "normal_model",
             json!({"channel_post_id": message_id.max(1)}),
         );
+        persist_new_draft(store, &key, &draft)?;
         let choices = models
             .entries
             .iter()
@@ -1886,19 +3235,21 @@ async fn begin_new_interaction(
                 (
                     "normal_model".to_owned(),
                     entry.model.clone(),
-                    format!("{} · {}", entry.display_name, entry.model),
+                    entry.display_name.clone(),
                 )
             })
             .collect::<Vec<_>>();
         let markup = new_choice_markup(store, &key, &mut draft, &choices)?;
-        return send_text_with_markup(
+        return send_control_text_with_json_markup(
             bot,
             &surface_for(bot, config, chat_id, None),
-            "请选择普通模式模型：",
+            "请选择 当前模式 使用的模型：",
+            "请选择 当前模式 使用的模型：",
             markup,
             metrics,
         )
-        .await;
+        .await
+        .map(|_| ());
     }
     let parsed = parse_new_arguments(text)?;
     let models = list_model_choices(agent).await?;
@@ -1965,15 +3316,14 @@ async fn begin_new_interaction(
         if let Some(prompt) = parsed.prompt {
             draft["payload"]["initial_prompt"] = Value::String(prompt);
         }
-        store
-            .upsert_workflow_record("new", &key, &draft, now_ms())
-            .map_err(|error| error.to_string())?;
+        persist_new_draft(store, &key, &draft)?;
         return finish_new_project(
             store, agent, sessions, bot, bots_by_id, config, metrics, &key, draft,
         )
         .await;
     }
     if phase == "plan_choice" {
+        persist_new_draft(store, &key, &draft)?;
         let choices = vec![
             ("plan_choice".into(), "yes".into(), "进入 Plan Mode".into()),
             ("plan_choice".into(), "no".into(), "不进入 Plan Mode".into()),
@@ -1988,9 +3338,7 @@ async fn begin_new_interaction(
         )
         .await
     } else {
-        store
-            .upsert_workflow_record("new", &key, &draft, now_ms())
-            .map_err(|error| error.to_string())?;
+        persist_new_draft(store, &key, &draft)?;
         send_text(
             bot,
             &surface_for(bot, config, chat_id, None),
@@ -2027,20 +3375,20 @@ async fn handle_new_callback(
         acknowledge_callback(&bot, &callback, Some("选择已过期或无权操作")).await;
         return Ok(());
     }
-    let Some(choice) = draft
-        .get("choices")
-        .and_then(Value::as_object)
-        .and_then(|choices| choices.get(nonce))
-        .cloned()
-    else {
-        acknowledge_callback(&bot, &callback, Some("选择已处理")).await;
+    let Some(user_id) = callback.actor.user_id else {
+        acknowledge_callback(&bot, &callback, Some("无法确认发送者")).await;
         return Ok(());
     };
-    let event = choice
-        .get("event")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let value = choice
+    let Some(stored) = store
+        .consume_control_callback(nonce, user_id, callback.chat_id, now_ms())
+        .map_err(|error| error.to_string())?
+    else {
+        acknowledge_callback(&bot, &callback, Some("选择已处理或已过期")).await;
+        return Ok(());
+    };
+    let event = stored.action.as_str();
+    let value = stored
+        .payload
         .get("value")
         .and_then(Value::as_str)
         .unwrap_or_default();
@@ -2051,6 +3399,9 @@ async fn handle_new_callback(
         "cancel" => {
             store
                 .delete_workflow_record("new", &key)
+                .map_err(|error| error.to_string())?;
+            store
+                .delete_control_interaction(&key, now_ms())
                 .map_err(|error| error.to_string())?;
             edit_text_with_markup(
                 &bot,
@@ -2069,7 +3420,11 @@ async fn handle_new_callback(
             };
             let next = advance_new_draft(store, &key, &draft, "normal_effort", json!({"normal_model": model.model}), false)?;
             let mut next = next;
-            let choices = model.efforts.iter().map(|effort| ("normal_effort".into(), effort.clone(), format!("effort · {effort}"))).collect::<Vec<_>>();
+            let choices = model
+                .efforts
+                .iter()
+                .map(|effort| ("normal_effort".into(), effort.clone(), effort.clone()))
+                .collect::<Vec<_>>();
             let markup = new_choice_markup(store, &key, &mut next, &choices)?;
             send_text_with_markup(&bot, &surface_for(&bot, config, callback.chat_id, None), "请选择普通模式 effort：", markup, metrics).await
         }
@@ -2087,7 +3442,11 @@ async fn handle_new_callback(
                 let next = advance_new_draft(store, &key, &draft, "plan_model", payload, false)?;
                 let models = list_model_choices(agent).await?;
                 let mut next = next;
-                let choices = models.entries.iter().map(|entry| ("plan_model".into(), entry.model.clone(), format!("{} · {}", entry.display_name, entry.model))).collect::<Vec<_>>();
+                let choices = models
+                    .entries
+                    .iter()
+                    .map(|entry| ("plan_model".into(), entry.model.clone(), entry.display_name.clone()))
+                    .collect::<Vec<_>>();
                 let markup = new_choice_markup(store, &key, &mut next, &choices)?;
                 send_text_with_markup(&bot, &surface_for(&bot, config, callback.chat_id, None), "请选择 Plan Mode 模型：", markup, metrics).await
             } else {
@@ -2102,7 +3461,11 @@ async fn handle_new_callback(
             };
             let next = advance_new_draft(store, &key, &draft, "plan_effort", json!({"normal_model": payload.get("normal_model").cloned().unwrap_or(Value::Null), "normal_effort": payload.get("normal_effort").cloned().unwrap_or(Value::Null), "plan_model": model.model}), false)?;
             let mut next = next;
-            let choices = model.efforts.iter().map(|effort| ("plan_effort".into(), effort.clone(), format!("effort · {effort}"))).collect::<Vec<_>>();
+            let choices = model
+                .efforts
+                .iter()
+                .map(|effort| ("plan_effort".into(), effort.clone(), effort.clone()))
+                .collect::<Vec<_>>();
             let markup = new_choice_markup(store, &key, &mut next, &choices)?;
             send_text_with_markup(&bot, &surface_for(&bot, config, callback.chat_id, None), "请选择 Plan Mode effort：", markup, metrics).await
         }
@@ -2125,7 +3488,7 @@ async fn handle_new_callback(
             let next = advance_new_draft(store, &key, &draft, "prompt", next_payload, true)?;
             send_new_prompt_or_finish(store, agent, sessions, &bot, bots_by_id, config, metrics, &key, next).await
         }
-        "hello" => finish_new_prompt(store, agent, sessions, &bot, bots_by_id, config, metrics, &key, draft, "Hello".into()).await,
+        "hello" => finish_new_prompt(store, agent, sessions, &bot, bots_by_id, config, metrics, &key, draft, "Hello".into(), false).await,
         _ => send_text(&bot, &surface_for(&bot, config, callback.chat_id, None), "该选择与当前步骤不匹配，请重新执行 /new。", metrics).await,
     }
     .map(|_| {
@@ -2161,6 +3524,7 @@ async fn handle_new_text(
         store
             .delete_workflow_record("new", &key)
             .map_err(|error| error.to_string())?;
+        let _ = store.delete_control_interaction(&key, now_ms());
         send_text(
             bot,
             &surface_for(bot, config, chat_id, None),
@@ -2202,6 +3566,7 @@ async fn handle_new_text(
                 &key,
                 draft,
                 text.trim().to_owned(),
+                false,
             )
             .await?;
         }
@@ -2235,9 +3600,11 @@ fn new_existing_projects(root: &Path, value: &str) -> Result<Vec<PathBuf>, Strin
     }
     let direct = root.join(value);
     if direct.is_dir() {
-        return Ok(vec![
-            fs::canonicalize(direct).map_err(|error| error.to_string())?,
-        ]);
+        let resolved = fs::canonicalize(direct).map_err(|error| error.to_string())?;
+        if resolved.strip_prefix(&root).is_err() {
+            return Err("项目路径必须位于 workspace 根目录内。".into());
+        }
+        return Ok(vec![resolved]);
     }
     let needle = value.to_ascii_lowercase();
     let mut matches = Vec::new();
@@ -2400,7 +3767,7 @@ async fn send_new_prompt_or_finish(
         .map(str::to_owned)
     {
         return finish_new_prompt(
-            store, agent, sessions, bot, bots_by_id, config, metrics, key, draft, prompt,
+            store, agent, sessions, bot, bots_by_id, config, metrics, key, draft, prompt, false,
         )
         .await;
     }
@@ -2488,6 +3855,7 @@ async fn create_pending_session_space(
     generation: i64,
     payload: &Value,
     prompt: &str,
+    space_id: &str,
 ) -> Result<(RustSessionSpace, SentMessage), String> {
     let cwd = payload
         .get("cwd")
@@ -2503,6 +3871,18 @@ async fn create_pending_session_space(
         .filter(|value| !value.trim().is_empty());
     if plan_model.is_some() != plan_effort.is_some() {
         return Err("Plan model 和 effort 必须同时存在".into());
+    }
+    if let Some(existing) = store
+        .get_session_space(space_id)
+        .map_err(|error| error.to_string())?
+        && existing.lifecycle == "pending"
+    {
+        return Ok((
+            existing.clone(),
+            SentMessage {
+                message_id: existing.channel_post_id,
+            },
+        ));
     }
     let channel = ChannelBinding::new(
         bot.config.instance_id.clone(),
@@ -2520,6 +3900,17 @@ async fn create_pending_session_space(
         truncate_text(prompt),
         mode,
     );
+    // Persist the activation intent before the Telegram side effect.  The
+    // message id is filled in after send, but a restart can still find the
+    // exact payload and retry instead of losing the claimed `/new` request.
+    let now = now_ms();
+    let mut pending = payload.clone();
+    pending["space_id"] = Value::String(space_id.to_owned());
+    pending["pending_cwd"] = Value::String(cwd.to_owned());
+    pending["pending_prompt"] = Value::String(prompt.to_owned());
+    store
+        .upsert_workflow_record("pending_space", space_id, &pending, now)
+        .map_err(|error| error.to_string())?;
     let message = send_text_message(
         bot,
         &TelegramSurfaceBinding::Channel(channel),
@@ -2527,10 +3918,12 @@ async fn create_pending_session_space(
         metrics,
     )
     .await?;
-    let now = now_ms();
-    let space_id = format!("telegram-pending-{}", next_approval_nonce());
+    pending["channel_post_id"] = Value::from(message.message_id.max(1));
+    store
+        .upsert_workflow_record("pending_space", space_id, &pending, now_ms())
+        .map_err(|error| error.to_string())?;
     let space = RustSessionSpace {
-        space_id: space_id.clone(),
+        space_id: space_id.to_owned(),
         thread_id: None,
         lifecycle: "pending".into(),
         generation,
@@ -2547,13 +3940,6 @@ async fn create_pending_session_space(
     };
     store
         .upsert_session_space(&space)
-        .map_err(|error| error.to_string())?;
-    let mut pending = payload.clone();
-    pending["space_id"] = Value::String(space_id.clone());
-    pending["pending_cwd"] = Value::String(cwd.to_owned());
-    pending["pending_prompt"] = Value::String(prompt.to_owned());
-    store
-        .upsert_workflow_record("pending_space", &space_id, &pending, now)
         .map_err(|error| error.to_string())?;
     Ok((space, message))
 }
@@ -2681,8 +4067,50 @@ async fn activate_pending_session(
         root_message_id: repair.discussion_root_message_id,
         sender_instance_id: bot.config.instance_id.clone(),
     });
-    let client_message_id = format!("telegram-new-{}-{}", repair.space_id, next_approval_nonce());
-    let mut intent = PromptIntent {
+    // The space id is the idempotency key for the initial prompt.  A retry
+    // after a transport timeout must reuse it so app-server can deduplicate
+    // the request instead of starting a second turn.
+    let client_message_id = format!("telegram-new-{}", repair.space_id);
+    let existing_intent = store
+        .prompt_intent_by_client_message_id(&client_message_id)
+        .map_err(|error| error.to_string())?;
+    if let Some(existing) = existing_intent.as_ref()
+        && let Some(turn_id) = existing.turn_id.clone()
+        && matches!(
+            existing.state,
+            PromptIntentState::Started | PromptIntentState::Steered | PromptIntentState::Completed
+        )
+    {
+        sessions.set_turn(thread.id.as_str(), Some(turn_id.clone()));
+        let active = RustSessionSpace {
+            lifecycle: "active".into(),
+            updated_at_ms: now_ms(),
+            ..repair
+        };
+        store
+            .upsert_session_space(&active)
+            .map_err(|error| error.to_string())?;
+        store
+            .delete_workflow_record("pending_space", &active.space_id)
+            .map_err(|error| error.to_string())?;
+        update_status_message(
+            store, bots_by_id, config, metrics, totp, &active, None, None,
+        )
+        .await?;
+        return send_text(
+            bot,
+            &surface_for(
+                bot,
+                config,
+                discussion_chat_id,
+                active.discussion_root_message_id,
+            ),
+            &format!("Session {} 已恢复，首条 prompt 已提交。", thread.id),
+            metrics,
+        )
+        .await;
+    }
+    let mut intent = existing_intent.unwrap_or_else(|| PromptIntent {
         intent_id: format!("intent-{client_message_id}"),
         client_message_id: client_message_id.clone(),
         source: "session_activation".into(),
@@ -2701,7 +4129,13 @@ async fn activate_pending_session(
         error: None,
         created_at_ms: now_ms(),
         updated_at_ms: now_ms(),
-    };
+    });
+    intent.thread_id = Some(thread.id.clone());
+    intent.space_id = Some(repair.space_id.clone());
+    intent.prompt = prompt.to_owned();
+    intent.state = PromptIntentState::Submitting;
+    intent.error = None;
+    intent.updated_at_ms = now_ms();
     store
         .upsert_prompt_intent(&intent)
         .map_err(|error| error.to_string())?;
@@ -2790,31 +4224,48 @@ async fn finish_new_prompt(
     key: &str,
     draft: Value,
     prompt: String,
+    expired: bool,
 ) -> Result<(), String> {
-    let chat_id = draft["chat_id"]
-        .as_i64()
-        .ok_or_else(|| "new draft chat_id missing".to_owned())?;
-    if !store
-        .delete_workflow_record("new", key)
-        .map_err(|error| error.to_string())?
-    {
+    let (current, revision) = new_interaction_revision(store, key, &draft)?;
+    let claimed = if expired {
+        store
+            .claim_expired_control_interaction(
+                key,
+                current.user_id,
+                current.chat_id,
+                revision,
+                now_ms(),
+            )
+            .map_err(|error| error.to_string())?
+    } else {
+        store
+            .claim_control_interaction(key, current.user_id, current.chat_id, revision, now_ms())
+            .map_err(|error| error.to_string())?
+    };
+    let Some(claimed) = claimed else {
         return Ok(());
-    }
-    let payload = draft.get("payload").cloned().unwrap_or_else(|| json!({}));
+    };
+    let chat_id = claimed.chat_id;
+    let claim_started_ms = claimed.claimed_at_ms.unwrap_or_default();
+    let payload = claimed.payload;
+    let space_id = format!("telegram-pending-{}-{}", chat_id, claimed.created_at_ms);
     let (space, channel_post) = match create_pending_session_space(
         store,
         bot,
         config,
         metrics,
-        chat_id,
+        claimed.chat_id,
         i64::try_from(agent.connection_state().generation).unwrap_or(0),
         &payload,
         &prompt,
+        &space_id,
     )
     .await
     {
         Ok(value) => value,
         Err(error) => {
+            let _ =
+                store.release_control_interaction_claim(key, revision, claim_started_ms, now_ms());
             send_text(
                 bot,
                 &surface_for(bot, config, chat_id, None),
@@ -2825,6 +4276,12 @@ async fn finish_new_prompt(
             return Err(error);
         }
     };
+    store
+        .delete_workflow_record("new", key)
+        .map_err(|error| error.to_string())?;
+    store
+        .delete_control_interaction(key, now_ms())
+        .map_err(|error| error.to_string())?;
     send_text(
         bot,
         &surface_for(bot, config, chat_id, None),
@@ -2880,23 +4337,48 @@ async fn run_new_interaction_expirer(
                     &key,
                     draft,
                     "Hello".into(),
+                    true,
                 )
                 .await
                 {
                     eprintln!("rust bridge /new Hello expiry failed: {error}");
                 }
-            } else if let Err(error) = store.delete_workflow_record("new", &key) {
-                eprintln!("rust bridge /new draft cleanup failed: {error}");
+            } else {
+                let Some(user_id) = draft.get("user_id").and_then(Value::as_i64) else {
+                    continue;
+                };
+                let Some(chat_id) = draft.get("chat_id").and_then(Value::as_i64) else {
+                    continue;
+                };
+                let Ok((_, revision)) = new_interaction_revision(&store, &key, &draft) else {
+                    continue;
+                };
+                match store.claim_expired_control_interaction(
+                    &key,
+                    user_id,
+                    chat_id,
+                    revision,
+                    now_ms(),
+                ) {
+                    Ok(Some(_)) => {
+                        let _ = store.delete_workflow_record("new", &key);
+                        let _ = store.delete_control_interaction(&key, now_ms());
+                    }
+                    Ok(None) => {}
+                    Err(error) => eprintln!("rust bridge /new draft cleanup failed: {error}"),
+                }
             }
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_pair_command(
     text: &str,
     chat_id: i64,
     actor_user_id: Option<i64>,
     bot: &RuntimeBot,
+    bots_by_id: &HashMap<String, RuntimeBot>,
     config: &RustConfig,
     store: &Arc<SqliteStore>,
     metrics: &MetricsRegistry,
@@ -2946,6 +4428,7 @@ async fn handle_pair_command(
             now_ms(),
         )
         .map_err(|error| error.to_string())?;
+    refresh_command_menus(bots_by_id, config, store).await;
     send_text(
         bot,
         &surface,
@@ -3106,6 +4589,7 @@ async fn handle_bind_command(
             now_ms(),
         )
         .map_err(|error| error.to_string())?;
+    refresh_command_menus(bots_by_id, config, store).await;
     send_text(bot, &surface, "频道与讨论组绑定成功。", metrics).await
 }
 
@@ -4183,114 +5667,6 @@ async fn answer_question(
     .await
 }
 
-async fn render_sessions_list(agent: &AppServerClient, query: &str) -> Result<String, String> {
-    const PAGE_SIZE: usize = 5;
-    let response = agent
-        .list_threads(1000, None)
-        .await
-        .map_err(|error| error.to_string())?;
-    let entries = response
-        .get("data")
-        .or_else(|| response.get("threads"))
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|thread| {
-            !thread
-                .get("ephemeral")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-        })
-        .filter(|thread| {
-            if query.trim().is_empty() {
-                return true;
-            }
-            let needle = query.to_ascii_lowercase();
-            [
-                "id",
-                "title",
-                "name",
-                "preview",
-                "summary",
-                "naturalSummary",
-            ]
-            .iter()
-            .filter_map(|field| thread.get(*field).and_then(Value::as_str))
-            .any(|value| value.to_ascii_lowercase().contains(&needle))
-        })
-        .collect::<Vec<_>>();
-
-    let total_pages = entries.len().div_ceil(PAGE_SIZE).max(1);
-    let mut lines = vec![format!("🤖 Codex Sessions · 1/{total_pages}")];
-    if !query.trim().is_empty() {
-        lines.push(format!("搜索 {}", query.trim()));
-    }
-    if entries.is_empty() {
-        lines.push(String::new());
-        lines.push("当前没有 Codex session。".into());
-        return Ok(lines.join("\n"));
-    }
-    for (index, thread) in entries.iter().take(PAGE_SIZE).enumerate() {
-        let id = thread
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        let summary = ["naturalSummary", "summary", "title", "name", "preview"]
-            .iter()
-            .find_map(|field| thread.get(*field).and_then(Value::as_str))
-            .unwrap_or("Codex session");
-        let status = thread
-            .get("status")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        let cwd = ["cwd", "path"]
-            .iter()
-            .find_map(|field| thread.get(*field).and_then(Value::as_str))
-            .unwrap_or("-");
-        lines.push(String::new());
-        lines.push(format!(
-            "{} {} {}\n📝 {}\n📁 {}\n状态 {}",
-            ["①", "②", "③", "④", "⑤"][index],
-            status,
-            id,
-            truncate_text(summary),
-            cwd,
-            status
-        ));
-    }
-    if entries.len() > PAGE_SIZE {
-        lines.push(String::new());
-        lines.push(format!(
-            "共 {} 个；当前显示前 {} 个。",
-            entries.len(),
-            PAGE_SIZE
-        ));
-    }
-    Ok(truncate_text(&lines.join("\n")))
-}
-
-fn render_topics_list(spaces: &[RustSessionSpace]) -> String {
-    if spaces.is_empty() {
-        return "当前没有 Session 帖子。".into();
-    }
-    let mut lines = vec!["🤖 Session 帖子".into()];
-    for (index, space) in spaces.iter().take(30).enumerate() {
-        lines.push(format!(
-            "{}. {} · {} · thread={} · discussion_root={}",
-            index + 1,
-            space.space_id,
-            space.lifecycle,
-            space.thread_id.as_deref().unwrap_or("-"),
-            space
-                .discussion_root_message_id
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "-".into())
-        ));
-    }
-    truncate_text(&lines.join("\n"))
-}
-
 async fn forward_codex_events(
     agent: AppServerClient,
     store: Arc<SqliteStore>,
@@ -4303,10 +5679,8 @@ async fn forward_codex_events(
     let mut events = agent.subscribe_events();
     let mut projector = EventProjector::default();
     loop {
-        let event = match events.recv().await {
-            Ok(event) => event,
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+        let Some(event) = events.recv().await else {
+            return;
         };
         if event.method.ends_with("/delta") {
             continue;
@@ -4666,11 +6040,27 @@ async fn handle_callback(
     sessions: &Arc<SessionRegistry>,
     metrics: &MetricsRegistry,
     totp: &Arc<TotpManager>,
+    control_runtime: &Arc<ControlRuntime>,
 ) -> Result<(), String> {
     let root_message_id = sessions
         .by_chat(callback.chat_id)
         .and_then(|session| session.root_message_id);
     let inbound_surface = surface_for(&inbound_bot, config, callback.chat_id, root_message_id);
+    if callback.data.starts_with("ctl:") {
+        return handle_control_callback(
+            callback,
+            inbound_bot,
+            bots_by_id,
+            config,
+            store,
+            agent,
+            sessions,
+            metrics,
+            totp,
+            control_runtime,
+        )
+        .await;
+    }
     if callback.data.starts_with("new:") {
         return handle_new_callback(
             callback,
@@ -4835,7 +6225,22 @@ async fn handle_callback(
     }
     let decision = domain_decision(&action.decision)
         .ok_or_else(|| "审批决定无效，未执行任何操作".to_owned())?;
+    if let Err(error) = agent
+        .respond(action.request_id.clone(), action.response_payload())
+        .await
+    {
+        let _ = store.restore_callback(nonce);
+        acknowledge_callback(&inbound_bot, &callback, Some("Codex 未接受响应")).await;
+        return send_text(
+            &inbound_bot,
+            &inbound_surface,
+            &format!("审批响应未送达，按钮已恢复，可稍后重试：{error}"),
+            metrics,
+        )
+        .await;
+    }
     if let Err(error) = approval.decide(decision, now_ms()) {
+        let _ = store.restore_callback(nonce);
         acknowledge_callback(&inbound_bot, &callback, Some("审批状态已变化")).await;
         return send_text(
             &inbound_bot,
@@ -4853,14 +6258,8 @@ async fn handle_callback(
             approval: approval.clone(),
         },
     };
-    store
-        .decide_approval(&approval, &event)
-        .map_err(|error| error.to_string())?;
-    if let Err(error) = agent
-        .respond(action.request_id.clone(), action.response_payload())
-        .await
-    {
-        acknowledge_callback(&inbound_bot, &callback, Some("Codex 未接受响应")).await;
+    if let Err(error) = store.decide_approval(&approval, &event) {
+        let _ = store.restore_callback(nonce);
         return Err(error.to_string());
     }
     acknowledge_callback(&inbound_bot, &callback, Some("审批已提交")).await;
@@ -5379,6 +6778,20 @@ async fn handle_status_callback(
         acknowledge_callback(&inbound_bot, &callback, Some("按钮不属于当前 Session")).await;
         return Ok(());
     }
+    if action.action == "status_unwatch_execute"
+        && !totp
+            .is_unlocked_for_space(&space.space_id, now_ms())
+            .map_err(|error| error.to_string())?
+    {
+        acknowledge_callback(&inbound_bot, &callback, Some("请先完成 TOTP 解锁")).await;
+        return send_text(
+            &inbound_bot,
+            &surface_for(&inbound_bot, config, callback.chat_id, None),
+            "取消关注是写操作，请先发送 /totp <6 位验证码>。",
+            metrics,
+        )
+        .await;
+    }
     let Some(_consumed) = store
         .take_callback_scoped(
             nonce,
@@ -5676,7 +7089,12 @@ async fn handle_plan_callback(
     }
     if decision == "execute" {
         if let Some(current) = publication.as_mut() {
-            update_plan_publication(store, current, PlanPublicationState::Executing, None)?;
+            if let Err(error) =
+                update_plan_publication(store, current, PlanPublicationState::Executing, None)
+            {
+                let _ = store.restore_callback(nonce);
+                return Err(error);
+            }
             let _ = edit_plan_publication(&inbound_bot, &session, config, metrics, current).await;
         }
         let prompt = "请按照刚才发布的 Plan 开始执行，完成后报告结果。";
@@ -5707,6 +7125,7 @@ async fn handle_plan_callback(
         let turn = match result {
             Ok(turn) => turn,
             Err(error) => {
+                let _ = store.restore_callback(nonce);
                 if let Some(current) = publication.as_mut() {
                     update_plan_publication(store, current, PlanPublicationState::Published, None)?;
                     let _ = edit_plan_publication(&inbound_bot, &session, config, metrics, current)
@@ -5729,12 +7148,15 @@ async fn handle_plan_callback(
         sessions.set_turn(session.thread_id.as_str(), Some(turn.id.clone()));
         if let Some(current) = publication.as_mut() {
             current.decision_turn_id = Some(turn.id.clone());
-            update_plan_publication(
+            if let Err(error) = update_plan_publication(
                 store,
                 current,
                 PlanPublicationState::Executing,
                 Some(turn.id.clone()),
-            )?;
+            ) {
+                let _ = store.restore_callback(nonce);
+                return Err(error);
+            }
             let _ = edit_plan_publication(&inbound_bot, &session, config, metrics, current).await;
         }
         send_text(
@@ -5751,7 +7173,12 @@ async fn handle_plan_callback(
         .await
     } else {
         if let Some(current) = publication.as_mut() {
-            update_plan_publication(store, current, PlanPublicationState::Revising, None)?;
+            if let Err(error) =
+                update_plan_publication(store, current, PlanPublicationState::Revising, None)
+            {
+                let _ = store.restore_callback(nonce);
+                return Err(error);
+            }
             let _ = edit_plan_publication(&inbound_bot, &session, config, metrics, current).await;
         }
         let prompt_message = send_text_with_markup_message(
@@ -5775,7 +7202,15 @@ async fn handle_plan_callback(
             Ok(prompt_message) => {
                 if let Some(current) = publication.as_mut() {
                     current.revision_prompt_message_id = Some(prompt_message.message_id);
-                    update_plan_publication(store, current, PlanPublicationState::Revising, None)?;
+                    if let Err(error) = update_plan_publication(
+                        store,
+                        current,
+                        PlanPublicationState::Revising,
+                        None,
+                    ) {
+                        let _ = store.restore_callback(nonce);
+                        return Err(error);
+                    }
                 }
                 send_text(
                     &inbound_bot,
@@ -5791,6 +7226,7 @@ async fn handle_plan_callback(
                 .await
             }
             Err(error) => {
+                let _ = store.restore_callback(nonce);
                 if let Some(current) = publication.as_mut() {
                     update_plan_publication(store, current, PlanPublicationState::Published, None)?;
                     let _ = edit_plan_publication(&inbound_bot, &session, config, metrics, current)
@@ -5901,10 +7337,8 @@ async fn handle_server_requests(
 ) {
     let mut requests = agent.subscribe_server_requests();
     loop {
-        let request = match requests.recv().await {
-            Ok(request) => request,
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+        let Some(request) = requests.recv().await else {
+            return;
         };
         if let Err(error) = handle_server_request(
             request,
@@ -7658,12 +9092,15 @@ mod tests {
     fn new_prompt_drafts_use_a_short_prompt_timeout() {
         let created_before = now_ms();
         let draft = new_draft(42, 7, "prompt", json!({"cwd":"/workspace"}));
+        let store = SqliteStore::in_memory().unwrap();
+        persist_new_draft(&store, "new:42", &draft).unwrap();
         assert!(
-            draft["expires_at_ms"].as_i64().unwrap() - created_before <= NEW_INTERACTION_TTL_MS
+            draft["expires_at_ms"].as_i64().unwrap() - created_before
+                <= NEW_INTERACTION_TTL_MS + 1000
         );
         let advanced_before = now_ms();
         let advanced = advance_new_draft(
-            &SqliteStore::in_memory().unwrap(),
+            &store,
             "new:42",
             &draft,
             "prompt",
@@ -7675,5 +9112,29 @@ mod tests {
             advanced["expires_at_ms"].as_i64().unwrap() - advanced_before
                 <= NEW_PROMPT_TTL_MS + 1000
         );
+    }
+
+    #[test]
+    fn new_choice_markup_always_keeps_a_cancel_button() {
+        let store = SqliteStore::in_memory().unwrap();
+        let draft = new_draft(42, 7, "project", json!({"normal_model":"gpt-5"}));
+        persist_new_draft(&store, "new:42", &draft).unwrap();
+        let mut draft = draft;
+        let markup = new_choice_markup(&store, "new:42", &mut draft, &[])
+            .unwrap()
+            .expect("empty choices still render an exit button");
+        assert_eq!(
+            markup["inline_keyboard"][0][0]["text"],
+            Value::String("退出".to_owned())
+        );
+        let choices = draft["choices"].as_object().unwrap();
+        assert_eq!(choices.len(), 1);
+        let cancel_nonce = choices.keys().next().unwrap();
+        assert_eq!(choices[cancel_nonce]["event"], "cancel");
+        let callback = store
+            .consume_control_callback(cancel_nonce, 7, 42, now_ms())
+            .unwrap()
+            .expect("cancel callback is durable and scoped");
+        assert_eq!(callback.action, "cancel");
     }
 }

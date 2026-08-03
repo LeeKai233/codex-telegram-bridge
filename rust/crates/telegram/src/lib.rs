@@ -189,6 +189,46 @@ pub struct CommandMenuEntry {
     pub description: &'static str,
 }
 
+impl CommandMenuEntry {
+    fn to_value(self) -> Value {
+        json!({"command": self.command, "description": self.description})
+    }
+}
+
+/// Telegram's command-menu visibility is a Bot API value, not a role-local
+/// routing decision. Keeping every wire variant typed prevents callers from
+/// accidentally sending an owner-only control menu to a broad chat scope.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BotCommandScope {
+    Default,
+    AllPrivateChats,
+    AllGroupChats,
+    AllChatAdministrators,
+    Chat { chat_id: i64 },
+    ChatAdministrators { chat_id: i64 },
+    ChatMember { chat_id: i64, user_id: i64 },
+}
+
+impl BotCommandScope {
+    fn to_value(self) -> Value {
+        match self {
+            Self::Default => json!({"type": "default"}),
+            Self::AllPrivateChats => json!({"type": "all_private_chats"}),
+            Self::AllGroupChats => json!({"type": "all_group_chats"}),
+            Self::AllChatAdministrators => json!({"type": "all_chat_administrators"}),
+            Self::Chat { chat_id } => json!({"type": "chat", "chat_id": chat_id}),
+            Self::ChatAdministrators { chat_id } => {
+                json!({"type": "chat_administrators", "chat_id": chat_id})
+            }
+            Self::ChatMember { chat_id, user_id } => json!({
+                "type": "chat_member",
+                "chat_id": chat_id,
+                "user_id": user_id,
+            }),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CommandMenuScope {
     /// Commands shown before a control bot is paired or a discussion group is
@@ -765,6 +805,9 @@ pub struct UpdateAuthorization {
     pub bot_username: Option<String>,
     pub enforce_chat_kind: bool,
     pub reject_sender_chat: bool,
+    /// When no owner exists, only the bootstrap `/pair` and `/help` commands
+    /// may pass through the Control Bot's configured chat gate.
+    pub bootstrap_only: bool,
 }
 
 impl UpdateAuthorization {
@@ -774,6 +817,7 @@ impl UpdateAuthorization {
             bot_username: Some(bot_username.into().to_ascii_lowercase()),
             enforce_chat_kind: true,
             reject_sender_chat: true,
+            bootstrap_only: false,
         }
     }
 
@@ -892,6 +936,12 @@ impl UpdateRouter {
             .document_file_id
             .clone()
             .or_else(|| message.photo_file_id.clone());
+        if self.authorization.bootstrap_only
+            && self.authorization.owner_user_id.is_none()
+            && file_id.is_some()
+        {
+            return RoutedEffect::Ignore;
+        }
         if let Some(file_id) = file_id {
             return RoutedEffect::Dispatch(WorkflowEffect::Attachment {
                 chat_id: message.chat_id,
@@ -909,10 +959,26 @@ impl UpdateRouter {
             return RoutedEffect::Ignore;
         };
         if let Some(parsed) = ParsedTelegramCommand::parse(&text) {
+            let bootstrap_command_allowed = match self.role {
+                RuntimeBotRole::Control => {
+                    matches!(
+                        parsed.command,
+                        TelegramCommand::Pair | TelegramCommand::Help
+                    )
+                }
+                RuntimeBotRole::Discussion => {
+                    matches!(
+                        parsed.command,
+                        TelegramCommand::Bind | TelegramCommand::Help
+                    )
+                }
+                RuntimeBotRole::Status | RuntimeBotRole::Alert => false,
+            };
             if !self
                 .authorization
                 .targets_this_bot(parsed.addressed_bot_username.as_deref())
                 || !parsed.command.allowed_for_role(self.role)
+                || (self.authorization.bootstrap_only && !bootstrap_command_allowed)
             {
                 return RoutedEffect::Ignore;
             }
@@ -926,6 +992,9 @@ impl UpdateRouter {
                 actor: message.actor,
             })
         } else {
+            if self.authorization.bootstrap_only {
+                return RoutedEffect::Ignore;
+            }
             RoutedEffect::Dispatch(WorkflowEffect::Prompt {
                 chat_id: message.chat_id,
                 message_id: message.message_id,
@@ -947,6 +1016,18 @@ impl UpdateRouter {
         {
             return false;
         }
+        if self.authorization.bootstrap_only
+            && self.authorization.owner_user_id.is_none()
+            && self.role == RuntimeBotRole::Status
+        {
+            return false;
+        }
+        if automatic_forward
+            && self.authorization.bootstrap_only
+            && self.authorization.owner_user_id.is_none()
+        {
+            return false;
+        }
         automatic_forward || self.authorization.allows_actor(&message.actor)
     }
 
@@ -961,6 +1042,9 @@ impl UpdateRouter {
                     )
             )
         {
+            return false;
+        }
+        if self.authorization.bootstrap_only && self.authorization.owner_user_id.is_none() {
             return false;
         }
         self.authorization.allows_actor(&callback.actor)
@@ -1385,6 +1469,15 @@ impl TelegramMessageRequest {
         }
     }
 
+    /// Builds the Python control bot's normal rich-text contract: Telegram
+    /// receives MarkdownV2 first and a supplied plain string on a 400 parse
+    /// rejection.
+    pub fn markdown_v2(markdown: impl Into<String>, plain_fallback: impl Into<String>) -> Self {
+        Self::new(markdown)
+            .with_plain_fallback(plain_fallback)
+            .with_parse_mode(TelegramParseMode::MarkdownV2)
+    }
+
     pub fn with_plain_fallback(mut self, plain_fallback: impl Into<String>) -> Self {
         self.plain_fallback = Some(plain_fallback.into());
         self
@@ -1397,6 +1490,11 @@ impl TelegramMessageRequest {
 
     pub fn with_reply_markup(mut self, reply_markup: InlineKeyboardMarkup) -> Self {
         self.reply_markup = Some(reply_markup);
+        self
+    }
+
+    pub fn with_reply_markup_option(mut self, reply_markup: Option<InlineKeyboardMarkup>) -> Self {
+        self.reply_markup = reply_markup;
         self
     }
 
@@ -2165,6 +2263,43 @@ where
         )
     }
 
+    /// Install a non-empty command menu for one explicit Bot API scope.
+    /// Clearing a menu is deliberately a separate `delete_my_commands` call,
+    /// matching Telegram's API and making a broad default clear auditable.
+    pub fn set_my_commands(
+        &self,
+        token: &BotToken,
+        commands: &[CommandMenuEntry],
+        scope: BotCommandScope,
+    ) -> Result<bool, TelegramError> {
+        if commands.is_empty() {
+            return Err(TelegramError::InvalidInput("command menu cannot be empty"));
+        }
+        self.call(
+            token,
+            "setMyCommands",
+            json!({
+                "commands": commands.iter().copied().map(CommandMenuEntry::to_value).collect::<Vec<_>>(),
+                "scope": scope.to_value(),
+            }),
+        )
+    }
+
+    /// Remove the command menu from exactly one scope. Callers must select a
+    /// scope explicitly so deleting an owner menu cannot implicitly alter the
+    /// all-private bootstrap menu.
+    pub fn delete_my_commands(
+        &self,
+        token: &BotToken,
+        scope: BotCommandScope,
+    ) -> Result<bool, TelegramError> {
+        self.call(
+            token,
+            "deleteMyCommands",
+            json!({"scope": scope.to_value()}),
+        )
+    }
+
     pub fn send_text(
         &self,
         token: &BotToken,
@@ -2671,6 +2806,94 @@ mod tests {
     }
 
     #[test]
+    fn command_scopes_serialize_to_the_exact_bot_api_shapes() {
+        assert_eq!(
+            BotCommandScope::Default.to_value(),
+            json!({"type": "default"})
+        );
+        assert_eq!(
+            BotCommandScope::AllPrivateChats.to_value(),
+            json!({"type": "all_private_chats"})
+        );
+        assert_eq!(
+            BotCommandScope::AllGroupChats.to_value(),
+            json!({"type": "all_group_chats"})
+        );
+        assert_eq!(
+            BotCommandScope::AllChatAdministrators.to_value(),
+            json!({"type": "all_chat_administrators"})
+        );
+        assert_eq!(
+            BotCommandScope::Chat { chat_id: 9527 }.to_value(),
+            json!({"type": "chat", "chat_id": 9527})
+        );
+        assert_eq!(
+            BotCommandScope::ChatAdministrators { chat_id: -1001 }.to_value(),
+            json!({"type": "chat_administrators", "chat_id": -1001})
+        );
+        assert_eq!(
+            BotCommandScope::ChatMember {
+                chat_id: -1001,
+                user_id: 9527,
+            }
+            .to_value(),
+            json!({"type": "chat_member", "chat_id": -1001, "user_id": 9527})
+        );
+    }
+
+    #[test]
+    fn command_menu_methods_keep_bootstrap_and_owner_scopes_distinct() {
+        let transport = RecordingTransport::responds_in_order(&[
+            r#"{"ok":true,"result":true}"#,
+            r#"{"ok":true,"result":true}"#,
+        ]);
+        let calls = transport.calls.clone();
+        let api = TelegramBotApi::new(transport);
+        let commands = [
+            CommandMenuEntry {
+                command: "pair",
+                description: "完成 owner 配对",
+            },
+            CommandMenuEntry {
+                command: "help",
+                description: "显示帮助",
+            },
+        ];
+
+        assert!(
+            api.set_my_commands(&token(), &commands, BotCommandScope::AllPrivateChats)
+                .unwrap()
+        );
+        assert!(
+            api.delete_my_commands(&token(), BotCommandScope::Chat { chat_id: 9527 })
+                .unwrap()
+        );
+        assert!(matches!(
+            api.set_my_commands(&token(), &[], BotCommandScope::Default),
+            Err(TelegramError::InvalidInput("command menu cannot be empty"))
+        ));
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "setMyCommands");
+        assert_eq!(
+            calls[0].1,
+            json!({
+                "commands": [
+                    {"command": "pair", "description": "完成 owner 配对"},
+                    {"command": "help", "description": "显示帮助"},
+                ],
+                "scope": {"type": "all_private_chats"},
+            })
+        );
+        assert_eq!(calls[1].0, "deleteMyCommands");
+        assert_eq!(
+            calls[1].1,
+            json!({"scope": {"type": "chat", "chat_id": 9527}})
+        );
+    }
+
+    #[test]
     fn production_transport_preserves_bot_api_bad_requests_for_markup_fallback() {
         assert!(should_parse_bot_api_response(reqwest::StatusCode::OK));
         assert!(should_parse_bot_api_response(
@@ -2759,9 +2982,7 @@ mod tests {
             InlineKeyboardButton::callback("Retry", "cb:retry").unwrap(),
         ]])
         .unwrap();
-        let request = TelegramMessageRequest::new("*formatted*")
-            .with_plain_fallback("formatted")
-            .with_parse_mode(TelegramParseMode::MarkdownV2)
+        let request = TelegramMessageRequest::markdown_v2("*formatted*", "formatted")
             .with_reply_markup(markup.clone())
             .reply_to(ReplyParameters::new(31).allow_sending_without_reply(true));
         let surface = TelegramSurfaceBinding::Channel(
@@ -3364,6 +3585,116 @@ mod tests {
                         "message_id": 22,
                         "chat": {"id": -1004290500369i64, "type": "supergroup"}
                     }
+                }
+            }))),
+            RoutedEffect::Ignore
+        );
+    }
+
+    #[test]
+    fn bootstrap_authorization_blocks_discussion_and_status_until_pairing() {
+        let bootstrap = UpdateAuthorization {
+            enforce_chat_kind: true,
+            reject_sender_chat: true,
+            bootstrap_only: true,
+            ..UpdateAuthorization::default()
+        };
+        let discussion = UpdateRouter::new_with_authorization(
+            RuntimeBotRole::Discussion,
+            policy(),
+            bootstrap.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            discussion.route_effect(&update(json!({
+                "message": {
+                    "message_id": 23,
+                    "chat": {"id": -1004290500369i64, "type": "supergroup"},
+                    "from": {"id": 77},
+                    "text": "/totp 123456"
+                }
+            }))),
+            RoutedEffect::Ignore
+        );
+        assert!(matches!(
+            discussion.route_effect(&update(json!({
+                "message": {
+                    "message_id": 28,
+                    "chat": {"id": -1004290500369i64, "type": "supergroup"},
+                    "from": {"id": 77},
+                    "text": "/bind"
+                }
+            }))),
+            RoutedEffect::Dispatch(WorkflowEffect::Command {
+                command: TelegramCommand::Bind,
+                ..
+            })
+        ));
+        assert_eq!(
+            discussion.route_effect(&update(json!({
+                "callback_query": {
+                    "id": "pre-pair",
+                    "from": {"id": 77},
+                    "data": "cb:status",
+                    "message": {
+                        "message_id": 24,
+                        "chat": {"id": -1004290500369i64, "type": "supergroup"}
+                    }
+                }
+            }))),
+            RoutedEffect::Ignore
+        );
+
+        let status =
+            UpdateRouter::new_with_authorization(RuntimeBotRole::Status, policy(), bootstrap)
+                .unwrap();
+        assert_eq!(
+            status.route_effect(&update(json!({
+                "callback_query": {
+                    "id": "pre-pair-status",
+                    "from": {"id": 77},
+                    "data": "cb:status",
+                    "message": {
+                        "message_id": 25,
+                        "chat": {"id": -1004290500369i64, "type": "supergroup"}
+                    }
+                }
+            }))),
+            RoutedEffect::Ignore
+        );
+
+        let control = UpdateRouter::new_with_authorization(
+            RuntimeBotRole::Control,
+            policy(),
+            UpdateAuthorization {
+                enforce_chat_kind: true,
+                reject_sender_chat: true,
+                bootstrap_only: true,
+                ..UpdateAuthorization::default()
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            control.route_effect(&update(json!({
+                "message": {
+                    "message_id": 26,
+                    "chat": {"id": 42, "type": "private"},
+                    "from": {"id": 77},
+                    "text": "/pair"
+                }
+            }))),
+            RoutedEffect::Dispatch(WorkflowEffect::Command {
+                command: TelegramCommand::Pair,
+                ..
+            })
+        ));
+        assert_eq!(
+            control.route_effect(&update(json!({
+                "message": {
+                    "message_id": 27,
+                    "chat": {"id": 42, "type": "private"},
+                    "from": {"id": 77},
+                    "text": "untrusted prompt"
                 }
             }))),
             RoutedEffect::Ignore

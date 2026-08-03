@@ -71,6 +71,19 @@ without exposing their identifiers in logs.
 bash scripts/rust-vnext-full.sh rollback
 ```
 
+For a Rust-only binary upgrade while this unit already owns the test Bot:
+
+```bash
+bash scripts/rust-vnext-full.sh upgrade
+bash scripts/rust-vnext-full.sh rollback-upgrade
+```
+
+`upgrade` stores the previous Rust binary and a consistent snapshot of the Rust
+SQLite database in the Rust state directory, restarts only
+`codex-telegram-rust-full.service`, and restores both if the health check
+fails. `rollback-upgrade` performs the same Rust-only restore explicitly;
+neither command starts, stops, or edits the Python 9527 service or its state.
+
 Rollback stops Rust before starting Python. The Python unit, credentials, and
 production SQLite state are not edited. `restore-files` is only for undoing the
 unit/config installation itself; it also leaves both services stopped.

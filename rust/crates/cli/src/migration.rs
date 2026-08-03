@@ -168,7 +168,7 @@ pub fn import_python_database(
     let mut report = ImportReport {
         source_schema_version,
         source_path_sha256,
-        target_schema_version: 4,
+        target_schema_version: 5,
         dry_run,
         tables,
         reconciliation,
