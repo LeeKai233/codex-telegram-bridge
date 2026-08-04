@@ -1,0 +1,24 @@
+{
+  "bot_role": "status",
+  "locked_write": "写操作已锁定，请先发送 /totp <验证码>。认证后可再次点击原按钮。",
+  "unwatch_confirm": "确认取消关注？评论历史会保留，但此评论串将永久只读。",
+  "unwatch_cancel": "已取消操作。",
+  "unwatch_closed": "已取消关注。评论历史已保留，此评论串现为只读。",
+  "active_buttons": [
+    [
+      {"label": "取消关注", "action": "space_unwatch"}
+    ]
+  ],
+  "terminal_buttons": [],
+  "confirmation_buttons": [
+    [
+      {"label": "确认取消关注", "action": "status_unwatch_execute"}
+    ],
+    [
+      {"label": "返回", "action": "status_unwatch_cancel"}
+    ]
+  ],
+  "debounce_ms": 500,
+  "heartbeat_seconds": 60,
+  "callback_expiry_seconds": 300
+}

@@ -1,10 +1,12 @@
 //! TOTP verification and the durable Rust write lock.
 
 use ctg_storage_sqlite::SqliteStore;
-use data_encoding::BASE32_NOPAD_NOCASE;
+use data_encoding::{BASE32_NOPAD_NOCASE, HEXLOWER};
 use sha1::{Digest, Sha1};
+use sha2::Sha256;
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
@@ -131,6 +133,39 @@ impl TotpManager {
         Ok(unlocked_until_ms.saturating_sub(now_ms))
     }
 
+    pub fn space_unlock_expires_at_ms(
+        &self,
+        space_id: &str,
+        _now_ms: i64,
+    ) -> Result<Option<i64>, TotpError> {
+        if space_id.trim().is_empty() {
+            let state = self
+                .store
+                .totp_state()
+                .map_err(|error| TotpError::State(error.to_string()))?;
+            return Ok((!state.force_locked).then_some(state.unlocked_until_ms));
+        }
+        let state = self
+            .store
+            .totp_state()
+            .map_err(|error| TotpError::State(error.to_string()))?;
+        if state.force_locked {
+            return Ok(None);
+        }
+        let mut leases = self
+            .leases
+            .lock()
+            .map_err(|_| TotpError::State("TOTP lease lock poisoned".into()))?;
+        let Some((unlocked_until_ms, auth_epoch)) = leases.get(space_id).copied() else {
+            return Ok(None);
+        };
+        if auth_epoch != state.auth_epoch {
+            leases.remove(space_id);
+            return Ok(None);
+        }
+        Ok(Some(unlocked_until_ms))
+    }
+
     pub fn verify_and_unlock(&self, value: &str, now_ms: i64) -> Result<bool, TotpError> {
         self.verify_and_unlock_inner("__legacy__", value, now_ms, true)
     }
@@ -154,51 +189,73 @@ impl TotpManager {
         if space_id.trim().is_empty() {
             return Ok(false);
         }
-        let value = value.trim();
-        if value.len() != TOTP_DIGITS as usize || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        let state = self
+            .store
+            .totp_state()
+            .map_err(|error| TotpError::State(error.to_string()))?;
+        if state.locked_until_ms > now_ms {
             return Ok(false);
         }
-        let secret = read_secret(&self.secret_path)?;
-        let secret = secret.trim_end_matches('=').as_bytes();
-        let key = BASE32_NOPAD_NOCASE
-            .decode(secret)
-            .map_err(|_| TotpError::SecretUnavailable)?;
-        let current = now_ms.div_euclid(1000).div_euclid(TOTP_INTERVAL_SECONDS);
-        for offset in -1_i64..=1_i64 {
-            let candidate_timecode = current.saturating_add(offset);
-            if candidate_timecode < 0 {
-                continue;
-            }
-            let candidate = hotp(&key, candidate_timecode as u64);
-            if candidate.as_bytes() == value.as_bytes() {
-                let accepted = if global {
-                    self.store
-                        .accept_totp_timecode(candidate_timecode, now_ms, self.unlock_seconds)
-                } else {
-                    self.store
-                        .accept_totp_timecode_for_space(candidate_timecode)
+        let value = value.trim();
+        let mut accepted = false;
+        if value.len() == TOTP_DIGITS as usize && value.bytes().all(|byte| byte.is_ascii_digit()) {
+            let secret = read_secret(&self.secret_path)?;
+            let secret = secret.trim_end_matches('=').as_bytes();
+            let key = BASE32_NOPAD_NOCASE
+                .decode(secret)
+                .map_err(|_| TotpError::SecretUnavailable)?;
+            let current = now_ms.div_euclid(1000).div_euclid(TOTP_INTERVAL_SECONDS);
+            for offset in -1_i64..=1_i64 {
+                let candidate_timecode = current.saturating_add(offset);
+                if candidate_timecode < 0 {
+                    continue;
                 }
-                .map_err(|error| TotpError::State(error.to_string()))?;
-                if accepted {
-                    let auth_epoch = self
-                        .store
-                        .totp_state()
-                        .map_err(|error| TotpError::State(error.to_string()))?
-                        .auth_epoch;
-                    self.leases
-                        .lock()
-                        .map_err(|_| TotpError::State("TOTP lease lock poisoned".into()))?
-                        .insert(
-                            space_id.to_owned(),
-                            (
-                                now_ms.saturating_add(self.unlock_seconds.saturating_mul(1000)),
-                                auth_epoch,
-                            ),
-                        );
+                let candidate = hotp(&key, candidate_timecode as u64);
+                if candidate.as_bytes() == value.as_bytes() {
+                    accepted = if global {
+                        self.store.accept_totp_timecode(
+                            candidate_timecode,
+                            now_ms,
+                            self.unlock_seconds,
+                        )
+                    } else {
+                        self.store
+                            .accept_totp_timecode_for_space(candidate_timecode)
+                    }
+                    .map_err(|error| TotpError::State(error.to_string()))?;
+                    break;
                 }
-                return Ok(accepted);
             }
+        } else if verify_recovery_code(&self.store, value, now_ms)? {
+            accepted = if global {
+                self.store
+                    .unlock_totp_after_recovery(now_ms, self.unlock_seconds)
+            } else {
+                self.store.accept_recovery_for_space()
+            }
+            .map_err(|error| TotpError::State(error.to_string()))?;
         }
+        if accepted {
+            let auth_epoch = self
+                .store
+                .totp_state()
+                .map_err(|error| TotpError::State(error.to_string()))?
+                .auth_epoch;
+            self.leases
+                .lock()
+                .map_err(|_| TotpError::State("TOTP lease lock poisoned".into()))?
+                .insert(
+                    space_id.to_owned(),
+                    (
+                        now_ms.saturating_add(self.unlock_seconds.saturating_mul(1000)),
+                        auth_epoch,
+                    ),
+                );
+            return Ok(true);
+        }
+        self.store
+            .record_totp_failure(now_ms)
+            .map_err(|error| TotpError::State(error.to_string()))?;
         Ok(false)
     }
 }
@@ -212,8 +269,10 @@ pub fn is_private_regular_file(path: &Path) -> bool {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o077 != 0 {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.permissions().mode() & 0o077 != 0
+            || (metadata.uid() != unsafe { libc::getuid() } && metadata.uid() != 0)
+        {
             return false;
         }
     }
@@ -221,15 +280,75 @@ pub fn is_private_regular_file(path: &Path) -> bool {
 }
 
 fn read_secret(path: &Path) -> Result<String, TotpError> {
-    fs::symlink_metadata(path).map_err(|_| TotpError::SecretUnavailable)?;
-    if !is_private_regular_file(path) {
-        return Err(TotpError::UnsafeSecret);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+            .map_err(|_| TotpError::SecretUnavailable)?;
+        let metadata = file.metadata().map_err(|_| TotpError::SecretUnavailable)?;
+        if !metadata.file_type().is_file()
+            || (metadata.mode() & 0o077) != 0
+            || (metadata.uid() != unsafe { libc::getuid() } && metadata.uid() != 0)
+        {
+            return Err(TotpError::UnsafeSecret);
+        }
+        read_secret_file(file)
     }
-    let secret = fs::read_to_string(path).map_err(|_| TotpError::SecretUnavailable)?;
-    if secret.len() > 256 || secret.trim().is_empty() {
+    #[cfg(not(unix))]
+    {
+        read_secret_file(File::open(path).map_err(|_| TotpError::SecretUnavailable)?)
+    }
+}
+
+fn read_secret_file(file: File) -> Result<String, TotpError> {
+    let mut payload = Vec::with_capacity(257);
+    file.take(257)
+        .read_to_end(&mut payload)
+        .map_err(|_| TotpError::SecretUnavailable)?;
+    if payload.len() > 256 {
+        return Err(TotpError::SecretUnavailable);
+    }
+    let secret = String::from_utf8(payload).map_err(|_| TotpError::SecretUnavailable)?;
+    if secret.trim().is_empty() {
         return Err(TotpError::SecretUnavailable);
     }
     Ok(secret.trim().to_owned())
+}
+
+fn verify_recovery_code(store: &SqliteStore, value: &str, now_ms: i64) -> Result<bool, TotpError> {
+    let normalized = value.trim().to_ascii_uppercase();
+    if normalized.len() != 13
+        || normalized.as_bytes().get(6) != Some(&b'-')
+        || !normalized
+            .bytes()
+            .enumerate()
+            .all(|(index, byte)| index == 6 || byte.is_ascii_hexdigit())
+    {
+        return Ok(false);
+    }
+    for (expected, encoded_salt) in store
+        .unused_recovery_codes()
+        .map_err(|error| TotpError::State(error.to_string()))?
+    {
+        let Ok(salt) = HEXLOWER.decode(encoded_salt.as_bytes()) else {
+            continue;
+        };
+        let mut digest = Sha256::new();
+        digest.update(&salt);
+        digest.update(normalized.as_bytes());
+        let candidate = format!("{:x}", digest.finalize());
+        if candidate == expected
+            && store
+                .consume_recovery_code(&expected, now_ms)
+                .map_err(|error| TotpError::State(error.to_string()))?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn hotp(key: &[u8], counter: u64) -> String {
@@ -329,6 +448,57 @@ mod tests {
         );
         manager.lock().unwrap();
         assert!(!manager.is_unlocked(now + 1000).unwrap());
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_dir(directory);
+    }
+
+    #[test]
+    fn recovery_code_is_one_time_and_invalid_attempts_lock_out() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let directory =
+            std::env::temp_dir().join(format!("ctg-totp-recovery-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("totp_secret");
+        fs::write(&path, "JBSWY3DPEHPK3PXP\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let code = "ABCDEF-123456";
+        let salt = b"0123456789abcdef";
+        let mut digest = Sha256::new();
+        digest.update(salt);
+        digest.update(code.as_bytes());
+        store
+            .replace_recovery_codes(&[(format!("{:x}", digest.finalize()), HEXLOWER.encode(salt))])
+            .unwrap();
+        let manager = TotpManager::new(store.clone(), &path, 60);
+        assert!(
+            manager
+                .verify_and_unlock_for_space("space-recovery", code, 1_700_000_000_000)
+                .unwrap()
+        );
+        assert!(
+            !manager
+                .verify_and_unlock_for_space("space-recovery-2", code, 1_700_000_000_001)
+                .unwrap()
+        );
+
+        let locked_now = 1_700_000_000_100;
+        for _ in 0..5 {
+            assert!(
+                !manager
+                    .verify_and_unlock_for_space("space-invalid", "wrong", locked_now)
+                    .unwrap()
+            );
+        }
+        assert!(store.totp_state().unwrap().locked_until_ms > locked_now);
+        assert!(
+            !manager
+                .verify_and_unlock_for_space("space-invalid", code, locked_now)
+                .unwrap()
+        );
         let _ = fs::remove_file(path);
         let _ = fs::remove_dir(directory);
     }

@@ -168,7 +168,7 @@ pub fn import_python_database(
     let mut report = ImportReport {
         source_schema_version,
         source_path_sha256,
-        target_schema_version: 5,
+        target_schema_version: 7,
         dry_run,
         tables,
         reconciliation,
@@ -352,6 +352,20 @@ fn workflow_projection(row: &LegacyRow) -> Option<(String, String, Value)> {
             let key = object.get("space_id").and_then(Value::as_str)?.to_owned();
             Some(("space".into(), key, value))
         }
+        "prompt_queue" => {
+            let key = object
+                .get("client_message_id")
+                .or_else(|| object.get("id"))
+                .map(|value| value.to_string().trim_matches('"').to_owned())?;
+            Some(("queue".into(), key, value))
+        }
+        "pending_inputs" => {
+            let key = object
+                .get("request_key")
+                .and_then(Value::as_str)?
+                .to_owned();
+            Some(("question".into(), key, value))
+        }
         _ => None,
     }
 }
@@ -380,6 +394,78 @@ fn import_typed_projection(
 ) -> Result<(), MigrationError> {
     let value: Value =
         serde_json::from_str(&row.row_json).map_err(|_| MigrationError::Unreadable)?;
+    let object = value.as_object().ok_or(MigrationError::Unreadable)?;
+    match row.table.as_str() {
+        "prompt_intents" => {
+            let intent_id = object_text(&value, "intent_id").ok_or(MigrationError::Unreadable)?;
+            let client_message_id =
+                object_text(&value, "client_message_id").ok_or(MigrationError::Unreadable)?;
+            let state = object_text(&value, "state").unwrap_or_else(|| "received".into());
+            let created_at_ms = epoch_ms(object_i64(&value, "created_at"));
+            let updated_at_ms = epoch_ms(object_i64(&value, "updated_at"));
+            let mut payload = serde_json::Map::new();
+            for key in [
+                "intent_id",
+                "client_message_id",
+                "source",
+                "prompt",
+                "mode",
+                "thread_id",
+                "space_id",
+                "generation",
+                "state",
+                "turn_id",
+                "queue_id",
+                "error",
+            ] {
+                if let Some(value) = object.get(key) {
+                    payload.insert(key.to_owned(), value.clone());
+                }
+            }
+            payload.insert("created_at_ms".into(), Value::from(created_at_ms));
+            payload.insert("updated_at_ms".into(), Value::from(updated_at_ms));
+            let payload_json = serde_json::to_string(&Value::Object(payload))
+                .map_err(|_| MigrationError::Target("prompt intent payload failed".into()))?;
+            transaction
+                .execute(
+                    "INSERT OR REPLACE INTO rust_prompt_intents(intent_id, client_message_id, state, payload_json, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![intent_id, client_message_id, state, payload_json, created_at_ms, updated_at_ms],
+                )
+                .map_err(|_| MigrationError::Target("prompt intent projection failed".into()))?;
+            return Ok(());
+        }
+        "plan_publications" => {
+            let space_id = object_text(&value, "space_id").ok_or(MigrationError::Unreadable)?;
+            let generation = object_i64(&value, "generation");
+            let item_id = object_text(&value, "item_id").unwrap_or_else(|| "plan".into());
+            let revision_key = object_text(&value, "revision_key").unwrap_or_default();
+            let status = object_text(&value, "status").unwrap_or_else(|| "published".into());
+            let updated_at_ms = epoch_ms(object_i64(&value, "updated_at"));
+            transaction
+                .execute(
+                    "INSERT OR REPLACE INTO rust_plan_publications(space_id, generation, item_id, revision_key, status, payload_json, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![space_id, generation, item_id, revision_key, status, row.row_json, updated_at_ms],
+                )
+                .map_err(|_| MigrationError::Target("plan publication projection failed".into()))?;
+            return Ok(());
+        }
+        "pending_inputs" => {
+            let request_key =
+                object_text(&value, "request_key").ok_or(MigrationError::Unreadable)?;
+            let generation = object_i64(&value, "generation");
+            let status = object_text(&value, "status").unwrap_or_else(|| "pending".into());
+            let created_at_ms = epoch_ms(object_i64(&value, "created_at"));
+            let updated_at_ms = epoch_ms(object_i64(&value, "updated_at"));
+            transaction
+                .execute(
+                    "INSERT OR REPLACE INTO rust_pending_questions(request_key, generation, status, payload_json, response_json, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6)",
+                    params![request_key, generation, status, row.row_json, created_at_ms, updated_at_ms],
+                )
+                .map_err(|_| MigrationError::Target("pending question projection failed".into()))?;
+            return Ok(());
+        }
+        _ => {}
+    }
     if row.table != "session_spaces" {
         return Ok(());
     }
@@ -433,6 +519,20 @@ fn import_typed_projection(
             ],
         )
         .map_err(|_| MigrationError::Target("session space projection failed".into()))?;
+    if let Some(thread_id) = thread_id.as_deref()
+        && let Some(state) = state_json.as_object()
+    {
+        let mut projection = state.clone();
+        projection.insert("thread_id".into(), Value::String(thread_id.to_owned()));
+        let projection_json = serde_json::to_string(&Value::Object(projection))
+            .map_err(|_| MigrationError::Target("thread projection serialization failed".into()))?;
+        transaction
+            .execute(
+                "INSERT OR REPLACE INTO rust_thread_projections(thread_id, generation, projection_json, updated_at_ms) VALUES (?1, ?2, ?3, ?4)",
+                params![thread_id, generation, projection_json, updated_at_ms],
+            )
+            .map_err(|_| MigrationError::Target("thread projection failed".into()))?;
+    }
     if matches!(lifecycle.as_str(), "pending" | "repair_required") {
         let mut pending = value.clone();
         if let Some(state) = pending

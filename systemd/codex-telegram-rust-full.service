@@ -36,6 +36,7 @@ RestrictSUIDSGID=true
 RestrictRealtime=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 ReadWritePaths=%h/.local/state/codex-telegram-bridge/rust-vnext-full
+ReadWritePaths=%h/PythonProjects
 MemoryMax=512M
 TasksMax=128
 

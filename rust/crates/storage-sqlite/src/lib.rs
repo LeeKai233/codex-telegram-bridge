@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// This is deliberately independent from the Python bridge schema. Rust
 /// deployments receive a new database path and never migrate Python state.
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 7;
 const DELETION_CLAIM_LEASE_MS: i64 = 60_000;
 const CONTROL_CLAIM_LEASE_MS: i64 = 60_000;
 
@@ -32,6 +32,7 @@ pub struct RustSessionSpace {
     pub status_bot_instance: Option<String>,
     pub owner_chat_id: Option<i64>,
     pub plan_mode: bool,
+    pub closed_at_ms: Option<i64>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
 }
@@ -59,6 +60,8 @@ pub struct TotpState {
     pub unlocked_until_ms: i64,
     pub force_locked: bool,
     pub auth_epoch: i64,
+    pub failures: i64,
+    pub locked_until_ms: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -875,7 +878,7 @@ impl SqliteStore {
         let connection = self.connection.lock().map_err(lock_error)?;
         connection
             .execute(
-                "INSERT INTO rust_session_spaces(space_id, thread_id, lifecycle, generation, channel_chat_id, channel_post_id, discussion_chat_id, discussion_root_message_id, status_message_id, status_bot_instance, owner_chat_id, plan_mode, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) ON CONFLICT(space_id) DO UPDATE SET thread_id=excluded.thread_id, lifecycle=excluded.lifecycle, generation=excluded.generation, channel_chat_id=excluded.channel_chat_id, channel_post_id=excluded.channel_post_id, discussion_chat_id=excluded.discussion_chat_id, discussion_root_message_id=excluded.discussion_root_message_id, status_message_id=excluded.status_message_id, status_bot_instance=excluded.status_bot_instance, owner_chat_id=excluded.owner_chat_id, plan_mode=excluded.plan_mode, updated_at_ms=excluded.updated_at_ms",
+                "INSERT INTO rust_session_spaces(space_id, thread_id, lifecycle, generation, channel_chat_id, channel_post_id, discussion_chat_id, discussion_root_message_id, status_message_id, status_bot_instance, owner_chat_id, plan_mode, closed_at_ms, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) ON CONFLICT(space_id) DO UPDATE SET thread_id=excluded.thread_id, lifecycle=excluded.lifecycle, generation=excluded.generation, channel_chat_id=excluded.channel_chat_id, channel_post_id=excluded.channel_post_id, discussion_chat_id=excluded.discussion_chat_id, discussion_root_message_id=excluded.discussion_root_message_id, status_message_id=excluded.status_message_id, status_bot_instance=excluded.status_bot_instance, owner_chat_id=excluded.owner_chat_id, plan_mode=excluded.plan_mode, closed_at_ms=excluded.closed_at_ms, updated_at_ms=excluded.updated_at_ms WHERE (rust_session_spaces.lifecycle != 'closed' AND excluded.generation >= rust_session_spaces.generation) OR excluded.lifecycle='closed'",
                 params![
                     space.space_id,
                     space.thread_id,
@@ -889,6 +892,7 @@ impl SqliteStore {
                     space.status_bot_instance,
                     space.owner_chat_id,
                     i64::from(space.plan_mode),
+                    space.closed_at_ms,
                     space.created_at_ms,
                     space.updated_at_ms,
                 ],
@@ -897,11 +901,107 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Atomically closes a SessionSpace and invalidates every callback and
+    /// queued prompt belonging to its current generation.  The generation is
+    /// incremented in the same transaction so a callback racing the close can
+    /// never observe a closed row with the old generation.
+    pub fn close_session_space(
+        &self,
+        space_id: &str,
+        expected_generation: i64,
+        closed_at_ms: i64,
+    ) -> PortResult<Option<RustSessionSpace>> {
+        let mut connection = self.connection.lock().map_err(lock_error)?;
+        let transaction = connection.transaction().map_err(sql_error)?;
+        let current = transaction
+            .query_row(
+                "SELECT space_id, thread_id, lifecycle, generation, channel_chat_id, channel_post_id, discussion_chat_id, discussion_root_message_id, status_message_id, status_bot_instance, owner_chat_id, plan_mode, closed_at_ms, created_at_ms, updated_at_ms FROM rust_session_spaces WHERE space_id=?1 AND generation=?2",
+                params![space_id, expected_generation],
+                row_to_space,
+            )
+            .optional()
+            .map_err(sql_error)?;
+        let Some(current) = current else {
+            transaction.commit().map_err(sql_error)?;
+            return Ok(None);
+        };
+        if current.lifecycle == "closed" {
+            transaction.commit().map_err(sql_error)?;
+            return Ok(Some(current));
+        }
+        let mut closed = current.clone();
+        closed.lifecycle = "closed".to_owned();
+        closed.generation = expected_generation.saturating_add(1);
+        closed.closed_at_ms = Some(closed_at_ms);
+        closed.updated_at_ms = closed_at_ms;
+        transaction
+            .execute(
+                "UPDATE rust_session_spaces SET lifecycle='closed', generation=?1, closed_at_ms=?2, updated_at_ms=?2 WHERE space_id=?3 AND generation=?4 AND lifecycle!='closed'",
+                params![closed.generation, closed_at_ms, space_id, expected_generation],
+            )
+            .map_err(sql_error)?;
+        transaction
+            .execute(
+                "UPDATE rust_callbacks SET consumed_at_ms=?1 WHERE space_id=?2 AND consumed_at_ms IS NULL",
+                params![closed_at_ms, space_id],
+            )
+            .map_err(sql_error)?;
+
+        let mut statement = transaction
+            .prepare(
+                "SELECT row_key, row_json FROM rust_legacy_records WHERE table_name='rust_workflow:queue'",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(sql_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sql_error)?;
+        drop(statement);
+        for (row_key, row_json) in rows {
+            let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&row_json) else {
+                continue;
+            };
+            let same_space = value.get("space_id").and_then(serde_json::Value::as_str)
+                == Some(space_id)
+                || (value.get("thread_id").and_then(serde_json::Value::as_str)
+                    == current.thread_id.as_deref()
+                    && value
+                        .get("generation")
+                        .and_then(serde_json::Value::as_i64)
+                        .is_some_and(|generation| generation <= expected_generation));
+            if !same_space
+                || value.get("status").and_then(serde_json::Value::as_str) != Some("queued")
+            {
+                continue;
+            }
+            value["status"] = serde_json::Value::String("cancelled".to_owned());
+            value["cancelled_at_ms"] = serde_json::Value::from(closed_at_ms);
+            let updated_json = serde_json::to_string(&value).map_err(|error| {
+                PortError::Adapter(format!("serialize cancelled queue: {error}"))
+            })?;
+            let mut digest = sha2::Sha256::new();
+            use sha2::Digest;
+            digest.update(updated_json.as_bytes());
+            let row_sha256 = format!("{:x}", digest.finalize());
+            transaction
+                .execute(
+                    "UPDATE rust_legacy_records SET row_json=?1, row_sha256=?2, imported_at_ms=?3 WHERE table_name='rust_workflow:queue' AND row_key=?4",
+                    params![updated_json, row_sha256, closed_at_ms, row_key],
+                )
+                .map_err(sql_error)?;
+        }
+        transaction.commit().map_err(sql_error)?;
+        Ok(Some(closed))
+    }
+
     pub fn get_session_space(&self, space_id: &str) -> PortResult<Option<RustSessionSpace>> {
         let connection = self.connection.lock().map_err(lock_error)?;
         connection
             .query_row(
-                "SELECT space_id, thread_id, lifecycle, generation, channel_chat_id, channel_post_id, discussion_chat_id, discussion_root_message_id, status_message_id, status_bot_instance, owner_chat_id, plan_mode, created_at_ms, updated_at_ms FROM rust_session_spaces WHERE space_id=?1",
+                "SELECT space_id, thread_id, lifecycle, generation, channel_chat_id, channel_post_id, discussion_chat_id, discussion_root_message_id, status_message_id, status_bot_instance, owner_chat_id, plan_mode, closed_at_ms, created_at_ms, updated_at_ms FROM rust_session_spaces WHERE space_id=?1",
                 params![space_id],
                 row_to_space,
             )
@@ -913,7 +1013,7 @@ impl SqliteStore {
         let connection = self.connection.lock().map_err(lock_error)?;
         let mut statement = connection
             .prepare(
-                "SELECT space_id, thread_id, lifecycle, generation, channel_chat_id, channel_post_id, discussion_chat_id, discussion_root_message_id, status_message_id, status_bot_instance, owner_chat_id, plan_mode, created_at_ms, updated_at_ms FROM rust_session_spaces WHERE lifecycle='active' ORDER BY updated_at_ms, space_id",
+                "SELECT space_id, thread_id, lifecycle, generation, channel_chat_id, channel_post_id, discussion_chat_id, discussion_root_message_id, status_message_id, status_bot_instance, owner_chat_id, plan_mode, closed_at_ms, created_at_ms, updated_at_ms FROM rust_session_spaces WHERE lifecycle='active' ORDER BY updated_at_ms, space_id",
             )
             .map_err(sql_error)?;
         let mut rows = statement.query([]).map_err(sql_error)?;
@@ -930,7 +1030,7 @@ impl SqliteStore {
         let connection = self.connection.lock().map_err(lock_error)?;
         let mut statement = connection
             .prepare(
-                "SELECT space_id, thread_id, lifecycle, generation, channel_chat_id, channel_post_id, discussion_chat_id, discussion_root_message_id, status_message_id, status_bot_instance, owner_chat_id, plan_mode, created_at_ms, updated_at_ms FROM rust_session_spaces WHERE lifecycle != 'closed' ORDER BY updated_at_ms, space_id",
+                "SELECT space_id, thread_id, lifecycle, generation, channel_chat_id, channel_post_id, discussion_chat_id, discussion_root_message_id, status_message_id, status_bot_instance, owner_chat_id, plan_mode, closed_at_ms, created_at_ms, updated_at_ms FROM rust_session_spaces WHERE lifecycle != 'closed' ORDER BY updated_at_ms, space_id",
             )
             .map_err(sql_error)?;
         let mut rows = statement.query([]).map_err(sql_error)?;
@@ -951,7 +1051,7 @@ impl SqliteStore {
         let connection = self.connection.lock().map_err(lock_error)?;
         connection
             .query_row(
-                "SELECT space_id, thread_id, lifecycle, generation, channel_chat_id, channel_post_id, discussion_chat_id, discussion_root_message_id, status_message_id, status_bot_instance, owner_chat_id, plan_mode, created_at_ms, updated_at_ms FROM rust_session_spaces WHERE discussion_chat_id=?1 AND lifecycle IN ('pending', 'repair_required') ORDER BY updated_at_ms DESC, space_id DESC LIMIT 1",
+                "SELECT space_id, thread_id, lifecycle, generation, channel_chat_id, channel_post_id, discussion_chat_id, discussion_root_message_id, status_message_id, status_bot_instance, owner_chat_id, plan_mode, closed_at_ms, created_at_ms, updated_at_ms FROM rust_session_spaces WHERE discussion_chat_id=?1 AND lifecycle IN ('pending', 'repair_required') ORDER BY updated_at_ms DESC, space_id DESC LIMIT 1",
                 params![discussion_chat_id],
                 row_to_space,
             )
@@ -966,7 +1066,7 @@ impl SqliteStore {
         let connection = self.connection.lock().map_err(lock_error)?;
         connection
             .query_row(
-                "SELECT space_id, thread_id, lifecycle, generation, channel_chat_id, channel_post_id, discussion_chat_id, discussion_root_message_id, status_message_id, status_bot_instance, owner_chat_id, plan_mode, created_at_ms, updated_at_ms FROM rust_session_spaces WHERE thread_id=?1 ORDER BY updated_at_ms DESC LIMIT 1",
+                "SELECT space_id, thread_id, lifecycle, generation, channel_chat_id, channel_post_id, discussion_chat_id, discussion_root_message_id, status_message_id, status_bot_instance, owner_chat_id, plan_mode, closed_at_ms, created_at_ms, updated_at_ms FROM rust_session_spaces WHERE thread_id=?1 ORDER BY updated_at_ms DESC LIMIT 1",
                 params![thread_id],
                 row_to_space,
             )
@@ -978,7 +1078,7 @@ impl SqliteStore {
         let connection = self.connection.lock().map_err(lock_error)?;
         connection
             .query_row(
-                "SELECT last_timecode, unlocked_until_ms, force_locked, auth_epoch FROM rust_security_state WHERE id=1",
+                "SELECT last_timecode, unlocked_until_ms, force_locked, auth_epoch, totp_failures, totp_locked_until_ms FROM rust_security_state WHERE id=1",
                 [],
                 |row| {
                     Ok(TotpState {
@@ -986,6 +1086,8 @@ impl SqliteStore {
                         unlocked_until_ms: row.get(1)?,
                         force_locked: row.get::<_, i64>(2)? != 0,
                         auth_epoch: row.get(3)?,
+                        failures: row.get(4)?,
+                        locked_until_ms: row.get(5)?,
                     })
                 },
             )
@@ -1022,7 +1124,7 @@ impl SqliteStore {
         }
         transaction
             .execute(
-                "UPDATE rust_security_state SET last_timecode=?1, unlocked_until_ms=?2, force_locked=0 WHERE id=1",
+                "UPDATE rust_security_state SET last_timecode=?1, unlocked_until_ms=?2, force_locked=0, totp_failures=0, totp_locked_until_ms=0 WHERE id=1",
                 params![timecode, now_ms.saturating_add(unlock_seconds.saturating_mul(1000))],
             )
             .map_err(sql_error)?;
@@ -1052,12 +1154,37 @@ impl SqliteStore {
         }
         transaction
             .execute(
-                "UPDATE rust_security_state SET last_timecode=?1, unlocked_until_ms=0, force_locked=0 WHERE id=1",
+                "UPDATE rust_security_state SET last_timecode=?1, unlocked_until_ms=0, force_locked=0, totp_failures=0, totp_locked_until_ms=0 WHERE id=1",
                 params![timecode],
             )
             .map_err(sql_error)?;
         transaction.commit().map_err(sql_error)?;
         Ok(true)
+    }
+
+    pub fn unlock_totp_after_recovery(&self, now_ms: i64, unlock_seconds: i64) -> PortResult<bool> {
+        if unlock_seconds <= 0 {
+            return Err(PortError::Adapter("invalid TOTP unlock duration".into()));
+        }
+        let connection = self.connection.lock().map_err(lock_error)?;
+        let changed = connection
+            .execute(
+                "UPDATE rust_security_state SET unlocked_until_ms=?1, force_locked=0, totp_failures=0, totp_locked_until_ms=0 WHERE id=1",
+                params![now_ms.saturating_add(unlock_seconds.saturating_mul(1000))],
+            )
+            .map_err(sql_error)?;
+        Ok(changed == 1)
+    }
+
+    pub fn accept_recovery_for_space(&self) -> PortResult<bool> {
+        let connection = self.connection.lock().map_err(lock_error)?;
+        let changed = connection
+            .execute(
+                "UPDATE rust_security_state SET force_locked=0, totp_failures=0, totp_locked_until_ms=0 WHERE id=1",
+                [],
+            )
+            .map_err(sql_error)?;
+        Ok(changed == 1)
     }
 
     pub fn lock_totp(&self) -> PortResult<()> {
@@ -1069,6 +1196,80 @@ impl SqliteStore {
             )
             .map_err(sql_error)?;
         Ok(())
+    }
+
+    /// Records an invalid TOTP/recovery attempt and applies a short lockout
+    /// after repeated failures. The caller checks the returned count only for
+    /// diagnostics; authorization remains false until a later valid attempt.
+    pub fn record_totp_failure(&self, now_ms: i64) -> PortResult<i64> {
+        let mut connection = self.connection.lock().map_err(lock_error)?;
+        let transaction = connection.transaction().map_err(sql_error)?;
+        let (failures, locked_until_ms): (i64, i64) = transaction
+            .query_row(
+                "SELECT totp_failures, totp_locked_until_ms FROM rust_security_state WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(sql_error)?;
+        if locked_until_ms > now_ms {
+            transaction.commit().map_err(sql_error)?;
+            return Ok(failures);
+        }
+        let failures = failures.saturating_add(1);
+        let locked_until_ms = if failures >= 5 {
+            now_ms.saturating_add(300_000)
+        } else {
+            0
+        };
+        transaction
+            .execute(
+                "UPDATE rust_security_state SET totp_failures=?1, totp_locked_until_ms=?2 WHERE id=1",
+                params![failures, locked_until_ms],
+            )
+            .map_err(sql_error)?;
+        transaction.commit().map_err(sql_error)?;
+        Ok(failures)
+    }
+
+    pub fn replace_recovery_codes(&self, entries: &[(String, String)]) -> PortResult<()> {
+        let mut connection = self.connection.lock().map_err(lock_error)?;
+        let transaction = connection.transaction().map_err(sql_error)?;
+        transaction
+            .execute("DELETE FROM rust_totp_recovery_codes", [])
+            .map_err(sql_error)?;
+        for (digest, salt) in entries {
+            transaction
+                .execute(
+                    "INSERT INTO rust_totp_recovery_codes(digest, salt, consumed_at_ms) VALUES (?1, ?2, NULL)",
+                    params![digest, salt],
+                )
+                .map_err(sql_error)?;
+        }
+        transaction.commit().map_err(sql_error)
+    }
+
+    pub fn unused_recovery_codes(&self) -> PortResult<Vec<(String, String)>> {
+        let connection = self.connection.lock().map_err(lock_error)?;
+        let mut statement = connection
+            .prepare(
+                "SELECT digest, salt FROM rust_totp_recovery_codes WHERE consumed_at_ms IS NULL",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(sql_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(sql_error)
+    }
+
+    pub fn consume_recovery_code(&self, digest: &str, now_ms: i64) -> PortResult<bool> {
+        let connection = self.connection.lock().map_err(lock_error)?;
+        let changed = connection
+            .execute(
+                "UPDATE rust_totp_recovery_codes SET consumed_at_ms=?1 WHERE digest=?2 AND consumed_at_ms IS NULL",
+                params![now_ms, digest],
+            )
+            .map_err(sql_error)?;
+        Ok(changed == 1)
     }
 
     /// Saves the immutable channel-post to discussion-root relationship. It
@@ -1120,7 +1321,7 @@ impl SqliteStore {
         let connection = self.connection.lock().map_err(lock_error)?;
         connection
             .query_row(
-                "SELECT space_id, thread_id, lifecycle, generation, channel_chat_id, channel_post_id, discussion_chat_id, discussion_root_message_id, status_message_id, status_bot_instance, owner_chat_id, plan_mode, created_at_ms, updated_at_ms FROM rust_session_spaces WHERE discussion_chat_id=?1 AND discussion_root_message_id=?2",
+                "SELECT space_id, thread_id, lifecycle, generation, channel_chat_id, channel_post_id, discussion_chat_id, discussion_root_message_id, status_message_id, status_bot_instance, owner_chat_id, plan_mode, closed_at_ms, created_at_ms, updated_at_ms FROM rust_session_spaces WHERE discussion_chat_id=?1 AND discussion_root_message_id=?2",
                 params![discussion_chat_id, root_message_id],
                 row_to_space,
             )
@@ -1137,7 +1338,27 @@ impl SqliteStore {
         let connection = self.connection.lock().map_err(lock_error)?;
         connection
             .execute(
-                "INSERT INTO rust_callbacks(nonce, space_id, generation, action, expires_at_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO rust_callbacks(nonce, space_id, generation, action, expires_at_ms, surface) VALUES (?1, ?2, ?3, ?4, ?5, 'workflow')",
+                params![callback.nonce, callback.space_id, callback.generation, callback.action, callback.expires_at_ms],
+            )
+            .map_err(sql_error)?;
+        Ok(())
+    }
+
+    /// Creates a callback owned by the 818 status surface.  The separate
+    /// surface column makes retirement durable and independent of action JSON
+    /// shape, while old v5 callbacks remain discoverable by the compatibility
+    /// predicate below.
+    pub fn create_status_callback(&self, callback: &StoredCallback) -> PortResult<()> {
+        if callback.nonce.trim().is_empty() || callback.action.trim().is_empty() {
+            return Err(PortError::Adapter(
+                "callback nonce and action cannot be empty".into(),
+            ));
+        }
+        let connection = self.connection.lock().map_err(lock_error)?;
+        connection
+            .execute(
+                "INSERT INTO rust_callbacks(nonce, space_id, generation, action, expires_at_ms, surface) VALUES (?1, ?2, ?3, ?4, ?5, 'status')",
                 params![callback.nonce, callback.space_id, callback.generation, callback.action, callback.expires_at_ms],
             )
             .map_err(sql_error)?;
@@ -1148,16 +1369,33 @@ impl SqliteStore {
     /// fresh keyboard is rendered. Plan, question, and approval callbacks use
     /// different JSON payloads and remain valid until their own scope expires.
     pub fn retire_status_callbacks(&self, space_id: &str, generation: i64) -> PortResult<usize> {
+        let retired_at = self.retire_status_callbacks_at(space_id, generation)?;
+        let connection = self.connection.lock().map_err(lock_error)?;
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM rust_callbacks WHERE space_id=?1 AND generation=?2 AND consumed_at_ms=?3",
+                params![space_id, generation, retired_at],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| usize::try_from(count).unwrap_or(usize::MAX))
+            .map_err(sql_error)
+    }
+
+    pub fn retire_status_callbacks_at(&self, space_id: &str, generation: i64) -> PortResult<i64> {
         let mut connection = self.connection.lock().map_err(lock_error)?;
         let transaction = connection.transaction().map_err(sql_error)?;
         let mut statement = transaction
             .prepare(
-                "SELECT nonce, action FROM rust_callbacks WHERE space_id=?1 AND generation=?2 AND consumed_at_ms IS NULL",
+                "SELECT nonce, action, surface FROM rust_callbacks WHERE space_id=?1 AND generation=?2 AND consumed_at_ms IS NULL",
             )
             .map_err(sql_error)?;
         let callbacks = statement
             .query_map(params![space_id, generation], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
             })
             .map_err(sql_error)?
             .collect::<Result<Vec<_>, _>>()
@@ -1168,27 +1406,27 @@ impl SqliteStore {
             .unwrap_or_default()
             .as_millis()
             .min(i64::MAX as u128) as i64;
-        let mut retired = 0usize;
-        for (nonce, action) in callbacks {
-            let is_status = serde_json::from_str::<serde_json::Value>(&action)
+        for (nonce, action, surface) in callbacks {
+            let legacy_status = serde_json::from_str::<serde_json::Value>(&action)
                 .ok()
                 .and_then(|value| {
                     value
                         .get("action")
                         .and_then(serde_json::Value::as_str)
-                        .map(str::to_owned)
+                        .map(|value| {
+                            matches!(
+                                value,
+                                "space_refresh"
+                                    | "space_unwatch"
+                                    | "status_unwatch_execute"
+                                    | "status_unwatch_cancel"
+                            )
+                        })
                 })
-                .is_some_and(|value| {
-                    matches!(
-                        value.as_str(),
-                        "space_refresh"
-                            | "space_unwatch"
-                            | "status_unwatch_execute"
-                            | "status_unwatch_cancel"
-                    )
-                });
+                .unwrap_or(false);
+            let is_status = surface == "status" || legacy_status;
             if is_status {
-                retired += transaction
+                transaction
                     .execute(
                         "UPDATE rust_callbacks SET consumed_at_ms=?1 WHERE nonce=?2 AND consumed_at_ms IS NULL",
                         params![now, nonce],
@@ -1197,7 +1435,23 @@ impl SqliteStore {
             }
         }
         transaction.commit().map_err(sql_error)?;
-        Ok(retired)
+        Ok(now)
+    }
+
+    pub fn restore_status_callbacks(
+        &self,
+        space_id: &str,
+        generation: i64,
+        retired_at_ms: i64,
+    ) -> PortResult<usize> {
+        let connection = self.connection.lock().map_err(lock_error)?;
+        let restored = connection
+            .execute(
+                "UPDATE rust_callbacks SET consumed_at_ms=NULL WHERE space_id=?1 AND generation=?2 AND surface='status' AND consumed_at_ms=?3",
+                params![space_id, generation, retired_at_ms],
+            )
+            .map_err(sql_error)?;
+        Ok(restored)
     }
 
     pub fn peek_callback(&self, nonce: &str, now_ms: i64) -> PortResult<Option<StoredCallback>> {
@@ -1207,6 +1461,21 @@ impl SqliteStore {
                 "SELECT nonce, space_id, generation, action, expires_at_ms FROM rust_callbacks WHERE nonce=?1 AND consumed_at_ms IS NULL AND expires_at_ms>=?2",
                 params![nonce, now_ms],
                 |row| Ok(StoredCallback { nonce: row.get(0)?, space_id: row.get(1)?, generation: row.get(2)?, action: row.get(3)?, expires_at_ms: row.get(4)? }),
+            )
+            .optional()
+            .map_err(sql_error)
+    }
+
+    /// Returns the durable owner surface for a live callback without
+    /// consuming it.  The daemon uses this as a second authorization gate so
+    /// a workflow callback can never be replayed through the 818 status Bot.
+    pub fn callback_surface(&self, nonce: &str, now_ms: i64) -> PortResult<Option<String>> {
+        let connection = self.connection.lock().map_err(lock_error)?;
+        connection
+            .query_row(
+                "SELECT surface FROM rust_callbacks WHERE nonce=?1 AND consumed_at_ms IS NULL AND expires_at_ms>=?2",
+                params![nonce, now_ms],
+                |row| row.get(0),
             )
             .optional()
             .map_err(sql_error)
@@ -1280,6 +1549,89 @@ impl SqliteStore {
             .map_err(sql_error)?;
         transaction.commit().map_err(sql_error)?;
         Ok((consumed == 1).then_some(callback))
+    }
+
+    pub fn upsert_thread_projection(
+        &self,
+        thread_id: &str,
+        generation: i64,
+        projection: &serde_json::Value,
+        updated_at_ms: i64,
+    ) -> PortResult<()> {
+        if thread_id.trim().is_empty() {
+            return Err(PortError::Adapter(
+                "thread projection id cannot be empty".into(),
+            ));
+        }
+        let payload = serde_json::to_string(projection)
+            .map_err(|error| PortError::Adapter(format!("serialize thread projection: {error}")))?;
+        let connection = self.connection.lock().map_err(lock_error)?;
+        connection
+            .execute(
+                "INSERT INTO rust_thread_projections(thread_id, generation, projection_json, updated_at_ms) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(thread_id) DO UPDATE SET generation=excluded.generation, projection_json=excluded.projection_json, updated_at_ms=excluded.updated_at_ms",
+                params![thread_id, generation, payload, updated_at_ms],
+            )
+            .map_err(sql_error)?;
+        Ok(())
+    }
+
+    pub fn thread_projections(&self) -> PortResult<Vec<(String, i64, serde_json::Value, i64)>> {
+        let connection = self.connection.lock().map_err(lock_error)?;
+        let mut statement = connection
+            .prepare(
+                "SELECT thread_id, generation, projection_json, updated_at_ms FROM rust_thread_projections ORDER BY updated_at_ms, thread_id",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                let payload: String = row.get(2)?;
+                let value = serde_json::from_str(&payload).map_err(to_from_sql_error)?;
+                Ok((row.get(0)?, row.get(1)?, value, row.get(3)?))
+            })
+            .map_err(sql_error)?;
+        rows.map(|row| row.map_err(sql_error)).collect()
+    }
+
+    pub fn telegram_fingerprint(
+        &self,
+        bot_instance_id: &str,
+        chat_id: i64,
+        message_id: i64,
+        semantic_key: &str,
+    ) -> PortResult<Option<String>> {
+        let connection = self.connection.lock().map_err(lock_error)?;
+        connection
+            .query_row(
+                "SELECT fingerprint FROM rust_telegram_fingerprints WHERE bot_instance_id=?1 AND chat_id=?2 AND message_id=?3 AND semantic_key=?4",
+                params![bot_instance_id, chat_id, message_id, semantic_key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)
+    }
+
+    pub fn set_telegram_fingerprint(
+        &self,
+        bot_instance_id: &str,
+        chat_id: i64,
+        message_id: i64,
+        semantic_key: &str,
+        fingerprint: &str,
+        updated_at_ms: i64,
+    ) -> PortResult<()> {
+        if bot_instance_id.trim().is_empty() || semantic_key.trim().is_empty() {
+            return Err(PortError::Adapter(
+                "telegram fingerprint key cannot be empty".into(),
+            ));
+        }
+        let connection = self.connection.lock().map_err(lock_error)?;
+        connection
+            .execute(
+                "INSERT INTO rust_telegram_fingerprints(bot_instance_id, chat_id, message_id, semantic_key, fingerprint, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(bot_instance_id, chat_id, message_id, semantic_key) DO UPDATE SET fingerprint=excluded.fingerprint, updated_at_ms=excluded.updated_at_ms",
+                params![bot_instance_id, chat_id, message_id, semantic_key, fingerprint, updated_at_ms],
+            )
+            .map_err(sql_error)?;
+        Ok(())
     }
 
     fn migrate(&self) -> PortResult<()> {
@@ -1513,6 +1865,50 @@ impl SqliteStore {
                     ) STRICT;
                     CREATE INDEX rust_scheduled_deletions_due
                         ON rust_scheduled_deletions(delete_at_ms, claimed_at_ms);
+                    ",
+                )
+                .map_err(sql_error)?;
+        }
+        if version < 6 {
+            transaction
+                .execute_batch(
+                    "
+                    ALTER TABLE rust_session_spaces ADD COLUMN closed_at_ms INTEGER;
+                    ALTER TABLE rust_callbacks ADD COLUMN surface TEXT NOT NULL DEFAULT 'workflow';
+                    CREATE TABLE rust_thread_projections (
+                        thread_id TEXT PRIMARY KEY NOT NULL,
+                        generation INTEGER NOT NULL,
+                        projection_json TEXT NOT NULL,
+                        updated_at_ms INTEGER NOT NULL
+                    ) STRICT;
+                    CREATE INDEX rust_thread_projections_by_updated
+                        ON rust_thread_projections(updated_at_ms, thread_id);
+                    CREATE TABLE rust_telegram_fingerprints (
+                        bot_instance_id TEXT NOT NULL,
+                        chat_id INTEGER NOT NULL,
+                        message_id INTEGER NOT NULL,
+                        semantic_key TEXT NOT NULL,
+                        fingerprint TEXT NOT NULL,
+                        updated_at_ms INTEGER NOT NULL,
+                        PRIMARY KEY(bot_instance_id, chat_id, message_id, semantic_key)
+                    ) STRICT;
+                    ",
+                )
+                .map_err(sql_error)?;
+        }
+        if version < 7 {
+            transaction
+                .execute_batch(
+                    "
+                    ALTER TABLE rust_security_state ADD COLUMN totp_failures INTEGER NOT NULL DEFAULT 0;
+                    ALTER TABLE rust_security_state ADD COLUMN totp_locked_until_ms INTEGER NOT NULL DEFAULT 0;
+                    CREATE TABLE rust_totp_recovery_codes (
+                        digest TEXT PRIMARY KEY NOT NULL,
+                        salt TEXT NOT NULL,
+                        consumed_at_ms INTEGER
+                    ) STRICT;
+                    CREATE INDEX rust_totp_recovery_codes_pending
+                        ON rust_totp_recovery_codes(consumed_at_ms);
                     ",
                 )
                 .map_err(sql_error)?;
@@ -1785,8 +2181,9 @@ fn row_to_space(row: &rusqlite::Row<'_>) -> rusqlite::Result<RustSessionSpace> {
         status_bot_instance: row.get(9)?,
         owner_chat_id: row.get(10)?,
         plan_mode: row.get::<_, i64>(11)? != 0,
-        created_at_ms: row.get(12)?,
-        updated_at_ms: row.get(13)?,
+        closed_at_ms: row.get(12)?,
+        created_at_ms: row.get(13)?,
+        updated_at_ms: row.get(14)?,
     })
 }
 
@@ -1856,6 +2253,7 @@ mod tests {
             status_bot_instance: Some("status".into()),
             owner_chat_id: Some(42),
             plan_mode: false,
+            closed_at_ms: None,
             created_at_ms: 10,
             updated_at_ms: 10,
         }
@@ -2220,5 +2618,104 @@ mod tests {
         assert_eq!(store.retire_status_callbacks("space-1", 0).unwrap(), 1);
         assert_eq!(store.peek_callback("status-1", i64::MAX).unwrap(), None);
         assert_eq!(store.peek_callback("plan-1", i64::MAX).unwrap(), Some(plan));
+    }
+
+    #[test]
+    fn close_session_space_is_atomic_and_invalidates_current_generation() {
+        let store = SqliteStore::in_memory().unwrap();
+        store.upsert_session_space(&space()).unwrap();
+        store
+            .create_status_callback(&StoredCallback {
+                nonce: "status-close-1".into(),
+                space_id: "space-1".into(),
+                generation: 0,
+                action: serde_json::json!({
+                    "space_id": "space-1",
+                    "generation": 0,
+                    "thread_id": "thread-1",
+                    "action": "space_unwatch"
+                })
+                .to_string(),
+                expires_at_ms: i64::MAX,
+            })
+            .unwrap();
+        store
+            .create_callback(&StoredCallback {
+                nonce: "workflow-close-high-generation".into(),
+                space_id: "space-1".into(),
+                generation: 99,
+                action: "approval".into(),
+                expires_at_ms: i64::MAX,
+            })
+            .unwrap();
+        store
+            .upsert_workflow_record(
+                "queue",
+                "queue-close-1",
+                &serde_json::json!({
+                    "space_id": "space-1",
+                    "thread_id": "thread-1",
+                    "generation": 0,
+                    "status": "queued",
+                    "prompt": "queued before close"
+                }),
+                10,
+            )
+            .unwrap();
+
+        let closed = store
+            .close_session_space("space-1", 0, 100)
+            .unwrap()
+            .expect("current generation should close");
+        assert_eq!(closed.lifecycle, "closed");
+        assert_eq!(closed.generation, 1);
+        assert_eq!(closed.closed_at_ms, Some(100));
+        assert_eq!(store.peek_callback("status-close-1", 100).unwrap(), None);
+        assert_eq!(
+            store
+                .peek_callback("workflow-close-high-generation", 100)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .workflow_record("queue", "queue-close-1")
+                .unwrap()
+                .and_then(|value| {
+                    value
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .unwrap(),
+            "cancelled"
+        );
+
+        assert!(
+            store
+                .close_session_space("space-1", 0, 200)
+                .unwrap()
+                .is_none()
+        );
+        let persisted = store
+            .get_session_space("space-1")
+            .unwrap()
+            .expect("closed row remains durable");
+        assert_eq!(persisted.generation, 1);
+        assert_eq!(persisted.closed_at_ms, Some(100));
+
+        let mut stale = persisted.clone();
+        stale.lifecycle = "active".into();
+        stale.generation = 0;
+        stale.status_message_id = Some(999);
+        stale.updated_at_ms = 200;
+        store.upsert_session_space(&stale).unwrap();
+        let still_closed = store
+            .get_session_space("space-1")
+            .unwrap()
+            .expect("closed row remains durable after stale update");
+        assert_eq!(still_closed.lifecycle, "closed");
+        assert_eq!(still_closed.generation, 1);
+        assert_eq!(still_closed.status_message_id, None);
     }
 }

@@ -13,6 +13,10 @@ use crate::control::{
 };
 use crate::metrics::{MetricsRegistry, MetricsServer};
 use crate::security::TotpManager;
+use crate::status_contract::{
+    DASHBOARD_DEBOUNCE_MS, HEARTBEAT_SECONDS, LOCKED_WRITE_MESSAGE, STATUS_CALLBACK_TTL_MS,
+    UNWATCH_CANCEL_MESSAGE, UNWATCH_CLOSED_MESSAGE, UNWATCH_CONFIRM_MESSAGE, is_status_action,
+};
 use codex_telegram_adapter::{
     BotCapability, BotCommandScope, ChannelBinding, CommandMenuScope, IncomingUpdate,
     InlineKeyboardButton, InlineKeyboardMarkup, LinkedDiscussion, NativeCommentBinding,
@@ -39,6 +43,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -241,6 +246,21 @@ impl SessionRegistry {
                 .insert(copy.thread_id.to_string(), copy);
         }
     }
+
+    fn remove(&self, thread_id: &str) -> Option<SessionRecord> {
+        let removed = self
+            .by_thread
+            .lock()
+            .expect("session registry poisoned")
+            .remove(thread_id);
+        if let Some(record) = removed.as_ref() {
+            self.by_chat
+                .lock()
+                .expect("session registry poisoned")
+                .remove(&record.chat_id);
+        }
+        removed
+    }
 }
 
 pub fn run(config_path: Option<&Path>) -> Result<(), DaemonError> {
@@ -323,24 +343,45 @@ async fn run_async(
         .collect::<HashMap<_, _>>();
     let control_runtime = Arc::new(ControlRuntime::default());
     refresh_command_menus(&bots_by_id, &config, &store).await;
-    restore_active_sessions(&sessions, &store, &config, &bots_by_id)?;
     let totp = Arc::new(TotpManager::new(
         store.clone(),
         config.totp_secret_path.clone(),
         config.totp_unlock_seconds,
     ));
+    let persisted_projections = store
+        .thread_projections()
+        .map_err(|error| DaemonError::Store(error.to_string()))?
+        .into_iter()
+        .filter_map(|(thread_id, _, payload, _)| {
+            serde_json::from_value::<ThreadProjection>(payload)
+                .ok()
+                .map(|projection| (thread_id, projection))
+        })
+        .collect::<HashMap<_, _>>();
+    restore_active_sessions(
+        &sessions,
+        &store,
+        &config,
+        &bots_by_id,
+        &persisted_projections,
+    )?;
     for space in store
         .active_session_spaces()
         .map_err(|error| DaemonError::Store(error.to_string()))?
     {
-        if let Err(error) = ensure_status_message(
+        if let Err(error) = update_status_message(
             &store,
             &bots_by_id,
             &config,
             &metrics,
             totp.as_ref(),
             &space,
+            space
+                .thread_id
+                .as_deref()
+                .and_then(|thread_id| persisted_projections.get(thread_id)),
             None,
+            true,
         )
         .await
         {
@@ -404,6 +445,13 @@ async fn run_async(
         metrics.clone(),
         totp.clone(),
     ));
+    let heartbeat_task = tokio::spawn(run_status_heartbeat_worker(
+        store.clone(),
+        bots_by_id.clone(),
+        config.clone(),
+        metrics.clone(),
+        totp.clone(),
+    ));
     let request_task = tokio::spawn(handle_server_requests(
         agent.clone(),
         store.clone(),
@@ -412,6 +460,31 @@ async fn run_async(
         config.clone(),
         metrics.clone(),
     ));
+    for space in store
+        .active_session_spaces()
+        .map_err(|error| DaemonError::Store(error.to_string()))?
+    {
+        let Some(thread_id) = space.thread_id.as_deref() else {
+            continue;
+        };
+        let Some(session) = sessions.by_thread(thread_id) else {
+            continue;
+        };
+        if session.turn_id.is_none()
+            && let Err(error) = dispatch_next_queued(
+                &store,
+                &agent,
+                &sessions,
+                &session,
+                &bots_by_id,
+                &config,
+                &metrics,
+            )
+            .await
+        {
+            eprintln!("rust bridge startup queue dispatch failed: {error}");
+        }
+    }
     let new_expiry_task = bots_by_id
         .values()
         .find(|bot| bot.role == RuntimeBotRole::Control)
@@ -490,7 +563,12 @@ async fn run_async(
             if let Err(error) = &result {
                 eprintln!("rust bridge action failed: {error}");
             }
-            let _ = inbound.completion.send(result.is_ok());
+            // Telegram's update stream is ordered.  Retrying one failed
+            // handler forever would therefore starve every later callback,
+            // including harmless inline-button acknowledgements.  The
+            // handler has already logged the durable failure; advance the
+            // update cursor so the next update can still be delivered.
+            let _ = inbound.completion.send(true);
         }
     });
 
@@ -504,6 +582,7 @@ async fn run_async(
                 task.abort();
             }
             deletion_task.abort();
+            heartbeat_task.abort();
         }
         result = &mut dispatch_task => {
             result.map_err(|error| DaemonError::Task(error.to_string()))?;
@@ -512,6 +591,7 @@ async fn run_async(
                 task.abort();
             }
             deletion_task.abort();
+            heartbeat_task.abort();
         }
     }
     let _ = tokio::task::spawn_blocking(move || {
@@ -521,6 +601,7 @@ async fn run_async(
     })
     .await;
     event_task.abort();
+    heartbeat_task.abort();
     request_task.abort();
     agent.shutdown().await;
     Ok(())
@@ -531,6 +612,7 @@ fn restore_active_sessions(
     store: &SqliteStore,
     config: &RustConfig,
     bots_by_id: &HashMap<String, RuntimeBot>,
+    projections: &HashMap<String, ThreadProjection>,
 ) -> Result<(), DaemonError> {
     let mut restored = 0usize;
     for space in store
@@ -559,9 +641,19 @@ fn restore_active_sessions(
         let Some(sender_instance_id) = sender_instance_id else {
             continue;
         };
+        let restored_turn_id = projections
+            .get(thread_id.as_str())
+            .filter(|projection| {
+                matches!(
+                    projection.turn_status.as_deref(),
+                    Some("inProgress" | "active" | "running")
+                )
+            })
+            .and_then(|projection| projection.turn_id.clone())
+            .and_then(|turn_id| TurnId::new(turn_id).ok());
         sessions.insert(SessionRecord {
             thread_id,
-            turn_id: None,
+            turn_id: restored_turn_id,
             chat_id,
             root_message_id: space.discussion_root_message_id,
             sender_instance_id,
@@ -1465,18 +1557,18 @@ async fn handle_command(
                 )
                 .await;
             };
-            let markup = status_callback_markup(
+            let markup = discussion_callback_markup_rows(
                 store,
                 &space,
                 &[
-                    ("确认取消关注", "status_unwatch_execute"),
-                    ("返回", "status_unwatch_cancel"),
+                    &[("确认取消关注", "status_unwatch_execute")],
+                    &[("返回", "status_unwatch_cancel")],
                 ],
             )?;
             send_text_with_markup(
                 &inbound_bot,
                 &surface_for(&inbound_bot, config, chat_id, session.root_message_id),
-                "确认取消关注？评论历史会保留，但此评论串将永久只读。",
+                UNWATCH_CONFIRM_MESSAGE,
                 markup,
                 metrics,
             )
@@ -1934,6 +2026,27 @@ fn control_user(actor_user_id: Option<i64>) -> Result<i64, String> {
     actor_user_id.ok_or_else(|| "无法确认个人发送身份；请关闭匿名管理员后重试。".to_owned())
 }
 
+fn workflow_callback_bot_allowed(bot: &RuntimeBot) -> bool {
+    matches!(
+        bot.role,
+        RuntimeBotRole::Control | RuntimeBotRole::Discussion
+    )
+}
+
+fn workflow_callback_owner_authorized(
+    store: &SqliteStore,
+    callback: &codex_telegram_adapter::TelegramCallback,
+) -> Result<bool, String> {
+    let Some(actor_user_id) = callback.actor.user_id else {
+        return Ok(false);
+    };
+    let owner_user_id = store
+        .workflow_record("onboarding", "owner")
+        .map_err(|error| error.to_string())?
+        .and_then(|value| value.get("user_id").and_then(Value::as_i64));
+    Ok(owner_user_id == Some(actor_user_id))
+}
+
 fn control_now_seconds() -> i64 {
     now_ms().saturating_div(1000)
 }
@@ -1950,6 +2063,73 @@ fn control_models(models: &ModelChoices) -> Vec<ControlModelOption> {
         .collect()
 }
 
+fn normalized_status(value: Option<&Value>, default: &str) -> String {
+    let Some(value) = value else {
+        return default.to_owned();
+    };
+    match value {
+        Value::String(value) if !value.trim().is_empty() => value.trim().to_owned(),
+        Value::Object(object) => {
+            for key in ["type", "status", "state", "name"] {
+                let normalized = normalized_status(object.get(key), "");
+                if !normalized.is_empty() {
+                    return normalized;
+                }
+            }
+            default.to_owned()
+        }
+        _ => default.to_owned(),
+    }
+}
+
+fn status_active_flags(value: Option<&Value>) -> Vec<String> {
+    let Some(object) = value.and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    object
+        .get("activeFlags")
+        .or_else(|| object.get("active_flags"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn control_epoch_value(value: Option<&Value>) -> Option<i64> {
+    match value {
+        Some(Value::Number(number)) => number
+            .as_i64()
+            .or_else(|| number.as_u64().and_then(|value| i64::try_from(value).ok())),
+        Some(Value::String(value)) => value.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+fn control_epoch_ms(value: Option<&Value>) -> Option<i64> {
+    let raw = control_epoch_value(value)?;
+    Some(if raw > 100_000_000_000 {
+        raw
+    } else {
+        raw.saturating_mul(1000)
+    })
+}
+
+fn error_message(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    let message = value
+        .get("message")
+        .or(Some(value))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|message| !message.is_empty())?;
+    Some(message.to_owned())
+}
+
 fn control_session_from_value(value: &Value) -> Option<ControlSession> {
     let thread_id = value.get("id").and_then(Value::as_str)?.trim();
     if thread_id.is_empty() || value.get("ephemeral").and_then(Value::as_bool) == Some(true) {
@@ -1961,7 +2141,7 @@ fn control_session_from_value(value: &Value) -> Option<ControlSession> {
         .unwrap_or("Codex session")
         .to_owned();
     let epoch = |field: &str| {
-        value.get(field).and_then(Value::as_i64).map(|raw| {
+        control_epoch_value(value.get(field)).map(|raw| {
             if raw > 100_000_000_000 {
                 raw / 1000
             } else {
@@ -1969,37 +2149,36 @@ fn control_session_from_value(value: &Value) -> Option<ControlSession> {
             }
         })
     };
+    let status = value.get("status");
     Some(ControlSession {
         thread_id: thread_id.to_owned(),
         title,
-        status: value
-            .get("status")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-            .to_owned(),
-        turn_status: value
-            .get("turnStatus")
-            .or_else(|| value.get("turn_status"))
-            .and_then(Value::as_str)
-            .unwrap_or("idle")
-            .to_owned(),
+        status: normalized_status(status, "unknown"),
+        turn_status: normalized_status(
+            value.get("turnStatus").or_else(|| value.get("turn_status")),
+            "idle",
+        ),
         lifecycle: value
             .get("lifecycle")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned(),
-        active_flags: value
-            .get("activeFlags")
-            .or_else(|| value.get("active_flags"))
-            .and_then(Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default(),
+        active_flags: if status_active_flags(status).is_empty() {
+            value
+                .get("activeFlags")
+                .or_else(|| value.get("active_flags"))
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            status_active_flags(status)
+        },
         error: value
             .get("error")
             .and_then(|error| error.get("message").or(Some(error)))
@@ -2015,6 +2194,275 @@ fn control_session_from_value(value: &Value) -> Option<ControlSession> {
             .unwrap_or("-")
             .to_owned(),
     })
+}
+
+fn thread_read_source(response: &Value) -> &Value {
+    response
+        .get("thread")
+        .filter(|thread| thread.is_object())
+        .unwrap_or(response)
+}
+
+fn thread_read_turns(source: &Value, response: &Value) -> Vec<Value> {
+    let turns = source
+        .get("turns")
+        .or_else(|| response.get("turns"))
+        .and_then(|value| {
+            value
+                .as_array()
+                .or_else(|| value.get("data").and_then(Value::as_array))
+        });
+    turns.cloned().unwrap_or_default()
+}
+
+fn projection_from_thread_read(thread_id: &str, response: &Value) -> ThreadProjection {
+    let source = thread_read_source(response);
+    let turns = thread_read_turns(source, response);
+    let latest_turn = turns.iter().rev().find(|turn| turn.is_object());
+    let status = source.get("status");
+    let mut projection = ThreadProjection {
+        thread_id: thread_id.to_owned(),
+        title: ["naturalSummary", "summary", "title", "name", "preview"]
+            .iter()
+            .find_map(|field| {
+                source
+                    .get(*field)
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            }),
+        cwd: source
+            .get("cwd")
+            .or_else(|| source.get("directory"))
+            .or_else(|| source.get("path"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        status: Some(normalized_status(status, "unknown")),
+        turn_id: latest_turn
+            .and_then(|turn| turn.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        turn_status: latest_turn
+            .and_then(|turn| turn.get("status"))
+            .map(|value| normalized_status(Some(value), "idle"))
+            .or_else(|| {
+                source
+                    .get("turnStatus")
+                    .or_else(|| source.get("turn_status"))
+                    .map(|value| normalized_status(Some(value), "idle"))
+            }),
+        goal: source
+            .get("goal")
+            .or_else(|| response.get("goal"))
+            .cloned()
+            .filter(|value| !value.is_null()),
+        plan: source
+            .get("plan")
+            .or_else(|| response.get("plan"))
+            .cloned()
+            .filter(|value| !value.is_null()),
+        review_status: None,
+        desired_mode: source
+            .get("collaborationMode")
+            .or_else(|| source.get("collaboration_mode"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        observed_mode: source
+            .get("observedMode")
+            .or_else(|| source.get("observed_mode"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        active_flags: status_active_flags(status),
+        model: source
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        effort: source
+            .get("effort")
+            .or_else(|| source.get("reasoningEffort"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        started_at_ms: latest_turn
+            .and_then(|turn| turn.get("startedAt").or_else(|| turn.get("started_at")))
+            .and_then(|value| control_epoch_ms(Some(value))),
+        finished_at_ms: latest_turn
+            .and_then(|turn| {
+                turn.get("completedAt")
+                    .or_else(|| turn.get("completed_at"))
+                    .or_else(|| turn.get("finishedAt"))
+                    .or_else(|| turn.get("finished_at"))
+            })
+            .and_then(|value| control_epoch_ms(Some(value))),
+        items: Default::default(),
+        item_order: Default::default(),
+        subagents: Default::default(),
+        last_error: error_message(
+            source
+                .get("error")
+                .or_else(|| latest_turn.and_then(|turn| turn.get("error"))),
+        ),
+        generation: source
+            .get("generation")
+            .or_else(|| response.get("generation"))
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        updated_at_ms: control_epoch_ms(
+            source
+                .get("updatedAt")
+                .or_else(|| source.get("updated_at"))
+                .or_else(|| response.get("updatedAt")),
+        )
+        .unwrap_or_default(),
+    };
+    if projection.finished_at_ms.is_none()
+        && matches!(
+            projection.turn_status.as_deref(),
+            Some("completed" | "failed" | "interrupted")
+        )
+        && projection.updated_at_ms > 0
+    {
+        projection.finished_at_ms = Some(projection.updated_at_ms);
+    }
+    if projection.observed_mode.is_none()
+        && let Some(settings) = source
+            .get("threadSettings")
+            .or_else(|| source.get("settings"))
+    {
+        projection.observed_mode = settings
+            .get("observedMode")
+            .or_else(|| settings.get("observed_mode"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        projection.desired_mode = projection.desired_mode.or_else(|| {
+            settings
+                .get("collaborationMode")
+                .or_else(|| settings.get("collaboration_mode"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+        projection.model = projection.model.or_else(|| {
+            settings
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+        projection.effort = projection.effort.or_else(|| {
+            settings
+                .get("effort")
+                .or_else(|| settings.get("reasoning_effort"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+    }
+
+    let mut plan_from_item = None;
+    for (turn_index, turn) in turns.iter().enumerate() {
+        let Some(items) = turn.get("items").and_then(Value::as_array) else {
+            continue;
+        };
+        for (item_index, item) in items.iter().enumerate() {
+            let item_id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("item-{turn_index}-{item_index}"));
+            if !projection.items.contains_key(&item_id) {
+                projection.item_order.push(item_id.clone());
+            }
+            projection.items.insert(item_id, item.clone());
+            if let Some(states) = item
+                .get("agentsStates")
+                .or_else(|| item.get("agents_states"))
+                .and_then(Value::as_object)
+            {
+                for (agent_id, state) in states {
+                    projection.subagents.insert(agent_id.clone(), state.clone());
+                }
+            }
+            for key in ["subagents", "subAgents"] {
+                if let Some(states) = item.get(key).and_then(Value::as_object) {
+                    for (agent_id, state) in states {
+                        projection.subagents.insert(agent_id.clone(), state.clone());
+                    }
+                }
+            }
+            if let Some(task) = item
+                .get("task")
+                .or_else(|| item.get("subagent"))
+                .filter(|value| value.is_object())
+                && let Some(agent_id) = task.get("id").and_then(Value::as_str)
+            {
+                projection
+                    .subagents
+                    .insert(agent_id.to_owned(), task.clone());
+            }
+            match item.get("type").and_then(Value::as_str) {
+                Some("plan") => {
+                    plan_from_item = item
+                        .get("plan")
+                        .or_else(|| item.get("steps"))
+                        .cloned()
+                        .or_else(|| Some(item.clone()));
+                }
+                Some("enteredReviewMode") => projection.review_status = Some("inProgress".into()),
+                Some("exitedReviewMode") => projection.review_status = Some("completed".into()),
+                Some("error" | "turnError") => {
+                    projection.last_error = projection
+                        .last_error
+                        .clone()
+                        .or_else(|| error_message(item.get("error").or(Some(item))));
+                }
+                _ => {}
+            }
+        }
+    }
+    if projection.plan.is_none() {
+        projection.plan = plan_from_item;
+    }
+    projection
+}
+
+fn synthetic_session_space(thread_id: &str, owner_chat_id: i64) -> RustSessionSpace {
+    RustSessionSpace {
+        space_id: format!("control-detail:{thread_id}"),
+        thread_id: Some(thread_id.to_owned()),
+        lifecycle: "active".to_owned(),
+        generation: 0,
+        channel_chat_id: owner_chat_id,
+        channel_post_id: 1,
+        discussion_chat_id: None,
+        discussion_root_message_id: None,
+        status_message_id: None,
+        status_bot_instance: None,
+        owner_chat_id: Some(owner_chat_id),
+        plan_mode: false,
+        closed_at_ms: None,
+        created_at_ms: 0,
+        updated_at_ms: 0,
+    }
+}
+
+fn session_status_markup(space: &RustSessionSpace) -> Option<Value> {
+    let url = space
+        .status_message_id
+        .filter(|message_id| *message_id > 0)
+        .filter(|_| space.channel_post_id > 0)
+        .map(|message_id| {
+            format!(
+                "{}?comment={message_id}",
+                telegram_message_link(space.channel_chat_id, space.channel_post_id)
+            )
+        })
+        .or_else(|| {
+            space
+                .discussion_chat_id
+                .zip(space.discussion_root_message_id)
+                .filter(|(_, message_id)| *message_id > 0)
+                .map(|(chat_id, message_id)| telegram_message_link(chat_id, message_id))
+        })?;
+    Some(json!({
+        "inline_keyboard": [[{"text": "打开实时状态", "url": url}]]
+    }))
 }
 
 async fn list_control_sessions(agent: &AppServerClient) -> Result<Vec<ControlSession>, String> {
@@ -2405,6 +2853,7 @@ async fn handle_control_sessions(
                 metrics.clone(),
                 scope_key,
                 query,
+                1,
                 reply_id,
                 refresh_seconds,
             ));
@@ -2421,10 +2870,11 @@ async fn run_sessions_refresh(
     metrics: MetricsRegistry,
     scope_key: String,
     query: String,
+    page: usize,
     reply_id: i64,
     refresh_seconds: u64,
 ) {
-    let mut revision = match store.control_interaction(&scope_key).ok().flatten() {
+    let revision = match store.control_interaction(&scope_key).ok().flatten() {
         Some(interaction) => interaction.revision,
         None => return,
     };
@@ -2440,24 +2890,9 @@ async fn run_sessions_refresh(
             Ok(sessions) => sessions,
             Err(_) => return,
         };
-        let next = match store.advance_control_interaction(
-            &scope_key,
-            current.revision,
-            "list",
-            &json!({"query": query.clone(), "page": 1}),
-            current.user_id,
-            current.chat_id,
-            Some(reply_id),
-            current.expires_at_ms,
-            now_ms(),
-        ) {
-            Ok(Some(next)) => next,
-            Ok(None) | Err(_) => return,
-        };
-        revision = next.revision;
         let Ok(effects) = ControlController.dispatch(ControlRequest::Sessions(SessionsRequest {
             query: query.clone(),
-            page: 1,
+            page,
             now: control_now_seconds(),
             utc_offset_seconds: CONTROL_UTC_OFFSET_SECONDS,
             sessions,
@@ -2473,16 +2908,16 @@ async fn run_sessions_refresh(
         let markup = match control_button_markup(
             &store,
             &scope_key,
-            next.revision,
-            next.user_id,
-            next.chat_id,
+            current.revision,
+            current.user_id,
+            current.chat_id,
             rendered.keyboard.as_deref().unwrap_or_default(),
-            next.expires_at_ms,
+            current.expires_at_ms,
         ) {
             Ok(markup) => markup,
             Err(_) => return,
         };
-        let reference = match TelegramMessageReference::new(next.chat_id.to_string(), reply_id) {
+        let reference = match TelegramMessageReference::new(current.chat_id.to_string(), reply_id) {
             Ok(reference) => reference,
             Err(_) => return,
         };
@@ -2549,43 +2984,170 @@ async fn handle_control_topics(
 }
 
 fn format_perf_snapshot(snapshot: &crate::perf::PerfSnapshot) -> (String, String) {
-    let mib = |value: u64| value as f64 / (1024.0 * 1024.0);
-    let markdown = format!(
-        "CPU `{:.1}%`\nMemory `{:.0}/{:.0} MiB`\nSwap `{:.0}/{:.0} MiB`\nDisk `{:.1}/{:.1} GiB`\nCodex `{}` proc / `{:.1}%` / `{:.0} MiB`{}",
-        snapshot.cpu_percent,
-        mib(snapshot.memory_used_bytes),
-        mib(snapshot.memory_total_bytes),
-        mib(snapshot.swap_used_bytes),
-        mib(snapshot.swap_total_bytes),
-        snapshot.disk_used_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-        snapshot.disk_total_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-        snapshot.codex_process_count,
-        snapshot.codex_cpu_percent,
-        mib(snapshot.codex_memory_bytes),
-        snapshot
-            .gpu
-            .as_deref()
-            .map(|gpu| format!("\nGPU `{gpu}`"))
-            .unwrap_or_default(),
+    let human_bytes = |value: u64| {
+        let mut number = value as f64;
+        for unit in ["B", "KiB", "MiB", "GiB", "TiB"] {
+            if number < 1024.0 || unit == "TiB" {
+                return format!("{number:.1} {unit}");
+            }
+            number /= 1024.0;
+        }
+        unreachable!("the TiB branch always returns")
+    };
+    let percent = |used: u64, total: u64| {
+        if total == 0 {
+            0.0
+        } else {
+            (used as f64 * 100.0 / total as f64).clamp(0.0, 100.0)
+        }
+    };
+    let bar = |value: f64| {
+        let filled = ((value.clamp(0.0, 100.0) * 10.0 / 100.0) + 0.5) as usize;
+        "#".repeat(filled.min(10)) + &"-".repeat(10usize.saturating_sub(filled.min(10)))
+    };
+    let escape = |value: &str| {
+        let mut escaped = String::with_capacity(value.len());
+        for character in value.chars() {
+            if matches!(
+                character,
+                '\\' | '_'
+                    | '*'
+                    | '['
+                    | ']'
+                    | '('
+                    | ')'
+                    | '~'
+                    | '`'
+                    | '>'
+                    | '#'
+                    | '+'
+                    | '-'
+                    | '='
+                    | '|'
+                    | '{'
+                    | '}'
+                    | '.'
+                    | '!'
+            ) {
+                escaped.push('\\');
+            }
+            escaped.push(character);
+        }
+        escaped
+    };
+    let memory_used = snapshot.memory_used_bytes;
+    let disk_used = snapshot.disk_used_bytes;
+    let memory_percent = percent(memory_used, snapshot.memory_total_bytes);
+    let swap_percent = percent(snapshot.swap_used_bytes, snapshot.swap_total_bytes);
+    let disk_percent = percent(disk_used, snapshot.disk_total_bytes);
+    let uptime_minutes = snapshot.uptime_seconds / 60;
+    let uptime_hours = uptime_minutes / 60;
+    let days = uptime_hours / 24;
+    let hours = uptime_hours % 24;
+    let minutes = uptime_minutes % 60;
+    let local_seconds = snapshot
+        .sampled_at_ms
+        .div_euclid(1000)
+        .saturating_add(CONTROL_UTC_OFFSET_SECONDS)
+        .rem_euclid(24 * 60 * 60);
+    let sampled_clock = format!(
+        "{:02}:{:02}:{:02}",
+        local_seconds / 3600,
+        (local_seconds % 3600) / 60,
+        local_seconds % 60
     );
-    let plain = format!(
-        "CPU {:.1}%\nMemory {:.0}/{:.0} MiB\nSwap {:.0}/{:.0} MiB\nDisk {:.1}/{:.1} GiB\nCodex {} proc / {:.1}% / {:.0} MiB{}",
-        snapshot.cpu_percent,
-        mib(snapshot.memory_used_bytes),
-        mib(snapshot.memory_total_bytes),
-        mib(snapshot.swap_used_bytes),
-        mib(snapshot.swap_total_bytes),
-        snapshot.disk_used_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-        snapshot.disk_total_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-        snapshot.codex_process_count,
-        snapshot.codex_cpu_percent,
-        mib(snapshot.codex_memory_bytes),
-        snapshot
-            .gpu
-            .as_deref()
-            .map(|gpu| format!("\nGPU {gpu}"))
-            .unwrap_or_default(),
-    );
+    let mut lines = vec![
+        "*🟠 Ubuntu · WSL*".to_owned(),
+        format!(
+            "CPU  `{:.1}%` `{}`",
+            snapshot.cpu_percent,
+            bar(snapshot.cpu_percent as f64)
+        ),
+        format!("RAM  `{memory_percent:.1}%` `{}`", bar(memory_percent)),
+        format!("Swap `{swap_percent:.1}%` `{}`", bar(swap_percent)),
+        format!("Disk `{disk_percent:.1}%` `{}`", bar(disk_percent)),
+        format!(
+            "内存 `{}`",
+            format!(
+                "{} / {}",
+                human_bytes(memory_used),
+                human_bytes(snapshot.memory_total_bytes)
+            )
+        ),
+        format!(
+            "交换 `{}`",
+            format!(
+                "{} / {}",
+                human_bytes(snapshot.swap_used_bytes),
+                human_bytes(snapshot.swap_total_bytes)
+            )
+        ),
+        format!(
+            "磁盘 `{}`",
+            format!(
+                "{} / {}",
+                human_bytes(disk_used),
+                human_bytes(snapshot.disk_total_bytes)
+            )
+        ),
+        format!(
+            "负载 `{:.2} / {:.2} / {:.2}`",
+            snapshot.load[0], snapshot.load[1], snapshot.load[2]
+        ),
+        format!("运行 `{days}d {hours}h {minutes}m`"),
+        String::new(),
+        "*⚙️ Codex*".to_owned(),
+        format!(
+            "进程 `{}` · RSS `{}`",
+            snapshot.codex_process_count,
+            human_bytes(snapshot.codex_memory_bytes)
+        ),
+        format!(
+            "CPU  `{:.1}%` `{}`",
+            snapshot.codex_cpu_percent,
+            bar(snapshot.codex_cpu_percent as f64)
+        ),
+    ];
+    if let Some(gpu) = snapshot.gpu.as_ref() {
+        lines.push(String::new());
+        lines.push(format!("*🟩 NVIDIA · {}*", escape(&gpu.name)));
+        let utilization = gpu
+            .utilization_percent
+            .map_or_else(|| "N/A".to_owned(), |value| format!("{value:.1}%"));
+        let utilization_bar = gpu
+            .utilization_percent
+            .map_or_else(|| "----------".to_owned(), |value| bar(value as f64));
+        lines.push(format!("GPU  `{utilization}` `{utilization_bar}`"));
+        match (gpu.memory_used_mib, gpu.memory_total_mib) {
+            (Some(used), Some(total)) if total > 0.0 => {
+                let ratio = (used * 100.0 / total).clamp(0.0, 100.0);
+                let memory = if total >= 1024.0 {
+                    format!("{:.1} / {:.1} GiB", used / 1024.0, total / 1024.0)
+                } else {
+                    format!("{used:.0} / {total:.0} MiB")
+                };
+                lines.push(format!("VRAM `{memory}` `{}`", bar(ratio as f64)));
+            }
+            _ => lines.push("VRAM `N/A`".to_owned()),
+        }
+        let temperature = gpu
+            .temperature_c
+            .map_or_else(|| "N/A".to_owned(), |value| format!("{value:.1}°C"));
+        let power = gpu
+            .power_w
+            .map_or_else(|| "N/A".to_owned(), |value| format!("{value:.1} W"));
+        lines.push(format!("温度 `{temperature}` · 功耗 `{power}`"));
+    } else {
+        lines.extend([
+            String::new(),
+            "*🟩 NVIDIA*".to_owned(),
+            "GPU  `N/A`".to_owned(),
+        ]);
+    }
+    lines.push(String::new());
+    lines.push(format!("采样 `{sampled_clock}`"));
+    let markdown = lines.join("\n");
+    let plain = markdown.replace(['*', '`', '\\'], "");
     (markdown, plain)
 }
 
@@ -2673,7 +3235,7 @@ async fn run_perf_ticker(
     chat_id: i64,
     reply_id: i64,
 ) {
-    for frame in 1..6 {
+    for _ in 1..6 {
         tokio::time::sleep(Duration::from_secs(5)).await;
         let Some(interaction) = store.control_interaction(&scope_key).ok().flatten() else {
             return;
@@ -2692,7 +3254,9 @@ async fn run_perf_ticker(
         };
         let (markdown_body, plain_body) = format_perf_snapshot(&snapshot);
         let Ok(effects) = ControlController.dispatch(ControlRequest::Perf {
-            frame,
+            // Python keeps the dynamic-performance clock anchored at the
+            // initial frame while only the sampled values change.
+            frame: 0,
             markdown_body,
             plain_body,
         }) else {
@@ -2726,7 +3290,7 @@ async fn handle_control_callback(
     agent: &AppServerClient,
     _sessions: &Arc<SessionRegistry>,
     metrics: &MetricsRegistry,
-    _totp: &Arc<TotpManager>,
+    totp: &Arc<TotpManager>,
     _control_runtime: &Arc<ControlRuntime>,
 ) -> Result<(), String> {
     let Some(user_id) = callback.actor.user_id else {
@@ -2768,21 +3332,31 @@ async fn handle_control_callback(
             .get("thread_id")
             .and_then(Value::as_str)
             .unwrap_or("unknown");
-        let sessions = list_control_sessions(agent).await?;
-        let detail = sessions
-            .iter()
-            .find(|session| session.thread_id == thread_id)
-            .map(|session| {
-                format!(
-                    "🤖 {}\n📝 {}\n📁 {}\n状态 {}",
-                    session.thread_id, session.title, session.cwd, session.status
+        let thread = ThreadId::new(thread_id.to_owned()).map_err(|error| error.to_string())?;
+        let response = match agent.read_thread(&thread, true).await {
+            Ok(response) => response,
+            Err(error) => {
+                return send_text(
+                    &bot,
+                    &surface_for(&bot, config, callback.chat_id, None),
+                    &format!("无法读取 Session {thread_id} 的实时状态：{error}"),
+                    metrics,
                 )
-            })
-            .unwrap_or_else(|| format!("Session {thread_id} 不存在或已关闭。"));
-        return send_text(
+                .await
+                .map(|_| ());
+            }
+        };
+        let projection = projection_from_thread_read(thread_id, &response);
+        let space = store
+            .session_space_for_thread(thread_id)
+            .map_err(|error| error.to_string())?
+            .unwrap_or_else(|| synthetic_session_space(thread_id, callback.chat_id));
+        let detail = status_text(store, &space, Some(&projection), None, totp.as_ref());
+        return send_text_with_markup(
             &bot,
             &surface_for(&bot, config, callback.chat_id, None),
             &detail,
+            session_status_markup(&space),
             metrics,
         )
         .await
@@ -2794,6 +3368,7 @@ async fn handle_control_callback(
         .and_then(Value::as_str)
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(1);
+    let refresh_query = query.clone();
     let sessions = list_control_sessions(agent).await?;
     let interaction = store
         .control_interaction(scope_key)
@@ -2826,7 +3401,7 @@ async fn handle_control_callback(
     let reference =
         TelegramMessageReference::new(callback.chat_id.to_string(), callback.message_id)
             .map_err(|error| error.to_string())?;
-    for effect in effects {
+    for effect in &effects {
         if let ControlEffect::Render(rendered) = effect {
             let markup = control_button_markup(
                 store,
@@ -2837,8 +3412,24 @@ async fn handle_control_callback(
                 rendered.keyboard.as_deref().unwrap_or_default(),
                 next.expires_at_ms,
             )?;
-            edit_control_rendered(&bot, &reference, &rendered, markup, metrics).await?;
+            edit_control_rendered(&bot, &reference, rendered, markup, metrics).await?;
         }
+    }
+    if let Some(refresh_seconds) = effects.iter().find_map(|effect| match effect {
+        ControlEffect::SessionRefresh { after_seconds } => Some(*after_seconds),
+        _ => None,
+    }) {
+        tokio::spawn(run_sessions_refresh(
+            agent.clone(),
+            store.clone(),
+            bot.clone(),
+            metrics.clone(),
+            scope_key.to_owned(),
+            refresh_query,
+            page,
+            callback.message_id,
+            refresh_seconds,
+        ));
     }
     let _ = interaction;
     Ok(())
@@ -3584,10 +4175,50 @@ async fn handle_new_text(
     Ok(true)
 }
 
+fn expand_user_path(value: &str) -> PathBuf {
+    let value = value.trim();
+    let home = env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    if value == "~" {
+        return home;
+    }
+    if let Some(relative) = value.strip_prefix("~/") {
+        return home.join(relative);
+    }
+    if let Some(relative) = value.strip_prefix("~\\") {
+        return home.join(relative);
+    }
+    PathBuf::from(value)
+}
+
+fn missing_path_has_safe_ancestor(root: &Path, target: &Path) -> bool {
+    let mut ancestor = target;
+    loop {
+        if ancestor.exists() {
+            return fs::canonicalize(ancestor)
+                .ok()
+                .is_some_and(|resolved| resolved == root || resolved.strip_prefix(root).is_ok());
+        }
+        let Some(parent) = ancestor.parent() else {
+            return false;
+        };
+        if parent == ancestor {
+            return false;
+        }
+        ancestor = parent;
+    }
+}
+
 fn new_existing_projects(root: &Path, value: &str) -> Result<Vec<PathBuf>, String> {
     let root =
         fs::canonicalize(root).map_err(|error| format!("workspace 根目录不可用: {error}"))?;
-    let candidate = Path::new(value);
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+    let candidate = expand_user_path(value);
     if candidate.is_absolute() {
         if !candidate.exists() {
             return Ok(Vec::new());
@@ -3706,10 +4337,10 @@ async fn handle_new_project_value(
         )
         .await;
     }
-    let raw = PathBuf::from(value.trim());
+    let raw = expand_user_path(value.trim());
     if raw.is_absolute() && !raw.exists() {
         let root = fs::canonicalize(&config.workspace_root).map_err(|error| error.to_string())?;
-        if raw.strip_prefix(&root).is_ok() {
+        if raw.strip_prefix(&root).is_ok() && missing_path_has_safe_ancestor(&root, &raw) {
             let mut payload = draft.get("payload").cloned().unwrap_or_else(|| json!({}));
             payload["project_target"] = Value::String(raw.to_string_lossy().into_owned());
             let mut next =
@@ -3935,6 +4566,7 @@ async fn create_pending_session_space(
         status_bot_instance: None,
         owner_chat_id: Some(owner_chat_id),
         plan_mode: plan_model.is_some(),
+        closed_at_ms: None,
         created_at_ms: now,
         updated_at_ms: now,
     };
@@ -4094,7 +4726,7 @@ async fn activate_pending_session(
             .delete_workflow_record("pending_space", &active.space_id)
             .map_err(|error| error.to_string())?;
         update_status_message(
-            store, bots_by_id, config, metrics, totp, &active, None, None,
+            store, bots_by_id, config, metrics, totp, &active, None, None, false,
         )
         .await?;
         return send_text(
@@ -4195,7 +4827,7 @@ async fn activate_pending_session(
         .delete_workflow_record("pending_space", &active.space_id)
         .map_err(|error| error.to_string())?;
     update_status_message(
-        store, bots_by_id, config, metrics, totp, &active, None, None,
+        store, bots_by_id, config, metrics, totp, &active, None, None, false,
     )
     .await?;
     send_text(
@@ -4282,16 +4914,35 @@ async fn finish_new_prompt(
     store
         .delete_control_interaction(key, now_ms())
         .map_err(|error| error.to_string())?;
-    send_text(
+    let post_link = telegram_message_link(space.channel_chat_id, channel_post.message_id);
+    let (rendered, markup) = pending_session_confirmation(&post_link)?;
+    send_control_rendered(
         bot,
         &surface_for(bot, config, chat_id, None),
-        &format!(
-            "待认证 Session 帖子已创建。请进入评论串并发送 /totp <验证码>。\n{}",
-            telegram_message_link(space.channel_chat_id, channel_post.message_id)
-        ),
+        &rendered,
+        Some(markup),
         metrics,
     )
     .await
+    .map(|_| ())
+}
+
+fn pending_session_confirmation(
+    post_link: &str,
+) -> Result<(RenderedEffect, InlineKeyboardMarkup), String> {
+    let markup = InlineKeyboardMarkup::new(vec![vec![
+        InlineKeyboardButton::url("打开帖子", post_link).map_err(|error| error.to_string())?,
+    ]])
+    .map_err(|error| error.to_string())?;
+    Ok((
+        RenderedEffect {
+            operation: RenderOperation::Send,
+            markdown: "待认证 Session 帖子已创建。进入评论串并发送 `/totp <验证码>`。".to_owned(),
+            plain: Some("待认证 Session 帖子已创建。进入评论串并发送 /totp <验证码>。".to_owned()),
+            keyboard: None,
+        },
+        markup,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4981,6 +5632,9 @@ fn enqueue_prompt(
     message_id: i64,
 ) -> Result<String, String> {
     let id = next_approval_nonce();
+    let space = store
+        .session_space_for_thread(session.thread_id.as_str())
+        .map_err(|error| error.to_string())?;
     store
         .upsert_workflow_record(
             "queue",
@@ -4988,6 +5642,8 @@ fn enqueue_prompt(
             &json!({
                 "queue_id": id,
                 "thread_id": session.thread_id.as_str(),
+                "space_id": space.as_ref().map(|value| value.space_id.as_str()),
+                "generation": space.as_ref().map_or(0, |value| value.generation),
                 "chat_id": session.chat_id,
                 "message_id": message_id,
                 "prompt": prompt,
@@ -5010,6 +5666,9 @@ async fn render_queue(
     let records = store
         .workflow_records("queue")
         .map_err(|error| error.to_string())?;
+    let session_space = store
+        .session_space_for_thread(session.thread_id.as_str())
+        .map_err(|error| error.to_string())?;
     let mut lines = vec!["📥 Queue".to_owned()];
     let mut rows = Vec::new();
     let mut visible = 0;
@@ -5023,16 +5682,20 @@ async fn render_queue(
         let prompt = value.get("prompt").and_then(Value::as_str).unwrap_or("-");
         lines.push(format!("{}. {}", visible, truncate_text(prompt)));
         let callback_nonce = format!("qc:{}", next_approval_nonce());
-        store
-            .create_callback(&StoredCallback {
-                nonce: callback_nonce.clone(),
-                space_id: format!("telegram-{}", session.chat_id),
-                generation: 0,
-                action: key.clone(),
-                expires_at_ms: now_ms() + APPROVAL_CALLBACK_TTL_MS,
-            })
-            .map_err(|error| error.to_string())?;
-        rows.push(vec![json!({"text": format!("取消 {visible}"), "callback_data": format!("qcancel:{callback_nonce}")})]);
+        if let Some((callback_space_id, callback_generation)) =
+            queue_callback_scope(&value, session_space.as_ref())
+        {
+            store
+                .create_callback(&StoredCallback {
+                    nonce: callback_nonce.clone(),
+                    space_id: callback_space_id,
+                    generation: callback_generation,
+                    action: key.clone(),
+                    expires_at_ms: now_ms() + APPROVAL_CALLBACK_TTL_MS,
+                })
+                .map_err(|error| error.to_string())?;
+            rows.push(vec![json!({"text": format!("取消 {visible}"), "callback_data": format!("qcancel:{callback_nonce}")})]);
+        }
         if visible >= 20 {
             break;
         }
@@ -5049,6 +5712,29 @@ async fn render_queue(
         metrics,
     )
     .await
+}
+
+fn queue_callback_scope(
+    value: &Value,
+    session_space: Option<&RustSessionSpace>,
+) -> Option<(String, i64)> {
+    let space_id = value
+        .get("space_id")
+        .and_then(Value::as_str)
+        .filter(|space_id| !space_id.trim().is_empty())
+        .map(str::to_owned);
+    match (space_id, session_space) {
+        (Some(space_id), space) => Some((
+            space_id,
+            value
+                .get("generation")
+                .and_then(Value::as_i64)
+                .or_else(|| space.map(|space| space.generation))
+                .unwrap_or(0),
+        )),
+        (None, Some(space)) => Some((space.space_id.clone(), space.generation)),
+        (None, None) => None,
+    }
 }
 
 fn plan_text_from_value(value: &Value) -> Option<String> {
@@ -5667,6 +6353,117 @@ async fn answer_question(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
+fn debounce_status_update(
+    tasks: &mut HashMap<String, tokio::task::JoinHandle<()>>,
+    store: &Arc<SqliteStore>,
+    bots_by_id: &HashMap<String, RuntimeBot>,
+    config: &RustConfig,
+    metrics: &MetricsRegistry,
+    totp: &Arc<TotpManager>,
+    space: &RustSessionSpace,
+    projection: &ThreadProjection,
+) {
+    if let Some(previous) = tasks.remove(&space.space_id) {
+        previous.abort();
+    }
+    let store = Arc::clone(store);
+    let bots_by_id = bots_by_id.clone();
+    let config = config.clone();
+    let metrics = metrics.clone();
+    let totp = Arc::clone(totp);
+    let space = space.clone();
+    let projection = projection.clone();
+    let space_id = space.space_id.clone();
+    let task_space_id = space_id.clone();
+    let task = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(
+            u64::try_from(DASHBOARD_DEBOUNCE_MS.max(0)).unwrap_or(500),
+        ))
+        .await;
+        let Some(current_space) = store.get_session_space(&space_id).ok().flatten() else {
+            return;
+        };
+        if current_space.lifecycle == "closed" || current_space.generation != space.generation {
+            return;
+        }
+        let current_projection = current_space.thread_id.as_deref().and_then(|thread_id| {
+            store
+                .thread_projections()
+                .ok()
+                .and_then(|rows| {
+                    rows.into_iter()
+                        .find(|(candidate, _, _, _)| candidate == thread_id)
+                })
+                .and_then(|(_, _, payload, _)| {
+                    serde_json::from_value::<ThreadProjection>(payload).ok()
+                })
+        });
+        if let Err(error) = update_status_message(
+            &store,
+            &bots_by_id,
+            &config,
+            &metrics,
+            totp.as_ref(),
+            &current_space,
+            current_projection.as_ref().or(Some(&projection)),
+            None,
+            false,
+        )
+        .await
+        {
+            eprintln!("rust bridge debounced status update failed: {error}");
+        }
+    });
+    tasks.insert(task_space_id, task);
+}
+
+async fn run_status_heartbeat_worker(
+    store: Arc<SqliteStore>,
+    bots_by_id: HashMap<String, RuntimeBot>,
+    config: RustConfig,
+    metrics: MetricsRegistry,
+    totp: Arc<TotpManager>,
+) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(
+            u64::try_from(HEARTBEAT_SECONDS.max(1)).unwrap_or(60),
+        ))
+        .await;
+        let projections = store
+            .thread_projections()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(thread_id, _, payload, _)| {
+                serde_json::from_value::<ThreadProjection>(payload)
+                    .ok()
+                    .map(|projection| (thread_id, projection))
+            })
+            .collect::<HashMap<_, _>>();
+        for space in store.active_session_spaces().unwrap_or_default() {
+            let projection = space
+                .thread_id
+                .as_deref()
+                .and_then(|thread_id| projections.get(thread_id));
+            if let Err(error) = update_status_message(
+                &store,
+                &bots_by_id,
+                &config,
+                &metrics,
+                totp.as_ref(),
+                &space,
+                projection,
+                None,
+                true,
+            )
+            .await
+            {
+                eprintln!("rust bridge status heartbeat failed: {error}");
+            }
+        }
+    }
+}
+
 async fn forward_codex_events(
     agent: AppServerClient,
     store: Arc<SqliteStore>,
@@ -5678,6 +6475,14 @@ async fn forward_codex_events(
 ) {
     let mut events = agent.subscribe_events();
     let mut projector = EventProjector::default();
+    let mut status_tasks: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+    if let Ok(rows) = store.thread_projections() {
+        for (_, _, payload, _) in rows {
+            if let Ok(projection) = serde_json::from_value::<ThreadProjection>(payload) {
+                projector.restore(projection);
+            }
+        }
+    }
     loop {
         let Some(event) = events.recv().await else {
             return;
@@ -5686,6 +6491,25 @@ async fn forward_codex_events(
             continue;
         }
         let effect = projector.apply(&event);
+        if let Some(thread_id) = event_thread_id(&event.params)
+            && let Some(projection) = projector.projection_mut(thread_id)
+        {
+            let updated_at_ms = now_ms();
+            projection.updated_at_ms = updated_at_ms;
+            if projection.turn_status.as_deref() == Some("inProgress")
+                && projection.started_at_ms.is_none()
+            {
+                projection.started_at_ms = Some(updated_at_ms);
+            }
+            if let Ok(payload) = serde_json::to_value(&*projection) {
+                let _ = store.upsert_thread_projection(
+                    thread_id,
+                    i64::try_from(projection.generation).unwrap_or(i64::MAX),
+                    &payload,
+                    updated_at_ms,
+                );
+            }
+        }
         if effect == ProjectionEffect::None {
             continue;
         }
@@ -5709,6 +6533,11 @@ async fn forward_codex_events(
                 _ => "completed",
             };
             sessions.set_turn(thread_id, None);
+            if let Some(space) = store.session_space_for_thread(thread_id).ok().flatten()
+                && let Some(task) = status_tasks.remove(&space.space_id)
+            {
+                task.abort();
+            }
             let finalized_plans = mark_turn_workflows(
                 &store,
                 thread_id,
@@ -5749,21 +6578,24 @@ async fn forward_codex_events(
                     &space,
                     Some(projection),
                     Some(&answer),
+                    false,
                 )
                 .await
             {
                 eprintln!("rust bridge terminal status update failed: {error}");
             }
-            let _ = dispatch_next_queued(
-                &store,
-                &agent,
-                &sessions,
-                &session,
-                &bots_by_id,
-                &config,
-                &metrics,
-            )
-            .await;
+            if let Some(dispatch_session) = sessions.by_thread(thread_id) {
+                let _ = dispatch_next_queued(
+                    &store,
+                    &agent,
+                    &sessions,
+                    &dispatch_session,
+                    &bots_by_id,
+                    &config,
+                    &metrics,
+                )
+                .await;
+            }
         } else if effect == ProjectionEffect::Error {
             let message = event
                 .params
@@ -5777,6 +6609,11 @@ async fn forward_codex_events(
                 .or_else(|| session.turn_id.as_ref().map(TurnId::as_str))
                 .unwrap_or_default();
             sessions.set_turn(thread_id, None);
+            if let Some(space) = store.session_space_for_thread(thread_id).ok().flatten()
+                && let Some(task) = status_tasks.remove(&space.space_id)
+            {
+                task.abort();
+            }
             let finalized_plans =
                 mark_turn_workflows(&store, thread_id, turn_id, "failed", Some(message));
             if let Some(bot) = bots_by_id.get(&session.sender_instance_id) {
@@ -5804,19 +6641,22 @@ async fn forward_codex_events(
                     &space,
                     Some(projection),
                     Some(message),
+                    false,
                 )
                 .await;
             }
-            let _ = dispatch_next_queued(
-                &store,
-                &agent,
-                &sessions,
-                &session,
-                &bots_by_id,
-                &config,
-                &metrics,
-            )
-            .await;
+            if let Some(dispatch_session) = sessions.by_thread(thread_id) {
+                let _ = dispatch_next_queued(
+                    &store,
+                    &agent,
+                    &sessions,
+                    &dispatch_session,
+                    &bots_by_id,
+                    &config,
+                    &metrics,
+                )
+                .await;
+            }
         } else if let Some(projection) = projector.projection(thread_id) {
             let Some(bot) = bots_by_id.get(&session.sender_instance_id) else {
                 continue;
@@ -5858,20 +6698,16 @@ async fn forward_codex_events(
                     }
                 }
             }
-            if let Err(error) = update_status_message(
+            debounce_status_update(
+                &mut status_tasks,
                 &store,
                 &bots_by_id,
                 &config,
                 &metrics,
-                totp.as_ref(),
+                &totp,
                 &space,
-                Some(projection),
-                None,
-            )
-            .await
-            {
-                eprintln!("rust bridge status update failed: {error}");
-            }
+                projection,
+            );
             let _ = bot;
         }
     }
@@ -5908,6 +6744,55 @@ fn mark_turn_workflows(
                     "interrupted" => PromptIntentState::Cancelled,
                     _ => intent.state,
                 };
+                intent.error = error.map(str::to_owned);
+                intent.updated_at_ms = now_ms();
+                let _ = store.upsert_prompt_intent(&intent);
+            }
+        }
+    }
+    if let Ok(records) = store.workflow_records("queue") {
+        for (key, mut value) in records {
+            if value.get("thread_id").and_then(Value::as_str) != Some(thread_id)
+                || !matches!(
+                    value.get("status").and_then(Value::as_str),
+                    Some("submitting" | "started")
+                )
+            {
+                continue;
+            }
+            let entry_turn_matches = value
+                .get("turn_id")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value == turn_id);
+            if !(entry_turn_matches
+                || turn_id.is_empty()
+                || value.get("turn_id").and_then(Value::as_str).is_some())
+            {
+                continue;
+            }
+            value["status"] = Value::String(
+                match state {
+                    "completed" => "completed",
+                    "interrupted" => "cancelled",
+                    _ => "failed",
+                }
+                .into(),
+            );
+            value["finished_at_ms"] = Value::from(now_ms());
+            if let Some(error) = error {
+                value["error"] = Value::String(truncate_text(error));
+            }
+            let _ = store.upsert_workflow_record("queue", &key, &value, now_ms());
+            if let Some(client_message_id) = value.get("client_message_id").and_then(Value::as_str)
+                && let Ok(Some(mut intent)) =
+                    store.prompt_intent_by_client_message_id(client_message_id)
+            {
+                intent.state = match state {
+                    "completed" => PromptIntentState::Completed,
+                    "interrupted" => PromptIntentState::Cancelled,
+                    _ => PromptIntentState::Failed,
+                };
+                intent.turn_id = TurnId::new(turn_id).ok();
                 intent.error = error.map(str::to_owned);
                 intent.updated_at_ms = now_ms();
                 let _ = store.upsert_prompt_intent(&intent);
@@ -6090,9 +6975,15 @@ async fn handle_callback(
         .await;
     }
     if let Some(nonce) = callback.data.strip_prefix("qcancel:") {
+        if !workflow_callback_bot_allowed(&inbound_bot)
+            || !workflow_callback_owner_authorized(store, &callback)?
+        {
+            acknowledge_callback(&inbound_bot, &callback, Some("无权操作此队列按钮")).await;
+            return Ok(());
+        }
         acknowledge_callback(&inbound_bot, &callback, Some("正在取消")).await;
-        let Some(stored) = store
-            .take_callback(nonce, now_ms())
+        let Some(preview) = store
+            .peek_callback(nonce, now_ms())
             .map_err(|error| error.to_string())?
         else {
             return send_text(
@@ -6103,10 +6994,10 @@ async fn handle_callback(
             )
             .await;
         };
-        if stored.space_id.is_empty() {
+        if preview.space_id.is_empty() {
             return send_text(&inbound_bot, &inbound_surface, "队列项无效。", metrics).await;
         }
-        let key = stored.action;
+        let key = preview.action;
         let Some(mut entry) = store
             .workflow_record("queue", &key)
             .map_err(|error| error.to_string())?
@@ -6116,6 +7007,32 @@ async fn handle_callback(
         if entry.get("status").and_then(Value::as_str) != Some("queued") {
             return send_text(&inbound_bot, &inbound_surface, "队列项已经处理。", metrics).await;
         }
+        if entry.get("chat_id").and_then(Value::as_i64) != Some(callback.chat_id)
+            || entry
+                .get("space_id")
+                .and_then(Value::as_str)
+                .is_some_and(|space_id| space_id != preview.space_id)
+        {
+            acknowledge_callback(&inbound_bot, &callback, Some("队列按钮不属于当前会话")).await;
+            return Ok(());
+        }
+        let Some(_stored) = store
+            .take_callback_scoped(
+                nonce,
+                now_ms(),
+                Some(&preview.space_id),
+                Some(preview.generation),
+            )
+            .map_err(|error| error.to_string())?
+        else {
+            return send_text(
+                &inbound_bot,
+                &inbound_surface,
+                "队列操作已过期或已处理。",
+                metrics,
+            )
+            .await;
+        };
         entry["status"] = Value::String("cancelled".into());
         store
             .upsert_workflow_record("queue", &key, &entry, now_ms())
@@ -6161,11 +7078,44 @@ async fn handle_callback(
         )
         .await;
     };
-    let approval_space_id = store
+    if !workflow_callback_bot_allowed(&inbound_bot)
+        || !workflow_callback_owner_authorized(store, &callback)?
+    {
+        acknowledge_callback(&inbound_bot, &callback, Some("无权操作此审批按钮")).await;
+        return Ok(());
+    }
+    let Some(preview) = store
         .peek_callback(nonce, now_ms())
         .map_err(|error| error.to_string())?
-        .map(|stored| stored.space_id)
-        .unwrap_or_default();
+    else {
+        acknowledge_callback(&inbound_bot, &callback, Some("按钮已过期或已处理")).await;
+        return send_text(
+            &inbound_bot,
+            &inbound_surface,
+            "这个审批按钮已过期或已经处理，未执行任何操作。",
+            metrics,
+        )
+        .await;
+    };
+    let preview_action: StoredApprovalAction = serde_json::from_str(&preview.action)
+        .map_err(|_| "审批状态损坏，未执行任何操作".to_owned())?;
+    let Some(approval_session) = sessions.by_thread(&preview_action.thread_id) else {
+        acknowledge_callback(&inbound_bot, &callback, Some("当前 Session 已不存在")).await;
+        return Ok(());
+    };
+    if preview.space_id.is_empty()
+        || preview.space_id
+            != store
+                .session_space_for_thread(&preview_action.thread_id)
+                .map_err(|error| error.to_string())?
+                .map(|space| space.space_id)
+                .unwrap_or_default()
+        || callback.chat_id != approval_session.chat_id
+    {
+        acknowledge_callback(&inbound_bot, &callback, Some("审批按钮不属于当前会话")).await;
+        return Ok(());
+    }
+    let approval_space_id = preview.space_id.clone();
     let approval_unlocked = if approval_space_id.is_empty() {
         totp.is_unlocked(now_ms())
     } else {
@@ -6183,7 +7133,12 @@ async fn handle_callback(
         .await;
     }
     let Some(stored) = store
-        .take_callback(nonce, now_ms())
+        .take_callback_scoped(
+            nonce,
+            now_ms(),
+            Some(&preview.space_id),
+            Some(preview.generation),
+        )
         .map_err(|error| error.to_string())?
     else {
         acknowledge_callback(&inbound_bot, &callback, Some("按钮已过期或已处理")).await;
@@ -6282,6 +7237,31 @@ fn status_callback_markup(
     space: &RustSessionSpace,
     actions: &[(&str, &str)],
 ) -> Result<Option<Value>, String> {
+    status_callback_markup_rows(store, space, &[actions])
+}
+
+fn status_callback_markup_rows(
+    store: &SqliteStore,
+    space: &RustSessionSpace,
+    rows: &[&[(&str, &str)]],
+) -> Result<Option<Value>, String> {
+    status_callback_markup_rows_for_surface(store, space, rows, "status")
+}
+
+fn discussion_callback_markup_rows(
+    store: &SqliteStore,
+    space: &RustSessionSpace,
+    rows: &[&[(&str, &str)]],
+) -> Result<Option<Value>, String> {
+    status_callback_markup_rows_for_surface(store, space, rows, "discussion")
+}
+
+fn status_callback_markup_rows_for_surface(
+    store: &SqliteStore,
+    space: &RustSessionSpace,
+    rows: &[&[(&str, &str)]],
+    surface: &str,
+) -> Result<Option<Value>, String> {
     if store
         .workflow_record("onboarding", "owner")
         .map_err(|error| error.to_string())?
@@ -6290,34 +7270,47 @@ fn status_callback_markup(
     {
         return Ok(None);
     }
-    store
-        .retire_status_callbacks(space.space_id.as_str(), space.generation)
-        .map_err(|error| error.to_string())?;
-    let mut buttons = Vec::with_capacity(actions.len());
-    for (label, action) in actions {
-        let nonce = format!("status-{}", next_approval_nonce());
-        let stored = StoredStatusAction {
-            space_id: space.space_id.clone(),
-            generation: u64::try_from(space.generation)
-                .map_err(|_| "status generation is negative".to_owned())?,
-            thread_id: space.thread_id.clone().unwrap_or_default(),
-            action: (*action).to_owned(),
-        };
-        store
-            .create_callback(&StoredCallback {
+    let mut keyboard = Vec::with_capacity(rows.len());
+    for actions in rows {
+        let mut buttons = Vec::with_capacity(actions.len());
+        for (label, action) in *actions {
+            if !is_status_action(action) {
+                return Err(format!("unknown status callback action: {action}"));
+            }
+            let nonce = format!("status-{}", next_approval_nonce());
+            let stored = StoredStatusAction {
+                space_id: space.space_id.clone(),
+                generation: u64::try_from(space.generation)
+                    .map_err(|_| "status generation is negative".to_owned())?,
+                thread_id: space.thread_id.clone().unwrap_or_default(),
+                action: (*action).to_owned(),
+            };
+            let callback = StoredCallback {
                 nonce: nonce.clone(),
                 space_id: space.space_id.clone(),
                 generation: space.generation,
                 action: serde_json::to_string(&stored).map_err(|error| error.to_string())?,
-                expires_at_ms: now_ms() + APPROVAL_CALLBACK_TTL_MS,
-            })
-            .map_err(|error| error.to_string())?;
-        buttons.push(json!({
-            "text": *label,
-            "callback_data": format!("cb:{nonce}"),
-        }));
+                expires_at_ms: now_ms() + STATUS_CALLBACK_TTL_MS,
+            };
+            if surface == "status" {
+                store
+                    .create_status_callback(&callback)
+                    .map_err(|error| error.to_string())?;
+            } else {
+                store
+                    .create_callback(&callback)
+                    .map_err(|error| error.to_string())?;
+            }
+            buttons.push(json!({
+                "text": *label,
+                "callback_data": format!("cb:{nonce}"),
+            }));
+        }
+        if !buttons.is_empty() {
+            keyboard.push(Value::Array(buttons));
+        }
     }
-    Ok((!buttons.is_empty()).then(|| json!({"inline_keyboard": [buttons]})))
+    Ok((!keyboard.is_empty()).then(|| json!({"inline_keyboard": keyboard})))
 }
 
 fn status_step_value(step: &Value) -> (String, String) {
@@ -6344,6 +7337,181 @@ fn status_steps(plan: Option<&Value>) -> Vec<Value> {
         .cloned()
         .or_else(|| plan.get("steps").and_then(Value::as_array).cloned())
         .unwrap_or_default()
+}
+
+fn compact_status_event_text(value: &str) -> String {
+    const LIMIT: usize = 360;
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= LIMIT {
+        return compact;
+    }
+    let mut result = compact.chars().take(LIMIT).collect::<String>();
+    result.push_str("...");
+    result
+}
+
+fn status_event_status(item: &Value, default: &str) -> String {
+    normalized_status(item.get("status").or_else(|| item.get("state")), default)
+}
+
+fn status_event_summary(item: &Value, completed: bool) -> Option<(String, String)> {
+    let item_type = item.get("type").and_then(Value::as_str)?;
+    let (text, status) = match item_type {
+        "agentMessage" => {
+            let text = item.get("text").and_then(Value::as_str)?;
+            let text = compact_status_event_text(text);
+            if text.is_empty() {
+                return None;
+            }
+            (text, "completed".to_owned())
+        }
+        "plan" => (
+            if completed {
+                "Plan 已完成".to_owned()
+            } else {
+                "Plan 正在生成".to_owned()
+            },
+            if completed {
+                "completed".to_owned()
+            } else {
+                "inProgress".to_owned()
+            },
+        ),
+        "enteredReviewMode" => ("Review 正在执行".to_owned(), "inProgress".to_owned()),
+        "exitedReviewMode" => ("Review 已完成".to_owned(), "completed".to_owned()),
+        "commandExecution" => {
+            let status =
+                status_event_status(item, if completed { "completed" } else { "inProgress" });
+            let suffix = item
+                .get("exitCode")
+                .map(|value| format!(" (exit {})", value))
+                .unwrap_or_default();
+            (format!("命令执行 {status}{suffix}"), status)
+        }
+        "fileChange" => {
+            let count = item
+                .get("changes")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            let status = item
+                .get("status")
+                .map(|value| normalized_status(Some(value), ""))
+                .unwrap_or_default();
+            let text = format!("文件变更 {count} 项: {status}").trim().to_owned();
+            (text, status)
+        }
+        "mcpToolCall" | "dynamicToolCall" => {
+            let name = item
+                .get("tool")
+                .or_else(|| item.get("server"))
+                .and_then(Value::as_str)
+                .unwrap_or("tool");
+            let status = status_event_status(item, "running");
+            (format!("工具 {name}: {status}"), status)
+        }
+        "collabAgentToolCall" => {
+            let tool = item.get("tool").and_then(Value::as_str).unwrap_or_default();
+            let status =
+                status_event_status(item, if completed { "completed" } else { "inProgress" });
+            (
+                format!("Agent task {tool}: {status}").trim().to_owned(),
+                status,
+            )
+        }
+        "subAgentActivity" => {
+            let kind = item.get("kind").and_then(Value::as_str).unwrap_or_default();
+            (
+                format!("Subagent {kind}").trim().to_owned(),
+                kind.to_owned(),
+            )
+        }
+        "imageGeneration" => {
+            let status = item
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            (
+                format!("图像生成: {status}").trim().to_owned(),
+                status.to_owned(),
+            )
+        }
+        "contextCompaction" => ("上下文已压缩".to_owned(), "completed".to_owned()),
+        "error" | "turnError" => (
+            error_message(item.get("error").or(Some(item)))
+                .unwrap_or_else(|| "Codex error".to_owned()),
+            "failed".to_owned(),
+        ),
+        _ => {
+            let status = if completed { "completed" } else { "inProgress" };
+            (format!("{item_type}: {status}"), status.to_owned())
+        }
+    };
+    Some((compact_status_event_text(&text), status))
+}
+
+fn status_event_clock(item: &Value) -> Option<String> {
+    let seconds = control_epoch_ms(
+        [
+            "timestamp",
+            "createdAt",
+            "created_at",
+            "updatedAt",
+            "updated_at",
+        ]
+        .iter()
+        .find_map(|key| item.get(*key)),
+    )?
+    .div_euclid(1000)
+    .rem_euclid(86_400);
+    Some(format!(
+        "{:02}:{:02}",
+        seconds / 3_600,
+        seconds % 3_600 / 60
+    ))
+}
+
+fn status_event_line(item: &Value, completed: bool) -> Option<String> {
+    let (text, status) = status_event_summary(item, completed)?;
+    let suffix = if status.is_empty() {
+        String::new()
+    } else {
+        format!(" · {status}")
+    };
+    Some(match status_event_clock(item) {
+        Some(clock) => format!("{clock} {text}{suffix}"),
+        None => format!("{text}{suffix}"),
+    })
+}
+
+fn status_progress_bar(completed: usize, total: usize) -> String {
+    const WIDTH: usize = 10;
+    if total == 0 {
+        return "----------".to_owned();
+    }
+    let filled = completed.saturating_mul(WIDTH).div_ceil(total).min(WIDTH);
+    format!("{}{}", "#".repeat(filled), "-".repeat(WIDTH - filled))
+}
+
+fn status_duration(started_at_ms: Option<i64>, now: i64) -> String {
+    let Some(started_at_ms) = started_at_ms.filter(|value| *value > 0) else {
+        return "N/A".to_owned();
+    };
+    let seconds = now.saturating_sub(started_at_ms).max(0).div_euclid(1_000);
+    if seconds >= 3_600 {
+        format!("{}h {:02}m", seconds / 3_600, seconds % 3_600 / 60)
+    } else {
+        format!("{}m {:02}s", seconds / 60, seconds % 60)
+    }
+}
+
+fn status_clock(epoch_ms: i64) -> String {
+    let seconds = epoch_ms.div_euclid(1_000).rem_euclid(86_400);
+    format!(
+        "{:02}:{:02}:{:02}",
+        seconds / 3_600,
+        seconds % 3_600 / 60,
+        seconds % 60
+    )
 }
 
 fn status_text(
@@ -6385,14 +7553,41 @@ fn status_text(
         .and_then(|value| value.turn_status.as_deref())
         .unwrap_or("idle");
     let last_error = projection.and_then(|value| value.last_error.as_deref());
+    let active_flags = projection
+        .map(|value| value.active_flags.as_slice())
+        .unwrap_or_default();
+    let waiting_on_input = active_flags.iter().any(|flag| {
+        matches!(
+            flag.as_str(),
+            "waitingOnUserInput" | "waiting_on_user_input"
+        )
+    });
+    let waiting_on_approval = active_flags.iter().any(|flag| {
+        matches!(
+            flag.as_str(),
+            "waitingOnApproval"
+                | "waiting_on_approval"
+                | "waitingForApproval"
+                | "waiting_for_approval"
+                | "approval"
+        )
+    });
     let (status_icon, status_label) = if lifecycle == "closed" {
         ("⚫", "已关闭")
+    } else if lifecycle == "pending" {
+        ("🟡", "待认证")
+    } else if lifecycle == "repair_required" {
+        ("🟠", "需要修复")
     } else if last_error.is_some() || raw_status == "systemError" || turn_status == "failed" {
         ("🔴", "错误")
-    } else if turn_status == "inProgress" || raw_status == "active" {
-        ("🟢", "执行中")
-    } else if turn_status == "completed" || turn_status == "interrupted" || raw_status == "idle" {
+    } else if waiting_on_input {
+        ("🟡", "等待回答")
+    } else if waiting_on_approval {
+        ("🟡", "等待审批")
+    } else if matches!(turn_status, "completed" | "interrupted") || raw_status == "idle" {
         ("⚪", "空闲")
+    } else if raw_status == "active" || turn_status == "inProgress" {
+        ("🟢", "执行中")
     } else {
         ("⚫", "未加载")
     };
@@ -6436,6 +7631,18 @@ fn status_text(
             })
             .count()
     });
+    let interrupted_tasks = projection.map_or(0, |value| {
+        value
+            .subagents
+            .values()
+            .filter(|task| {
+                matches!(
+                    task.get("status").and_then(Value::as_str),
+                    Some("interrupted" | "cancelled" | "canceled")
+                )
+            })
+            .count()
+    });
     let queue = store
         .workflow_records("queue")
         .unwrap_or_default()
@@ -6445,25 +7652,53 @@ fn status_text(
                 && value.get("status").and_then(Value::as_str) == Some("queued")
         })
         .count();
-    let auth = match totp.space_unlock_remaining_ms(&space.space_id, now_ms()) {
-        Ok(remaining_ms) if remaining_ms > 0 => format!(
-            "🔓 TOTP 已认证 · 剩余 {} min",
-            ((remaining_ms + 59_999) / 60_000).max(1)
-        ),
+    let auth_now = now_ms();
+    let auth = match totp.space_unlock_remaining_ms(&space.space_id, auth_now) {
+        Ok(remaining_ms) if remaining_ms > 0 => {
+            let expiry = totp
+                .space_unlock_expires_at_ms(&space.space_id, auth_now)
+                .ok()
+                .flatten()
+                .map(status_clock)
+                .unwrap_or_else(|| "--:--:--".to_owned());
+            format!(
+                "🔓 TOTP 已认证 · 剩余 {} min · 到期 {}",
+                ((remaining_ms + 59_999) / 60_000).max(1),
+                expiry
+            )
+        }
+        Ok(_)
+            if totp
+                .space_unlock_expires_at_ms(&space.space_id, auth_now)
+                .ok()
+                .flatten()
+                .is_some_and(|expires_at| expires_at <= auth_now) =>
+        {
+            "🔒 TOTP 已过期".to_owned()
+        }
         _ => "🔒 TOTP 未认证".to_owned(),
     };
     let mode = projection
         .and_then(|value| value.observed_mode.as_deref())
-        .or_else(|| projection.and_then(|value| value.desired_mode.as_deref()))
         .unwrap_or("unknown");
+    let review_active =
+        projection.and_then(|value| value.review_status.as_deref()) == Some("inProgress");
+    let model = projection.and_then(|value| value.model.as_deref());
+    let effort = projection.and_then(|value| value.effort.as_deref());
+    let updated_at_ms = projection
+        .map(|value| value.updated_at_ms)
+        .filter(|value| *value > 0)
+        .unwrap_or(space.updated_at_ms);
+    let now = now_ms();
     let mut lines = vec![
         format!("🤖 Codex · {}", truncate_text(title)),
         format!(
-            "{} · {} {} · Turn {}",
+            "{} · {} {} · Turn {} · 总执行 {}",
             truncate_text(thread_id),
             status_icon,
             status_label,
-            turn_status
+            turn_status,
+            status_duration(projection.and_then(|value| value.started_at_ms), now),
         ),
         format!("生命周期：{} · Mode：{}", lifecycle, mode),
         format!(
@@ -6471,8 +7706,37 @@ fn status_text(
             goal_status,
             truncate_text(goal_objective)
         ),
-        format!("🧭 Plan · {completed}/{plan_total}"),
+        format!(
+            "🧭 Plan · {completed}/{plan_total} · [{}]",
+            status_progress_bar(completed, plan_total)
+        ),
     ];
+    if review_active {
+        lines.push("🔎 Review · 执行中".into());
+    } else if mode == "plan" {
+        lines.push("🧭 TUI Plan mode".into());
+    } else if mode == "default" {
+        lines.push("⚙️ TUI Normal mode".into());
+    }
+    if model.is_some() || effort.is_some() {
+        lines.push(format!(
+            "🧠 Main · {} · Effort {}",
+            model.unwrap_or("N/A"),
+            effort.unwrap_or("N/A")
+        ));
+    }
+    if waiting_on_input {
+        lines.push("⏳ 等待用户输入".into());
+    }
+    if waiting_on_approval {
+        lines.push("🛂 等待审批".into());
+    }
+    if let Some(cwd) = projection
+        .and_then(|value| value.cwd.as_deref())
+        .filter(|value| !value.trim().is_empty())
+    {
+        lines.push(format!("📁 项目 · {}", truncate_text(cwd)));
+    }
     if let Some(pending) = pending_payload.as_ref() {
         if let Some(cwd) = pending
             .get("pending_cwd")
@@ -6509,35 +7773,69 @@ fn status_text(
         lines.push(format!("… 另有 {} 项，请使用 /plan 查看", plan_total - 14));
     }
     lines.push(format!(
-        "🧩 Agent Tasks · {}/{} · Running {} · Failed {}",
+        "🧩 Agent Tasks · {}/{} · Running {} · Failed {} · Interrupted {}",
         tasks.saturating_sub(active_tasks),
         tasks,
         active_tasks,
-        failed_tasks
+        failed_tasks,
+        interrupted_tasks
     ));
     lines.push(format!("📥 Queue · {queue}"));
     if let Some(error) = last_error.filter(|value| !value.trim().is_empty()) {
         lines.push(format!("❌ 错误 · {}", truncate_text(error)));
     }
     if let Some(projection) = projection {
-        let recent = projection
-            .items
-            .values()
-            .rev()
-            .take(4)
-            .filter_map(|item| {
-                let kind = item.get("type").and_then(Value::as_str)?;
-                Some(format!("{} · {}", kind, truncate_text(&item.to_string())))
-            })
-            .collect::<Vec<_>>();
+        let completed = projection.turn_status.as_deref() != Some("inProgress");
+        let recent = if projection.item_order.is_empty() {
+            projection
+                .items
+                .values()
+                .rev()
+                .take(4)
+                .filter_map(|item| status_event_line(item, completed))
+                .collect::<Vec<_>>()
+        } else {
+            projection
+                .item_order
+                .iter()
+                .rev()
+                .filter_map(|item_id| projection.items.get(item_id))
+                .take(4)
+                .filter_map(|item| status_event_line(item, completed))
+                .collect::<Vec<_>>()
+        };
         if !recent.is_empty() {
             lines.push("🕘 近期事件".into());
             lines.extend(recent);
         }
     }
+    for (agent_id, task) in projection
+        .map(|value| value.subagents.iter())
+        .into_iter()
+        .flatten()
+        .filter(|(_, task)| {
+            matches!(
+                task.get("status").and_then(Value::as_str),
+                Some("interrupted" | "cancelled" | "canceled")
+            )
+        })
+        .take(4)
+    {
+        let title = task
+            .get("title")
+            .or_else(|| task.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or(agent_id);
+        lines.push(format!(
+            "↩️ Subagent interrupted · {}",
+            truncate_text(title)
+        ));
+    }
     lines.push(auth);
     lines.push(format!(
-        "🕒 更新 · generation {}",
+        "🕒 更新 {} · 心跳 ≤{}s · generation {}",
+        status_clock(updated_at_ms.max(0)),
+        HEARTBEAT_SECONDS,
         projection.map_or(0, |value| value.generation)
     ));
     let mut text = lines.join("\n");
@@ -6568,23 +7866,235 @@ fn status_bot_for<'a>(
         })
 }
 
+fn preferred_status_bot(bots_by_id: &HashMap<String, RuntimeBot>) -> Option<&RuntimeBot> {
+    bots_by_id
+        .values()
+        .find(|bot| bot.role == RuntimeBotRole::Status)
+}
+
+fn status_semantic_fingerprint(
+    text: &str,
+    lifecycle: &str,
+    terminal: bool,
+    confirmation: bool,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(text.as_bytes());
+    digest.update([0]);
+    digest.update(lifecycle.as_bytes());
+    digest.update([0]);
+    let state: &[u8] = if terminal { b"terminal" } else { b"active" };
+    digest.update(state);
+    digest.update([0]);
+    let surface: &[u8] = if confirmation {
+        b"confirmation"
+    } else {
+        b"status"
+    };
+    digest.update(surface);
+    format!("{:x}", digest.finalize())
+}
+
 fn channel_status_text(
     store: &SqliteStore,
     space: &RustSessionSpace,
     projection: Option<&ThreadProjection>,
-    totp: &TotpManager,
+    _totp: &TotpManager,
 ) -> String {
-    let full = status_text(store, space, projection, None, totp);
-    let mut text = full;
-    if text.len() > 950 {
-        let mut end = 950;
-        while end > 0 && !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        text.truncate(end);
-        text.push_str("\n…");
+    let thread_id = space.thread_id.as_deref().unwrap_or("Pending");
+    let pending_title = store
+        .workflow_record("pending_space", &space.space_id)
+        .ok()
+        .flatten()
+        .and_then(|value| {
+            value
+                .get("pending_prompt")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+    let title = projection
+        .and_then(|value| value.title.as_deref())
+        .or(pending_title.as_deref())
+        .unwrap_or("Codex session");
+    let raw_status = projection
+        .and_then(|value| value.status.as_deref())
+        .unwrap_or("unknown");
+    let turn_status = projection
+        .and_then(|value| value.turn_status.as_deref())
+        .unwrap_or("idle");
+    let flags = projection
+        .map(|value| value.active_flags.as_slice())
+        .unwrap_or_default();
+    let waiting_on_input = flags.iter().any(|flag| {
+        matches!(
+            flag.as_str(),
+            "waitingOnUserInput" | "waiting_on_user_input"
+        )
+    });
+    let waiting_on_approval = flags.iter().any(|flag| {
+        matches!(
+            flag.as_str(),
+            "waitingOnApproval"
+                | "waiting_on_approval"
+                | "waitingForApproval"
+                | "waiting_for_approval"
+                | "approval"
+        )
+    });
+    let error = projection.and_then(|value| value.last_error.as_deref());
+    let (icon, label) = if space.lifecycle == "pending" {
+        ("🟡", "待认证")
+    } else if space.lifecycle == "closed" {
+        ("⚫", "已关闭")
+    } else if space.lifecycle == "repair_required" {
+        ("🟠", "需要修复")
+    } else if error.is_some() || raw_status == "systemError" || turn_status == "failed" {
+        ("🔴", "错误")
+    } else if waiting_on_input {
+        ("🟡", "等待回答")
+    } else if waiting_on_approval {
+        ("🟡", "等待审批")
+    } else if matches!(turn_status, "completed" | "interrupted") || raw_status == "idle" {
+        ("⚪", "空闲")
+    } else if raw_status == "active" || turn_status == "inProgress" {
+        ("🟢", "执行中")
+    } else {
+        ("⚫", "未加载")
+    };
+    let goal = projection.and_then(|value| value.goal.as_ref());
+    let goal_status = goal
+        .and_then(|value| value.get("status"))
+        .and_then(Value::as_str)
+        .unwrap_or("none");
+    let goal_icon = match goal_status {
+        "active" | "inProgress" => "🟢",
+        "paused" => "⏸",
+        "blocked" | "usageLimited" | "budgetLimited" => "🟠",
+        "complete" => "✅",
+        _ => "⚪",
+    };
+    let steps = status_steps(projection.and_then(|value| value.plan.as_ref()));
+    let completed = steps
+        .iter()
+        .filter(|step| status_step_value(step).1 == "completed")
+        .count();
+    let tasks = projection.map_or(0, |value| value.subagents.len());
+    let active_tasks = projection.map_or(0, |value| {
+        value
+            .subagents
+            .values()
+            .filter(|task| {
+                matches!(
+                    task.get("status").and_then(Value::as_str),
+                    Some("pending" | "pendingInit" | "active" | "running" | "inProgress")
+                )
+            })
+            .count()
+    });
+    let failed_tasks = projection.map_or(0, |value| {
+        value
+            .subagents
+            .values()
+            .filter(|task| {
+                matches!(
+                    task.get("status").and_then(Value::as_str),
+                    Some("failed" | "errored" | "notFound")
+                )
+            })
+            .count()
+    });
+    let interrupted_tasks = projection.map_or(0, |value| {
+        value
+            .subagents
+            .values()
+            .filter(|task| {
+                matches!(
+                    task.get("status").and_then(Value::as_str),
+                    Some("interrupted" | "cancelled" | "canceled")
+                )
+            })
+            .count()
+    });
+    let queue = store
+        .workflow_records("queue")
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(_, value)| {
+            value.get("thread_id").and_then(Value::as_str) == Some(thread_id)
+                && value.get("status").and_then(Value::as_str) == Some("queued")
+        })
+        .count();
+    let desired_mode = projection.and_then(|value| value.desired_mode.as_deref());
+    let observed_mode = projection
+        .and_then(|value| value.observed_mode.as_deref())
+        .unwrap_or("unknown");
+    let review_active =
+        projection.and_then(|value| value.review_status.as_deref()) == Some("inProgress");
+    let model = projection
+        .and_then(|value| value.model.as_deref())
+        .unwrap_or("N/A");
+    let effort = projection
+        .and_then(|value| value.effort.as_deref())
+        .unwrap_or("N/A");
+    let mut lines = Vec::new();
+    if review_active {
+        lines.push("🔎 Review · 执行中".to_owned());
+    } else if desired_mode.is_some() || observed_mode != "unknown" {
+        let mode_label = match observed_mode {
+            "plan" => "🧭 TUI Plan mode",
+            "default" => "⚙️ TUI Normal mode",
+            _ => "⚪ TUI mode 未确认",
+        };
+        lines.push(mode_label.to_owned());
     }
-    text
+    lines.extend([
+        format!("🤖 Codex · {}", truncate_text(title)),
+        format!(
+            "{} · {} {} · 总执行 {}",
+            truncate_text(thread_id),
+            icon,
+            label,
+            status_duration(projection.and_then(|value| value.started_at_ms), now_ms()),
+        ),
+    ]);
+    if review_active
+        || desired_mode.is_some()
+        || projection.is_some_and(|value| value.model.is_some() || value.effort.is_some())
+    {
+        lines.push(format!("🧠 Main · {} · Effort {}", model, effort));
+    }
+    lines.push(format!("🎯 Goal {} {}", goal_icon, goal_status));
+    lines.push(format!(
+        "🧭 Plan {}/{} {}",
+        completed,
+        steps.len(),
+        status_progress_bar(completed, steps.len())
+    ));
+    lines.push(format!(
+        "🧩 Tasks {}/{} · Active {} · Failed {} · Interrupted {} · Queue {}",
+        tasks.saturating_sub(active_tasks),
+        tasks,
+        active_tasks,
+        failed_tasks,
+        interrupted_tasks,
+        queue
+    ));
+    if let Some(cwd) = projection
+        .and_then(|value| value.cwd.as_deref())
+        .filter(|value| !value.trim().is_empty())
+    {
+        lines.push(format!("📁 {}", truncate_text(cwd)));
+    }
+    let updated_at_ms = projection
+        .map(|value| value.updated_at_ms)
+        .filter(|value| *value > 0)
+        .unwrap_or(space.updated_at_ms);
+    lines.push(format!(
+        "🕒 更新 {} · 心跳 ≤{}s",
+        status_clock(updated_at_ms.max(0)),
+        HEARTBEAT_SECONDS
+    ));
+    truncate_text(&lines.join("\n"))
 }
 
 fn status_is_terminal(space: &RustSessionSpace, projection: Option<&ThreadProjection>) -> bool {
@@ -6600,6 +8110,17 @@ fn status_is_terminal(space: &RustSessionSpace, projection: Option<&ThreadProjec
         .and_then(|value| value.get("status"))
         .and_then(Value::as_str)
         != Some("complete")
+    {
+        return false;
+    }
+    // A completed Goal is not enough when the thread-level status is still
+    // active. The Python dashboard keeps the status surface live until the
+    // current turn reaches a terminal state.
+    if projection.status.as_deref() == Some("active")
+        && !matches!(
+            projection.turn_status.as_deref(),
+            Some("completed" | "failed" | "interrupted")
+        )
     {
         return false;
     }
@@ -6625,23 +8146,92 @@ async fn ensure_status_message(
     space: &RustSessionSpace,
     projection: Option<&ThreadProjection>,
 ) -> Result<Option<RustSessionSpace>, String> {
-    if space.status_message_id.is_some()
-        || space.discussion_chat_id.is_none()
-        || space.discussion_root_message_id.is_none()
-    {
+    if space.discussion_chat_id.is_none() || space.discussion_root_message_id.is_none() {
         return Ok(Some(space.clone()));
     }
+    let terminal = status_is_terminal(space, projection);
+    let text = status_text(store, space, projection, None, totp);
+    let semantic = status_semantic_fingerprint(&text, &space.lifecycle, terminal, false);
+
+    if space.status_message_id.is_some() {
+        let Some(preferred) = preferred_status_bot(bots_by_id) else {
+            return Ok(Some(space.clone()));
+        };
+        if space.status_bot_instance.as_deref() == Some(preferred.config.instance_id.as_str()) {
+            return Ok(Some(space.clone()));
+        }
+        let old_bot_instance = space.status_bot_instance.clone();
+        let old_message_id = space.status_message_id;
+        let preferred = preferred.clone();
+        if !terminal {
+            store
+                .retire_status_callbacks(space.space_id.as_str(), space.generation)
+                .map_err(|error| error.to_string())?;
+        }
+        let markup = if terminal {
+            None
+        } else {
+            status_callback_markup(store, space, &[("取消关注", "space_unwatch")])?
+        };
+        let message = send_text_with_markup_message(
+            &preferred,
+            &surface_for(
+                &preferred,
+                config,
+                space.discussion_chat_id.expect("checked above"),
+                space.discussion_root_message_id,
+            ),
+            &text,
+            markup,
+            metrics,
+        )
+        .await?;
+        let mut migrated = space.clone();
+        migrated.status_message_id = Some(message.message_id);
+        migrated.status_bot_instance = Some(preferred.config.instance_id.clone());
+        migrated.updated_at_ms = now_ms();
+        store
+            .upsert_session_space(&migrated)
+            .map_err(|error| error.to_string())?;
+        if let (Some(old_bot_instance), Some(old_message_id)) = (old_bot_instance, old_message_id) {
+            store
+                .schedule_deletion(&ScheduledDeletion {
+                    bot_instance_id: old_bot_instance,
+                    chat_id: migrated.discussion_chat_id.expect("checked above"),
+                    message_id: old_message_id,
+                    group_key: format!("status-migration:{}", migrated.space_id),
+                    delete_at_ms: now_ms().saturating_add(600_000),
+                    attempts: 0,
+                    claimed_at_ms: None,
+                    last_error_class: None,
+                })
+                .map_err(|error| error.to_string())?;
+        }
+        store
+            .set_telegram_fingerprint(
+                &preferred.config.instance_id,
+                migrated.discussion_chat_id.expect("checked above"),
+                message.message_id,
+                "status",
+                &semantic,
+                now_ms(),
+            )
+            .map_err(|error| error.to_string())?;
+        return Ok(Some(migrated));
+    }
+
     let Some(bot) = status_bot_for(space, bots_by_id) else {
         return Ok(None);
     };
-    let markup = if status_is_terminal(space, projection) {
+    if !terminal {
+        store
+            .retire_status_callbacks(space.space_id.as_str(), space.generation)
+            .map_err(|error| error.to_string())?;
+    }
+    let markup = if terminal {
         None
     } else {
-        status_callback_markup(
-            store,
-            space,
-            &[("刷新", "space_refresh"), ("取消关注", "space_unwatch")],
-        )?
+        status_callback_markup(store, space, &[("取消关注", "space_unwatch")])?
     };
     let message = send_text_with_markup_message(
         bot,
@@ -6651,7 +8241,7 @@ async fn ensure_status_message(
             space.discussion_chat_id.expect("checked above"),
             space.discussion_root_message_id,
         ),
-        &status_text(store, space, projection, None, totp),
+        &text,
         markup,
         metrics,
     )
@@ -6662,6 +8252,16 @@ async fn ensure_status_message(
     updated.updated_at_ms = now_ms();
     store
         .upsert_session_space(&updated)
+        .map_err(|error| error.to_string())?;
+    store
+        .set_telegram_fingerprint(
+            &bot.config.instance_id,
+            updated.discussion_chat_id.expect("checked above"),
+            message.message_id,
+            "status",
+            &semantic,
+            now_ms(),
+        )
         .map_err(|error| error.to_string())?;
     Ok(Some(updated))
 }
@@ -6676,6 +8276,7 @@ async fn update_status_message(
     space: &RustSessionSpace,
     projection: Option<&ThreadProjection>,
     note: Option<&str>,
+    force_refresh: bool,
 ) -> Result<(), String> {
     let Some(current) =
         ensure_status_message(store, bots_by_id, config, metrics, totp, space, projection).await?
@@ -6688,37 +8289,93 @@ async fn update_status_message(
     let Some(bot) = status_bot_for(&current, bots_by_id) else {
         return Ok(());
     };
-    if let Some(control) = bots_by_id
+    let terminal = status_is_terminal(&current, projection);
+    let text = status_text(store, &current, projection, note, totp);
+    let semantic = status_semantic_fingerprint(&text, &current.lifecycle, terminal, false);
+    let discussion_chat_id = current
+        .discussion_chat_id
+        .unwrap_or(config.discussion_chat_id);
+    let status_changed = force_refresh
+        || store
+            .telegram_fingerprint(
+                &bot.config.instance_id,
+                discussion_chat_id,
+                message_id,
+                "status",
+            )
+            .map_err(|error| error.to_string())?
+            .as_deref()
+            != Some(semantic.as_str());
+    let dashboard_text = channel_status_text(store, &current, projection, totp);
+    let dashboard_semantic =
+        status_semantic_fingerprint(&dashboard_text, &current.lifecycle, terminal, false);
+    let control_bot = bots_by_id
         .values()
-        .find(|candidate| candidate.role == RuntimeBotRole::Control)
+        .find(|candidate| candidate.role == RuntimeBotRole::Control);
+    let dashboard_changed = force_refresh
+        || control_bot.is_some_and(|control| {
+            store
+                .telegram_fingerprint(
+                    &control.config.instance_id,
+                    current.channel_chat_id,
+                    current.channel_post_id,
+                    "dashboard",
+                )
+                .ok()
+                .flatten()
+                .as_deref()
+                != Some(dashboard_semantic.as_str())
+        });
+    if !status_changed && !dashboard_changed && note.is_none() {
+        return Ok(());
+    }
+    if let Some(control) = control_bot
         && current.channel_post_id > 0
+        && dashboard_changed
     {
         let reference = TelegramMessageReference::new(
             current.channel_chat_id.to_string(),
             current.channel_post_id,
         )
         .map_err(|error| error.to_string())?;
-        if let Err(error) = edit_text_message(
-            control,
-            &reference,
-            &channel_status_text(store, &current, projection, totp),
-            metrics,
-        )
-        .await
-        {
+        if let Err(error) = edit_text_message(control, &reference, &dashboard_text, metrics).await {
             eprintln!("rust bridge channel dashboard update failed: {error}");
+        } else {
+            store
+                .set_telegram_fingerprint(
+                    &control.config.instance_id,
+                    current.channel_chat_id,
+                    current.channel_post_id,
+                    "dashboard",
+                    &dashboard_semantic,
+                    now_ms(),
+                )
+                .map_err(|error| error.to_string())?;
         }
     }
-    let markup = if status_is_terminal(&current, projection) {
+    if !status_changed && note.is_none() {
+        return Ok(());
+    }
+    if terminal {
+        store
+            .retire_status_callbacks(&current.space_id, current.generation)
+            .map_err(|error| error.to_string())?;
+    }
+    let retired_at = if terminal {
         None
     } else {
-        status_callback_markup(
-            store,
-            &current,
-            &[("刷新", "space_refresh"), ("取消关注", "space_unwatch")],
-        )?
+        Some(
+            store
+                .retire_status_callbacks_at(&current.space_id, current.generation)
+                .map_err(|error| error.to_string())?,
+        )
     };
-    edit_text_with_markup(
+    let markup = if terminal {
+        None
+    } else {
+        status_callback_markup(store, &current, &[("取消关注", "space_unwatch")])?
+    };
+    let edit_result = edit_text_with_markup(
         bot,
         &TelegramMessageReference::new(
             current
@@ -6728,11 +8385,29 @@ async fn update_status_message(
             message_id,
         )
         .map_err(|error| error.to_string())?,
-        &status_text(store, &current, projection, note, totp),
+        &text,
         markup,
         metrics,
     )
-    .await
+    .await;
+    if let Err(error) = edit_result {
+        if let Some(retired_at) = retired_at {
+            let _ =
+                store.restore_status_callbacks(&current.space_id, current.generation, retired_at);
+        }
+        return Err(error);
+    }
+    store
+        .set_telegram_fingerprint(
+            &bot.config.instance_id,
+            discussion_chat_id,
+            message_id,
+            "status",
+            &semantic,
+            now_ms(),
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6748,6 +8423,35 @@ async fn handle_status_callback(
     metrics: &MetricsRegistry,
     totp: &TotpManager,
 ) -> Result<(), String> {
+    if !matches!(
+        inbound_bot.role,
+        RuntimeBotRole::Status | RuntimeBotRole::Discussion
+    ) {
+        acknowledge_callback(&inbound_bot, &callback, Some("该按钮不属于状态 Bot")).await;
+        return Ok(());
+    }
+    let owner_user_id = store
+        .workflow_record("onboarding", "owner")
+        .map_err(|error| error.to_string())?
+        .and_then(|value| value.get("user_id").and_then(Value::as_i64));
+    if owner_user_id.is_none() || callback.actor.user_id != owner_user_id {
+        acknowledge_callback(&inbound_bot, &callback, Some("无权操作此状态按钮")).await;
+        return Ok(());
+    }
+    let expected_surface = if inbound_bot.role == RuntimeBotRole::Status {
+        "status"
+    } else {
+        "discussion"
+    };
+    if store
+        .callback_surface(nonce, now_ms())
+        .map_err(|error| error.to_string())?
+        .as_deref()
+        != Some(expected_surface)
+    {
+        acknowledge_callback(&inbound_bot, &callback, Some("按钮不属于状态面板")).await;
+        return Ok(());
+    }
     let Some(preview) = store
         .peek_callback(nonce, now_ms())
         .map_err(|error| error.to_string())?
@@ -6764,6 +8468,16 @@ async fn handle_status_callback(
         acknowledge_callback(&inbound_bot, &callback, Some("Session 已不存在")).await;
         return Ok(());
     };
+    let expected_status_chat = space
+        .discussion_chat_id
+        .unwrap_or(config.discussion_chat_id);
+    if callback.chat_id != expected_status_chat
+        || (inbound_bot.role == RuntimeBotRole::Status
+            && space.status_message_id != Some(callback.message_id))
+    {
+        acknowledge_callback(&inbound_bot, &callback, Some("按钮不属于当前状态消息")).await;
+        return Ok(());
+    }
     let session = if action.thread_id.trim().is_empty() {
         None
     } else {
@@ -6773,8 +8487,11 @@ async fn handle_status_callback(
         .as_ref()
         .map(|value| value.chat_id)
         .or(space.discussion_chat_id)
-        .unwrap_or(callback.chat_id);
-    if preview.space_id != action.space_id || callback.chat_id != expected_chat_id {
+        .unwrap_or(config.discussion_chat_id);
+    if preview.space_id != action.space_id
+        || callback.chat_id != expected_chat_id
+        || !is_status_action(&action.action)
+    {
         acknowledge_callback(&inbound_bot, &callback, Some("按钮不属于当前 Session")).await;
         return Ok(());
     }
@@ -6787,7 +8504,7 @@ async fn handle_status_callback(
         return send_text(
             &inbound_bot,
             &surface_for(&inbound_bot, config, callback.chat_id, None),
-            "取消关注是写操作，请先发送 /totp <6 位验证码>。",
+            LOCKED_WRITE_MESSAGE,
             metrics,
         )
         .await;
@@ -6804,8 +8521,13 @@ async fn handle_status_callback(
         acknowledge_callback(&inbound_bot, &callback, Some("按钮已过期或已处理")).await;
         return Ok(());
     };
-    let Some(bot) = status_bot_for(&space, bots_by_id).or(Some(&inbound_bot)) else {
-        return Ok(());
+    let bot = if inbound_bot.role == RuntimeBotRole::Discussion {
+        &inbound_bot
+    } else {
+        let Some(status_bot) = status_bot_for(&space, bots_by_id).or(Some(&inbound_bot)) else {
+            return Ok(());
+        };
+        status_bot
     };
     match action.action.as_str() {
         "space_refresh" => {
@@ -6825,24 +8547,31 @@ async fn handle_status_callback(
                 &space,
                 None,
                 Some("已从 Codex 刷新 Session 状态。"),
+                true,
             )
             .await
         }
         "space_unwatch" => {
-            let markup = status_callback_markup(
-                store,
-                &space,
-                &[
-                    ("确认取消关注", "status_unwatch_execute"),
-                    ("返回", "status_unwatch_cancel"),
-                ],
-            )?;
+            if inbound_bot.role == RuntimeBotRole::Status {
+                store
+                    .retire_status_callbacks(&space.space_id, space.generation)
+                    .map_err(|error| error.to_string())?;
+            }
+            let rows = &[
+                &[("确认取消关注", "status_unwatch_execute")][..],
+                &[("返回", "status_unwatch_cancel")][..],
+            ];
+            let markup = if inbound_bot.role == RuntimeBotRole::Discussion {
+                discussion_callback_markup_rows(store, &space, rows)?
+            } else {
+                status_callback_markup_rows(store, &space, rows)?
+            };
             acknowledge_callback(&inbound_bot, &callback, Some("请确认")).await;
             edit_text_with_markup(
                 bot,
                 &TelegramMessageReference::new(callback.chat_id.to_string(), callback.message_id)
                     .map_err(|error| error.to_string())?,
-                "确认取消关注？评论历史会保留，但此评论串将永久只读。",
+                UNWATCH_CONFIRM_MESSAGE,
                 markup,
                 metrics,
             )
@@ -6850,6 +8579,20 @@ async fn handle_status_callback(
         }
         "status_unwatch_cancel" => {
             acknowledge_callback(&inbound_bot, &callback, Some("已取消")).await;
+            if inbound_bot.role == RuntimeBotRole::Discussion {
+                return edit_text_with_markup(
+                    &inbound_bot,
+                    &TelegramMessageReference::new(
+                        callback.chat_id.to_string(),
+                        callback.message_id,
+                    )
+                    .map_err(|error| error.to_string())?,
+                    UNWATCH_CANCEL_MESSAGE,
+                    None,
+                    metrics,
+                )
+                .await;
+            }
             update_status_message(
                 store,
                 bots_by_id,
@@ -6858,23 +8601,28 @@ async fn handle_status_callback(
                 totp,
                 &space,
                 None,
-                Some("已取消操作。"),
+                Some(UNWATCH_CANCEL_MESSAGE),
+                true,
             )
             .await
         }
         "status_unwatch_execute" => {
-            let mut closed = space.clone();
-            closed.lifecycle = "closed".into();
-            closed.updated_at_ms = now_ms();
-            store
-                .upsert_session_space(&closed)
-                .map_err(|error| error.to_string())?;
+            let Some(_closed) = store
+                .close_session_space(&space.space_id, space.generation, now_ms())
+                .map_err(|error| error.to_string())?
+            else {
+                acknowledge_callback(&inbound_bot, &callback, Some("Session 状态已变化")).await;
+                return Ok(());
+            };
+            if let Some(thread_id) = space.thread_id.as_deref() {
+                sessions.remove(thread_id);
+            }
             acknowledge_callback(&inbound_bot, &callback, Some("已取消关注")).await;
             edit_text_with_markup(
                 bot,
                 &TelegramMessageReference::new(callback.chat_id.to_string(), callback.message_id)
                     .map_err(|error| error.to_string())?,
-                "已取消关注。评论历史已保留，此评论串现为只读。",
+                UNWATCH_CLOSED_MESSAGE,
                 None,
                 metrics,
             )
@@ -6988,6 +8736,12 @@ async fn handle_plan_callback(
     sessions: &Arc<SessionRegistry>,
     metrics: &MetricsRegistry,
 ) -> Result<(), String> {
+    if !workflow_callback_bot_allowed(&inbound_bot)
+        || !workflow_callback_owner_authorized(store, &callback)?
+    {
+        acknowledge_callback(&inbound_bot, &callback, Some("无权操作此 Plan 按钮")).await;
+        return Ok(());
+    }
     acknowledge_callback(&inbound_bot, &callback, Some("正在处理 Plan")).await;
     let Some(preview) = store
         .peek_callback(nonce, now_ms())
@@ -7249,6 +9003,12 @@ async fn handle_question_callback(
     sessions: &Arc<SessionRegistry>,
     metrics: &MetricsRegistry,
 ) -> Result<(), String> {
+    if !workflow_callback_bot_allowed(&inbound_bot)
+        || !workflow_callback_owner_authorized(store, &callback)?
+    {
+        acknowledge_callback(&inbound_bot, &callback, Some("无权操作此问题按钮")).await;
+        return Ok(());
+    }
     acknowledge_callback(&inbound_bot, &callback, Some("已选择")).await;
     let Some(preview) = store
         .peek_callback(nonce, now_ms())
@@ -9089,6 +10849,106 @@ mod tests {
     }
 
     #[test]
+    fn pending_session_confirmation_matches_python_contract() {
+        let (rendered, markup) =
+            pending_session_confirmation("https://t.me/c/4446000549/9").unwrap();
+        assert_eq!(rendered.operation, RenderOperation::Send);
+        assert_eq!(
+            rendered.markdown,
+            "待认证 Session 帖子已创建。进入评论串并发送 `/totp <验证码>`。"
+        );
+        assert_eq!(
+            rendered.plain.as_deref(),
+            Some("待认证 Session 帖子已创建。进入评论串并发送 /totp <验证码>。")
+        );
+        assert!(rendered.keyboard.is_none());
+        assert_eq!(
+            markup.rows,
+            vec![vec![InlineKeyboardButton::Url {
+                text: "打开帖子".to_owned(),
+                url: "https://t.me/c/4446000549/9".to_owned(),
+            }]]
+        );
+    }
+
+    #[test]
+    fn new_project_resolution_expands_home_and_nested_names() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-telegram-bridge-project-resolution-{}",
+            std::process::id()
+        ));
+        let nested = root.join("tmp").join("rust_tg_test");
+        fs::create_dir_all(&nested).unwrap();
+        let root = fs::canonicalize(&root).unwrap();
+        assert_eq!(
+            expand_user_path("~/PythonProjects"),
+            env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("PythonProjects")
+        );
+        assert_eq!(
+            new_existing_projects(&root, "rust_tg_test").unwrap(),
+            vec![nested]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn new_project_creation_requires_a_safe_existing_ancestor() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-telegram-bridge-project-create-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let root = fs::canonicalize(&root).unwrap();
+        assert!(missing_path_has_safe_ancestor(
+            &root,
+            &root.join("tmp/rust_test")
+        ));
+        assert!(!missing_path_has_safe_ancestor(
+            &root,
+            &std::env::temp_dir().join("outside")
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn perf_render_matches_python_metric_sections_and_plain_fallback() {
+        let snapshot = crate::perf::PerfSnapshot {
+            sampled_at_ms: 1_700_000_000_000,
+            uptime_seconds: 90_061,
+            load: [1.0, 0.5, 0.25],
+            cpu_percent: 12.3,
+            memory_used_bytes: 512 * 1024 * 1024,
+            memory_total_bytes: 1024 * 1024 * 1024,
+            swap_used_bytes: 128 * 1024 * 1024,
+            swap_total_bytes: 512 * 1024 * 1024,
+            disk_used_bytes: 20 * 1024 * 1024 * 1024,
+            disk_total_bytes: 100 * 1024 * 1024 * 1024,
+            codex_process_count: 2,
+            codex_cpu_percent: 3.4,
+            codex_memory_bytes: 64 * 1024 * 1024,
+            gpu: Some(crate::perf::GpuSnapshot {
+                name: "Test GPU".into(),
+                memory_used_mib: Some(512.0),
+                memory_total_mib: Some(2048.0),
+                utilization_percent: Some(25.0),
+                temperature_c: Some(55.0),
+                power_w: Some(80.0),
+            }),
+        };
+        let (markdown, plain) = format_perf_snapshot(&snapshot);
+        assert!(markdown.contains("*🟠 Ubuntu · WSL*"));
+        assert!(markdown.contains("RAM  `50.0%` `#####-----`"));
+        assert!(markdown.contains("负载 `1.00 / 0.50 / 0.25`"));
+        assert!(markdown.contains("*🟩 NVIDIA · Test GPU*"));
+        assert!(plain.contains("Ubuntu · WSL"));
+        assert!(!plain.contains('`'));
+        assert!(!plain.contains('*'));
+    }
+
+    #[test]
     fn new_prompt_drafts_use_a_short_prompt_timeout() {
         let created_before = now_ms();
         let draft = new_draft(42, 7, "prompt", json!({"cwd":"/workspace"}));
@@ -9136,5 +10996,238 @@ mod tests {
             .unwrap()
             .expect("cancel callback is durable and scoped");
         assert_eq!(callback.action, "cancel");
+    }
+
+    #[test]
+    fn control_session_status_accepts_app_server_objects() {
+        let session = control_session_from_value(&json!({
+            "id": "thread-1",
+            "status": {"type": "idle", "activeFlags": ["waitingOnUserInput"]},
+            "turnStatus": {"type": "completed"},
+            "title": "Object status",
+        }))
+        .expect("session should be visible");
+
+        assert_eq!(session.status, "idle");
+        assert_eq!(session.turn_status, "completed");
+        assert_eq!(session.active_flags, vec!["waitingOnUserInput"]);
+    }
+
+    #[test]
+    fn session_detail_projection_renders_rich_status_and_live_link() {
+        let thread_id = "019fc5f6-2d0c-7f72-9dfb-8041619f4761";
+        let response = json!({
+            "thread": {
+                "id": thread_id,
+                "name": "Rich session detail",
+                "status": {"type": "active"},
+                "collaborationMode": "plan",
+                "goal": {"status": "active", "objective": "Ship Rust parity"},
+                "updatedAt": 1_700_000_000,
+                "turns": [{
+                    "id": "turn-1",
+                    "status": {"type": "inProgress"},
+                    "items": [
+                        {"id": "plan-1", "type": "plan", "steps": [
+                            {"step": "Inspect", "status": "completed"},
+                            {"step": "Deploy", "status": "inProgress"}
+                        ]},
+                        {"id": "agent-call", "type": "collabAgentToolCall", "agentsStates": {
+                            "agent-1": {"status": "running"}
+                        }}
+                    ]
+                }]
+            }
+        });
+        let projection = projection_from_thread_read(thread_id, &response);
+        assert_eq!(projection.status.as_deref(), Some("active"));
+        assert_eq!(projection.turn_status.as_deref(), Some("inProgress"));
+        assert_eq!(projection.item_order, vec!["plan-1", "agent-call"]);
+        assert_eq!(projection.cwd, None);
+        assert_eq!(
+            projection
+                .goal
+                .as_ref()
+                .and_then(|value| value.get("status")),
+            Some(&json!("active"))
+        );
+        assert_eq!(projection.subagents.len(), 1);
+
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let totp = TotpManager::new(store.clone(), "/tmp/nonexistent-rust-bridge-totp", 60);
+        let space = synthetic_session_space(thread_id, 42);
+        let rendered = status_text(&store, &space, Some(&projection), None, &totp);
+        assert!(rendered.contains("🤖 Codex · Rich session detail"));
+        assert!(rendered.contains("🎯 Goal · active · Ship Rust parity"));
+        assert!(rendered.contains("🧭 Plan · 1/2"));
+        assert!(rendered.contains("🧩 Agent Tasks · 0/1 · Running 1"));
+
+        let linked_space = RustSessionSpace {
+            channel_chat_id: -1004446000549,
+            channel_post_id: 81,
+            discussion_chat_id: Some(-1004446000549),
+            discussion_root_message_id: Some(9),
+            status_message_id: Some(82),
+            ..space
+        };
+        let markup = session_status_markup(&linked_space).expect("status link");
+        assert_eq!(
+            markup["inline_keyboard"][0][0]["url"],
+            "https://t.me/c/4446000549/81?comment=82"
+        );
+    }
+
+    #[test]
+    fn recent_event_summary_matches_python_activity_contract() {
+        assert_eq!(
+            status_event_summary(
+                &json!({
+                    "id": "item-99",
+                    "type": "agentMessage",
+                    "memoryCitation": null,
+                    "phase": "commentary",
+                    "text": "修复91 Bot新建Session文案差异"
+                }),
+                true,
+            ),
+            Some((
+                "修复91 Bot新建Session文案差异".to_owned(),
+                "completed".to_owned()
+            ))
+        );
+        assert_eq!(
+            status_event_summary(&json!({"type": "contextCompaction"}), true),
+            Some(("上下文已压缩".to_owned(), "completed".to_owned()))
+        );
+        assert_eq!(
+            status_event_summary(
+                &json!({
+                    "type": "commandExecution",
+                    "status": "completed",
+                    "exitCode": 0
+                }),
+                true,
+            ),
+            Some((
+                "命令执行 completed (exit 0)".to_owned(),
+                "completed".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn status_text_does_not_leak_recent_item_json() {
+        let thread_id = "thread-readable-events";
+        let response = json!({
+            "thread": {
+                "id": thread_id,
+                "name": "Readable events",
+                "status": {"type": "idle"},
+                "turns": [{
+                    "id": "turn-1",
+                    "status": {"type": "completed"},
+                    "items": [
+                        {
+                            "id": "item-99",
+                            "type": "agentMessage",
+                            "memoryCitation": null,
+                            "phase": "commentary",
+                            "text": "修复91 Bot新建Session文案差异"
+                        },
+                        {"id": "item-98", "type": "contextCompaction"}
+                    ]
+                }]
+            }
+        });
+        let projection = projection_from_thread_read(thread_id, &response);
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let totp = TotpManager::new(store.clone(), "/tmp/nonexistent-rust-bridge-totp", 60);
+        let space = synthetic_session_space(thread_id, 42);
+        let rendered = status_text(&store, &space, Some(&projection), None, &totp);
+
+        assert!(rendered.contains("🕘 近期事件"));
+        assert!(rendered.contains("修复91 Bot新建Session文案差异 · completed"));
+        assert!(rendered.contains("上下文已压缩 · completed"));
+        assert!(!rendered.contains("memoryCitation"));
+        assert!(!rendered.contains("{\"id\":"));
+    }
+
+    #[test]
+    fn status_priority_matches_python_terminal_and_waiting_rules() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let totp = TotpManager::new(store.clone(), "/tmp/nonexistent-rust-bridge-totp", 60);
+        let space = synthetic_session_space("thread-status-rules", 42);
+
+        let mut projection = ThreadProjection {
+            status: Some("active".into()),
+            turn_status: Some("completed".into()),
+            ..ThreadProjection::default()
+        };
+        let rendered = status_text(&store, &space, Some(&projection), None, &totp);
+        assert!(rendered.contains("⚪ 空闲"));
+        assert!(!rendered.contains("🟢 执行中"));
+
+        projection.turn_status = Some("inProgress".into());
+        projection.active_flags = vec!["waitingOnUserInput".into()];
+        let rendered = status_text(&store, &space, Some(&projection), None, &totp);
+        assert!(rendered.contains("🟡 等待回答"));
+        assert!(rendered.contains("⏳ 等待用户输入"));
+
+        projection.active_flags = vec!["waitingOnApproval".into()];
+        let rendered = status_text(&store, &space, Some(&projection), None, &totp);
+        assert!(rendered.contains("🟡 等待审批"));
+        assert!(rendered.contains("🛂 等待审批"));
+
+        projection.active_flags.clear();
+        projection.desired_mode = Some("plan".into());
+        projection.observed_mode = Some("unknown".into());
+        let rendered = status_text(&store, &space, Some(&projection), None, &totp);
+        assert!(rendered.contains("Mode：unknown"));
+        assert!(!rendered.contains("Mode：plan"));
+    }
+
+    #[test]
+    fn terminal_guard_rejects_stale_active_thread_and_channel_is_compact() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let totp = TotpManager::new(store.clone(), "/tmp/nonexistent-rust-bridge-totp", 60);
+        let space = synthetic_session_space("thread-terminal-guard", 42);
+        let projection = ThreadProjection {
+            thread_id: "thread-terminal-guard".into(),
+            status: Some("active".into()),
+            turn_status: Some("idle".into()),
+            goal: Some(json!({"status":"complete"})),
+            ..ThreadProjection::default()
+        };
+        assert!(!status_is_terminal(&space, Some(&projection)));
+
+        let mut completed = projection.clone();
+        completed.turn_status = Some("completed".into());
+        assert!(status_is_terminal(&space, Some(&completed)));
+
+        let channel = channel_status_text(&store, &space, Some(&completed), &totp);
+        assert!(channel.contains("🤖 Codex"));
+        assert!(channel.contains("🎯 Goal"));
+        assert!(!channel.contains("生命周期："));
+        assert!(!channel.contains("🕘 近期事件"));
+    }
+
+    #[test]
+    fn queue_callbacks_keep_the_record_session_scope() {
+        let mut space = synthetic_session_space("thread-queue", 42);
+        space.space_id = "space-queue".into();
+        space.generation = 7;
+
+        assert_eq!(
+            queue_callback_scope(
+                &json!({"space_id":"space-queue","generation":7}),
+                Some(&space),
+            ),
+            Some(("space-queue".into(), 7))
+        );
+        assert_eq!(
+            queue_callback_scope(&json!({}), Some(&space)),
+            Some(("space-queue".into(), 7))
+        );
+        assert_eq!(queue_callback_scope(&json!({}), None), None);
     }
 }

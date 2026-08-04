@@ -1,5 +1,6 @@
 //! Bounded local performance sampling for the Control Bot `/perf` panel.
 
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::thread;
@@ -10,8 +11,20 @@ use sysinfo::{Disks, ProcessesToUpdate, System};
 const GPU_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct GpuSnapshot {
+    pub name: String,
+    pub memory_used_mib: Option<f32>,
+    pub memory_total_mib: Option<f32>,
+    pub utilization_percent: Option<f32>,
+    pub temperature_c: Option<f32>,
+    pub power_w: Option<f32>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct PerfSnapshot {
     pub sampled_at_ms: i64,
+    pub uptime_seconds: u64,
+    pub load: [f32; 3],
     pub cpu_percent: f32,
     pub memory_used_bytes: u64,
     pub memory_total_bytes: u64,
@@ -22,7 +35,7 @@ pub struct PerfSnapshot {
     pub codex_process_count: usize,
     pub codex_cpu_percent: f32,
     pub codex_memory_bytes: u64,
-    pub gpu: Option<String>,
+    pub gpu: Option<GpuSnapshot>,
 }
 
 pub struct PerfSampler {
@@ -48,6 +61,8 @@ impl PerfSampler {
 
     pub fn sample(&self, include_gpu: bool) -> PerfSnapshot {
         let (
+            uptime_seconds,
+            load,
             cpu_percent,
             memory_used_bytes,
             memory_total_bytes,
@@ -72,6 +87,8 @@ impl PerfSampler {
             }
             system.refresh_memory();
             system.refresh_processes(ProcessesToUpdate::All, false);
+            let memory_total_bytes = system.total_memory();
+            let memory_used_bytes = memory_total_bytes.saturating_sub(system.available_memory());
             let mut codex_process_count = 0;
             let mut codex_cpu_percent = 0.0;
             let mut codex_memory_bytes: u64 = 0;
@@ -84,9 +101,14 @@ impl PerfSampler {
                 }
             }
             (
+                System::uptime(),
+                {
+                    let load = System::load_average();
+                    [load.one as f32, load.five as f32, load.fifteen as f32]
+                },
                 system.global_cpu_usage(),
-                system.used_memory(),
-                system.total_memory(),
+                memory_used_bytes,
+                memory_total_bytes,
                 system.used_swap(),
                 system.total_swap(),
                 codex_process_count,
@@ -97,13 +119,13 @@ impl PerfSampler {
         let (disk_used_bytes, disk_total_bytes) = {
             let mut disks = self.disks.lock().expect("perf disk lock poisoned");
             disks.refresh(false);
-            disks.iter().fold((0_u64, 0_u64), |(used, total), disk| {
-                let disk_total = disk.total_space();
-                let disk_used = disk_total.saturating_sub(disk.available_space());
-                (
-                    used.saturating_add(disk_used),
-                    total.saturating_add(disk_total),
-                )
+            let disk = disks
+                .iter()
+                .find(|disk| disk.mount_point() == Path::new("/"))
+                .or_else(|| disks.iter().next());
+            disk.map_or((0, 0), |disk| {
+                let total = disk.total_space();
+                (total.saturating_sub(disk.available_space()), total)
             })
         };
         PerfSnapshot {
@@ -112,6 +134,8 @@ impl PerfSampler {
                 .unwrap_or_default()
                 .as_millis()
                 .min(i64::MAX as u128) as i64,
+            uptime_seconds,
+            load,
             cpu_percent,
             memory_used_bytes,
             memory_total_bytes,
@@ -127,17 +151,21 @@ impl PerfSampler {
     }
 }
 
-fn sample_gpu() -> Option<String> {
-    let mut child = Command::new("nvidia-smi")
-        .args([
-            "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu",
-            "--format=csv,noheader,nounits",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+fn sample_gpu() -> Option<GpuSnapshot> {
+    let mut child = ["nvidia-smi", "/usr/lib/wsl/lib/nvidia-smi"]
+        .into_iter()
+        .find_map(|program| {
+            Command::new(program)
+                .args([
+                    "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw",
+                    "--format=csv,noheader,nounits",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .ok()
+        })?;
     let deadline = Instant::now() + GPU_COMMAND_TIMEOUT;
     loop {
         match child.try_wait().ok()? {
@@ -149,7 +177,26 @@ fn sample_gpu() -> Option<String> {
                     .next()
                     .map(str::trim)
                     .filter(|line| !line.is_empty())?;
-                return Some(line.to_owned());
+                let fields = line.split(',').map(str::trim).collect::<Vec<_>>();
+                if fields.len() < 6 || fields[0].is_empty() {
+                    return None;
+                }
+                let parse = |value: &str| {
+                    let value = value.trim();
+                    if value.is_empty() || value.eq_ignore_ascii_case("n/a") {
+                        None
+                    } else {
+                        value.parse::<f32>().ok()
+                    }
+                };
+                return Some(GpuSnapshot {
+                    name: fields[0].to_owned(),
+                    utilization_percent: parse(fields[1]),
+                    memory_used_mib: parse(fields[2]),
+                    memory_total_mib: parse(fields[3]),
+                    temperature_c: parse(fields[4]),
+                    power_w: parse(fields[5]),
+                });
             }
             Some(_) => return None,
             None if Instant::now() >= deadline => {

@@ -2,11 +2,14 @@ use ctg_domain::{AgentEvent, ThreadId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ThreadProjection {
     pub thread_id: String,
     pub title: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
     pub status: Option<String>,
     pub turn_id: Option<String>,
     pub turn_status: Option<String>,
@@ -15,7 +18,21 @@ pub struct ThreadProjection {
     pub review_status: Option<String>,
     pub desired_mode: Option<String>,
     pub observed_mode: Option<String>,
+    #[serde(default)]
+    pub active_flags: Vec<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub effort: Option<String>,
+    #[serde(default)]
+    pub started_at_ms: Option<i64>,
+    #[serde(default)]
+    pub finished_at_ms: Option<i64>,
     pub items: BTreeMap<String, Value>,
+    /// Stable event order for rendering recent activity. `items` remains a
+    /// map for idempotent updates and durable compatibility.
+    #[serde(default)]
+    pub item_order: Vec<String>,
     pub subagents: BTreeMap<String, Value>,
     pub last_error: Option<String>,
     pub generation: u64,
@@ -36,8 +53,22 @@ pub struct EventProjector {
 }
 
 impl EventProjector {
+    /// Restores a projection persisted by the Rust daemon before new app
+    /// server events arrive.  The caller owns schema validation and can skip
+    /// corrupt rows without preventing the process from starting.
+    pub fn restore(&mut self, projection: ThreadProjection) {
+        if !projection.thread_id.trim().is_empty() {
+            self.threads
+                .insert(projection.thread_id.clone(), projection);
+        }
+    }
+
     pub fn projection(&self, thread_id: &str) -> Option<&ThreadProjection> {
         self.threads.get(thread_id)
+    }
+
+    pub fn projection_mut(&mut self, thread_id: &str) -> Option<&mut ThreadProjection> {
+        self.threads.get_mut(thread_id)
     }
 
     pub fn apply(&mut self, event: &AgentEvent) -> ProjectionEffect {
@@ -53,14 +84,42 @@ impl EventProjector {
                     ..ThreadProjection::default()
                 });
         projection.generation = event.generation;
-        projection.updated_at_ms = projection.updated_at_ms.saturating_add(1);
+        projection.updated_at_ms = projection.updated_at_ms.max(now_ms());
         match event.method.as_str() {
             "thread/started" | "thread/created" | "thread/updated" => {
                 merge_thread(projection, &event.params);
                 ProjectionEffect::RefreshStatus
             }
             "thread/status/updated" | "thread/status/changed" => {
-                projection.status = string_at(&event.params, &["status", "thread", "status"]);
+                let status = event
+                    .params
+                    .get("status")
+                    .or_else(|| event.params.pointer("/thread/status"));
+                projection.status =
+                    status
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .or_else(|| {
+                            status
+                                .and_then(|value| value.get("type"))
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                        });
+                projection.active_flags = status
+                    .and_then(|value| {
+                        value
+                            .get("activeFlags")
+                            .or_else(|| value.get("active_flags"))
+                    })
+                    .and_then(Value::as_array)
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 ProjectionEffect::RefreshStatus
             }
             "thread/settings/updated" | "thread/settings/update" => {
@@ -77,11 +136,29 @@ impl EventProjector {
                     &event.params,
                     &["observedMode", "observed_mode", "settings", "observedMode"],
                 );
+                let settings = event
+                    .params
+                    .get("threadSettings")
+                    .or_else(|| event.params.get("settings"))
+                    .unwrap_or(&event.params);
+                projection.model = settings
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .or_else(|| projection.model.clone());
+                projection.effort = settings
+                    .get("effort")
+                    .or_else(|| settings.get("reasoning_effort"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .or_else(|| projection.effort.clone());
                 ProjectionEffect::RefreshStatus
             }
             "turn/started" | "turn/created" => {
                 projection.turn_id = string_at(&event.params, &["turnId", "turn", "id"]);
                 projection.turn_status = Some("inProgress".into());
+                projection.started_at_ms = Some(now_ms());
+                projection.finished_at_ms = None;
                 ProjectionEffect::RefreshStatus
             }
             "turn/updated" => {
@@ -102,12 +179,16 @@ impl EventProjector {
                     .and_then(Value::as_str)
                     .map(str::to_owned)
                     .or_else(|| Some(event.method.trim_start_matches("turn/").to_owned()));
+                projection.finished_at_ms = Some(now_ms());
                 ProjectionEffect::TurnCompleted
             }
             "item/started" | "item/updated" | "item/completed" | "item/failed" => {
                 if let Some(item) = event.params.get("item")
                     && let Some(item_id) = item.get("id").and_then(Value::as_str)
                 {
+                    if !projection.items.contains_key(item_id) {
+                        projection.item_order.push(item_id.to_owned());
+                    }
                     projection.items.insert(item_id.to_owned(), item.clone());
                 }
                 ProjectionEffect::RefreshStatus
@@ -160,11 +241,20 @@ impl EventProjector {
                     .map(str::to_owned)
                     .or_else(|| Some("Codex error".into()));
                 projection.turn_status = Some("failed".into());
+                projection.finished_at_ms = Some(now_ms());
                 ProjectionEffect::Error
             }
             _ => ProjectionEffect::None,
         }
     }
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
 }
 
 fn thread_id_from_params(params: &Value) -> Option<String> {
@@ -198,9 +288,19 @@ fn merge_thread(projection: &mut ThreadProjection, params: &Value) {
         .iter()
         .find_map(|key| source.get(*key).and_then(Value::as_str).map(str::to_owned))
         .or(projection.title.clone());
+    projection.cwd = source
+        .get("cwd")
+        .or_else(|| source.get("directory"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or(projection.cwd.clone());
     projection.status = source
         .get("status")
-        .and_then(Value::as_str)
+        .and_then(|value| {
+            value
+                .as_str()
+                .or_else(|| value.get("type").and_then(Value::as_str))
+        })
         .map(str::to_owned)
         .or(projection.status.clone());
     projection.desired_mode = source
@@ -208,6 +308,31 @@ fn merge_thread(projection: &mut ThreadProjection, params: &Value) {
         .and_then(Value::as_str)
         .map(str::to_owned)
         .or(projection.desired_mode.clone());
+    projection.model = source
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or(projection.model.clone());
+    projection.effort = source
+        .get("effort")
+        .or_else(|| source.get("reasoningEffort"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or(projection.effort.clone());
+    if let Some(status) = source.get("status") {
+        projection.active_flags = status
+            .get("activeFlags")
+            .or_else(|| status.get("active_flags"))
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
 }
 
 pub fn projection_thread_id(projection: &ThreadProjection) -> Option<ThreadId> {

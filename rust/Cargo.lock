@@ -154,6 +154,7 @@ dependencies = [
  "ctg-ports",
  "ctg-storage-sqlite",
  "data-encoding",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

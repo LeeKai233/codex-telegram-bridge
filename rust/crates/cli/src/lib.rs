@@ -13,6 +13,7 @@ pub mod migration;
 pub mod perf;
 pub mod replay;
 pub mod security;
+pub mod status_contract;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CliValidationIssue {

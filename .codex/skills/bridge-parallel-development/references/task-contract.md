@@ -291,3 +291,131 @@ available read-only reviewer route if the configured reviewer route is likewise 
   bodies, or correlation IDs. Correlation IDs belong only in redacted structured logs.
 - The root integrates one lane at a time, runs the affected Rust tests after each integration, closes
   every child, then performs local install/service actions and the live acceptance/rollback sequence.
+
+## Active Goal Addendum: rust-python-business-parity
+
+- Goal thread: `019fc25c-d4fe-74e3-b7ee-48e0b9cb2d61`.
+- Baseline SHA: `e93f6935f58b48a0f025808d865b5c6471748201`.
+- Integration branch: `main` in the current dirty root worktree; preserve `AGENTS.md`,
+  `CLAUDE.md`, and the untracked `assets/` directory.
+- Root coordinator: `/root`, `gpt-5.6-sol/xhigh`; owns domain/ports contracts, the HIGH
+  `handle_command` path, CRITICAL SQLite migration/import, daemon integration, cutover, and all
+  user communication.
+- No `cross-agent-handoff`, `cah`, Goal Contract, push, tag, release, package installation, or
+  child service/credential control.
+- In scope: Python golden parity for all three business Bot surfaces, Telegram adapter effects,
+  Codex projection/server requests/approvals, native Rust persistence/recovery, read-only Python
+  SQLite import, complete `codex-tg` CLI parity, and controlled cutover validation.
+- Out of scope: Rust-only monitoring experiments as business substitutes, upstream Codex changes,
+  unrelated user files, and the existing `assets/` directory.
+
+| Lane | Agent role | Model | Effort | Selection reason | Worktree | Branch | Owned files | Integration order |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| telegram-parity | bridge-worker | gpt-5.6-terra | max | Fallback because configured luna is unavailable; owns Telegram transport types, role routing, controllers, renderers, callbacks, and golden Telegram effects without touching core state or migration. | `/tmp/codex-bridge-rust-python-telegram` | `agent/rust-python-parity/telegram` | `rust/crates/telegram/src`, Telegram-focused tests/fixtures | 1 |
+| codex-parity | bridge-worker | gpt-5.6-terra | max | Fallback because configured luna is unavailable; owns Codex event projection, server-request handling, queue/plan/question/approval workflows, and recovery tests behind the frozen domain/ports interfaces. | `/tmp/codex-bridge-rust-python-codex` | `agent/rust-python-parity/codex` | `rust/crates/engine/src`, `rust/crates/app-server/src`, engine/app-server tests/fixtures | 2 |
+| cli-parity | bridge-worker | gpt-5.6-terra | max | Fallback because configured luna is unavailable; owns local Rust CLI command/flag/output parity and offline doctor/status/watchdog behavior without touching migration or daemon composition. | `/tmp/codex-bridge-rust-python-cli` | `agent/rust-python-parity/cli` | `rust/crates/cli/src/config.rs`, `main.rs`, `replay.rs`, `security.rs`, CLI tests | 3 |
+| integration-review | bridge-reviewer | gpt-5.6-terra | max | Fallback because configured luna is unavailable; independent read-only review after integration for contract drift, migration safety, poller uniqueness, recovery races, and missing tests. | none | none | none | final |
+
+### Shared Contracts
+
+- Python is the behavior oracle. Fixtures compare exact text, parse mode, reply/edit/delete order,
+  keyboard row matrix, callback data, command menus, Codex calls, and logical state transitions;
+  only declared volatile IDs/timestamps may be normalized.
+- Root freezes the `domain`/`ports` interfaces before worker edits. Every existing symbol requires
+  upstream impact; HIGH/CRITICAL results must be reported before editing.
+- `SqliteStore::migrate` remains root-owned. The import command creates a new native target only,
+  opens Python SQLite read-only, emits count/hash reconciliation, and refuses unresolved
+  connection-bound work or ambiguous dispatched prompts.
+- Workers run focused Rust tests, Clippy, and scoped `detect_changes`; the root integrates one
+  commit at a time, reruns affected tests, closes all children, and only then performs service or
+  cutover actions.
+
+## Active Goal Addendum: rust-91-control-parity
+
+- Goal thread: `019fc5f6-2d0c-7f72-9dfb-8041619f4761`.
+- Baseline SHA: `d72cde43311d01e02324f4ddd25a2655e33f54ec`.
+- Integration branch: `main` in the current dirty root worktree; preserve `AGENTS.md`,
+  `CLAUDE.md`, the existing task-contract edits, and the untracked `assets/` directory.
+- Root coordinator: `/root`, `gpt-5.6-sol/xhigh`; owns architecture, HIGH/CRITICAL symbols,
+  daemon integration, SQLite v5 migration, performance sampling, deployment, live Telegram
+  acceptance, rollback, and user communication.
+- In scope: Rust 91 Control Bot behavior parity with Python 9527 for command menus, pairing guard,
+  help, sessions, topics, new, perf, callbacks, MarkdownV2 fallback, durable control state,
+  schema v5, and Rust-only upgrade/rollback.
+- Out of scope: Python 9527 behavior/database/service changes, credentials, remote Git state,
+  releases, package installation, unrelated user files, and `assets/`.
+
+| Lane | Agent role | Model | Effort | Selection reason | Worktree | Branch | Owned files | Required tests | Integration order |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| telegram-surface | bridge-worker | gpt-5.6-terra | high | Configured luna is unavailable here; terra/high fallback isolates Bot API command scopes, MarkdownV2/plain effects, and transport-level callback/menu contracts from root-owned daemon and persistence code. | `/tmp/codex-bridge-91-telegram` | `agent/rust-91-control-parity/telegram-surface` | `rust/crates/telegram/src/lib.rs`, `rust/crates/telegram/src/controllers.rs`, Telegram unit tests and fixtures only | focused cargo test, fmt, Clippy, scoped `detect_changes` | 1 |
+| control-contract | bridge-worker | gpt-5.6-terra | high | Configured luna is unavailable here; terra/high fallback builds the controller and Python/Rust golden contract in new files, keeping workflow semantics independently testable before daemon integration. | `/tmp/codex-bridge-91-control` | `agent/rust-91-control-parity/control-contract` | new `rust/crates/cli/src/control.rs`, new Rust/Python parity fixtures and focused tests only | focused cargo/Python tests, fmt, Clippy, scoped `detect_changes` | 2 |
+| integration-review | bridge-reviewer | gpt-5.6-terra | high | Configured luna is unavailable here; terra/high fallback independently reviews authorization, callback races, migration safety, effect ordering, and live rollback gaps. | none | none | none | final diff and verification evidence | final |
+
+### Shared Contracts
+
+- Control menu scopes are default empty, all-private `/pair` and `/help`, and owner-chat full
+  commands. Owner is created only by a real `/pair`; existing Rust Session rows remain untouched.
+- Python 9527 is the behavior oracle. Golden fixtures compare exact text, parse mode, plain
+  fallback, keyboard labels/rows, callback effects, edit/delete order, deadlines, and app-server
+  calls; only declared volatile IDs, timestamps, nonces, and temporary paths are normalized.
+- Schema v5 adds native control interactions, callbacks, and scheduled deletions. Revision/claim,
+  one-time callback consumption, fixed deadlines, restart recovery, and v4 data preservation are
+  transactional contracts. `SqliteStore::migrate` is root-only after CRITICAL impact review.
+- Children must not edit services or credentials, install packages, touch other worktrees, push,
+  publish, or operate on `assets/`. Root integrates one lane at a time and closes every child before
+  any service action.
+
+## Active Goal Addendum: rust-818-python-69-business-parity-v2
+
+- Goal thread ID: `019fca52-43af-7583-92fd-df005fdbf263`.
+- Baseline SHA: `b2f72d582236a63658c9760a8f6f8ffe381ec8a5`.
+- Integration branch: `main` in the current dirty root worktree; preserve all pre-existing user
+  edits, especially `rust/crates/cli/src/daemon.rs`, task-contract/AGENTS/CLAUDE/docs/systemd
+  changes, and the untracked `assets/`, `.playwright-cli/`, and `target/` paths.
+- Root coordinator: `/root`, `gpt-5.6-sol/xhigh`; owns the CRITICAL status/callback path, SQLite
+  migration, daemon integration, service state, credentials, deployment, live Telegram validation,
+  rollback, and user communication.
+- In scope: exact Python 69 status/dashboard contract on Rust 818, 411 confirmation handoff and
+  close transaction, generation/callback invalidation, scoped queued-prompt cancellation, status
+  message migration and delayed cleanup, persisted thread projections, richer SessionSpace state,
+  status callback records, semantic Telegram fingerprints, SQLite v6 migration/recovery, golden
+  fixtures, focused/full verification, and controlled Rust upgrade/live acceptance.
+- Out of scope: Python service/database mutation, upstream Codex changes, releases/remotes, package
+  publication, automatic Forum conversion, unrelated user files, and the existing untracked
+  `assets/` directory.
+
+| Lane | Agent role | Model | Effort | Selection reason | Worktree | Branch | Owned files | Integration order |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| python-status-audit | bridge-explorer | gpt-5.6-luna | max | Read-only oracle audit of Python 69 status text, keyboard, callback expiry, debounce, and close/error effects before Rust edits. | none | none | none | advisory before implementation |
+| rust-recovery-audit | bridge-explorer | gpt-5.6-terra | high | Configured luna unavailable; fallback read-only audit of Rust SQLite schema, thread/session persistence, callback storage, delivery ownership, restart recovery, and migration hazards. | none | none | none | advisory before implementation |
+| integration-review | bridge-reviewer | gpt-5.6-luna | max | Read-only final review of callback authorization, generation races, atomic close, migration/recovery, dashboard coalescing, and live rollback evidence. | none | none | none | final |
+
+Execution note: configured `gpt-5.6-luna/max` was unavailable in this environment (the spawn
+registry exposes only `gpt-5.6-sol` and `gpt-5.6-terra`). Both audit lanes therefore use the
+available `bridge-explorer / gpt-5.6-terra / high` fallback; root architecture/integration remains
+with the coordinator.
+
+### Shared Contracts
+
+- Python 69 is the behavior oracle. Status cards normally expose only `取消关注`; terminal cards
+  expose no buttons. Locked writes use `写操作已锁定，请先发送 /totp <验证码>。认证后可再次点击原按钮。`.
+- 818 `取消关注` hands off to 411 confirmation text `确认取消关注？评论历史会保留，但此评论串将永久只读。`
+  with `确认取消关注` and `返回`; successful close edits that confirmation to
+  `已取消关注。评论历史已保留，此评论串现为只读。`.
+- Close atomically increments generation, marks lifecycle `closed`, invalidates old callbacks,
+  cancels queued prompts, unsubscribes unused threads, updates queue state, and emits closed state.
+- Status migration sends through 818, retires old callbacks, and schedules deletion of the old
+  discussion-owned message after 600 seconds. Dashboard debounce is `0.5s`, heartbeat `60s`,
+  status callback expiry `300s`.
+- SQLite v6 must preserve v5 data and persist richer SessionSpace/ThreadProjection state,
+  status-specific callbacks, and semantic Telegram fingerprints sufficient for restart deduplication.
+
+### Integration Rules
+
+- Every existing symbol edit requires the recorded GitNexus upstream impact; HIGH/CRITICAL results
+  are warnings already reported before implementation. New pure-contract files still require tests.
+- Read-only lanes must not edit files, services, credentials, packages, remotes, other worktrees, or
+  `assets/`; they only return evidence and testable findings.
+- Root integrates one writer change at a time, reruns focused tests after each integration, closes
+  every child before `rust-vnext-full.sh upgrade` or any service operation, and runs
+  `detect_changes(compare main)` before Goal completion.
