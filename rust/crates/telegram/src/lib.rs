@@ -121,6 +121,8 @@ pub struct TelegramMessage {
     pub is_photo: bool,
     pub actor: TelegramActor,
     pub reply_to_message_id: Option<i64>,
+    pub reply_to_message_thread_id: Option<i64>,
+    pub reply_to_is_automatic_forward: bool,
     pub message_thread_id: Option<i64>,
     /// The linked-discussion automatic forward from a channel post. Telegram's
     /// `is_automatic_forward` is the source of truth; forum topics are optional.
@@ -910,7 +912,15 @@ impl UpdateRouter {
                     }
                     self.route_message_effect(
                         message.clone(),
-                        message.reply_to_message_id.or(message.message_thread_id),
+                        message
+                            .message_thread_id
+                            .or(message.reply_to_message_thread_id)
+                            .or_else(|| {
+                                message
+                                    .reply_to_is_automatic_forward
+                                    .then_some(message.reply_to_message_id?)
+                            })
+                            .or(message.reply_to_message_id),
                     )
                 }
             }
@@ -1122,6 +1132,13 @@ fn parse_message(value: &Value) -> Option<TelegramMessage> {
         reply_to_message_id: value
             .pointer("/reply_to_message/message_id")
             .and_then(Value::as_i64),
+        reply_to_message_thread_id: value
+            .pointer("/reply_to_message/message_thread_id")
+            .and_then(Value::as_i64),
+        reply_to_is_automatic_forward: value
+            .pointer("/reply_to_message/is_automatic_forward")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         message_thread_id: value.get("message_thread_id").and_then(Value::as_i64),
         automatic_forward_from_channel,
         automatic_forward_channel_post_id: value
@@ -3466,6 +3483,8 @@ mod tests {
                     sender_chat_id: None,
                 },
                 reply_to_message_id: Some(12),
+                reply_to_message_thread_id: None,
+                reply_to_is_automatic_forward: false,
                 message_thread_id: Some(41),
                 automatic_forward_from_channel: None,
                 automatic_forward_channel_post_id: None,

@@ -20,10 +20,10 @@ use crate::status_contract::{
 use codex_telegram_adapter::{
     BotCapability, BotCommandScope, ChannelBinding, CommandMenuScope, IncomingUpdate,
     InlineKeyboardButton, InlineKeyboardMarkup, LinkedDiscussion, NativeCommentBinding,
-    ReqwestTransport, RoutedUpdate, RuntimeBotRole, SentMessage, TelegramBotApi,
-    TelegramMessageReference, TelegramMessageRequest, TelegramSurfaceBinding, TokenLeaseRegistry,
-    UpdateAuthorization, UpdateRouter, UpdateRoutingPolicy, WorkflowAction, WorkflowCommand,
-    command_menu,
+    ParsedTelegramCommand, ReqwestTransport, RoutedUpdate, RuntimeBotRole, SentMessage,
+    TelegramBotApi, TelegramCommand, TelegramMessageReference, TelegramMessageRequest,
+    TelegramSurfaceBinding, TokenLeaseRegistry, UpdateAuthorization, UpdateRouter,
+    UpdateRoutingPolicy, WorkflowAction, WorkflowCommand, command_menu,
 };
 use codex_telegram_credentials::BotToken;
 use ctg_app_server::{AppServerClient, AppServerConfig};
@@ -102,6 +102,7 @@ struct RuntimeBot {
     role: RuntimeBotRole,
     token: BotToken,
     api: Arc<TelegramBotApi<ReqwestTransport>>,
+    username: String,
 }
 
 struct InboundUpdate {
@@ -288,11 +289,15 @@ pub fn run(config_path: Option<&Path>) -> Result<(), DaemonError> {
         if role.is_none() && bot.capability != BotCapability::ProductionAlert {
             continue;
         }
+        let profile = api
+            .get_me(&token)
+            .map_err(|error| DaemonError::Config(format!("Telegram getMe failed: {error}")))?;
         bots.push(RuntimeBot {
             config: bot.clone(),
             role: role.unwrap_or(RuntimeBotRole::Alert),
             token,
             api: api.clone(),
+            username: profile.username.unwrap_or_default(),
         });
     }
     if !bots.iter().any(|bot| bot.role.polls_updates()) {
@@ -519,7 +524,7 @@ async fn run_async(
                 .and_then(|value| value.get("user_id").and_then(Value::as_i64));
             let authorization = UpdateAuthorization {
                 owner_user_id,
-                bot_username: None,
+                bot_username: Some(bot.username.clone()),
                 enforce_chat_kind: true,
                 reject_sender_chat: true,
                 // Before `/pair`, only the Control Bot's private bootstrap
@@ -546,20 +551,50 @@ async fn run_async(
                     }
                 };
             let routed = router.route(&inbound.update);
-            let result = handle_action(
-                routed,
-                actor_user_id,
-                bot,
-                &bots_by_id,
-                &config,
-                &store,
-                &dispatch_agent,
-                &sessions,
-                &metrics,
-                &totp,
-                &dispatch_control_runtime,
-            )
-            .await;
+            let bind_identity_warning = match IncomingUpdate::from_update(&inbound.update) {
+                IncomingUpdate::Message(message)
+                    if message.chat_id == config.discussion_chat_id
+                        && message.actor.sender_chat_id.is_some()
+                        && message.automatic_forward_from_channel.is_none()
+                        && message.text.as_deref().is_some_and(|text| {
+                            ParsedTelegramCommand::parse(text).is_some_and(|parsed| {
+                                parsed.command == TelegramCommand::Bind
+                                    && parsed.addressed_bot_username.as_deref().is_none_or(
+                                        |target| target.eq_ignore_ascii_case(&bot.username),
+                                    )
+                            })
+                        }) =>
+                {
+                    Some(message)
+                }
+                _ => None,
+            };
+            let result = if let Some(message) = bind_identity_warning {
+                let surface = surface_for(&bot, &config, message.chat_id, None);
+                send_text(
+                    &bot,
+                    &surface,
+                    "绑定请求未获授权。请使用已配对的个人账号发送，并将发送身份切换为个人账号；若启用了匿名管理员，请先关闭。",
+                    &metrics,
+                )
+                .await
+                .map(|_| ())
+            } else {
+                handle_action(
+                    routed,
+                    actor_user_id,
+                    bot,
+                    &bots_by_id,
+                    &config,
+                    &store,
+                    &dispatch_agent,
+                    &sessions,
+                    &metrics,
+                    &totp,
+                    &dispatch_control_runtime,
+                )
+                .await
+            };
             if let Err(error) = &result {
                 eprintln!("rust bridge action failed: {error}");
             }
@@ -876,27 +911,29 @@ async fn handle_action(
             {
                 return Ok(());
             }
-            if !totp
-                .is_unlocked_for_space(
-                    &root_message_id
-                        .and_then(|root| {
-                            store
-                                .session_space_for_discussion_root(chat_id, root)
-                                .ok()
-                                .flatten()
-                        })
-                        .or_else(|| {
-                            store
-                                .pending_session_space_for_discussion(chat_id)
-                                .ok()
-                                .flatten()
-                        })
-                        .map(|space| space.space_id)
-                        .unwrap_or_default(),
-                    now_ms(),
-                )
-                .map_err(|error| error.to_string())?
-            {
+            let discussion_space = if inbound_bot.role == RuntimeBotRole::Discussion {
+                root_message_id.and_then(|root| {
+                    store
+                        .session_space_for_discussion_root(chat_id, root)
+                        .ok()
+                        .flatten()
+                })
+            } else {
+                None
+            };
+            if inbound_bot.role == RuntimeBotRole::Discussion && discussion_space.is_none() {
+                eprintln!(
+                    "rust bridge ignored prompt without an exact discussion root chat_id={chat_id}"
+                );
+                return Ok(());
+            }
+            let unlocked = if let Some(space) = discussion_space.as_ref() {
+                totp.is_unlocked_for_space(&space.space_id, now_ms())
+            } else {
+                totp.is_unlocked(now_ms())
+            }
+            .map_err(|error| error.to_string())?;
+            if !unlocked {
                 send_text(
                     &inbound_bot,
                     &surface_for(&inbound_bot, config, chat_id, root_message_id),
@@ -1104,6 +1141,16 @@ async fn handle_action(
             discussion_chat_id,
             discussion_root_message_id,
         } => {
+            if store
+                .workflow_record("onboarding", "binding")
+                .map_err(|error| error.to_string())?
+                .is_none()
+            {
+                eprintln!(
+                    "rust bridge ignored native comment before binding channel_post_id={channel_post_id}"
+                );
+                return Ok(());
+            }
             store
                 .bind_native_comment_root(
                     &NativeCommentRoot {
@@ -1140,28 +1187,7 @@ async fn handle_action(
                     eprintln!("rust bridge status message provisioning failed: {error}");
                 }
             }
-            let sender = bots_by_id
-                .values()
-                .find(|bot| bot.role == RuntimeBotRole::Discussion)
-                .unwrap_or(&inbound_bot);
-            send_text(
-                sender,
-                &TelegramSurfaceBinding::NativeCommentRoot(
-                    NativeCommentBinding::new(
-                        ChannelBinding::new(
-                            sender.config.instance_id.clone(),
-                            config.channel_chat_id.to_string(),
-                        )
-                        .map_err(|error| error.message.to_owned())?,
-                        config.discussion_chat_id.to_string(),
-                        discussion_root_message_id,
-                    )
-                    .map_err(|error| error.message.to_owned())?,
-                ),
-                "Rust Bridge 已绑定这条 Channel 评论入口。",
-                metrics,
-            )
-            .await
+            Ok(())
         }
         WorkflowAction::Callback(callback) => {
             handle_callback(
@@ -1201,22 +1227,22 @@ async fn handle_command(
     control_runtime: &Arc<ControlRuntime>,
 ) -> Result<(), String> {
     let bound_space = if inbound_bot.role == RuntimeBotRole::Discussion {
-        root_message_id
-            .and_then(|root| {
-                store
-                    .session_space_for_discussion_root(chat_id, root)
-                    .ok()
-                    .flatten()
-            })
-            .or_else(|| {
-                store
-                    .pending_session_space_for_discussion(chat_id)
-                    .ok()
-                    .flatten()
-            })
+        root_message_id.and_then(|root| {
+            store
+                .session_space_for_discussion_root(chat_id, root)
+                .ok()
+                .flatten()
+        })
     } else {
         None
     };
+    if inbound_bot.role == RuntimeBotRole::Discussion
+        && !matches!(command, WorkflowCommand::Bind | WorkflowCommand::Help)
+        && bound_space.is_none()
+    {
+        eprintln!("rust bridge ignored discussion command without an exact root chat_id={chat_id}");
+        return Ok(());
+    }
     let response_root_message_id = bound_space
         .as_ref()
         .and_then(|space| space.discussion_root_message_id)
@@ -1350,7 +1376,19 @@ async fn handle_command(
             send_text(&inbound_bot, &surface, help, metrics).await
         }
         WorkflowCommand::Totp => {
+            if inbound_bot.role == RuntimeBotRole::Discussion {
+                delete_inbound_message(&inbound_bot, chat_id, message_id).await;
+            }
             let code = text.split_whitespace().nth(1).unwrap_or_default();
+            if code.is_empty() {
+                return send_text(
+                    &inbound_bot,
+                    &surface,
+                    "用法：`/totp <6 位验证码或恢复码>`",
+                    metrics,
+                )
+                .await;
+            }
             let verified = if let Some(space) = bound_space.as_ref() {
                 totp.verify_and_unlock_for_space(&space.space_id, code, now_ms())
             } else {
@@ -1375,11 +1413,14 @@ async fn handle_command(
                 .await;
             }
             let message = if verified {
-                "当前 Session 已解锁。"
+                format!(
+                    "当前 Session 已解锁 {} 分钟。",
+                    config.totp_unlock_seconds.max(60) / 60
+                )
             } else {
-                "验证码无效、已使用，或验证暂时锁定。"
+                "验证码无效、已使用，或验证暂时锁定。".to_owned()
             };
-            send_text(&inbound_bot, &surface, message, metrics).await
+            send_text(&inbound_bot, &surface, &message, metrics).await
         }
         WorkflowCommand::Lock => {
             if let Some(space) = bound_space.as_ref() {
@@ -1867,6 +1908,11 @@ async fn refresh_command_menus(
         .ok()
         .flatten()
         .is_some();
+    let owner_user_id = store
+        .workflow_record("onboarding", "owner")
+        .ok()
+        .flatten()
+        .and_then(|value| value.get("user_id").and_then(Value::as_i64));
     let discussion_bound = store
         .workflow_record("onboarding", "binding")
         .ok()
@@ -1918,19 +1964,26 @@ async fn refresh_command_menus(
                             BotCommandScope::AllGroupChats,
                             command_menu(RuntimeBotRole::Discussion, CommandMenuScope::Bootstrap),
                         )?;
-                        if paired && discussion_bound {
+                        install(
+                            BotCommandScope::Chat {
+                                chat_id: discussion_chat_id,
+                            },
+                            &[],
+                        )?;
+                        if let Some(owner_user_id) = owner_user_id {
                             install(
-                                BotCommandScope::Chat {
+                                BotCommandScope::ChatMember {
                                     chat_id: discussion_chat_id,
+                                    user_id: owner_user_id,
                                 },
-                                command_menu(RuntimeBotRole::Discussion, CommandMenuScope::Owner),
-                            )?;
-                        } else {
-                            install(
-                                BotCommandScope::Chat {
-                                    chat_id: discussion_chat_id,
+                                if paired && discussion_bound {
+                                    command_menu(
+                                        RuntimeBotRole::Discussion,
+                                        CommandMenuScope::Owner,
+                                    )
+                                } else {
+                                    &[]
                                 },
-                                &[],
                             )?;
                         }
                     }
@@ -2024,6 +2077,15 @@ async fn delete_scheduled_message(
         }) => Ok(()),
         Err(_error) => Err("telegram_delete_failed".to_owned()),
     }
+}
+
+async fn delete_inbound_message(bot: &RuntimeBot, chat_id: i64, message_id: i64) {
+    let Ok(reference) = TelegramMessageReference::new(chat_id.to_string(), message_id) else {
+        return;
+    };
+    let api = bot.api.clone();
+    let token = bot.token.clone();
+    let _ = tokio::task::spawn_blocking(move || api.delete_message(&token, &reference)).await;
 }
 
 fn control_user(actor_user_id: Option<i64>) -> Result<i64, String> {
@@ -2605,29 +2667,6 @@ fn typed_markup_from_json(value: Option<Value>) -> Result<Option<InlineKeyboardM
     (!typed_rows.is_empty())
         .then(|| InlineKeyboardMarkup::new(typed_rows).map_err(|error| error.to_string()))
         .transpose()
-}
-
-async fn send_control_text_with_json_markup(
-    bot: &RuntimeBot,
-    surface: &TelegramSurfaceBinding,
-    markdown: &str,
-    plain: &str,
-    markup: Option<Value>,
-    metrics: &MetricsRegistry,
-) -> Result<SentMessage, String> {
-    send_control_rendered(
-        bot,
-        surface,
-        &RenderedEffect {
-            operation: RenderOperation::Send,
-            markdown: markdown.to_owned(),
-            plain: Some(plain.to_owned()),
-            keyboard: None,
-        },
-        typed_markup_from_json(markup)?,
-        metrics,
-    )
-    .await
 }
 
 async fn send_control_rendered(
@@ -3520,6 +3559,63 @@ fn parse_new_arguments(text: &str) -> Result<NewArguments, String> {
     }
 }
 
+fn new_argument_suggestion(models: &ModelChoices, arguments: &str) -> String {
+    let fields = arguments.split('|').map(str::trim).collect::<Vec<_>>();
+    let normal = fields
+        .first()
+        .and_then(|value| model_choice(models, value))
+        .or_else(|| models.entries.first());
+    let Some(normal) = normal else {
+        return "/new <model> | <effort>".to_owned();
+    };
+    let effort = fields
+        .get(1)
+        .filter(|value| normal.efforts.iter().any(|candidate| candidate == *value))
+        .copied()
+        .unwrap_or(normal.default_effort.as_str());
+    let mut suggestion = vec![format!("/new {}", normal.model), effort.to_owned()];
+    let Some(raw_mode) = fields.get(2).filter(|value| !value.is_empty()) else {
+        return suggestion.join(" | ");
+    };
+    let plan = raw_mode.to_ascii_lowercase().contains("plan");
+    suggestion.push(if plan { "planmode" } else { "noplan" }.to_owned());
+    if plan {
+        let plan_model = fields
+            .get(3)
+            .and_then(|value| model_choice(models, value))
+            .or_else(|| model_choice(models, fields.first().copied().unwrap_or_default()))
+            .or_else(|| models.entries.first());
+        if let Some(plan_model) = plan_model {
+            let plan_effort = fields
+                .get(4)
+                .filter(|value| {
+                    plan_model
+                        .efforts
+                        .iter()
+                        .any(|candidate| candidate == *value)
+                })
+                .copied()
+                .unwrap_or(plan_model.default_effort.as_str());
+            suggestion.push(plan_model.model.clone());
+            suggestion.push(plan_effort.to_owned());
+        }
+        if let Some(cwd) = fields.get(5).filter(|value| !value.is_empty()) {
+            suggestion.push((*cwd).to_owned());
+            if fields.len() > 6 {
+                suggestion.push(fields[6..].join(" | "));
+            }
+        }
+    } else {
+        if let Some(cwd) = fields.get(3).filter(|value| !value.is_empty()) {
+            suggestion.push((*cwd).to_owned());
+            if fields.len() > 4 {
+                suggestion.push(fields[4..].join(" | "));
+            }
+        }
+    }
+    suggestion.join(" | ")
+}
+
 fn model_choice<'a>(models: &'a ModelChoices, requested: &str) -> Option<&'a ModelChoice> {
     let normalized = requested.trim().to_ascii_lowercase();
     models.entries.iter().find(|entry| {
@@ -3749,11 +3845,129 @@ fn new_choice_markup(
         .chunks(columns)
         .map(|row| Value::Array(row.to_vec()))
         .collect::<Vec<_>>();
+    if columns > 1
+        && rows.len() > 1
+        && rows
+            .last()
+            .is_some_and(|row| row.as_array().is_some_and(|buttons| buttons.len() == 1))
+    {
+        let previous = rows.len().saturating_sub(2);
+        let moved = rows
+            .get_mut(previous)
+            .and_then(Value::as_array_mut)
+            .and_then(Vec::pop);
+        if let Some(button) = moved {
+            rows.last_mut()
+                .and_then(Value::as_array_mut)
+                .expect("rows is non-empty")
+                .insert(0, button);
+        }
+    }
     rows.push(json!([{
         "text": "退出",
         "callback_data": format!("new:{cancel_nonce}"),
     }]));
     Ok(Some(json!({"inline_keyboard": rows})))
+}
+
+fn new_control_phase(value: &str) -> Option<crate::control::NewPhase> {
+    match value {
+        "normal_model" => Some(crate::control::NewPhase::NormalModel),
+        "normal_effort" => Some(crate::control::NewPhase::NormalEffort),
+        "plan_choice" => Some(crate::control::NewPhase::PlanChoice),
+        "plan_model" => Some(crate::control::NewPhase::PlanModel),
+        "plan_effort" => Some(crate::control::NewPhase::PlanEffort),
+        "project" => Some(crate::control::NewPhase::Project),
+        "prompt" => Some(crate::control::NewPhase::Prompt),
+        _ => None,
+    }
+}
+
+fn new_control_event(value: &str) -> Option<crate::control::NewEvent> {
+    match value {
+        "cancel" => Some(crate::control::NewEvent::Cancel),
+        "normal_model" => Some(crate::control::NewEvent::NormalModel),
+        "normal_effort" => Some(crate::control::NewEvent::NormalEffort),
+        "plan_choice" => Some(crate::control::NewEvent::PlanChoice),
+        "plan_model" => Some(crate::control::NewEvent::PlanModel),
+        "plan_effort" => Some(crate::control::NewEvent::PlanEffort),
+        "hello" => Some(crate::control::NewEvent::Hello),
+        _ => None,
+    }
+}
+
+fn dispatch_new_control_effects(
+    draft: &Value,
+    event: &str,
+    value: &str,
+    models: &ModelChoices,
+) -> Result<Vec<ControlEffect>, String> {
+    let Some(phase_name) = draft.get("phase").and_then(Value::as_str) else {
+        return Ok(Vec::new());
+    };
+    let Some(phase) = new_control_phase(phase_name) else {
+        return Ok(Vec::new());
+    };
+    let Some(event) = new_control_event(event) else {
+        return Ok(Vec::new());
+    };
+    let payload = draft.get("payload").cloned().unwrap_or_else(|| json!({}));
+    ControlController
+        .dispatch(ControlRequest::NewCallback {
+            draft: crate::control::NewDraft {
+                phase,
+                normal_model: payload
+                    .get("normal_model")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                plan_model: payload
+                    .get("plan_model")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            },
+            event,
+            value: value.to_owned(),
+            models: control_models(models),
+        })
+        .map_err(|error| format!("control /new transition failed: {error:?}"))
+}
+
+fn new_render_effect(
+    effects: &[ControlEffect],
+    operation: RenderOperation,
+) -> Option<RenderedEffect> {
+    effects.iter().find_map(|effect| match effect {
+        ControlEffect::Render(rendered) if rendered.operation == operation => {
+            Some(rendered.clone())
+        }
+        _ => None,
+    })
+}
+
+async fn send_new_render_effect(
+    bot: &RuntimeBot,
+    surface: &TelegramSurfaceBinding,
+    rendered: Option<&RenderedEffect>,
+    fallback_markdown: &str,
+    fallback_plain: &str,
+    markup: Option<Value>,
+    metrics: &MetricsRegistry,
+) -> Result<(), String> {
+    let rendered = rendered.cloned().unwrap_or_else(|| RenderedEffect {
+        operation: RenderOperation::Send,
+        markdown: fallback_markdown.to_owned(),
+        plain: Some(fallback_plain.to_owned()),
+        keyboard: None,
+    });
+    send_control_rendered(
+        bot,
+        surface,
+        &rendered,
+        typed_markup_from_json(markup)?,
+        metrics,
+    )
+    .await
+    .map(|_| ())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3806,7 +4020,7 @@ async fn begin_new_interaction(
     if args.is_empty() {
         let models = list_model_choices(agent).await?;
         let contract_models = control_models(&models);
-        let _ = ControlController
+        let effects = ControlController
             .dispatch(ControlRequest::New {
                 draft: crate::control::NewDraft {
                     phase: crate::control::NewPhase::NormalModel,
@@ -3816,6 +4030,7 @@ async fn begin_new_interaction(
                 models: contract_models,
             })
             .map_err(|error| format!("control /new contract failed: {error:?}"))?;
+        let rendered = new_render_effect(&effects, RenderOperation::Send);
         let mut draft = new_draft(
             chat_id,
             user_id,
@@ -3835,38 +4050,47 @@ async fn begin_new_interaction(
             })
             .collect::<Vec<_>>();
         let markup = new_choice_markup(store, &key, &mut draft, &choices)?;
-        return send_control_text_with_json_markup(
+        return send_new_render_effect(
             bot,
             &surface_for(bot, config, chat_id, None),
+            rendered.as_ref(),
             "请选择 当前模式 使用的模型：",
             "请选择 当前模式 使用的模型：",
             markup,
             metrics,
         )
-        .await
-        .map(|_| ());
+        .await;
     }
-    let parsed = parse_new_arguments(text)?;
     let models = list_model_choices(agent).await?;
+    let parsed = match parse_new_arguments(text) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            let suggestion = new_argument_suggestion(&models, new_command_arguments(text));
+            return send_text(
+                bot,
+                &surface_for(bot, config, chat_id, None),
+                &format!("{error}\n你可能想发送：`{suggestion}`"),
+                metrics,
+            )
+            .await;
+        }
+    };
     let Some(normal) = model_choice(&models, &parsed.model) else {
+        let suggestion = new_argument_suggestion(&models, new_command_arguments(text));
         return send_text(
             bot,
             &surface_for(bot, config, chat_id, None),
-            &format!("模型 {} 不在当前可用列表中。", parsed.model),
+            &format!("模型、effort 或模式无效。你可能想发送：\n`{suggestion}`"),
             metrics,
         )
         .await;
     };
     if !normal.efforts.iter().any(|value| value == &parsed.effort) {
+        let suggestion = new_argument_suggestion(&models, new_command_arguments(text));
         return send_text(
             bot,
             &surface_for(bot, config, chat_id, None),
-            &format!(
-                "effort {} 不适用于 {}；可用：{}",
-                parsed.effort,
-                normal.model,
-                normal.efforts.join(", ")
-            ),
+            &format!("模型、effort 或模式无效。你可能想发送：\n`{suggestion}`"),
             metrics,
         )
         .await;
@@ -3880,19 +4104,21 @@ async fn begin_new_interaction(
         let plan_model = parsed.plan_model.as_deref().unwrap_or_default();
         let plan_effort = parsed.plan_effort.as_deref().unwrap_or_default();
         let Some(plan) = model_choice(&models, plan_model) else {
+            let suggestion = new_argument_suggestion(&models, new_command_arguments(text));
             return send_text(
                 bot,
                 &surface_for(bot, config, chat_id, None),
-                "Plan model 不可用。",
+                &format!("模型、effort 或模式无效。你可能想发送：\n`{suggestion}`"),
                 metrics,
             )
             .await;
         };
         if !plan.efforts.iter().any(|value| value == plan_effort) {
+            let suggestion = new_argument_suggestion(&models, new_command_arguments(text));
             return send_text(
                 bot,
                 &surface_for(bot, config, chat_id, None),
-                "Plan effort 不适用。",
+                &format!("模型、effort 或模式无效。你可能想发送：\n`{suggestion}`"),
                 metrics,
             )
             .await;
@@ -3920,14 +4146,14 @@ async fn begin_new_interaction(
     if phase == "plan_choice" {
         persist_new_draft(store, &key, &draft)?;
         let choices = vec![
-            ("plan_choice".into(), "yes".into(), "进入 Plan Mode".into()),
-            ("plan_choice".into(), "no".into(), "不进入 Plan Mode".into()),
+            ("plan_choice".into(), "yes".into(), "是".into()),
+            ("plan_choice".into(), "no".into(), "否".into()),
         ];
         let markup = new_choice_markup(store, &key, &mut draft, &choices)?;
         send_text_with_markup(
             bot,
             &surface_for(bot, config, chat_id, None),
-            "是否进入 Plan Mode？",
+            "新 Session 是否先进入 Plan Mode？",
             markup,
             metrics,
         )
@@ -3990,6 +4216,29 @@ async fn handle_new_callback(
     acknowledge_callback(&bot, &callback, Some("已收到")).await;
     draft["choices"] = json!({});
     let payload = draft.get("payload").cloned().unwrap_or_else(|| json!({}));
+    let logical_effects = if new_control_event(event).is_some() {
+        let models = if event == "cancel" {
+            ModelChoices {
+                entries: Vec::new(),
+                summary: String::new(),
+            }
+        } else {
+            list_model_choices(agent).await.unwrap_or(ModelChoices {
+                entries: Vec::new(),
+                summary: String::new(),
+            })
+        };
+        dispatch_new_control_effects(&draft, event, value, &models).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let logical_send = new_render_effect(&logical_effects, RenderOperation::Send);
+    if let Some(rendered) = new_render_effect(&logical_effects, RenderOperation::Edit) {
+        let reference =
+            TelegramMessageReference::new(callback.chat_id.to_string(), callback.message_id)
+                .map_err(|error| error.to_string())?;
+        edit_control_rendered(&bot, &reference, &rendered, None, metrics).await?;
+    }
     match event {
         "cancel" => {
             store
@@ -3997,16 +4246,8 @@ async fn handle_new_callback(
                 .map_err(|error| error.to_string())?;
             store
                 .delete_control_interaction(&key, now_ms())
-                .map_err(|error| error.to_string())?;
-            edit_text_with_markup(
-                &bot,
-                &TelegramMessageReference::new(callback.chat_id.to_string(), callback.message_id)
-                    .map_err(|error| error.to_string())?,
-                "已退出 /new。",
-                None,
-                metrics,
-            )
-            .await
+                .map_err(|error| error.to_string())
+                .map(|_| ())
         }
         "normal_model" => {
             let models = list_model_choices(agent).await?;
@@ -4021,16 +4262,34 @@ async fn handle_new_callback(
                 .map(|effort| ("normal_effort".into(), effort.clone(), effort.clone()))
                 .collect::<Vec<_>>();
             let markup = new_choice_markup(store, &key, &mut next, &choices)?;
-            send_text_with_markup(&bot, &surface_for(&bot, config, callback.chat_id, None), "请选择普通模式 effort：", markup, metrics).await
+            send_new_render_effect(
+                &bot,
+                &surface_for(&bot, config, callback.chat_id, None),
+                logical_send.as_ref(),
+                "模型支持以下 effort：",
+                "模型支持以下 effort：",
+                markup,
+                metrics,
+            )
+            .await
         }
         "normal_effort" => {
             let mut next_payload = payload;
             next_payload["normal_effort"] = Value::String(value.to_owned());
             let next = advance_new_draft(store, &key, &draft, "plan_choice", next_payload, false)?;
             let mut next = next;
-            let choices = vec![("plan_choice".into(), "yes".into(), "进入 Plan Mode".into()), ("plan_choice".into(), "no".into(), "不进入 Plan Mode".into())];
+            let choices = vec![("plan_choice".into(), "yes".into(), "是".into()), ("plan_choice".into(), "no".into(), "否".into())];
             let markup = new_choice_markup(store, &key, &mut next, &choices)?;
-            send_text_with_markup(&bot, &surface_for(&bot, config, callback.chat_id, None), "是否进入 Plan Mode？", markup, metrics).await
+            send_new_render_effect(
+                &bot,
+                &surface_for(&bot, config, callback.chat_id, None),
+                logical_send.as_ref(),
+                "新 Session 是否先进入 Plan Mode？",
+                "新 Session 是否先进入 Plan Mode？",
+                markup,
+                metrics,
+            )
+            .await
         }
         "plan_choice" => {
             if value == "yes" {
@@ -4043,10 +4302,29 @@ async fn handle_new_callback(
                     .map(|entry| ("plan_model".into(), entry.model.clone(), entry.display_name.clone()))
                     .collect::<Vec<_>>();
                 let markup = new_choice_markup(store, &key, &mut next, &choices)?;
-                send_text_with_markup(&bot, &surface_for(&bot, config, callback.chat_id, None), "请选择 Plan Mode 模型：", markup, metrics).await
+                send_new_render_effect(
+                    &bot,
+                    &surface_for(&bot, config, callback.chat_id, None),
+                    logical_send.as_ref(),
+                    "请选择 Plan Mode 使用的模型：",
+                    "请选择 Plan Mode 使用的模型：",
+                    markup,
+                    metrics,
+                )
+                .await
             } else {
-                let next = advance_new_draft(store, &key, &draft, "project", payload, false)?;
-                send_text(&bot, &surface_for(&bot, config, callback.chat_id, None), "请发送项目地址或项目描述；下一条文本消息会被识别为项目。", metrics).await.map(|_| { let _ = next; })
+                let mut next = advance_new_draft(store, &key, &draft, "project", payload, false)?;
+                let markup = new_choice_markup(store, &key, &mut next, &[])?;
+                send_new_render_effect(
+                    &bot,
+                    &surface_for(&bot, config, callback.chat_id, None),
+                    logical_send.as_ref(),
+                    "请发送项目地址或项目描述；下一条文本消息会被识别为项目。",
+                    "请发送项目地址或项目描述；下一条文本消息会被识别为项目。",
+                    markup,
+                    metrics,
+                )
+                .await
             }
         }
         "plan_model" => {
@@ -4062,13 +4340,32 @@ async fn handle_new_callback(
                 .map(|effort| ("plan_effort".into(), effort.clone(), effort.clone()))
                 .collect::<Vec<_>>();
             let markup = new_choice_markup(store, &key, &mut next, &choices)?;
-            send_text_with_markup(&bot, &surface_for(&bot, config, callback.chat_id, None), "请选择 Plan Mode effort：", markup, metrics).await
+            send_new_render_effect(
+                &bot,
+                &surface_for(&bot, config, callback.chat_id, None),
+                logical_send.as_ref(),
+                "模型支持以下 effort：",
+                "模型支持以下 effort：",
+                markup,
+                metrics,
+            )
+            .await
         }
         "plan_effort" => {
             let mut next_payload = payload;
             next_payload["plan_effort"] = Value::String(value.to_owned());
-            let next = advance_new_draft(store, &key, &draft, "project", next_payload, false)?;
-            send_text(&bot, &surface_for(&bot, config, callback.chat_id, None), "请发送项目地址或项目描述；下一条文本消息会被识别为项目。", metrics).await.map(|_| { let _ = next; })
+            let mut next = advance_new_draft(store, &key, &draft, "project", next_payload, false)?;
+            let markup = new_choice_markup(store, &key, &mut next, &[])?;
+            send_new_render_effect(
+                &bot,
+                &surface_for(&bot, config, callback.chat_id, None),
+                logical_send.as_ref(),
+                "请发送项目地址或项目描述；下一条文本消息会被识别为项目。",
+                "请发送项目地址或项目描述；下一条文本消息会被识别为项目。",
+                markup,
+                metrics,
+            )
+            .await
         }
         "project" => handle_new_project_value(store, agent, sessions, &bot, bots_by_id, config, metrics, &key, draft, value.to_owned()).await,
         "create_project" => {
@@ -4134,7 +4431,7 @@ async fn handle_new_text(
         .and_then(Value::as_str)
         .unwrap_or_default()
     {
-        "project" | "project_choice" => {
+        "project" | "project_choice" | "project_confirmation" => {
             handle_new_project_value(
                 store,
                 agent,
@@ -4363,7 +4660,10 @@ async fn handle_new_project_value(
                     next["chat_id"].as_i64().unwrap_or_default(),
                     None,
                 ),
-                "目录不存在，是否创建？",
+                &format!(
+                    "目录 `{}` 不存在，是否创建？",
+                    truncate_text(&raw.to_string_lossy())
+                ),
                 markup,
                 metrics,
             )
@@ -4378,7 +4678,7 @@ async fn handle_new_project_value(
             draft["chat_id"].as_i64().unwrap_or_default(),
             None,
         ),
-        "没有找到匹配项目。请发送 workspace 内的明确目录路径。",
+        "没有找到匹配项目。请发送允许目录中的明确路径。",
         metrics,
     )
     .await
@@ -4417,7 +4717,7 @@ async fn send_new_prompt_or_finish(
             next["chat_id"].as_i64().unwrap_or_default(),
             None,
         ),
-        "请发送第一条 prompt。30 秒内未发送时将使用 Hello。",
+        "请发送第一条 prompt。30 秒内未发送时将使用 `Hello`。",
         markup,
         metrics,
     )
@@ -4496,6 +4796,13 @@ async fn create_pending_session_space(
         .get("cwd")
         .and_then(Value::as_str)
         .ok_or_else(|| "项目目录未选择".to_owned())?;
+    if store
+        .workflow_record("onboarding", "binding")
+        .map_err(|error| error.to_string())?
+        .is_none()
+    {
+        return Err("频道与讨论组尚未绑定，请先完成 /bind。".to_owned());
+    }
     let plan_model = payload
         .get("plan_model")
         .and_then(Value::as_str)
@@ -4510,7 +4817,7 @@ async fn create_pending_session_space(
     if let Some(existing) = store
         .get_session_space(space_id)
         .map_err(|error| error.to_string())?
-        && existing.lifecycle == "pending"
+        && matches!(existing.lifecycle.as_str(), "pending" | "repair_required")
     {
         return Ok((
             existing.clone(),
@@ -4518,6 +4825,58 @@ async fn create_pending_session_space(
                 message_id: existing.channel_post_id,
             },
         ));
+    }
+    if let Some(previous) = store
+        .workflow_record("pending_space", space_id)
+        .map_err(|error| error.to_string())?
+        && let Some(post_id) = previous.get("channel_post_id").and_then(Value::as_i64)
+        && post_id > 0
+    {
+        let native_root = store
+            .native_comment_root(config.channel_chat_id, post_id)
+            .map_err(|error| error.to_string())?;
+        let recovered = RustSessionSpace {
+            space_id: space_id.to_owned(),
+            thread_id: None,
+            lifecycle: "pending".into(),
+            generation,
+            channel_chat_id: config.channel_chat_id,
+            channel_post_id: post_id,
+            discussion_chat_id: native_root.as_ref().map(|root| root.discussion_chat_id),
+            discussion_root_message_id: native_root.as_ref().map(|root| root.root_message_id),
+            status_message_id: None,
+            status_bot_instance: None,
+            owner_chat_id: Some(owner_chat_id),
+            plan_mode: plan_model.is_some(),
+            closed_at_ms: None,
+            created_at_ms: now_ms(),
+            updated_at_ms: now_ms(),
+        };
+        match store.upsert_session_space(&recovered) {
+            Ok(()) => {
+                return Ok((
+                    recovered.clone(),
+                    SentMessage {
+                        message_id: post_id,
+                    },
+                ));
+            }
+            Err(error) => {
+                if let Some(existing) = store
+                    .session_space_for_channel_post(config.channel_chat_id, post_id)
+                    .map_err(|lookup| lookup.to_string())?
+                    .filter(|existing| existing.lifecycle != "closed")
+                {
+                    return Ok((
+                        existing.clone(),
+                        SentMessage {
+                            message_id: existing.channel_post_id,
+                        },
+                    ));
+                }
+                return Err(error.to_string());
+            }
+        }
     }
     let channel = ChannelBinding::new(
         bot.config.instance_id.clone(),
@@ -4748,6 +5107,7 @@ async fn activate_pending_session(
             store, bots_by_id, config, metrics, totp, &active, None, None, false,
         )
         .await?;
+        let short_id = thread.id.as_str().chars().take(8).collect::<String>();
         return send_text(
             bot,
             &surface_for(
@@ -4756,7 +5116,7 @@ async fn activate_pending_session(
                 discussion_chat_id,
                 active.discussion_root_message_id,
             ),
-            &format!("Session {} 已恢复，首条 prompt 已提交。", thread.id),
+            &format!("已创建 Session `{short_id}`。"),
             metrics,
         )
         .await;
@@ -4849,6 +5209,7 @@ async fn activate_pending_session(
         store, bots_by_id, config, metrics, totp, &active, None, None, false,
     )
     .await?;
+    let short_id = thread.id.as_str().chars().take(8).collect::<String>();
     send_text(
         bot,
         &surface_for(
@@ -4857,7 +5218,7 @@ async fn activate_pending_session(
             discussion_chat_id,
             active.discussion_root_message_id,
         ),
-        &format!("已创建 Session {}，首条 prompt 已提交。", thread.id),
+        &format!("已创建 Session `{short_id}`。"),
         metrics,
     )
     .await
@@ -4897,7 +5258,6 @@ async fn finish_new_prompt(
         return Ok(());
     };
     let chat_id = claimed.chat_id;
-    let claim_started_ms = claimed.claimed_at_ms.unwrap_or_default();
     let payload = claimed.payload;
     let space_id = format!("telegram-pending-{}-{}", chat_id, claimed.created_at_ms);
     let (space, channel_post) = match create_pending_session_space(
@@ -4915,8 +5275,13 @@ async fn finish_new_prompt(
     {
         Ok(value) => value,
         Err(error) => {
-            let _ =
-                store.release_control_interaction_claim(key, revision, claim_started_ms, now_ms());
+            // A claimed /new interaction is terminal once creation has
+            // reached this point. Releasing the claim lets the expiry worker
+            // submit a second implicit `Hello`, producing "failed" followed
+            // by a later successful Session. The user can explicitly retry
+            // with a fresh /new instead.
+            let _ = store.delete_workflow_record("new", key);
+            let _ = store.delete_control_interaction(key, now_ms());
             send_text(
                 bot,
                 &surface_for(bot, config, chat_id, None),
@@ -6473,7 +6838,7 @@ async fn run_status_heartbeat_worker(
                 &space,
                 projection,
                 None,
-                true,
+                false,
             )
             .await
             {
@@ -11015,6 +11380,70 @@ mod tests {
             .unwrap()
             .expect("cancel callback is durable and scoped");
         assert_eq!(callback.action, "cancel");
+    }
+
+    #[test]
+    fn new_choice_markup_balances_a_trailing_singleton_before_exit() {
+        let store = SqliteStore::in_memory().unwrap();
+        let draft = new_draft(42, 7, "normal_model", json!({}));
+        persist_new_draft(&store, "new:42", &draft).unwrap();
+        let mut draft = draft;
+        let choices = (0..5)
+            .map(|index| {
+                (
+                    "normal_model".to_owned(),
+                    format!("model-{index}"),
+                    format!("Model {index}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let markup = new_choice_markup(&store, "new:42", &mut draft, &choices)
+            .unwrap()
+            .unwrap();
+        let rows = markup["inline_keyboard"].as_array().unwrap();
+        assert_eq!(
+            rows[..3]
+                .iter()
+                .map(|row| row.as_array().unwrap().len())
+                .collect::<Vec<_>>(),
+            vec![2, 1, 2]
+        );
+        assert_eq!(rows[3].as_array().unwrap()[0]["text"], "退出");
+    }
+
+    #[test]
+    fn new_argument_suggestions_normalize_mode_and_preserve_prompt_tail() {
+        let models = ModelChoices {
+            entries: vec![
+                ModelChoice {
+                    model: "gpt-5.6-luna".into(),
+                    display_name: "GPT 5.6 Luna".into(),
+                    efforts: vec!["low".into(), "high".into(), "max".into()],
+                    default_effort: "high".into(),
+                },
+                ModelChoice {
+                    model: "gpt-5.6-sol".into(),
+                    display_name: "GPT 5.6 Sol".into(),
+                    efforts: vec!["low".into(), "medium".into(), "high".into()],
+                    default_effort: "high".into(),
+                },
+            ],
+            summary: String::new(),
+        };
+        assert_eq!(
+            new_argument_suggestion(
+                &models,
+                "luna | max | nopln | /workspace | keep this | exact prompt"
+            ),
+            "/new gpt-5.6-luna | max | noplan | /workspace | keep this | exact prompt"
+        );
+        assert_eq!(
+            new_argument_suggestion(
+                &models,
+                "luna | max | planmode | sol | | /workspace | prompt"
+            ),
+            "/new gpt-5.6-luna | max | planmode | gpt-5.6-sol | high | /workspace | prompt"
+        );
     }
 
     #[test]

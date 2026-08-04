@@ -791,7 +791,22 @@ fn callback_button<'a>(
 }
 
 fn balanced_rows(buttons: Vec<ControlButton>, columns: usize) -> Vec<Vec<ControlButton>> {
-    buttons.chunks(columns).map(|row| row.to_vec()).collect()
+    if columns == 0 {
+        return Vec::new();
+    }
+    let mut rows = buttons
+        .chunks(columns)
+        .map(|row| row.to_vec())
+        .collect::<Vec<_>>();
+    if columns > 1 && rows.len() > 1 && rows.last().is_some_and(|row| row.len() == 1) {
+        let previous = rows.len().saturating_sub(2);
+        if let Some(button) = rows.get_mut(previous).and_then(Vec::pop) {
+            rows.last_mut()
+                .expect("rows is non-empty")
+                .insert(0, button);
+        }
+    }
+    rows
 }
 
 fn pagination(page: usize, total_pages: usize) -> Vec<(String, usize, bool)> {
