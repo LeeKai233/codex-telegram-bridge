@@ -660,6 +660,27 @@ fn restore_active_sessions(
         let Ok(thread_id) = ThreadId::new(thread_id) else {
             continue;
         };
+        if let Some(projection) = projections.get(thread_id.as_str())
+            && let Some(status) = projection
+                .turn_status
+                .as_deref()
+                .filter(|status| matches!(*status, "completed" | "failed" | "interrupted"))
+        {
+            let reconciled = reconcile_terminal_prompt_intents(
+                store,
+                thread_id.as_str(),
+                status,
+                projection.turn_id.as_deref(),
+                projection.finished_at_ms,
+            )
+            .map_err(DaemonError::Store)?;
+            if reconciled > 0 {
+                eprintln!(
+                    "rust bridge reconciled {reconciled} terminal prompt intent(s) for {}",
+                    thread_id.as_str()
+                );
+            }
+        }
         let sender_instance_id = if chat_id == config.control_chat_id {
             bots_by_id
                 .values()
@@ -697,6 +718,45 @@ fn restore_active_sessions(
     }
     eprintln!("rust bridge restored {restored} active session(s)");
     Ok(())
+}
+
+fn reconcile_terminal_prompt_intents(
+    store: &SqliteStore,
+    thread_id: &str,
+    status: &str,
+    turn_id: Option<&str>,
+    finished_at_ms: Option<i64>,
+) -> Result<usize, String> {
+    let target = match status {
+        "completed" => PromptIntentState::Completed,
+        "failed" => PromptIntentState::Failed,
+        "interrupted" => PromptIntentState::Cancelled,
+        _ => return Ok(0),
+    };
+    let Some(finished_at_ms) = finished_at_ms else {
+        return Ok(0);
+    };
+    let mut reconciled = 0usize;
+    for mut intent in store.prompt_intents().map_err(|error| error.to_string())? {
+        if intent.thread_id.as_ref().map(ThreadId::as_str) != Some(thread_id)
+            || !matches!(
+                intent.state,
+                PromptIntentState::Started | PromptIntentState::Steered
+            )
+            || intent.updated_at_ms > finished_at_ms
+            || turn_id
+                .is_some_and(|turn_id| intent.turn_id.as_ref().map(TurnId::as_str) != Some(turn_id))
+        {
+            continue;
+        }
+        intent.state = target;
+        intent.updated_at_ms = now_ms();
+        store
+            .upsert_prompt_intent(&intent)
+            .map_err(|error| error.to_string())?;
+        reconciled += 1;
+    }
+    Ok(reconciled)
 }
 
 async fn wait_for_shutdown_signal() -> Result<(), DaemonError> {
@@ -5193,6 +5253,24 @@ async fn activate_pending_session(
     intent.updated_at_ms = now_ms();
     store
         .upsert_prompt_intent(&intent)
+        .map_err(|error| error.to_string())?;
+    let activation_record = json!({
+        "intent_id": intent.intent_id,
+        "client_message_id": client_message_id,
+        "source": "session_activation",
+        "thread_id": turn.thread_id.as_str(),
+        "turn_id": turn.id.as_str(),
+        "space_id": repair.space_id,
+        "generation": repair.generation,
+        "state": "started",
+    });
+    store
+        .upsert_workflow_record(
+            "prompt",
+            &intent.client_message_id,
+            &activation_record,
+            now_ms(),
+        )
         .map_err(|error| error.to_string())?;
     let active = RustSessionSpace {
         lifecycle: "active".into(),
@@ -11355,6 +11433,127 @@ mod tests {
         assert!(
             advanced["expires_at_ms"].as_i64().unwrap() - advanced_before
                 <= NEW_PROMPT_TTL_MS + 1000
+        );
+    }
+
+    #[test]
+    fn session_activation_workflow_is_finalized_with_the_initial_turn() {
+        let store = SqliteStore::in_memory().unwrap();
+        let thread_id = ThreadId::new("thread-activation").unwrap();
+        let turn_id = TurnId::new("turn-activation").unwrap();
+        let intent = PromptIntent {
+            intent_id: "intent-activation".into(),
+            client_message_id: "telegram-new-space-activation".into(),
+            source: "session_activation".into(),
+            prompt: "Hello".into(),
+            mode: "default".into(),
+            thread_id: Some(thread_id.clone()),
+            space_id: Some("space-activation".into()),
+            generation: 1,
+            state: PromptIntentState::Started,
+            turn_id: Some(turn_id.clone()),
+            queue_id: None,
+            error: None,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        };
+        store.upsert_prompt_intent(&intent).unwrap();
+        store
+            .upsert_workflow_record(
+                "prompt",
+                &intent.client_message_id,
+                &json!({
+                    "intent_id": intent.intent_id,
+                    "client_message_id": intent.client_message_id,
+                    "source": "session_activation",
+                    "thread_id": thread_id.as_str(),
+                    "turn_id": turn_id.as_str(),
+                    "space_id": "space-activation",
+                    "generation": 1,
+                    "state": "started",
+                }),
+                2,
+            )
+            .unwrap();
+
+        assert!(
+            mark_turn_workflows(
+                &store,
+                thread_id.as_str(),
+                turn_id.as_str(),
+                "completed",
+                None,
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            store
+                .prompt_intent_by_client_message_id(&intent.client_message_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            PromptIntentState::Completed
+        );
+        assert_eq!(
+            store
+                .workflow_record("prompt", &intent.client_message_id)
+                .unwrap()
+                .unwrap()["state"],
+            "completed"
+        );
+    }
+
+    #[test]
+    fn terminal_projection_recovery_only_closes_older_active_intents() {
+        let store = SqliteStore::in_memory().unwrap();
+        let thread_id = ThreadId::new("thread-recovery").unwrap();
+        for (suffix, updated_at_ms) in [("old", 50), ("new", 150)] {
+            store
+                .upsert_prompt_intent(&PromptIntent {
+                    intent_id: format!("intent-recovery-{suffix}"),
+                    client_message_id: format!("client-recovery-{suffix}"),
+                    source: "session_activation".into(),
+                    prompt: "Hello".into(),
+                    mode: "default".into(),
+                    thread_id: Some(thread_id.clone()),
+                    space_id: Some("space-recovery".into()),
+                    generation: 1,
+                    state: PromptIntentState::Started,
+                    turn_id: None,
+                    queue_id: None,
+                    error: None,
+                    created_at_ms: updated_at_ms,
+                    updated_at_ms,
+                })
+                .unwrap();
+        }
+
+        assert_eq!(
+            reconcile_terminal_prompt_intents(
+                &store,
+                thread_id.as_str(),
+                "completed",
+                None,
+                Some(100),
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .prompt_intent_by_client_message_id("client-recovery-old")
+                .unwrap()
+                .unwrap()
+                .state,
+            PromptIntentState::Completed
+        );
+        assert_eq!(
+            store
+                .prompt_intent_by_client_message_id("client-recovery-new")
+                .unwrap()
+                .unwrap()
+                .state,
+            PromptIntentState::Started
         );
     }
 

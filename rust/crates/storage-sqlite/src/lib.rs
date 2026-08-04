@@ -185,6 +185,26 @@ impl SqliteStore {
             .transpose()
     }
 
+    pub fn prompt_intents(&self) -> PortResult<Vec<PromptIntent>> {
+        let connection = self.connection.lock().map_err(lock_error)?;
+        let mut statement = connection
+            .prepare(
+                "SELECT payload_json FROM rust_prompt_intents ORDER BY updated_at_ms, intent_id",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(sql_error)?;
+        let mut intents = Vec::new();
+        for row in rows {
+            let payload = row.map_err(sql_error)?;
+            let intent = serde_json::from_str(&payload)
+                .map_err(|error| PortError::Adapter(error.to_string()))?;
+            intents.push(intent);
+        }
+        Ok(intents)
+    }
+
     pub fn upsert_question(&self, request: &QuestionRequest) -> PortResult<()> {
         let payload = serde_json::to_string(request)
             .map_err(|error| PortError::Adapter(error.to_string()))?;
@@ -2320,6 +2340,41 @@ mod tests {
 
         let fetched = store.get_approval(&approval.id).unwrap().unwrap();
         assert_eq!(fetched, approval);
+    }
+
+    #[test]
+    fn lists_prompt_intents_in_updated_order() {
+        let store = SqliteStore::in_memory().unwrap();
+        let thread_id = ctg_domain::ThreadId::new("thread-intents").unwrap();
+        for (suffix, updated_at_ms) in [("first", 2), ("second", 3)] {
+            store
+                .upsert_prompt_intent(&PromptIntent {
+                    intent_id: format!("intent-{suffix}"),
+                    client_message_id: format!("client-{suffix}"),
+                    source: "telegram".into(),
+                    prompt: suffix.into(),
+                    mode: "default".into(),
+                    thread_id: Some(thread_id.clone()),
+                    space_id: Some("space-intents".into()),
+                    generation: 1,
+                    state: ctg_domain::PromptIntentState::Started,
+                    turn_id: None,
+                    queue_id: None,
+                    error: None,
+                    created_at_ms: 1,
+                    updated_at_ms,
+                })
+                .unwrap();
+        }
+
+        let intents = store.prompt_intents().unwrap();
+        assert_eq!(
+            intents
+                .iter()
+                .map(|intent| intent.intent_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["intent-first", "intent-second"]
+        );
     }
 
     #[test]
