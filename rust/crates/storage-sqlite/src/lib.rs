@@ -878,7 +878,7 @@ impl SqliteStore {
         let connection = self.connection.lock().map_err(lock_error)?;
         connection
             .execute(
-                "INSERT INTO rust_session_spaces(space_id, thread_id, lifecycle, generation, channel_chat_id, channel_post_id, discussion_chat_id, discussion_root_message_id, status_message_id, status_bot_instance, owner_chat_id, plan_mode, closed_at_ms, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) ON CONFLICT(space_id) DO UPDATE SET thread_id=excluded.thread_id, lifecycle=excluded.lifecycle, generation=excluded.generation, channel_chat_id=excluded.channel_chat_id, channel_post_id=excluded.channel_post_id, discussion_chat_id=excluded.discussion_chat_id, discussion_root_message_id=excluded.discussion_root_message_id, status_message_id=excluded.status_message_id, status_bot_instance=excluded.status_bot_instance, owner_chat_id=excluded.owner_chat_id, plan_mode=excluded.plan_mode, closed_at_ms=excluded.closed_at_ms, updated_at_ms=excluded.updated_at_ms WHERE (rust_session_spaces.lifecycle != 'closed' AND excluded.generation >= rust_session_spaces.generation) OR excluded.lifecycle='closed'",
+                "INSERT INTO rust_session_spaces(space_id, thread_id, lifecycle, generation, channel_chat_id, channel_post_id, discussion_chat_id, discussion_root_message_id, status_message_id, status_bot_instance, owner_chat_id, plan_mode, closed_at_ms, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) ON CONFLICT(space_id) DO UPDATE SET thread_id=excluded.thread_id, lifecycle=excluded.lifecycle, generation=excluded.generation, channel_chat_id=excluded.channel_chat_id, channel_post_id=excluded.channel_post_id, discussion_chat_id=COALESCE(excluded.discussion_chat_id, rust_session_spaces.discussion_chat_id), discussion_root_message_id=COALESCE(excluded.discussion_root_message_id, rust_session_spaces.discussion_root_message_id), status_message_id=excluded.status_message_id, status_bot_instance=excluded.status_bot_instance, owner_chat_id=excluded.owner_chat_id, plan_mode=excluded.plan_mode, closed_at_ms=excluded.closed_at_ms, updated_at_ms=excluded.updated_at_ms WHERE (rust_session_spaces.lifecycle != 'closed' AND excluded.generation >= rust_session_spaces.generation) OR excluded.lifecycle='closed'",
                 params![
                     space.space_id,
                     space.thread_id,
@@ -1009,6 +1009,22 @@ impl SqliteStore {
             .map_err(sql_error)
     }
 
+    pub fn session_space_for_channel_post(
+        &self,
+        channel_chat_id: i64,
+        channel_post_id: i64,
+    ) -> PortResult<Option<RustSessionSpace>> {
+        let connection = self.connection.lock().map_err(lock_error)?;
+        connection
+            .query_row(
+                "SELECT space_id, thread_id, lifecycle, generation, channel_chat_id, channel_post_id, discussion_chat_id, discussion_root_message_id, status_message_id, status_bot_instance, owner_chat_id, plan_mode, closed_at_ms, created_at_ms, updated_at_ms FROM rust_session_spaces WHERE channel_chat_id=?1 AND channel_post_id=?2",
+                params![channel_chat_id, channel_post_id],
+                row_to_space,
+            )
+            .optional()
+            .map_err(sql_error)
+    }
+
     pub fn active_session_spaces(&self) -> PortResult<Vec<RustSessionSpace>> {
         let connection = self.connection.lock().map_err(lock_error)?;
         let mut statement = connection
@@ -1051,7 +1067,7 @@ impl SqliteStore {
         let connection = self.connection.lock().map_err(lock_error)?;
         connection
             .query_row(
-                "SELECT space_id, thread_id, lifecycle, generation, channel_chat_id, channel_post_id, discussion_chat_id, discussion_root_message_id, status_message_id, status_bot_instance, owner_chat_id, plan_mode, closed_at_ms, created_at_ms, updated_at_ms FROM rust_session_spaces WHERE discussion_chat_id=?1 AND lifecycle IN ('pending', 'repair_required') ORDER BY updated_at_ms DESC, space_id DESC LIMIT 1",
+                "SELECT s.space_id, s.thread_id, s.lifecycle, s.generation, s.channel_chat_id, s.channel_post_id, COALESCE(s.discussion_chat_id, r.discussion_chat_id), COALESCE(s.discussion_root_message_id, r.root_message_id), s.status_message_id, s.status_bot_instance, s.owner_chat_id, s.plan_mode, s.closed_at_ms, s.created_at_ms, s.updated_at_ms FROM rust_session_spaces AS s LEFT JOIN rust_native_comment_roots AS r ON r.channel_chat_id=s.channel_chat_id AND r.channel_post_id=s.channel_post_id WHERE COALESCE(s.discussion_chat_id, r.discussion_chat_id)=?1 AND s.lifecycle IN ('pending', 'repair_required') ORDER BY s.updated_at_ms DESC, s.space_id DESC LIMIT 1",
                 params![discussion_chat_id],
                 row_to_space,
             )
@@ -1321,7 +1337,7 @@ impl SqliteStore {
         let connection = self.connection.lock().map_err(lock_error)?;
         connection
             .query_row(
-                "SELECT space_id, thread_id, lifecycle, generation, channel_chat_id, channel_post_id, discussion_chat_id, discussion_root_message_id, status_message_id, status_bot_instance, owner_chat_id, plan_mode, closed_at_ms, created_at_ms, updated_at_ms FROM rust_session_spaces WHERE discussion_chat_id=?1 AND discussion_root_message_id=?2",
+                "SELECT s.space_id, s.thread_id, s.lifecycle, s.generation, s.channel_chat_id, s.channel_post_id, COALESCE(s.discussion_chat_id, r.discussion_chat_id), COALESCE(s.discussion_root_message_id, r.root_message_id), s.status_message_id, s.status_bot_instance, s.owner_chat_id, s.plan_mode, s.closed_at_ms, s.created_at_ms, s.updated_at_ms FROM rust_session_spaces AS s LEFT JOIN rust_native_comment_roots AS r ON r.channel_chat_id=s.channel_chat_id AND r.channel_post_id=s.channel_post_id WHERE COALESCE(s.discussion_chat_id, r.discussion_chat_id)=?1 AND COALESCE(s.discussion_root_message_id, r.root_message_id)=?2",
                 params![discussion_chat_id, root_message_id],
                 row_to_space,
             )
@@ -1914,6 +1930,12 @@ impl SqliteStore {
                 .map_err(sql_error)?;
         }
         transaction
+            .execute(
+                "UPDATE rust_session_spaces AS s SET discussion_chat_id=(SELECT r.discussion_chat_id FROM rust_native_comment_roots AS r WHERE r.channel_chat_id=s.channel_chat_id AND r.channel_post_id=s.channel_post_id), discussion_root_message_id=(SELECT r.root_message_id FROM rust_native_comment_roots AS r WHERE r.channel_chat_id=s.channel_chat_id AND r.channel_post_id=s.channel_post_id), updated_at_ms=MAX(s.updated_at_ms, (SELECT r.created_at_ms FROM rust_native_comment_roots AS r WHERE r.channel_chat_id=s.channel_chat_id AND r.channel_post_id=s.channel_post_id)) WHERE EXISTS (SELECT 1 FROM rust_native_comment_roots AS r WHERE r.channel_chat_id=s.channel_chat_id AND r.channel_post_id=s.channel_post_id)",
+                [],
+            )
+            .map_err(sql_error)?;
+        transaction
             .pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(sql_error)?;
         transaction.commit().map_err(sql_error)
@@ -2347,6 +2369,64 @@ mod tests {
         assert_eq!(bound.space_id, "space-1");
         assert_eq!(bound.discussion_root_message_id, Some(700));
         assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn native_comment_binding_survives_stale_session_snapshot_and_recovery_lookup() {
+        let store = SqliteStore::in_memory().unwrap();
+        store.upsert_session_space(&space()).unwrap();
+        let root = NativeCommentRoot {
+            channel_chat_id: -1004446000549,
+            channel_post_id: 81,
+            discussion_chat_id: -1004290500369,
+            root_message_id: 700,
+        };
+        store.bind_native_comment_root(&root, 20).unwrap();
+
+        let mut stale = space();
+        stale.updated_at_ms = 30;
+        store.upsert_session_space(&stale).unwrap();
+
+        let bound = store
+            .session_space_for_discussion_root(-1004290500369, 700)
+            .unwrap()
+            .unwrap();
+        assert_eq!(bound.discussion_chat_id, Some(-1004290500369));
+        assert_eq!(bound.discussion_root_message_id, Some(700));
+        assert_eq!(
+            store
+                .session_space_for_channel_post(-1004446000549, 81)
+                .unwrap()
+                .unwrap()
+                .space_id,
+            "space-1"
+        );
+    }
+
+    #[test]
+    fn pending_lookup_recovers_a_root_recorded_before_space_creation() {
+        let store = SqliteStore::in_memory().unwrap();
+        let root = NativeCommentRoot {
+            channel_chat_id: -1004446000549,
+            channel_post_id: 82,
+            discussion_chat_id: -1004290500369,
+            root_message_id: 701,
+        };
+        store.bind_native_comment_root(&root, 20).unwrap();
+        let mut pending = space();
+        pending.space_id = "pending-root-before-space".into();
+        pending.thread_id = None;
+        pending.lifecycle = "pending".into();
+        pending.channel_post_id = 82;
+        pending.updated_at_ms = 21;
+        store.upsert_session_space(&pending).unwrap();
+
+        let resolved = store
+            .pending_session_space_for_discussion(-1004290500369)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.space_id, "pending-root-before-space");
+        assert_eq!(resolved.discussion_root_message_id, Some(701));
     }
 
     #[test]

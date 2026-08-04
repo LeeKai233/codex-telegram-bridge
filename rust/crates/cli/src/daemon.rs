@@ -1200,7 +1200,6 @@ async fn handle_command(
     totp: &Arc<TotpManager>,
     control_runtime: &Arc<ControlRuntime>,
 ) -> Result<(), String> {
-    let surface = surface_for(&inbound_bot, config, chat_id, None);
     let bound_space = if inbound_bot.role == RuntimeBotRole::Discussion {
         root_message_id
             .and_then(|root| {
@@ -1218,6 +1217,11 @@ async fn handle_command(
     } else {
         None
     };
+    let response_root_message_id = bound_space
+        .as_ref()
+        .and_then(|space| space.discussion_root_message_id)
+        .or(root_message_id);
+    let surface = surface_for(&inbound_bot, config, chat_id, response_root_message_id);
     let write_unlocked = if let Some(space) = bound_space.as_ref() {
         totp.is_unlocked_for_space(&space.space_id, now_ms())
     } else {
@@ -4553,6 +4557,9 @@ async fn create_pending_session_space(
     store
         .upsert_workflow_record("pending_space", space_id, &pending, now_ms())
         .map_err(|error| error.to_string())?;
+    let native_root = store
+        .native_comment_root(config.channel_chat_id, message.message_id)
+        .map_err(|error| error.to_string())?;
     let space = RustSessionSpace {
         space_id: space_id.to_owned(),
         thread_id: None,
@@ -4560,8 +4567,8 @@ async fn create_pending_session_space(
         generation,
         channel_chat_id: config.channel_chat_id,
         channel_post_id: message.message_id.max(1),
-        discussion_chat_id: None,
-        discussion_root_message_id: None,
+        discussion_chat_id: native_root.as_ref().map(|root| root.discussion_chat_id),
+        discussion_root_message_id: native_root.as_ref().map(|root| root.root_message_id),
         status_message_id: None,
         status_bot_instance: None,
         owner_chat_id: Some(owner_chat_id),
@@ -4570,9 +4577,21 @@ async fn create_pending_session_space(
         created_at_ms: now,
         updated_at_ms: now,
     };
-    store
-        .upsert_session_space(&space)
-        .map_err(|error| error.to_string())?;
+    if let Err(error) = store.upsert_session_space(&space) {
+        if let Some(existing) = store
+            .session_space_for_channel_post(space.channel_chat_id, space.channel_post_id)
+            .map_err(|lookup| lookup.to_string())?
+            .filter(|existing| existing.lifecycle != "closed")
+        {
+            return Ok((
+                existing.clone(),
+                SentMessage {
+                    message_id: existing.channel_post_id,
+                },
+            ));
+        }
+        return Err(error.to_string());
+    }
     Ok((space, message))
 }
 

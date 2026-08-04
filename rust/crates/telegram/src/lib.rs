@@ -908,7 +908,10 @@ impl UpdateRouter {
                     if !self.message_is_authorized(&message, false) {
                         return RoutedEffect::Ignore;
                     }
-                    self.route_message_effect(message.clone(), message.reply_to_message_id)
+                    self.route_message_effect(
+                        message.clone(),
+                        message.reply_to_message_id.or(message.message_thread_id),
+                    )
                 }
             }
             (RuntimeBotRole::Discussion, IncomingUpdate::Callback(callback))
@@ -3409,6 +3412,27 @@ mod tests {
             }))),
             RoutedEffect::Dispatch(WorkflowEffect::Command {
                 command: TelegramCommand::Bind,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn discussion_command_uses_message_thread_as_comment_root() {
+        let discussion = UpdateRouter::new(RuntimeBotRole::Discussion, policy()).unwrap();
+        let routed = discussion.route(&update(json!({
+            "message": {
+                "message_id": 12,
+                "chat": {"id": -1004290500369i64},
+                "message_thread_id": 700,
+                "text": "/totp 123456"
+            }
+        })));
+        assert!(matches!(
+            routed,
+            RoutedUpdate::Dispatch(WorkflowAction::Command {
+                command: WorkflowCommand::Totp,
+                root_message_id: Some(700),
                 ..
             })
         ));
