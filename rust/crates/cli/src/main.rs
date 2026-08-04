@@ -202,6 +202,32 @@ fn probe(
             profile.id,
             profile.username.as_deref().unwrap_or("<none>")
         )?;
+        for surface in config
+            .surfaces
+            .iter()
+            .filter(|surface| surface.bot_instance_id == bot.instance_id)
+        {
+            let chat = api
+                .get_chat(&token, surface.chat_id)
+                .map_err(|error| CliError::Runtime(error.to_string()))?;
+            let member = api
+                .get_chat_member(&token, surface.chat_id, profile.id)
+                .map_err(|error| CliError::Runtime(error.to_string()))?;
+            writeln!(
+                output,
+                "{}: surface={:?} chat_id={} chat_type={} forum={} linked_chat_id={:?} member_status={} can_post={} can_edit={} can_delete={}",
+                bot.instance_id,
+                surface.kind,
+                surface.chat_id,
+                chat.chat_type,
+                chat.is_forum,
+                chat.linked_chat_id,
+                member.status,
+                member.can_post_messages,
+                member.can_edit_messages,
+                member.can_delete_messages,
+            )?;
+        }
     }
     Ok(0)
 }
