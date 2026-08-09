@@ -21,7 +21,7 @@ async def test_resume_thread_merges_latest_turn_metadata() -> None:
         calls.append((method, params, timeout))
         return {
             "thread": {"id": "thread-1", "turns": []},
-            "model": "gpt-5.6-luna",
+            "model": "gpt-5.6-terra",
             "reasoningEffort": "max",
             "cwd": "/tmp/project",
             "activePermissionProfile": {"id": "workspace-safe", "extends": "default"},
@@ -38,7 +38,7 @@ async def test_resume_thread_merges_latest_turn_metadata() -> None:
     thread = await client.resume_thread("thread-1")
 
     assert thread["turns"][0]["id"] == "turn-2"
-    assert thread["model"] == "gpt-5.6-luna"
+    assert thread["model"] == "gpt-5.6-terra"
     assert thread["reasoningEffort"] == "max"
     assert thread["cwd"] == "/tmp/project"
     assert thread["activePermissionProfile"] == {
@@ -158,7 +158,7 @@ async def test_start_turn_passes_security_overrides(tmp_path: Path) -> None:
         cwd=tmp_path,
         sandbox_policy=policy,
         approval_policy="never",
-        model="gpt-5.6-luna",
+        model="gpt-5.6-terra",
         effort="max",
     )
 
@@ -166,7 +166,7 @@ async def test_start_turn_passes_security_overrides(tmp_path: Path) -> None:
     assert params["cwd"] == str(tmp_path)
     assert params["sandboxPolicy"] == policy
     assert params["approvalPolicy"] == "never"
-    assert params["model"] == "gpt-5.6-luna"
+    assert params["model"] == "gpt-5.6-terra"
     assert params["effort"] == "max"
 
 
@@ -329,13 +329,13 @@ async def test_collaboration_modes_are_validated_and_resolved() -> None:
 
     explicit = await client.resolve_collaboration_mode(
         "default",
-        model=" gpt-5.6-luna ",
+        model=" gpt-5.6-terra ",
         effort=" max ",
     )
     assert explicit == {
         "mode": "default",
         "settings": {
-            "model": "gpt-5.6-luna",
+            "model": "gpt-5.6-terra",
             "reasoning_effort": "max",
             "developer_instructions": None,
         },
@@ -397,7 +397,7 @@ async def test_collaboration_modes_fail_closed_on_missing_or_invalid_capability(
     with pytest.raises(ValueError, match="Unsupported"):
         await client.resolve_collaboration_mode("review")
     with pytest.raises(ValueError, match="provided together"):
-        await client.resolve_collaboration_mode("plan", model="gpt-5.6-luna")
+        await client.resolve_collaboration_mode("plan", model="gpt-5.6-terra")
 
 
 @pytest.mark.asyncio
@@ -414,8 +414,8 @@ async def test_model_options_follow_pagination_and_validate_efforts() -> None:
             return {
                 "data": [
                     {
-                        "model": "gpt-5.6-luna",
-                        "displayName": "GPT-5.6 Luna",
+                        "model": "gpt-5.6-terra",
+                        "displayName": "GPT-5.6 Terra",
                         "defaultReasoningEffort": "high",
                         "isDefault": True,
                         "supportedReasoningEfforts": [
@@ -445,7 +445,7 @@ async def test_model_options_follow_pagination_and_validate_efforts() -> None:
 
     options = await client.list_model_options(page_size=1)
 
-    assert [option.model for option in options] == ["gpt-5.6-luna", "gpt-5.6-sol"]
+    assert [option.model for option in options] == ["gpt-5.6-terra", "gpt-5.6-sol"]
     assert options[0].supported_efforts == ("high", "max")
     assert options[0].is_default
     assert calls == [
@@ -544,7 +544,7 @@ async def test_update_thread_settings_sends_explicit_collaboration_profile() -> 
     client.request = request  # type: ignore[method-assign]
     collaboration_mode = await client.resolve_collaboration_mode(
         "plan",
-        model="gpt-5.6-luna",
+        model="gpt-5.6-terra",
         effort="low",
     )
 
@@ -874,7 +874,7 @@ async def test_isolated_question_model_override_failure_is_scoped_and_clear(
         if method == "thread/fork":
             return {"thread": {"id": "fork-unsupported", "ephemeral": True}}
         if method == "turn/start":
-            raise CodexRpcError(method, {"message": "unknown model gpt-5.6-luna"})
+            raise CodexRpcError(method, {"message": "unknown model gpt-5.6-terra"})
         if method == "thread/list":
             return {"data": [{"id": "primary"}]}
         return {}
@@ -883,19 +883,19 @@ async def test_isolated_question_model_override_failure_is_scoped_and_clear(
 
     with pytest.raises(
         RuntimeError,
-        match=r"Configured utility model or effort was rejected.*gpt-5\.6-luna, max",
+        match=r"Configured utility model or effort was rejected.*gpt-5\.6-terra, max",
     ):
         await client.ask_fork_question(
             "primary",
             tmp_path,
             "question?",
             client_message_id="telegram-model",
-            model="gpt-5.6-luna",
+            model="gpt-5.6-terra",
             effort="max",
         )
 
     turn_params = next(params for method, params in calls if method == "turn/start")
-    assert turn_params["model"] == "gpt-5.6-luna"
+    assert turn_params["model"] == "gpt-5.6-terra"
     assert turn_params["effort"] == "max"
     assert ("thread/delete", {"threadId": "fork-unsupported"}) in calls
     assert await client.list_threads(limit=1) == [{"id": "primary"}]

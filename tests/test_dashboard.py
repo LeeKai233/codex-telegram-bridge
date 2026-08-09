@@ -390,7 +390,7 @@ async def test_space_dashboard_passes_mode_profiles_tasks_and_advancing_animatio
             "current_mode": "plan",
             "normal_model": "gpt-5.6-sol",
             "normal_effort": "xhigh",
-            "plan_model": "gpt-5.6-luna",
+            "plan_model": "gpt-5.6-terra",
             "plan_effort": "max",
         }
     )
@@ -404,7 +404,7 @@ async def test_space_dashboard_passes_mode_profiles_tasks_and_advancing_animatio
                 task_id="subagent-1",
                 title="Review",
                 status="inProgress",
-                model="gpt-5.6-luna",
+                model="gpt-5.6-terra",
                 reasoning_effort="max",
             )
         ],
@@ -475,7 +475,7 @@ async def test_space_dashboard_passes_mode_profiles_tasks_and_advancing_animatio
     assert received[0][0]["current_mode"] == "plan"
     assert received[0][0]["normal_model"] == "gpt-5.6-sol"
     assert received[0][0]["plan_effort"] == "max"
-    assert received[0][1].tasks[0].model == "gpt-5.6-luna"
+    assert received[0][1].tasks[0].model == "gpt-5.6-terra"
     assert received[0][1].tasks[0].reasoning_effort == "max"
     assert [item.key.bot_role for item in delivery.intents] == [
         "control",

@@ -510,8 +510,8 @@ async def test_model_profile_alias_and_effort_are_resolved_from_catalog(
     async def list_options() -> list[ModelOption]:
         return [
             ModelOption(
-                model="gpt-5.6-luna",
-                display_name="GPT-5.6 Luna",
+                model="gpt-5.6-terra",
+                display_name="GPT-5.6 Terra",
                 supported_efforts=("high", "max"),
                 default_effort="high",
                 is_default=True,
@@ -520,11 +520,11 @@ async def test_model_profile_alias_and_effort_are_resolved_from_catalog(
 
     monkeypatch.setattr(bridge.client, "list_model_options", list_options)
 
-    assert await bridge.resolve_model_profile("luna", "MAX") == ModelProfile(
-        "gpt-5.6-luna", "max"
+    assert await bridge.resolve_model_profile("terra", "MAX") == ModelProfile(
+        "gpt-5.6-terra", "max"
     )
     with pytest.raises(ValueError, match="unavailable for model"):
-        await bridge.resolve_model_profile("luna", "xhigh")
+        await bridge.resolve_model_profile("terra", "xhigh")
     store.close()
 
 
@@ -539,9 +539,9 @@ async def test_activate_pending_session_starts_with_explicit_plan_profile(
             space_type="pending_new",
             pending_cwd=str(tmp_path),
             pending_prompt="Plan first",
-            normal_model="gpt-5.6-luna",
+            normal_model="gpt-5.6-terra",
             normal_effort="max",
-            plan_model="gpt-5.6-luna",
+            plan_model="gpt-5.6-terra",
             plan_effort="low",
             current_mode="plan",
         )
@@ -585,7 +585,7 @@ async def test_activate_pending_session_starts_with_explicit_plan_profile(
 
     assert started[0]["collaboration_mode"] == {
         "mode": "plan",
-        "settings": {"model": "gpt-5.6-luna", "reasoning_effort": "low"},
+        "settings": {"model": "gpt-5.6-terra", "reasoning_effort": "low"},
     }
     space = store.get_session_space("space-profiled")
     assert space is not None and (space.current_mode, space.lifecycle) == ("plan", "active")
@@ -614,7 +614,7 @@ async def test_change_space_model_updates_current_mode_for_subsequent_turns(
     updates: list[tuple[str, dict[str, Any]]] = []
 
     async def resolve_profile(_model: str, _effort: str) -> ModelProfile:
-        return ModelProfile("gpt-5.6-luna", "max")
+        return ModelProfile("gpt-5.6-terra", "max")
 
     async def resolve_mode(
         mode: str, *, model: str | None = None, effort: str | None = None
@@ -633,9 +633,9 @@ async def test_change_space_model_updates_current_mode_for_subsequent_turns(
     monkeypatch.setattr(bridge.client, "resolve_collaboration_mode", resolve_mode)
     monkeypatch.setattr(bridge.client, "update_thread_settings", update_settings)
 
-    changed = await bridge.change_space_model("space-change", "luna", "max")
+    changed = await bridge.change_space_model("space-change", "terra", "max")
 
-    assert (changed.normal_model, changed.normal_effort) == ("gpt-5.6-luna", "max")
+    assert (changed.normal_model, changed.normal_effort) == ("gpt-5.6-terra", "max")
     assert (changed.plan_model, changed.plan_effort) == ("plan-old", "low")
     assert updates[0][0] == "thread-change"
     assert updates[0][1]["mode"] == "default"
@@ -671,7 +671,7 @@ async def test_change_space_model_preserves_permission_profile(
     updates: list[dict[str, Any]] = []
 
     async def resolve_profile(_model: str, _effort: str) -> ModelProfile:
-        return ModelProfile("gpt-5.6-luna", "max")
+        return ModelProfile("gpt-5.6-terra", "max")
 
     async def resolve_mode(
         mode: str, *, model: str | None = None, effort: str | None = None
@@ -688,14 +688,14 @@ async def test_change_space_model_preserves_permission_profile(
     monkeypatch.setattr(bridge.client, "resolve_collaboration_mode", resolve_mode)
     monkeypatch.setattr(bridge.client, "update_thread_settings", update_settings)
 
-    await bridge.change_space_model("space-security", "luna", "max")
+    await bridge.change_space_model("space-security", "terra", "max")
 
     assert updates == [
         {
             "collaboration_mode": {
                 "mode": "default",
                 "settings": {
-                    "model": "gpt-5.6-luna",
+                    "model": "gpt-5.6-terra",
                     "reasoning_effort": "max",
                 },
             },
@@ -1652,7 +1652,7 @@ async def test_ask_space_question_uses_isolated_client_without_mutating_primary_
     )
     bridge.config = replace(
         bridge.config,
-        ask_model="gpt-5.6-luna",
+        ask_model="gpt-5.6-terra",
         ask_reasoning_effort="medium",
     )
     calls: list[tuple[str, Path, str, str, str | None, str | None]] = []
@@ -1683,7 +1683,7 @@ async def test_ask_space_question_uses_isolated_client_without_mutating_primary_
             tmp_path.resolve(),
             "What does this error mean?",
             "tg-ask-1",
-            "gpt-5.6-luna",
+            "gpt-5.6-terra",
             "medium",
         )
     ]
@@ -1838,7 +1838,7 @@ async def test_collaboration_turn_validates_space_generation_before_start(
         return {
             "id": "thread-plan",
             "cwd": str(tmp_path),
-            "model": "gpt-5.6-luna",
+            "model": "gpt-5.6-terra",
             "reasoningEffort": "max",
             "status": {"type": "idle"},
         }
@@ -1847,7 +1847,7 @@ async def test_collaboration_turn_validates_space_generation_before_start(
         mode: str, *, model: str, effort: str
     ) -> dict[str, Any]:
         assert mode == "default"
-        assert (model, effort) == ("gpt-5.6-luna", "max")
+        assert (model, effort) == ("gpt-5.6-terra", "max")
         space = store.get_session_space("space-plan")
         assert space is not None
         space.generation = 4
@@ -2207,11 +2207,11 @@ async def test_subagent_activity_hydrates_effective_child_profile(
     store.subscribe("parent")
 
     async def resume_thread(thread_id: str) -> dict[str, Any]:
-        assert thread_id == "child-luna"
+        assert thread_id == "child-terra"
         return {
             "id": thread_id,
             "parentThreadId": "parent",
-            "model": "gpt-5.6-luna",
+            "model": "gpt-5.6-terra",
             "reasoningEffort": "max",
             "status": {"type": "active"},
         }
@@ -2222,21 +2222,21 @@ async def test_subagent_activity_hydrates_effective_child_profile(
         {
             "threadId": "parent",
             "item": {
-                "id": "activity-child-luna",
+                "id": "activity-child-terra",
                 "type": "subAgentActivity",
-                "agentThreadId": "child-luna",
+                "agentThreadId": "child-terra",
                 "agentPath": "/root/reviewer",
                 "kind": "started",
             },
         },
     )
-    task = bridge._subagent_profile_tasks["child-luna"]
+    task = bridge._subagent_profile_tasks["child-terra"]
     await task
 
     parent = store.get_thread("parent")
     assert parent is not None
     assert [(item.model, item.reasoning_effort) for item in parent.tasks] == [
-        ("gpt-5.6-luna", "max")
+        ("gpt-5.6-terra", "max")
     ]
     store.close()
 
@@ -2387,7 +2387,7 @@ async def test_subagent_hydration_retries_transient_failures_in_one_coalesced_ta
         return {
             "id": thread_id,
             "parentThreadId": "parent",
-            "model": "gpt-5.6-luna",
+            "model": "gpt-5.6-terra",
             "reasoningEffort": "max",
             "status": {"type": "active"},
         }
@@ -2405,7 +2405,7 @@ async def test_subagent_hydration_retries_transient_failures_in_one_coalesced_ta
     assert attempts == 3
     assert parent is not None
     assert (parent.tasks[0].model, parent.tasks[0].reasoning_effort) == (
-        "gpt-5.6-luna",
+        "gpt-5.6-terra",
         "max",
     )
     store.close()

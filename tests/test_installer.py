@@ -143,7 +143,7 @@ def test_final_app_server_mode_is_persisted_after_strategy_selection(tmp_path: P
     config_dir.mkdir(mode=0o700, parents=True)
     config = config_dir / "config.toml"
     config.write_text(
-        '[bridge]\napp_server_mode = "installer-service"\nask_model = "gpt-5.6-luna"\n',
+        '[bridge]\napp_server_mode = "installer-service"\nask_model = "gpt-5.6-terra"\n',
         encoding="utf-8",
     )
     config.chmod(0o600)

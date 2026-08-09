@@ -583,13 +583,13 @@ def test_interaction_draft_progress_and_claim_are_atomic_across_connections(
             draft.flow_id,
             draft.revision,
             phase="effort",
-            payload={"model": "gpt-5.6-luna"},
+            payload={"model": "gpt-5.6-terra"},
             expires_at=4_000_000_001,
         )
         assert advanced is not None
         assert advanced.revision == 2
         assert advanced.phase == "effort"
-        assert advanced.payload == {"model": "gpt-5.6-luna"}
+        assert advanced.payload == {"model": "gpt-5.6-terra"}
         assert (
             first.advance_interaction(
                 draft.scope_key,
@@ -697,7 +697,7 @@ def test_reset_owner_deletes_interaction_drafts(tmp_path: Path) -> None:
             "discussion:22:8:planmode",
             kind="planmode",
             phase="prompt",
-            payload={"model": "gpt-5.6-luna", "effort": "max"},
+            payload={"model": "gpt-5.6-terra", "effort": "max"},
             user_id=8,
             bot_role="discussion",
             chat_id=22,

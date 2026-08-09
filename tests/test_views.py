@@ -168,7 +168,7 @@ def test_status_comment_lists_active_agents_before_bounded_terminal_history() ->
             agent_path="/root/security_status",
             agent_nickname="Ada_*[]",
             agent_role="reviewer",
-            model="gpt-5.6-luna",
+            model="gpt-5.6-terra",
             reasoning_effort="max",
             message="PRIVATE REASONING AND TOOL ARGUMENTS",
             started_at=1_700_000_000,
@@ -202,7 +202,7 @@ def test_status_comment_lists_active_agents_before_bounded_terminal_history() ->
     assert "*🤝 Subagents*" in rendered.markdown
     assert "Ada\\_\\*\\[\\]" in rendered.markdown
     assert "`reviewer`" in rendered.markdown
-    assert "`gpt-5.6-luna/max`" in rendered.markdown
+    assert "`gpt-5.6-terra/max`" in rendered.markdown
     assert "`00:02:00`" in rendered.markdown
     assert rendered.plain.index("active-a") < rendered.plain.index("done-new")
     assert "Recent completion" in rendered.plain
@@ -219,7 +219,7 @@ def test_status_comment_shows_animated_mode_and_main_and_subagent_profiles() -> 
             task_id="worker",
             title="Implement command",
             status="inProgress",
-            model="gpt-5.6-luna",
+            model="gpt-5.6-terra",
             reasoning_effort="max",
         )
     ]
@@ -227,7 +227,7 @@ def test_status_comment_shows_animated_mode_and_main_and_subagent_profiles() -> 
         "space_id": "space-1",
         "lifecycle": "active",
         "thread_id": "parent",
-        "normal_model": "gpt-5.6-luna",
+        "normal_model": "gpt-5.6-terra",
         "normal_effort": "max",
         "plan_model": "gpt-5.6-sol",
         "plan_effort": "xhigh",
@@ -240,7 +240,7 @@ def test_status_comment_shows_animated_mode_and_main_and_subagent_profiles() -> 
 
     assert rendered.markdown.startswith("🌒 *🧭 TUI Plan mode*")
     assert "*🧠 Main*  `gpt-5.6-sol` · Effort `xhigh`" in rendered.markdown
-    assert "`gpt-5.6-luna/max`" in rendered.markdown
+    assert "`gpt-5.6-terra/max`" in rendered.markdown
     assert rendered.plain.startswith("🌒 🧭 TUI Plan mode")
 
     channel = render_channel_post(state, space=space, animation_frame=1)

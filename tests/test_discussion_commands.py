@@ -25,7 +25,7 @@ SPACE = {
     "current_mode": "normal",
     "normal_model": "gpt-5.6-sol",
     "normal_effort": "xhigh",
-    "plan_model": "gpt-5.6-luna",
+    "plan_model": "gpt-5.6-terra",
     "plan_effort": "max",
 }
 
@@ -225,8 +225,8 @@ class FakeBridge:
         self.store = store
         self.options = [
             SimpleNamespace(
-                model="gpt-5.6-luna",
-                display_name="GPT-5.6 Luna",
+                model="gpt-5.6-terra",
+                display_name="GPT-5.6 Terra",
                 supported_efforts=("high", "max"),
                 default_effort="max",
                 is_default=False,
@@ -249,7 +249,7 @@ class FakeBridge:
         return self.options
 
     async def resolve_model_profile(self, model: str, effort: str) -> object:
-        aliases = {"luna": "gpt-5.6-luna", "sol": "gpt-5.6-sol"}
+        aliases = {"terra": "gpt-5.6-terra", "sol": "gpt-5.6-sol"}
         selected = aliases.get(model, model)
         option = next((item for item in self.options if item.model == selected), None)
         if option is None or effort not in option.supported_efforts:
@@ -383,17 +383,17 @@ async def test_planmode_full_command_preserves_pipe_text_and_uses_selected_profi
     runtime = command_runtime
 
     await runtime.controller.planmode(
-        update("/planmode luna | max | inspect A | then B"), SimpleNamespace()
+        update("/planmode terra | max | inspect A | then B"), SimpleNamespace()
     )
 
     assert runtime.bridge.profile_sets == [
-        ("space-command", "plan", "gpt-5.6-luna", "max")
+        ("space-command", "plan", "gpt-5.6-terra", "max")
     ]
     [turn] = runtime.bridge.turns
     assert turn["prompt"] == "inspect A | then B"
     assert turn["mode"] == "plan"
     assert (turn["profile"].model, turn["profile"].effort) == (
-        "gpt-5.6-luna",
+        "gpt-5.6-terra",
         "max",
     )
 
@@ -472,12 +472,12 @@ async def test_invalid_profile_returns_a_normalized_command_suggestion(
     runtime = command_runtime
 
     await runtime.controller.changemodel(
-        update("/changemodel lunaa | mx"), SimpleNamespace()
+        update("/changemodel terraa | mx"), SimpleNamespace()
     )
 
     assert runtime.bridge.model_changes == []
     assert (
-        "/changemodel gpt-5.6-luna | max" in runtime.sent[-1]["markdown"]
+        "/changemodel gpt-5.6-terra | max" in runtime.sent[-1]["markdown"]
     )
 
 
@@ -488,12 +488,12 @@ async def test_invalid_planmode_profile_suggestion_preserves_prompt(
     runtime = command_runtime
 
     await runtime.controller.planmode(
-        update("/planmode lunaa | mx | keep this | exact prompt"),
+        update("/planmode terraa | mx | keep this | exact prompt"),
         SimpleNamespace(),
     )
 
     assert (
-        "/planmode gpt-5.6-luna | max | keep this | exact prompt"
+        "/planmode gpt-5.6-terra | max | keep this | exact prompt"
         in runtime.sent[-1]["markdown"]
     )
 
@@ -575,7 +575,7 @@ async def test_profile_effort_claims_revision_before_profile_side_effect(
     assert runtime.bridge.profile_sets[-1] == (
         "space-command",
         "plan",
-        "gpt-5.6-luna",
+        "gpt-5.6-terra",
         "max",
     )
 
@@ -671,7 +671,7 @@ async def test_expired_prompt_and_absent_plan_execution_are_recovered(
         "discussion:-100426:space-command:3:7",
         kind="planmode",
         phase="await_prompt",
-        payload={"model": "gpt-5.6-luna", "effort": "max"},
+        payload={"model": "gpt-5.6-terra", "effort": "max"},
         user_id=7,
         bot_role=DISCUSSION_ROLE,
         chat_id=-100426,

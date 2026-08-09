@@ -303,7 +303,7 @@ async def test_thread_settings_notification_updates_space_mode_and_profile(tmp_p
             space_id="space-settings",
             lifecycle="active",
             thread_id="thread-settings",
-            normal_model="gpt-5.6-luna",
+            normal_model="gpt-5.6-terra",
             normal_effort="max",
         )
     )
@@ -912,7 +912,7 @@ async def test_subagent_protocol_metadata_is_linked_without_exposing_activity_pa
             "parentThreadId": "parent",
             "agentNickname": "Ada",
             "agentRole": "reviewer",
-            "model": "gpt-5.6-luna",
+            "model": "gpt-5.6-terra",
             "reasoningEffort": "max",
             "ephemeral": False,
             "source": {
@@ -992,7 +992,7 @@ async def test_subagent_protocol_metadata_is_linked_without_exposing_activity_pa
     assert task.agent_nickname == "Ada"
     assert task.agent_role == "reviewer"
     assert task.agent_path == "/root/reviewer"
-    assert task.model == "gpt-5.6-luna"
+    assert task.model == "gpt-5.6-terra"
     assert task.reasoning_effort == "max"
     assert task.status == "interrupted"
     assert task.finished_at == 500
@@ -1014,9 +1014,9 @@ async def test_mixed_subagent_profiles_are_not_overwritten_by_group_activity(
     projector.apply_thread({"id": "parent", "status": {"type": "active"}})
     projector.apply_thread(
         {
-            "id": "child-luna",
+            "id": "child-terra",
             "parentThreadId": "parent",
-            "model": "gpt-5.6-luna",
+            "model": "gpt-5.6-terra",
             "reasoningEffort": "max",
             "status": {"type": "active"},
         }
@@ -1041,9 +1041,9 @@ async def test_mixed_subagent_profiles_are_not_overwritten_by_group_activity(
                 "tool": "sendMessage",
                 "status": "inProgress",
                 "reasoningEffort": "low",
-                "receiverThreadIds": ["child-luna"],
+                "receiverThreadIds": ["child-terra"],
                 "agentsStates": {
-                    "child-luna": {"status": "running"},
+                    "child-terra": {"status": "running"},
                     "child-sol": {"status": "running"},
                 },
             },
@@ -1056,7 +1056,7 @@ async def test_mixed_subagent_profiles_are_not_overwritten_by_group_activity(
         task.task_id: (task.model, task.reasoning_effort) for task in parent.tasks
     }
     assert profiles == {
-        "child-luna": ("gpt-5.6-luna", "max"),
+        "child-terra": ("gpt-5.6-terra", "max"),
         "child-sol": ("gpt-5.6-sol", "xhigh"),
     }
     store.close()
