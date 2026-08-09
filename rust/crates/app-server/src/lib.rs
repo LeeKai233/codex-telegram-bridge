@@ -18,7 +18,7 @@ use std::{
         Arc, Mutex as StdMutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use thiserror::Error;
 use tokio::{
@@ -658,8 +658,34 @@ impl AppServerClient {
         params: Value,
         request_timeout: Duration,
     ) -> Result<Value, AppServerError> {
-        let state = self.wait_connected(request_timeout).await?;
-        let permit = timeout(request_timeout, self.inner.permits.clone().acquire_owned())
+        let method = method.into();
+        // One shared deadline across the connection wait, the permit wait,
+        // and the response wait (previously each phase restarted its own
+        // full budget, tripling the worst case). A reconnect that kills an
+        // in-flight request gets a single retry inside the same budget.
+        let deadline = Instant::now() + request_timeout;
+        for attempt in 0..2 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(AppServerError::Timeout);
+            }
+            match self.request_once(&method, params.clone(), deadline).await {
+                Err(AppServerError::Disconnected) if attempt == 0 => continue,
+                result => return result,
+            }
+        }
+        unreachable!("the second attempt always returns")
+    }
+
+    async fn request_once(
+        &self,
+        method: &str,
+        params: Value,
+        deadline: Instant,
+    ) -> Result<Value, AppServerError> {
+        let remaining = || deadline.saturating_duration_since(Instant::now());
+        let state = self.wait_connected(remaining()).await?;
+        let permit = timeout(remaining(), self.inner.permits.clone().acquire_owned())
             .await
             .map_err(|_| AppServerError::Timeout)
             .and_then(|value| value.map_err(|_| AppServerError::Shutdown))?;
@@ -667,7 +693,7 @@ impl AppServerClient {
         let outbound = Outbound::Request {
             generation: state.generation,
             id: self.inner.ids.fetch_add(1, Ordering::Relaxed),
-            method: method.into(),
+            method: method.to_owned(),
             params,
             response: response_tx,
             permit,
@@ -679,7 +705,7 @@ impl AppServerClient {
                 mpsc::error::TrySendError::Full(_) => AppServerError::QueueFull,
                 mpsc::error::TrySendError::Closed(_) => AppServerError::Shutdown,
             })?;
-        timeout(request_timeout, response_rx)
+        timeout(remaining(), response_rx)
             .await
             .map_err(|_| AppServerError::Timeout)?
             .map_err(|_| AppServerError::Disconnected)?
