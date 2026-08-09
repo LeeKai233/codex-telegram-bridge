@@ -44,6 +44,10 @@ pub struct RustConfig {
     pub poll_timeout_seconds: u16,
     #[serde(default = "default_max_backlog")]
     pub max_backlog: usize,
+    #[serde(default = "default_ask_model")]
+    pub ask_model: String,
+    #[serde(default = "default_ask_reasoning_effort")]
+    pub ask_reasoning_effort: String,
     #[serde(default)]
     pub poll_updates: bool,
     #[serde(default = "default_channel_chat_id")]
@@ -107,6 +111,8 @@ impl Default for RustConfig {
             request_timeout_seconds: default_request_timeout_seconds(),
             poll_timeout_seconds: default_poll_timeout_seconds(),
             max_backlog: default_max_backlog(),
+            ask_model: default_ask_model(),
+            ask_reasoning_effort: default_ask_reasoning_effort(),
             poll_updates: false,
             channel_chat_id: default_channel_chat_id(),
             discussion_chat_id: default_discussion_chat_id(),
@@ -248,6 +254,9 @@ impl RustConfig {
         if self.max_backlog == 0 || self.max_backlog > 1000 {
             return Err(ConfigError::InvalidBacklog);
         }
+        if self.ask_model.trim().is_empty() || self.ask_reasoning_effort.trim().is_empty() {
+            return Err(ConfigError::InvalidAskProfile);
+        }
         if !self.metrics_bind.starts_with("127.0.0.1:") {
             return Err(ConfigError::MetricsMustBeLoopback);
         }
@@ -319,6 +328,14 @@ fn default_poll_timeout_seconds() -> u16 {
 
 fn default_max_backlog() -> usize {
     100
+}
+
+fn default_ask_model() -> String {
+    "gpt-5.6-terra".into()
+}
+
+fn default_ask_reasoning_effort() -> String {
+    "medium".into()
 }
 
 fn default_channel_chat_id() -> i64 {
@@ -444,6 +461,8 @@ pub enum ConfigError {
     InvalidPollTimeout,
     #[error("poll backlog must be between 1 and 1000 updates")]
     InvalidBacklog,
+    #[error("ask model and reasoning effort must not be empty")]
+    InvalidAskProfile,
     #[error("channel and discussion chat ids must be negative; control chat id must be nonzero")]
     InvalidTopology,
     #[error("invalid bot instance: {instance_id}")]
@@ -462,7 +481,7 @@ impl serde::Serialize for RustConfig {
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("RustConfig", 21)?;
+        let mut state = serializer.serialize_struct("RustConfig", 23)?;
         state.serialize_field("api_base", &self.api_base)?;
         state.serialize_field("credential_registry", &self.credential_registry)?;
         state.serialize_field("legacy_control_token", &self.legacy_control_token)?;
@@ -478,6 +497,8 @@ impl serde::Serialize for RustConfig {
         state.serialize_field("request_timeout_seconds", &self.request_timeout_seconds)?;
         state.serialize_field("poll_timeout_seconds", &self.poll_timeout_seconds)?;
         state.serialize_field("max_backlog", &self.max_backlog)?;
+        state.serialize_field("ask_model", &self.ask_model)?;
+        state.serialize_field("ask_reasoning_effort", &self.ask_reasoning_effort)?;
         state.serialize_field("poll_updates", &self.poll_updates)?;
         state.serialize_field("channel_chat_id", &self.channel_chat_id)?;
         state.serialize_field("discussion_chat_id", &self.discussion_chat_id)?;
