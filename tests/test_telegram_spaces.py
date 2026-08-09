@@ -182,8 +182,8 @@ class FakeBridge:
     async def list_model_options(self) -> list[ModelOption]:
         return [
             ModelOption(
-                model="gpt-5.6-luna",
-                display_name="GPT-5.6 Luna",
+                model="gpt-5.6-terra",
+                display_name="GPT-5.6 Terra",
                 supported_efforts=("high", "max"),
                 default_effort="high",
                 is_default=True,
@@ -191,9 +191,9 @@ class FakeBridge:
         ]
 
     async def resolve_model_profile(self, model: str, effort: str) -> ModelProfile:
-        if model not in {"gpt-5.6-luna", "luna"} or effort not in {"high", "max"}:
+        if model not in {"gpt-5.6-terra", "terra"} or effort not in {"high", "max"}:
             raise ValueError("invalid model profile")
-        return ModelProfile("gpt-5.6-luna", effort)
+        return ModelProfile("gpt-5.6-terra", effort)
 
     async def list_sessions(
         self, *, search_term: str | None = None, limit: int = 200
@@ -938,7 +938,7 @@ async def test_space_dashboard_keeps_channel_native_comments_and_status_controls
 @pytest.mark.asyncio
 async def test_new_session_is_activated_only_after_totp_inside_its_comment_thread(rig: Rig) -> None:
     new_update = update_for_message(
-        "/new gpt-5.6-luna | max | noplan | project | Build the feature",
+        "/new gpt-5.6-terra | max | noplan | project | Build the feature",
         update_id=80,
         message_id=20,
         chat_id=OWNER_CHAT_ID,
@@ -950,7 +950,7 @@ async def test_new_session_is_activated_only_after_totp_inside_its_comment_threa
     assert space["space_type"] == "pending_new"
     assert space["thread_id"] is None
     assert (space["normal_model"], space["normal_effort"], space["current_mode"]) == (
-        "gpt-5.6-luna",
+        "gpt-5.6-terra",
         "max",
         "default",
     )

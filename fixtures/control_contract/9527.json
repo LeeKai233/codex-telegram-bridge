@@ -24,20 +24,20 @@
   },
   {
     "name": "new_model_choices_deadline_and_rows",
-    "request": {"kind": "new", "draft": {"phase": "normal_model"}, "models": [{"model": "gpt-5.6-luna", "display_name": "GPT 5.6 Luna", "supported_efforts": ["low", "max"]}, {"model": "gpt-5.6-sol", "display_name": "GPT 5.6 Sol", "supported_efforts": ["high", "xhigh"]}]},
+    "request": {"kind": "new", "draft": {"phase": "normal_model"}, "models": [{"model": "gpt-5.6-terra", "display_name": "GPT 5.6 Terra", "supported_efforts": ["low", "medium", "high", "xhigh", "max"]}, {"model": "gpt-5.6-sol", "display_name": "GPT 5.6 Sol", "supported_efforts": ["high", "xhigh"]}]},
     "effects": [
       {"type": "interaction_deadline", "phase": "normal_model", "deadline_seconds": 300},
-      {"type": "render", "operation": "send", "markdown": "请选择 当前模式 使用的模型：", "plain": null, "keyboard": [[{"label": "GPT 5.6 Luna", "target": {"kind": "callback", "action": "normal_model", "payload": {"value": "gpt-5.6-luna"}}}, {"label": "GPT 5.6 Sol", "target": {"kind": "callback", "action": "normal_model", "payload": {"value": "gpt-5.6-sol"}}}], [{"label": "退出", "target": {"kind": "callback", "action": "cancel", "payload": {}}}]]}
+      {"type": "render", "operation": "send", "markdown": "请选择 当前模式 使用的模型：", "plain": null, "keyboard": [[{"label": "GPT 5.6 Terra", "target": {"kind": "callback", "action": "normal_model", "payload": {"value": "gpt-5.6-terra"}}}, {"label": "GPT 5.6 Sol", "target": {"kind": "callback", "action": "normal_model", "payload": {"value": "gpt-5.6-sol"}}}], [{"label": "退出", "target": {"kind": "callback", "action": "cancel", "payload": {}}}]]}
     ]
   },
   {
     "name": "new_callback_model_selection_marks_old_choice_and_shows_efforts",
-    "request": {"kind": "new_callback", "draft": {"phase": "normal_model"}, "event": "normal_model", "value": "gpt-5.6-luna", "models": [{"model": "gpt-5.6-luna", "display_name": "GPT 5.6 Luna", "supported_efforts": ["low", "max"]}]},
+    "request": {"kind": "new_callback", "draft": {"phase": "normal_model"}, "event": "normal_model", "value": "gpt-5.6-terra", "models": [{"model": "gpt-5.6-terra", "display_name": "GPT 5.6 Terra", "supported_efforts": ["low", "medium", "high", "xhigh", "max"]}]},
     "effects": [
       {"type": "callback_answer", "text": null, "show_alert": false},
-      {"type": "render", "operation": "edit", "markdown": "已选择模型 `gpt-5.6-luna`。", "plain": "已选择模型 gpt-5.6-luna。", "keyboard": null},
+      {"type": "render", "operation": "edit", "markdown": "已选择模型 `gpt-5.6-terra`。", "plain": "已选择模型 gpt-5.6-terra。", "keyboard": null},
       {"type": "interaction_deadline", "phase": "normal_effort", "deadline_seconds": 300},
-      {"type": "render", "operation": "send", "markdown": "模型 `gpt-5.6-luna` 支持以下 effort：", "plain": null, "keyboard": [[{"label": "low", "target": {"kind": "callback", "action": "normal_effort", "payload": {"value": "low"}}}, {"label": "max", "target": {"kind": "callback", "action": "normal_effort", "payload": {"value": "max"}}}], [{"label": "退出", "target": {"kind": "callback", "action": "cancel", "payload": {}}}]]}
+      {"type": "render", "operation": "send", "markdown": "模型 `gpt-5.6-terra` 支持以下 effort：", "plain": null, "keyboard": [[{"label": "low", "target": {"kind": "callback", "action": "normal_effort", "payload": {"value": "low"}}}, {"label": "medium", "target": {"kind": "callback", "action": "normal_effort", "payload": {"value": "medium"}}}, {"label": "high", "target": {"kind": "callback", "action": "normal_effort", "payload": {"value": "high"}}}], [{"label": "xhigh", "target": {"kind": "callback", "action": "normal_effort", "payload": {"value": "xhigh"}}}, {"label": "max", "target": {"kind": "callback", "action": "normal_effort", "payload": {"value": "max"}}}], [{"label": "退出", "target": {"kind": "callback", "action": "cancel", "payload": {}}}]]}
     ]
   },
   {

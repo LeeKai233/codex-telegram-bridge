@@ -18,6 +18,11 @@ poll_timeout_seconds = 10
 max_backlog = 100
 poll_updates = true
 
+# Read-only utility profile used by /ask. The Rust daemon defaults to these
+# values; they are pinned here so live tests exercise the intended profile.
+ask_model = "gpt-5.6-terra"
+ask_reasoning_effort = "medium"
+
 # Real test topology:
 #   Rust Cotton Field Channel -> Rust Cotton Field Forum
 channel_chat_id = -1004446000549

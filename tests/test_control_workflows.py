@@ -220,8 +220,8 @@ class FakeBridge:
         self.metrics = FakeMetrics()
         self.options = [
             SimpleNamespace(
-                model="gpt-5.6-luna",
-                display_name="GPT 5.6 Luna",
+                model="gpt-5.6-terra",
+                display_name="GPT 5.6 Terra",
                 supported_efforts=("low", "max"),
                 default_effort="max",
                 is_default=True,
@@ -375,7 +375,7 @@ async def test_new_interactive_flow_captures_project_and_prompt(tmp_path: Path) 
     controller, store, endpoint, _bridge, coordinator, _deletions = build_controller(tmp_path)
     try:
         await controller.new(make_update("/new"), SimpleNamespace())
-        await click_last_button(controller, store, endpoint, label="GPT 5.6 Luna")
+        await click_last_button(controller, store, endpoint, label="GPT 5.6 Terra")
         await click_last_button(controller, store, endpoint, label="max")
         await click_last_button(controller, store, endpoint, label="否")
 
@@ -386,7 +386,7 @@ async def test_new_interactive_flow_captures_project_and_prompt(tmp_path: Path) 
             {
                 "cwd": tmp_path,
                 "prompt": "Build the feature",
-                "normal_model": "gpt-5.6-luna",
+                "normal_model": "gpt-5.6-terra",
                 "normal_effort": "max",
                 "plan_model": None,
                 "plan_effort": None,
@@ -458,14 +458,14 @@ async def test_new_parameterized_plan_preserves_pipe_in_prompt(tmp_path: Path) -
     controller, _store, _endpoint, _bridge, coordinator, _deletions = build_controller(tmp_path)
     try:
         command = (
-            "/new gpt-5.6-luna | max | planmode | luna | low | "
+            "/new gpt-5.6-terra | max | planmode | terra | low | "
             f"{tmp_path} | inspect a | b pipeline"
         )
         await controller.new(make_update(command), SimpleNamespace())
 
         assert coordinator.created[0]["prompt"] == "inspect a | b pipeline"
-        assert coordinator.created[0]["normal_model"] == "gpt-5.6-luna"
-        assert coordinator.created[0]["plan_model"] == "gpt-5.6-luna"
+        assert coordinator.created[0]["normal_model"] == "gpt-5.6-terra"
+        assert coordinator.created[0]["plan_model"] == "gpt-5.6-terra"
         assert coordinator.created[0]["plan_effort"] == "low"
         assert coordinator.created[0]["current_mode"] == "plan"
     finally:
@@ -476,12 +476,12 @@ async def test_new_parameterized_plan_preserves_pipe_in_prompt(tmp_path: Path) -
 async def test_new_two_argument_form_continues_at_plan_choice(tmp_path: Path) -> None:
     controller, store, endpoint, _bridge, coordinator, _deletions = build_controller(tmp_path)
     try:
-        await controller.new(make_update("/new luna | max"), SimpleNamespace())
+        await controller.new(make_update("/new terra | max"), SimpleNamespace())
 
         draft = next(iter(store.drafts.values()))
         assert draft.phase == "plan_choice"
         assert draft.payload == {
-            "normal_model": "gpt-5.6-luna",
+            "normal_model": "gpt-5.6-terra",
             "normal_effort": "max",
         }
         assert "是否先进入 Plan Mode" in endpoint.sent[-1]["markdown"]
@@ -495,11 +495,11 @@ async def test_new_invalid_profile_suggests_canonical_command(tmp_path: Path) ->
     controller, _store, endpoint, _bridge, _coordinator, _deletions = build_controller(tmp_path)
     try:
         await controller.new(
-            make_update("/new luna | max | nopln"), SimpleNamespace()
+            make_update("/new terra | max | nopln"), SimpleNamespace()
         )
 
         assert "你可能想发送" in endpoint.sent[-1]["markdown"]
-        assert "/new gpt-5.6-luna | max | noplan" in endpoint.sent[-1]["markdown"]
+        assert "/new gpt-5.6-terra | max | noplan" in endpoint.sent[-1]["markdown"]
     finally:
         await controller.stop()
 
@@ -515,13 +515,13 @@ async def test_new_invalid_mode_suggestion_preserves_directory_and_prompt(
     try:
         await controller.new(
             make_update(
-                f"/new luna | max | nopln | {target} | keep this | exact prompt"
+                f"/new terra | max | nopln | {target} | keep this | exact prompt"
             ),
             SimpleNamespace(),
         )
 
         suggestion = endpoint.sent[-1]["markdown"]
-        assert f"/new gpt-5.6-luna | max | noplan | {target}" in suggestion
+        assert f"/new gpt-5.6-terra | max | noplan | {target}" in suggestion
         assert "keep this | exact prompt" in suggestion
     finally:
         await controller.stop()
@@ -531,10 +531,10 @@ async def test_new_invalid_mode_suggestion_preserves_directory_and_prompt(
 async def test_new_incomplete_arguments_suggest_a_complete_command(tmp_path: Path) -> None:
     controller, _store, endpoint, _bridge, _coordinator, _deletions = build_controller(tmp_path)
     try:
-        await controller.new(make_update("/new lunaa"), SimpleNamespace())
+        await controller.new(make_update("/new terraa"), SimpleNamespace())
 
         assert "你可能想发送" in endpoint.sent[-1]["markdown"]
-        assert "/new gpt-5.6-luna | max" in endpoint.sent[-1]["markdown"]
+        assert "/new gpt-5.6-terra | max" in endpoint.sent[-1]["markdown"]
     finally:
         await controller.stop()
 
@@ -548,7 +548,7 @@ async def test_new_missing_plan_effort_suggestion_preserves_tail(tmp_path: Path)
     try:
         await controller.new(
             make_update(
-                f"/new luna | max | planmode | sol | | {target} | first prompt"
+                f"/new terra | max | planmode | sol | | {target} | first prompt"
             ),
             SimpleNamespace(),
         )
@@ -564,7 +564,7 @@ async def test_new_missing_plan_effort_suggestion_preserves_tail(tmp_path: Path)
 async def test_new_prompt_timeout_claims_hello_once(tmp_path: Path) -> None:
     controller, store, endpoint, _bridge, coordinator, _deletions = build_controller(tmp_path)
     try:
-        await controller.new(make_update("/new luna | max | noplan | project"), SimpleNamespace())
+        await controller.new(make_update("/new terra | max | noplan | project"), SimpleNamespace())
         draft = next(iter(store.drafts.values()))
         draft.expires_at = int(time.time()) - 1
         await controller._run_new_timeout(draft.scope_key, draft.flow_id, draft.revision)
@@ -580,7 +580,7 @@ async def test_new_prompt_timeout_claims_hello_once(tmp_path: Path) -> None:
 async def test_new_late_prompt_cannot_replace_timeout_hello(tmp_path: Path) -> None:
     controller, store, _endpoint, _bridge, coordinator, _deletions = build_controller(tmp_path)
     try:
-        await controller.new(make_update("/new luna | max | noplan | project"), SimpleNamespace())
+        await controller.new(make_update("/new terra | max | noplan | project"), SimpleNamespace())
         draft = next(iter(store.drafts.values()))
         draft.expires_at = int(time.time()) - 1
 
@@ -612,7 +612,7 @@ async def test_confirmed_project_is_claimed_before_directory_creation(
     bridge.create_project_directory = blocked_create
     try:
         await controller.new(
-            make_update(f"/new luna | max | noplan | {target}"),
+            make_update(f"/new terra | max | noplan | {target}"),
             SimpleNamespace(),
         )
         confirming = next(iter(store.drafts.values()))
