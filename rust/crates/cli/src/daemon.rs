@@ -7711,7 +7711,10 @@ async fn forward_codex_events(
     // holds the only in-memory copy, so hydration must finish first to keep
     // sparse live updates from clobbering the rebuilt projections.
     if let Ok(models) = list_model_choices(&agent).await {
-        for mut space in store.active_session_spaces().unwrap_or_default() {
+        // Remap every stored space, not just active ones: pending and
+        // repair_required sessions resume later and must not carry a model
+        // the provider no longer serves.
+        for mut space in store.session_spaces().unwrap_or_default() {
             if remap_legacy_session_models(&mut space, &models.entries)
                 && let Err(error) = store.upsert_session_space(&space)
             {
