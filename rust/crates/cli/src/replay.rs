@@ -34,6 +34,8 @@ pub struct BenchmarkReport {
     pub p50_event_us: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub p95_event_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peak_rss_bytes: Option<u64>,
     pub outcome: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_class: Option<String>,
@@ -52,6 +54,7 @@ pub fn run_fixture(
     let text = fs::read_to_string(fixture.as_ref()).map_err(|_| ReplayError::Runtime)?;
     let events = parse_events(&text)?;
     let mut elapsed_samples = Vec::with_capacity(repetitions as usize);
+    let mut peak_rss_bytes = current_rss_bytes();
     for _ in 0..warmup_repetitions {
         validate_events(&events)?;
     }
@@ -62,6 +65,10 @@ pub fn run_fixture(
         elapsed_samples.push(event_started.elapsed().as_micros() as u64);
     }
     let elapsed_ms = started.elapsed().as_millis() as u64;
+    peak_rss_bytes = match (peak_rss_bytes, current_rss_bytes()) {
+        (Some(peak), Some(current)) => Some(peak.max(current)),
+        (peak, current) => peak.or(current),
+    };
     elapsed_samples.sort_unstable();
     Ok(BenchmarkReport {
         schema_version: 1,
@@ -72,9 +79,22 @@ pub fn run_fixture(
         elapsed_ms,
         p50_event_us: percentile(&elapsed_samples, 50),
         p95_event_us: percentile(&elapsed_samples, 95),
+        peak_rss_bytes,
         outcome: "success".into(),
         failure_class: None,
     })
+}
+
+/// Resident set of this process at sample time, reported as the report's
+/// `peak_rss_bytes` upper bound. sysinfo is used instead of parsing
+/// `/proc/self` so the metric stays platform-neutral; the run is short, so
+/// the start/end samples bound the peak closely enough for a benchmark
+/// comparison signal.
+fn current_rss_bytes() -> Option<u64> {
+    let pid = sysinfo::get_current_pid().ok()?;
+    let mut system = sysinfo::System::new();
+    system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+    system.process(pid).map(|process| process.memory())
 }
 
 fn parse_events(text: &str) -> Result<Vec<ReplayEvent>, ReplayError> {
@@ -280,5 +300,11 @@ mod tests {
         let report = run_fixture(fixture, "steady_delivery", "rust-vnext", 2, 1).unwrap();
         assert_eq!(report.events_processed, 12);
         assert_eq!(report.outcome, "success");
+        let peak_rss = report
+            .peak_rss_bytes
+            .expect("the runner samples its own RSS");
+        assert!(peak_rss > 0);
+        let payload = serde_json::to_value(&report).unwrap();
+        assert_eq!(payload["peak_rss_bytes"], peak_rss);
     }
 }
