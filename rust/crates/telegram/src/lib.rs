@@ -2033,6 +2033,21 @@ pub trait TelegramTransport {
         payload: Value,
     ) -> Result<String, TelegramTransportError>;
 
+    /// Optional per-request timeout override. Transports that cannot honor
+    /// per-request deadlines fall back to the client-wide timeout via the
+    /// default implementation, keeping test transports source-compatible.
+    fn post_json_with_timeout(
+        &self,
+        api_base: &str,
+        token: &BotToken,
+        method: &'static str,
+        payload: Value,
+        timeout: Option<Duration>,
+    ) -> Result<String, TelegramTransportError> {
+        let _ = timeout;
+        self.post_json(api_base, token, method, payload)
+    }
+
     /// Multipart is optional so test transports and non-file adapters remain
     /// intentionally text-only. Production reqwest enables it for bounded
     /// Telegram document uploads.
@@ -2085,26 +2100,37 @@ impl TelegramTransport for ReqwestTransport {
         method: &'static str,
         payload: Value,
     ) -> Result<String, TelegramTransportError> {
+        self.post_json_with_timeout(api_base, token, method, payload, None)
+    }
+
+    fn post_json_with_timeout(
+        &self,
+        api_base: &str,
+        token: &BotToken,
+        method: &'static str,
+        payload: Value,
+        timeout: Option<Duration>,
+    ) -> Result<String, TelegramTransportError> {
         let url = format!(
             "{}/bot{}/{}",
             api_base.trim_end_matches('/'),
             token.as_str(),
             method
         );
-        let response = self
-            .client
-            .post(url)
-            .json(&payload)
-            .send()
-            .map_err(|error| {
-                if error.is_timeout() {
-                    TelegramTransportError::new("timeout")
-                } else if error.is_connect() {
-                    TelegramTransportError::new("connect")
-                } else {
-                    TelegramTransportError::new("request")
-                }
-            })?;
+        let request = self.client.post(url).json(&payload);
+        let request = match timeout {
+            Some(timeout) => request.timeout(timeout),
+            None => request,
+        };
+        let response = request.send().map_err(|error| {
+            if error.is_timeout() {
+                TelegramTransportError::new("timeout")
+            } else if error.is_connect() {
+                TelegramTransportError::new("connect")
+            } else {
+                TelegramTransportError::new("request")
+            }
+        })?;
         if !should_parse_bot_api_response(response.status()) {
             return Err(TelegramTransportError::new("http-status"));
         }
@@ -2338,9 +2364,26 @@ where
         surface: &TelegramSurfaceBinding,
         request: &TelegramMessageRequest,
     ) -> Result<SentMessage, TelegramError> {
-        self.call_rendered(token, "sendMessage", request, |request| {
-            surface.render_message_payload(request)
-        })
+        self.send_rendered_with_timeout(token, surface, request, None)
+    }
+
+    /// `send_rendered` with a per-request deadline for latency-sensitive
+    /// writes such as the `/perf` ticker (the client-wide default applies
+    /// when `timeout` is `None`).
+    pub fn send_rendered_with_timeout(
+        &self,
+        token: &BotToken,
+        surface: &TelegramSurfaceBinding,
+        request: &TelegramMessageRequest,
+        timeout: Option<Duration>,
+    ) -> Result<SentMessage, TelegramError> {
+        self.call_rendered_with_timeout(
+            token,
+            "sendMessage",
+            request,
+            |request| surface.render_message_payload(request),
+            timeout,
+        )
     }
 
     pub fn send_text_with_markup(
@@ -2366,9 +2409,26 @@ where
         message: &TelegramMessageReference,
         request: &TelegramMessageRequest,
     ) -> Result<SentMessage, TelegramError> {
-        self.call_rendered(token, "editMessageText", request, |request| {
-            render_edit_text_payload(message, request)
-        })
+        self.edit_text_with_timeout(token, message, request, None)
+    }
+
+    /// `edit_text` with a per-request deadline; `None` keeps the client-wide
+    /// default. Used by the `/perf` ticker and the status heartbeat so a slow
+    /// edit cannot stall their refresh loops for the full request timeout.
+    pub fn edit_text_with_timeout(
+        &self,
+        token: &BotToken,
+        message: &TelegramMessageReference,
+        request: &TelegramMessageRequest,
+        timeout: Option<Duration>,
+    ) -> Result<SentMessage, TelegramError> {
+        self.call_rendered_with_timeout(
+            token,
+            "editMessageText",
+            request,
+            |request| render_edit_text_payload(message, request),
+            timeout,
+        )
     }
 
     /// Edit text while preserving the daemon's JSON keyboard contract.  The
@@ -2418,10 +2478,22 @@ where
         token: &BotToken,
         message: &TelegramMessageReference,
     ) -> Result<bool, TelegramError> {
-        self.call(
+        self.delete_message_with_timeout(token, message, None)
+    }
+
+    /// `delete_message` with a per-request deadline; `None` keeps the
+    /// client-wide default.
+    pub fn delete_message_with_timeout(
+        &self,
+        token: &BotToken,
+        message: &TelegramMessageReference,
+        timeout: Option<Duration>,
+    ) -> Result<bool, TelegramError> {
+        self.call_with_timeout(
             token,
             "deleteMessage",
             json!({"chat_id": message.chat_id, "message_id": message.message_id}),
+            timeout,
         )
     }
 
@@ -2535,24 +2607,27 @@ where
         )
     }
 
-    fn call_rendered(
+    fn call_rendered_with_timeout(
         &self,
         token: &BotToken,
         method: &'static str,
         request: &TelegramMessageRequest,
         render_payload: impl Fn(&TelegramMessageRequest) -> Value,
+        timeout: Option<Duration>,
     ) -> Result<SentMessage, TelegramError> {
         if request.text.is_empty() {
             return Err(TelegramError::InvalidInput("message text cannot be empty"));
         }
-        match self.call(token, method, render_payload(request)) {
+        match self.call_with_timeout(token, method, render_payload(request), timeout) {
             Err(
                 error @ TelegramError::ApiRejected {
                     error_code: Some(400),
                     ..
                 },
             ) => match request.fallback() {
-                Some(fallback) => self.call(token, method, render_payload(&fallback)),
+                Some(fallback) => {
+                    self.call_with_timeout(token, method, render_payload(&fallback), timeout)
+                }
                 None => Err(error),
             },
             result => result,
@@ -2565,9 +2640,19 @@ where
         method: &'static str,
         payload: Value,
     ) -> Result<R, TelegramError> {
+        self.call_with_timeout(token, method, payload, None)
+    }
+
+    fn call_with_timeout<R: for<'de> Deserialize<'de>>(
+        &self,
+        token: &BotToken,
+        method: &'static str,
+        payload: Value,
+        timeout: Option<Duration>,
+    ) -> Result<R, TelegramError> {
         let body = self
             .transport
-            .post_json(&self.api_base, token, method, payload)
+            .post_json_with_timeout(&self.api_base, token, method, payload, timeout)
             .map_err(TelegramError::Transport)?;
         parse_api_response(&body, method)
     }
