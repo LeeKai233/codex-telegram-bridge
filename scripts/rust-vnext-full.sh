@@ -28,7 +28,7 @@ require_user() {
 
 build_binary() {
   info "building Rust CLI"
-  cargo build --release --manifest-path "${PROJECT_ROOT}/rust/Cargo.toml" -p codex-telegram-cli
+  cargo build --release --locked --manifest-path "${PROJECT_ROOT}/rust/Cargo.toml" -p codex-telegram-cli
   install -D -m 755 "${PROJECT_ROOT}/rust/target/release/codex-telegram-cli" "${BINARY_PATH}"
 }
 
@@ -65,6 +65,20 @@ save_rollback_bundle() {
     : >"${backup}/state-absent"
   fi
   info "saved rollback bundle under ${backup}"
+  prune_rollback_bundles
+}
+
+# Keep only the newest rollback bundles so upgrades do not accumulate an
+# unbounded series of full SQLite snapshots under the state directory.
+prune_rollback_bundles() {
+  local keep=3 old
+  find "${STATE_DIR}" -mindepth 1 -maxdepth 1 -type d -name 'rollback-*' -printf '%T@ %p\n' 2>/dev/null \
+    | sort -nr | awk -v keep="${keep}" 'NR > keep { sub(/^[^ ]+ /, ""); print }' \
+    | while IFS= read -r old; do
+      [[ -n "${old}" && "${old}" == "${STATE_DIR}"/rollback-* ]] || continue
+      rm -rf -- "${old}"
+      info "pruned old rollback bundle ${old}"
+    done
 }
 
 latest_rollback_bundle() {
@@ -75,8 +89,12 @@ latest_rollback_bundle() {
 install_full() {
   require_user
   install -d -m 700 "${CONFIG_DIR}" "${USER_UNIT_DIR}" "${STATE_DIR}" "${LOCK_DIR}" "${HOME}/.local/bin"
-  save_rollback_bundle
+  # The SQLite snapshot runs concurrently with the release build; both must
+  # succeed before the new unit is enabled.
+  save_rollback_bundle &
+  local backup_pid=$!
   build_binary
+  wait "${backup_pid}" || die "rollback snapshot failed; aborting install"
   render_config
   install -m 644 "${UNIT_TEMPLATE}" "${UNIT_PATH}"
   validate_config
@@ -109,8 +127,12 @@ upgrade() {
   systemctl --user is-active --quiet "${UNIT_NAME}" \
     || die "${UNIT_NAME} is not active; use install/start before upgrade"
   install -d -m 700 "${CONFIG_DIR}" "${USER_UNIT_DIR}" "${STATE_DIR}" "${LOCK_DIR}" "${HOME}/.local/bin"
-  save_rollback_bundle
+  # The SQLite snapshot runs concurrently with the release build; the build
+  # usually dominates, so the backup adds no wall time to the upgrade.
+  save_rollback_bundle &
+  local backup_pid=$!
   build_binary
+  wait "${backup_pid}" || die "rollback snapshot failed; aborting upgrade before restart"
   if [[ -e "${CONFIG_PATH}" ]]; then validate_config; else render_config; validate_config; fi
   install -m 644 "${UNIT_TEMPLATE}" "${UNIT_PATH}"
   systemctl --user daemon-reload
@@ -121,13 +143,20 @@ upgrade() {
     systemctl --user start "${UNIT_NAME}" || true
     die "Rust upgrade failed; Python Bridge was not started or modified"
   fi
-  if ! systemctl --user is-active --quiet "${UNIT_NAME}"; then
-    info "Rust upgrade did not become active; restoring the previous Rust binary"
-    restore_binary_from_latest || true
-    systemctl --user daemon-reload
-    systemctl --user start "${UNIT_NAME}" || true
-    die "Rust upgrade health check failed; Python Bridge was not started or modified"
-  fi
+  # Bounded readiness wait (60s, polling every 2s) instead of a single
+  # immediate check that raced the service startup.
+  local waited=0
+  until systemctl --user is-active --quiet "${UNIT_NAME}"; do
+    if (( waited >= 60 )); then
+      info "Rust upgrade did not become active; restoring the previous Rust binary"
+      restore_binary_from_latest || true
+      systemctl --user daemon-reload
+      systemctl --user start "${UNIT_NAME}" || true
+      die "Rust upgrade health check failed; Python Bridge was not started or modified"
+    fi
+    sleep 2
+    waited=$((waited + 2))
+  done
   info "Rust upgrade completed; ${UNIT_NAME} is active"
 }
 

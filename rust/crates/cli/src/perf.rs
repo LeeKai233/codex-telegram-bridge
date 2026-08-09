@@ -93,8 +93,12 @@ impl PerfSampler {
             let mut codex_cpu_percent = 0.0;
             let mut codex_memory_bytes: u64 = 0;
             for process in system.processes().values() {
-                let name = process.name().to_string_lossy().to_ascii_lowercase();
-                if name.contains("codex") {
+                let name = process.name().to_string_lossy();
+                let exe_name = process
+                    .exe()
+                    .and_then(|exe| exe.file_name())
+                    .map(|exe| exe.to_string_lossy().into_owned());
+                if codex_process_matches(&name, exe_name.as_deref()) {
                     codex_process_count += 1;
                     codex_cpu_percent += process.cpu_usage();
                     codex_memory_bytes = codex_memory_bytes.saturating_add(process.memory());
@@ -149,6 +153,20 @@ impl PerfSampler {
             gpu: include_gpu.then(sample_gpu).flatten(),
         }
     }
+}
+
+/// Counts bridge and Codex app-server processes for the `/perf` Codex
+/// section. The process name (`comm`) is matched first; the executable
+/// basename is a fallback because runtimes may rename `comm` (for example to
+/// `MainThread`) and the app-server binary may be installed as
+/// `codex-app-server` or plain `app-server`, in which case a `comm`-only
+/// match reports zero processes, CPU, and RSS.
+fn codex_process_matches(name: &str, exe_name: Option<&str>) -> bool {
+    fn matches(value: &str) -> bool {
+        let value = value.to_ascii_lowercase();
+        value.contains("codex") || value.contains("app-server") || value.contains("app_server")
+    }
+    matches(name) || exe_name.is_some_and(matches)
 }
 
 fn sample_gpu() -> Option<GpuSnapshot> {
@@ -212,6 +230,20 @@ fn sample_gpu() -> Option<GpuSnapshot> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_process_matching_covers_comm_exe_and_app_server_names() {
+        assert!(codex_process_matches("codex", None));
+        // `comm` is truncated to 15 bytes for the installed bridge binary.
+        assert!(codex_process_matches("codex-telegram-", None));
+        assert!(codex_process_matches("codex-app-server", None));
+        assert!(codex_process_matches("app-server", None));
+        // A runtime-renamed `comm` still matches via the executable basename.
+        assert!(codex_process_matches("MainThread", Some("codex")));
+        assert!(codex_process_matches("node", Some("app-server")));
+        assert!(!codex_process_matches("grafana", None));
+        assert!(!codex_process_matches("prometheus", Some("prometheus")));
+    }
 
     #[test]
     fn sampler_returns_bounded_snapshot_without_gpu_requirement() {

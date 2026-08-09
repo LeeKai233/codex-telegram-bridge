@@ -33,3 +33,8 @@ async-trait = "0.1"
 tokio = { version = "1.49", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 futures-util = "0.3"
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+
+# Incremental release builds cut the `rust-vnext-full.sh upgrade` wall time
+# for the small, frequent changes this workspace ships.
+[profile.release]
+incremental = true

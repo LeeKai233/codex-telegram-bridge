@@ -58,18 +58,38 @@ const APPROVAL_CALLBACK_TTL_MS: i64 = 15 * 60 * 1000;
 const NEW_INTERACTION_TTL_MS: i64 = 5 * 60 * 1000;
 const NEW_PROMPT_TTL_MS: i64 = 30 * 1000;
 const MAX_ARTIFACT_BYTES: u64 = 10 * 1024 * 1024;
+/// Shorter deadline for `/perf` and heartbeat edits so one slow edit cannot
+/// stall a refresh loop for the full 30s request timeout.
+const PERF_EDIT_TIMEOUT: Duration = Duration::from_secs(10);
 const UPLOAD_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 static NEXT_APPROVAL_NONCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 struct ControlRuntime {
     perf: Arc<crate::perf::PerfSampler>,
+    sessions_cache: Arc<Mutex<SessionsCache>>,
+    sessions_dirty: Arc<AtomicBool>,
+}
+
+/// Cached `/sessions` list built from durable thread projections. Refresh
+/// loops reuse it instead of calling `thread/list` every few seconds; Codex
+/// lifecycle events mark it dirty so transitions still show up promptly.
+#[derive(Default)]
+struct SessionsCache {
+    sessions: Vec<crate::control::Session>,
+    built_at_ms: i64,
+    /// `createdAt` is absent from projections, so it is harvested once from
+    /// `thread/list` and kept indefinitely (creation time never changes).
+    created_at_ms: HashMap<String, i64>,
+    created_backfill_attempted_at_ms: i64,
 }
 
 impl Default for ControlRuntime {
     fn default() -> Self {
         Self {
             perf: Arc::new(crate::perf::PerfSampler::new()),
+            sessions_cache: Arc::new(Mutex::new(SessionsCache::default())),
+            sessions_dirty: Arc::new(AtomicBool::new(true)),
         }
     }
 }
@@ -264,6 +284,189 @@ impl SessionRegistry {
     }
 }
 
+/// Fan-out key for the update dispatcher: updates from the same chat keep
+/// their Telegram order, while a slow handler in one chat no longer blocks
+/// commands, callbacks, or approvals of other chats or bots.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct DispatchKey {
+    bot_instance_id: String,
+    chat_id: i64,
+}
+
+impl DispatchKey {
+    fn for_update(inbound: &InboundUpdate) -> Self {
+        let chat_id = match IncomingUpdate::from_update(&inbound.update) {
+            IncomingUpdate::Message(message) | IncomingUpdate::EditedMessage(message) => {
+                message.chat_id
+            }
+            IncomingUpdate::Callback(callback) => callback.chat_id,
+            IncomingUpdate::Membership(membership) => membership.chat_id,
+            IncomingUpdate::Unsupported => 0,
+        };
+        Self {
+            bot_instance_id: inbound.bot_instance_id.clone(),
+            chat_id,
+        }
+    }
+}
+
+/// Spawns one serial worker per [`DispatchKey`] on first use. A polling
+/// thread waits for each update's completion before sending the next, so a
+/// per-key queue holds at most one pending item and stays bounded.
+struct KeyedDispatcher<T, H> {
+    workers: HashMap<DispatchKey, mpsc::UnboundedSender<T>>,
+    handler: H,
+}
+
+impl<T, H, Fut> KeyedDispatcher<T, H>
+where
+    T: Send + 'static,
+    H: Fn(T) -> Fut + Clone + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    fn new(handler: H) -> Self {
+        Self {
+            workers: HashMap::new(),
+            handler,
+        }
+    }
+
+    fn dispatch(&mut self, key: DispatchKey, item: T) {
+        let sender = self.workers.entry(key).or_insert_with(|| {
+            let (sender, mut receiver) = mpsc::unbounded_channel::<T>();
+            let handler = self.handler.clone();
+            tokio::spawn(async move {
+                while let Some(item) = receiver.recv().await {
+                    handler(item).await;
+                }
+            });
+            sender
+        });
+        // The receiver only closes when this dispatcher drops (shutdown),
+        // in which case losing a queued update is acceptable.
+        let _ = sender.send(item);
+    }
+
+    #[cfg(test)]
+    fn worker_count(&self) -> usize {
+        self.workers.len()
+    }
+}
+
+/// Shared dependencies for processing one inbound update, cloned once per
+/// per-key worker instead of being re-captured per update.
+struct DispatchContext {
+    bots_by_id: HashMap<String, RuntimeBot>,
+    policy: UpdateRoutingPolicy,
+    config: RustConfig,
+    store: Arc<SqliteStore>,
+    agent: AppServerClient,
+    sessions: Arc<SessionRegistry>,
+    metrics: MetricsRegistry,
+    totp: Arc<TotpManager>,
+    control_runtime: Arc<ControlRuntime>,
+}
+
+impl DispatchContext {
+    async fn process(&self, inbound: InboundUpdate) {
+        let Some(bot) = self.bots_by_id.get(&inbound.bot_instance_id).cloned() else {
+            let _ = inbound.completion.send(false);
+            return;
+        };
+        let owner_user_id = self
+            .store
+            .workflow_record("onboarding", "owner")
+            .ok()
+            .flatten()
+            .and_then(|value| value.get("user_id").and_then(Value::as_i64));
+        let authorization = UpdateAuthorization {
+            owner_user_id,
+            bot_username: Some(bot.username.clone()),
+            enforce_chat_kind: true,
+            reject_sender_chat: true,
+            // Before `/pair`, only the Control Bot's private bootstrap
+            // commands are reachable. Discussion/Status updates must not
+            // interpret a missing owner as an unrestricted actor.
+            bootstrap_only: owner_user_id.is_none(),
+        };
+        let actor_user_id = match IncomingUpdate::from_update(&inbound.update) {
+            IncomingUpdate::Message(message) | IncomingUpdate::EditedMessage(message) => {
+                message.actor.user_id
+            }
+            IncomingUpdate::Callback(callback) => callback.actor.user_id,
+            IncomingUpdate::Membership(membership) => membership.actor.user_id,
+            IncomingUpdate::Unsupported => None,
+        };
+        let router = match UpdateRouter::new_with_authorization(
+            bot.role,
+            self.policy.clone(),
+            authorization,
+        ) {
+            Ok(router) => router,
+            Err(error) => {
+                eprintln!("rust bridge routing disabled: {error}");
+                let _ = inbound.completion.send(false);
+                return;
+            }
+        };
+        let routed = router.route(&inbound.update);
+        let bind_identity_warning = match IncomingUpdate::from_update(&inbound.update) {
+            IncomingUpdate::Message(message)
+                if message.chat_id == self.config.discussion_chat_id
+                    && message.actor.sender_chat_id.is_some()
+                    && message.automatic_forward_from_channel.is_none()
+                    && message.text.as_deref().is_some_and(|text| {
+                        ParsedTelegramCommand::parse(text).is_some_and(|parsed| {
+                            parsed.command == TelegramCommand::Bind
+                                && parsed
+                                    .addressed_bot_username
+                                    .as_deref()
+                                    .is_none_or(|target| target.eq_ignore_ascii_case(&bot.username))
+                        })
+                    }) =>
+            {
+                Some(message)
+            }
+            _ => None,
+        };
+        let result = if let Some(message) = bind_identity_warning {
+            let surface = surface_for(&bot, &self.config, message.chat_id, None);
+            send_text(
+                &bot,
+                &surface,
+                "绑定请求未获授权。请使用已配对的个人账号发送，并将发送身份切换为个人账号；若启用了匿名管理员，请先关闭。",
+                &self.metrics,
+            )
+            .await
+            .map(|_| ())
+        } else {
+            handle_action(
+                routed,
+                actor_user_id,
+                bot,
+                &self.bots_by_id,
+                &self.config,
+                &self.store,
+                &self.agent,
+                &self.sessions,
+                &self.metrics,
+                &self.totp,
+                &self.control_runtime,
+            )
+            .await
+        };
+        if let Err(error) = &result {
+            eprintln!("rust bridge action failed: {error}");
+        }
+        // Telegram's update stream is ordered.  Retrying one failed
+        // handler forever would therefore starve every later callback,
+        // including harmless inline-button acknowledgements.  The
+        // handler has already logged the durable failure; advance the
+        // update cursor so the next update can still be delivered.
+        let _ = inbound.completion.send(true);
+    }
+}
+
 pub fn run(config_path: Option<&Path>) -> Result<(), DaemonError> {
     let config = if let Some(path) = config_path {
         RustConfig::load(path).map_err(|error| DaemonError::Config(error.to_string()))?
@@ -450,6 +653,7 @@ async fn run_async(
         config.clone(),
         metrics.clone(),
         totp.clone(),
+        control_runtime.clone(),
     ));
     let heartbeat_task = tokio::spawn(run_status_heartbeat_worker(
         store.clone(),
@@ -510,101 +714,27 @@ async fn run_async(
         store.clone(),
         bots_by_id.clone(),
     ));
-    let dispatch_agent = agent.clone();
-    let dispatch_control_runtime = control_runtime.clone();
+    let dispatch_context = Arc::new(DispatchContext {
+        bots_by_id,
+        policy,
+        config,
+        store,
+        agent: agent.clone(),
+        sessions,
+        metrics,
+        totp,
+        control_runtime,
+    });
     let dispatch_task = tokio::spawn(async move {
-        while let Some(inbound) = updates_rx.recv().await {
-            let Some(bot) = bots_by_id.get(&inbound.bot_instance_id).cloned() else {
-                let _ = inbound.completion.send(false);
-                continue;
-            };
-            let owner_user_id = store
-                .workflow_record("onboarding", "owner")
-                .ok()
-                .flatten()
-                .and_then(|value| value.get("user_id").and_then(Value::as_i64));
-            let authorization = UpdateAuthorization {
-                owner_user_id,
-                bot_username: Some(bot.username.clone()),
-                enforce_chat_kind: true,
-                reject_sender_chat: true,
-                // Before `/pair`, only the Control Bot's private bootstrap
-                // commands are reachable. Discussion/Status updates must not
-                // interpret a missing owner as an unrestricted actor.
-                bootstrap_only: owner_user_id.is_none(),
-            };
-            let actor_user_id = match IncomingUpdate::from_update(&inbound.update) {
-                IncomingUpdate::Message(message) | IncomingUpdate::EditedMessage(message) => {
-                    message.actor.user_id
-                }
-                IncomingUpdate::Callback(callback) => callback.actor.user_id,
-                IncomingUpdate::Membership(membership) => membership.actor.user_id,
-                IncomingUpdate::Unsupported => None,
-            };
-            let router =
-                match UpdateRouter::new_with_authorization(bot.role, policy.clone(), authorization)
-                {
-                    Ok(router) => router,
-                    Err(error) => {
-                        eprintln!("rust bridge routing disabled: {error}");
-                        let _ = inbound.completion.send(false);
-                        continue;
-                    }
-                };
-            let routed = router.route(&inbound.update);
-            let bind_identity_warning = match IncomingUpdate::from_update(&inbound.update) {
-                IncomingUpdate::Message(message)
-                    if message.chat_id == config.discussion_chat_id
-                        && message.actor.sender_chat_id.is_some()
-                        && message.automatic_forward_from_channel.is_none()
-                        && message.text.as_deref().is_some_and(|text| {
-                            ParsedTelegramCommand::parse(text).is_some_and(|parsed| {
-                                parsed.command == TelegramCommand::Bind
-                                    && parsed.addressed_bot_username.as_deref().is_none_or(
-                                        |target| target.eq_ignore_ascii_case(&bot.username),
-                                    )
-                            })
-                        }) =>
-                {
-                    Some(message)
-                }
-                _ => None,
-            };
-            let result = if let Some(message) = bind_identity_warning {
-                let surface = surface_for(&bot, &config, message.chat_id, None);
-                send_text(
-                    &bot,
-                    &surface,
-                    "绑定请求未获授权。请使用已配对的个人账号发送，并将发送身份切换为个人账号；若启用了匿名管理员，请先关闭。",
-                    &metrics,
-                )
-                .await
-                .map(|_| ())
-            } else {
-                handle_action(
-                    routed,
-                    actor_user_id,
-                    bot,
-                    &bots_by_id,
-                    &config,
-                    &store,
-                    &dispatch_agent,
-                    &sessions,
-                    &metrics,
-                    &totp,
-                    &dispatch_control_runtime,
-                )
-                .await
-            };
-            if let Err(error) = &result {
-                eprintln!("rust bridge action failed: {error}");
+        let mut dispatcher = KeyedDispatcher::new({
+            let context = dispatch_context.clone();
+            move |inbound: InboundUpdate| {
+                let context = context.clone();
+                async move { context.process(inbound).await }
             }
-            // Telegram's update stream is ordered.  Retrying one failed
-            // handler forever would therefore starve every later callback,
-            // including harmless inline-button acknowledgements.  The
-            // handler has already logged the durable failure; advance the
-            // update cursor so the next update can still be delivered.
-            let _ = inbound.completion.send(true);
+        });
+        while let Some(inbound) = updates_rx.recv().await {
+            dispatcher.dispatch(DispatchKey::for_update(&inbound), inbound);
         }
     });
 
@@ -1392,6 +1522,7 @@ async fn handle_command(
                 config,
                 store,
                 metrics,
+                control_runtime,
                 chat_id,
                 actor_user_id,
                 message_id,
@@ -2105,6 +2236,7 @@ async fn run_scheduled_deletion_worker(
                         deletion.chat_id,
                         deletion.message_id,
                         &error,
+                        now_ms(),
                     );
                     eprintln!(
                         "rust bridge scheduled deletion retry bot={} chat={} message={} class={error}",
@@ -2548,6 +2680,9 @@ fn projection_from_thread_read(thread_id: &str, response: &Value) -> ThreadProje
     if projection.plan.is_none() {
         projection.plan = plan_from_item;
     }
+    // A full thread/read can carry the complete item history; keep the same
+    // bounded tail the live projector enforces.
+    ctg_engine::truncate_items(&mut projection);
     projection
 }
 
@@ -2599,9 +2734,12 @@ fn session_status_markup(space: &RustSessionSpace) -> Option<Value> {
     }))
 }
 
+const SESSIONS_CACHE_TTL_MS: i64 = 15_000;
+const SESSIONS_CREATED_BACKFILL_BACKOFF_MS: i64 = 60_000;
+
 async fn list_control_sessions(agent: &AppServerClient) -> Result<Vec<ControlSession>, String> {
     let response = agent
-        .list_threads(1000, None)
+        .list_threads(200, None)
         .await
         .map_err(|error| error.to_string())?;
     Ok(response
@@ -2615,6 +2753,152 @@ async fn list_control_sessions(agent: &AppServerClient) -> Result<Vec<ControlSes
                 .collect()
         })
         .unwrap_or_default())
+}
+
+/// Builds the `/sessions` rows from durable thread projections, avoiding a
+/// full `thread/list` round trip. Rows are sorted by recency descending to
+/// match the app-server ordering the panel previously rendered.
+fn control_sessions_from_projections(
+    projections: Vec<(String, i64, Value, i64)>,
+    created_at_ms: &HashMap<String, i64>,
+) -> Vec<ControlSession> {
+    let mut sessions = projections
+        .into_iter()
+        .filter_map(|(thread_id, _, payload, _)| {
+            let projection = serde_json::from_value::<ThreadProjection>(payload).ok()?;
+            Some(ControlSession {
+                thread_id: thread_id.clone(),
+                title: projection
+                    .title
+                    .filter(|title| !title.trim().is_empty())
+                    .unwrap_or_else(|| "Codex session".to_owned()),
+                status: projection.status.unwrap_or_else(|| "unknown".to_owned()),
+                turn_status: projection.turn_status.unwrap_or_else(|| "idle".to_owned()),
+                lifecycle: String::new(),
+                active_flags: projection.active_flags,
+                error: if projection.last_error_recoverable {
+                    String::new()
+                } else {
+                    projection.last_error.unwrap_or_default()
+                },
+                created_at: created_at_ms.get(&thread_id).copied(),
+                updated_at: (projection.updated_at_ms > 0)
+                    .then_some(projection.updated_at_ms.div_euclid(1000)),
+                cwd: projection.cwd.unwrap_or_else(|| "-".to_owned()),
+            })
+        })
+        .collect::<Vec<_>>();
+    sessions.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| left.thread_id.cmp(&right.thread_id))
+    });
+    sessions
+}
+
+/// `/sessions` data source: a TTL cache over durable projections with
+/// event-driven invalidation. `thread/list` remains the cold-start fallback
+/// (no projections yet) and the one-time `createdAt` backfill.
+async fn list_control_sessions_cached(
+    agent: &AppServerClient,
+    store: &Arc<SqliteStore>,
+    control_runtime: &Arc<ControlRuntime>,
+) -> Result<Vec<ControlSession>, String> {
+    let now = now_ms();
+    {
+        let cache = control_runtime
+            .sessions_cache
+            .lock()
+            .map_err(|error| error.to_string())?;
+        if cache.built_at_ms > 0
+            && now.saturating_sub(cache.built_at_ms) < SESSIONS_CACHE_TTL_MS
+            && !control_runtime.sessions_dirty.load(Ordering::Acquire)
+        {
+            return Ok(cache.sessions.clone());
+        }
+    }
+    // Consume the dirty flag before reading the store so an event landing
+    // mid-rebuild marks the cache dirty again instead of being lost.
+    control_runtime
+        .sessions_dirty
+        .store(false, Ordering::Release);
+    let projection_rows = store.thread_projections().unwrap_or_default();
+    let mut sessions = if !projection_rows.is_empty() {
+        let created_at_ms = {
+            let cache = control_runtime
+                .sessions_cache
+                .lock()
+                .map_err(|error| error.to_string())?;
+            cache.created_at_ms.clone()
+        };
+        let mut sessions = control_sessions_from_projections(projection_rows, &created_at_ms);
+        let created_missing = sessions.iter().any(|session| session.created_at.is_none());
+        let backfill_due = {
+            let cache = control_runtime
+                .sessions_cache
+                .lock()
+                .map_err(|error| error.to_string())?;
+            now.saturating_sub(cache.created_backfill_attempted_at_ms)
+                >= SESSIONS_CREATED_BACKFILL_BACKOFF_MS
+        };
+        if created_missing && backfill_due {
+            if let Ok(listed) = list_control_sessions(agent).await {
+                let harvested = listed
+                    .iter()
+                    .filter_map(|session| {
+                        session
+                            .created_at
+                            .map(|created| (session.thread_id.clone(), created))
+                    })
+                    .collect::<Vec<_>>();
+                let mut cache = control_runtime
+                    .sessions_cache
+                    .lock()
+                    .map_err(|error| error.to_string())?;
+                for (thread_id, created_at) in harvested {
+                    cache.created_at_ms.insert(thread_id, created_at);
+                }
+                cache.created_backfill_attempted_at_ms = now;
+                for session in sessions
+                    .iter_mut()
+                    .filter(|session| session.created_at.is_none())
+                {
+                    session.created_at = cache.created_at_ms.get(&session.thread_id).copied();
+                }
+            } else {
+                let mut cache = control_runtime
+                    .sessions_cache
+                    .lock()
+                    .map_err(|error| error.to_string())?;
+                cache.created_backfill_attempted_at_ms = now;
+            }
+        }
+        sessions
+    } else {
+        // Cold start before any projection exists: fall back to one
+        // `thread/list` and harvest creation times for later cache builds.
+        let listed = list_control_sessions(agent).await?;
+        let mut cache = control_runtime
+            .sessions_cache
+            .lock()
+            .map_err(|error| error.to_string())?;
+        for session in &listed {
+            if let Some(created_at) = session.created_at {
+                cache
+                    .created_at_ms
+                    .insert(session.thread_id.clone(), created_at);
+            }
+        }
+        listed
+    };
+    let mut cache = control_runtime
+        .sessions_cache
+        .lock()
+        .map_err(|error| error.to_string())?;
+    cache.sessions = std::mem::take(&mut sessions);
+    cache.built_at_ms = now_ms();
+    Ok(cache.sessions.clone())
 }
 
 fn control_topic_from_space(store: &SqliteStore, space: &RustSessionSpace) -> ControlTopic {
@@ -2783,6 +3067,7 @@ async fn edit_control_rendered(
     rendered: &RenderedEffect,
     markup: Option<InlineKeyboardMarkup>,
     metrics: &MetricsRegistry,
+    timeout: Option<Duration>,
 ) -> Result<(), String> {
     let plain = rendered
         .plain
@@ -2794,9 +3079,11 @@ async fn edit_control_rendered(
     let token = bot.token.clone();
     let reference = reference.clone();
     let started = Instant::now();
-    let result = tokio::task::spawn_blocking(move || api.edit_text(&token, &reference, &request))
-        .await
-        .map_err(|error| error.to_string())?;
+    let result = tokio::task::spawn_blocking(move || {
+        api.edit_text_with_timeout(&token, &reference, &request, timeout)
+    })
+    .await
+    .map_err(|error| error.to_string())?;
     match result {
         Ok(_) => {
             metrics.observe_delivery_duration_for(
@@ -2889,6 +3176,7 @@ async fn handle_control_sessions(
     config: &RustConfig,
     store: &Arc<SqliteStore>,
     metrics: &MetricsRegistry,
+    control_runtime: &Arc<ControlRuntime>,
     chat_id: i64,
     actor_user_id: Option<i64>,
     command_id: i64,
@@ -2900,7 +3188,7 @@ async fn handle_control_sessions(
         .skip(1)
         .collect::<Vec<_>>()
         .join(" ");
-    let sessions = list_control_sessions(agent).await?;
+    let sessions = list_control_sessions_cached(agent, store, control_runtime).await?;
     let scope_key = format!("sessions:{chat_id}");
     let interaction = store
         .replace_control_interaction(
@@ -2962,6 +3250,7 @@ async fn handle_control_sessions(
                 store.clone(),
                 bot.clone(),
                 metrics.clone(),
+                control_runtime.clone(),
                 scope_key,
                 query,
                 1,
@@ -2973,12 +3262,17 @@ async fn handle_control_sessions(
     Ok(())
 }
 
+/// Periodically re-renders the `/sessions` panel from the cached projection
+/// listing. A single list/render/edit failure is logged and retried on the
+/// next tick; the loop ends only when the interaction expires (panel TTL) or
+/// a newer revision (re-issued command or page change) replaces it.
 #[allow(clippy::too_many_arguments)]
 async fn run_sessions_refresh(
     agent: AppServerClient,
     store: Arc<SqliteStore>,
     bot: RuntimeBot,
     metrics: MetricsRegistry,
+    control_runtime: Arc<ControlRuntime>,
     scope_key: String,
     query: String,
     page: usize,
@@ -2989,6 +3283,17 @@ async fn run_sessions_refresh(
         Some(interaction) => interaction.revision,
         None => return,
     };
+    let reference = store
+        .control_interaction(&scope_key)
+        .ok()
+        .flatten()
+        .and_then(|current| {
+            TelegramMessageReference::new(current.chat_id.to_string(), reply_id).ok()
+        });
+    let Some(reference) = reference else {
+        return;
+    };
+    let mut last_content: Option<(String, String)> = None;
     loop {
         tokio::time::sleep(Duration::from_secs(refresh_seconds)).await;
         let Some(current) = store.control_interaction(&scope_key).ok().flatten() else {
@@ -2997,25 +3302,39 @@ async fn run_sessions_refresh(
         if current.revision != revision || current.expires_at_ms <= now_ms() {
             return;
         }
-        let sessions = match list_control_sessions(&agent).await {
+        let sessions = match list_control_sessions_cached(&agent, &store, &control_runtime).await {
             Ok(sessions) => sessions,
-            Err(_) => return,
+            Err(error) => {
+                eprintln!("rust bridge sessions refresh list failed: {error}");
+                continue;
+            }
         };
-        let Ok(effects) = ControlController.dispatch(ControlRequest::Sessions(SessionsRequest {
+        let effects = match ControlController.dispatch(ControlRequest::Sessions(SessionsRequest {
             query: query.clone(),
             page,
             now: control_now_seconds(),
             utc_offset_seconds: CONTROL_UTC_OFFSET_SECONDS,
             sessions,
-        })) else {
-            return;
+        })) {
+            Ok(effects) => effects,
+            Err(error) => {
+                eprintln!("rust bridge sessions refresh render failed: {error:?}");
+                continue;
+            }
         };
         let Some(rendered) = effects.iter().find_map(|effect| match effect {
             ControlEffect::Render(rendered) => Some(rendered),
             _ => None,
         }) else {
-            return;
+            continue;
         };
+        let content = (
+            rendered.markdown.clone(),
+            rendered.plain.clone().unwrap_or_default(),
+        );
+        if last_content.as_ref() == Some(&content) {
+            continue;
+        }
         let markup = match control_button_markup(
             &store,
             &scope_key,
@@ -3026,18 +3345,18 @@ async fn run_sessions_refresh(
             current.expires_at_ms,
         ) {
             Ok(markup) => markup,
-            Err(_) => return,
+            Err(error) => {
+                eprintln!("rust bridge sessions refresh markup failed: {error}");
+                continue;
+            }
         };
-        let reference = match TelegramMessageReference::new(current.chat_id.to_string(), reply_id) {
-            Ok(reference) => reference,
-            Err(_) => return,
-        };
-        if edit_control_rendered(&bot, &reference, rendered, markup, &metrics)
-            .await
-            .is_err()
+        if let Err(error) =
+            edit_control_rendered(&bot, &reference, rendered, markup, &metrics, None).await
         {
-            return;
+            eprintln!("rust bridge sessions refresh edit failed: {error}");
+            continue;
         }
+        last_content = Some(content);
     }
 }
 
@@ -3279,6 +3598,7 @@ async fn handle_control_perf(
         .await
         .map_err(|error| error.to_string())?;
     let (markdown_body, plain_body) = format_perf_snapshot(&snapshot);
+    let initial_content = (markdown_body.clone(), plain_body.clone());
     let effects = ControlController
         .dispatch(ControlRequest::Perf {
             frame: 0,
@@ -3331,10 +3651,16 @@ async fn handle_control_perf(
         interaction.revision,
         chat_id,
         reply_id,
+        initial_content,
     ));
     Ok(())
 }
 
+/// `/perf` dynamic panel, aligned with Python `control_bot._run_perf`:
+/// absolute tick schedule anchored at the first-frame send with catch-up
+/// (`tick = elapsed // interval`), edits skipped when the rendered content is
+/// unchanged, and single sample/edit failures logged and retried — the loop
+/// ends only at the lifetime deadline or on a revision change.
 #[allow(clippy::too_many_arguments)]
 async fn run_perf_ticker(
     sampler: Arc<crate::perf::PerfSampler>,
@@ -3345,13 +3671,31 @@ async fn run_perf_ticker(
     revision: i64,
     chat_id: i64,
     reply_id: i64,
+    initial_content: (String, String),
 ) {
-    for _ in 1..6 {
-        tokio::time::sleep(Duration::from_secs(5)).await;
+    // Anchored after the first frame landed, matching the Python lifetime
+    // anchor; the fixture-locked constants keep 30s lifetime / 5s updates.
+    let started = Instant::now();
+    let update_seconds = crate::control::PERF_UPDATE_SECONDS;
+    let interval = Duration::from_secs(update_seconds);
+    let expires = started + Duration::from_secs(crate::control::PERF_LIFETIME_SECONDS);
+    let mut tick: u64 = 1;
+    let mut last_content = Some(initial_content);
+    loop {
+        let target = started + interval * tick as u32;
+        if target >= expires {
+            return;
+        }
+        tokio::time::sleep(target.saturating_duration_since(Instant::now())).await;
+        let elapsed_seconds = Instant::now().saturating_duration_since(started).as_secs();
+        tick = tick.max(elapsed_seconds / update_seconds.max(1));
+        if Instant::now() >= expires {
+            return;
+        }
         let Some(interaction) = store.control_interaction(&scope_key).ok().flatten() else {
             return;
         };
-        if interaction.revision != revision || interaction.expires_at_ms <= now_ms() {
+        if interaction.revision != revision {
             return;
         }
         let snapshot = match tokio::task::spawn_blocking({
@@ -3361,33 +3705,56 @@ async fn run_perf_ticker(
         .await
         {
             Ok(snapshot) => snapshot,
-            Err(_) => return,
+            Err(error) => {
+                eprintln!("rust bridge perf sample failed: {error}");
+                tick += 1;
+                continue;
+            }
         };
-        let (markdown_body, plain_body) = format_perf_snapshot(&snapshot);
+        if Instant::now() >= expires {
+            return;
+        }
+        let content = format_perf_snapshot(&snapshot);
+        if last_content.as_ref() == Some(&content) {
+            tick += 1;
+            continue;
+        }
         let Ok(effects) = ControlController.dispatch(ControlRequest::Perf {
             // Python keeps the dynamic-performance clock anchored at the
             // initial frame while only the sampled values change.
             frame: 0,
-            markdown_body,
-            plain_body,
+            markdown_body: content.0.clone(),
+            plain_body: content.1.clone(),
         }) else {
-            return;
+            tick += 1;
+            continue;
         };
         let Some(rendered) = effects.iter().find_map(|effect| match effect {
             ControlEffect::Render(rendered) => Some(rendered),
             _ => None,
         }) else {
-            return;
+            tick += 1;
+            continue;
         };
         let Ok(reference) = TelegramMessageReference::new(chat_id.to_string(), reply_id) else {
             return;
         };
-        if edit_control_rendered(&bot, &reference, rendered, None, &metrics)
-            .await
-            .is_err()
+        if let Err(error) = edit_control_rendered(
+            &bot,
+            &reference,
+            rendered,
+            None,
+            &metrics,
+            Some(PERF_EDIT_TIMEOUT),
+        )
+        .await
         {
-            return;
+            eprintln!("rust bridge perf edit failed: {error}");
+            tick += 1;
+            continue;
         }
+        last_content = Some(content);
+        tick += 1;
     }
 }
 
@@ -3402,7 +3769,7 @@ async fn handle_control_callback(
     _sessions: &Arc<SessionRegistry>,
     metrics: &MetricsRegistry,
     totp: &Arc<TotpManager>,
-    _control_runtime: &Arc<ControlRuntime>,
+    control_runtime: &Arc<ControlRuntime>,
 ) -> Result<(), String> {
     let Some(user_id) = callback.actor.user_id else {
         acknowledge_callback(&bot, &callback, Some("无法确认发送者")).await;
@@ -3480,7 +3847,7 @@ async fn handle_control_callback(
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(1);
     let refresh_query = query.clone();
-    let sessions = list_control_sessions(agent).await?;
+    let sessions = list_control_sessions_cached(agent, store, control_runtime).await?;
     let interaction = store
         .control_interaction(scope_key)
         .map_err(|error| error.to_string())?;
@@ -3523,18 +3890,21 @@ async fn handle_control_callback(
                 rendered.keyboard.as_deref().unwrap_or_default(),
                 next.expires_at_ms,
             )?;
-            edit_control_rendered(&bot, &reference, rendered, markup, metrics).await?;
+            edit_control_rendered(&bot, &reference, rendered, markup, metrics, None).await?;
         }
     }
     if let Some(refresh_seconds) = effects.iter().find_map(|effect| match effect {
         ControlEffect::SessionRefresh { after_seconds } => Some(*after_seconds),
         _ => None,
     }) {
+        // The interaction revision bump retires the previous refresh loop at
+        // its next wake-up, so each panel keeps exactly one active loop.
         tokio::spawn(run_sessions_refresh(
             agent.clone(),
             store.clone(),
             bot.clone(),
             metrics.clone(),
+            control_runtime.clone(),
             scope_key.to_owned(),
             refresh_query,
             page,
@@ -4305,7 +4675,7 @@ async fn handle_new_callback(
         let reference =
             TelegramMessageReference::new(callback.chat_id.to_string(), callback.message_id)
                 .map_err(|error| error.to_string())?;
-        edit_control_rendered(&bot, &reference, &rendered, None, metrics).await?;
+        edit_control_rendered(&bot, &reference, &rendered, None, metrics, None).await?;
     }
     match event {
         "cancel" => {
@@ -6957,7 +7327,7 @@ async fn run_status_heartbeat_worker(
                 animation_frames.remove(&space.space_id);
                 None
             };
-            if let Err(error) = update_status_message(
+            if let Err(error) = update_status_message_with_edit_timeout(
                 &store,
                 &bots_by_id,
                 &config,
@@ -6968,6 +7338,7 @@ async fn run_status_heartbeat_worker(
                 None,
                 false,
                 animation_frame,
+                Some(PERF_EDIT_TIMEOUT),
             )
             .await
             {
@@ -7206,6 +7577,16 @@ fn remap_legacy_session_models(space: &mut RustSessionSpace, available: &[ModelC
     changed
 }
 
+/// Disk persistence of projections is rate-limited during streaming turns;
+/// terminal transitions always flush immediately. The in-memory projector is
+/// the live render source, so status rendering never waits on SQLite.
+const PROJECTION_PERSIST_INTERVAL_MS: i64 = 2_000;
+/// Terminal threads older than this are evicted from the in-memory projector
+/// (the durable row stays and is lazily reloaded on the next event).
+const PROJECTION_TERMINAL_RETENTION_MS: i64 = 60 * 60 * 1000;
+const PROJECTION_EVICTION_SWEEP_SECONDS: u64 = 60;
+
+#[allow(clippy::too_many_arguments)]
 async fn forward_codex_events(
     agent: AppServerClient,
     store: Arc<SqliteStore>,
@@ -7214,10 +7595,13 @@ async fn forward_codex_events(
     config: RustConfig,
     metrics: MetricsRegistry,
     totp: Arc<TotpManager>,
+    control_runtime: Arc<ControlRuntime>,
 ) {
     let mut events = agent.subscribe_events();
     let mut projector = EventProjector::default();
     let mut status_tasks: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+    let mut last_persisted_ms: HashMap<String, i64> = HashMap::new();
+    let mut last_eviction = Instant::now();
     if let Ok(rows) = store.thread_projections() {
         for (_, _, payload, _) in rows {
             if let Ok(projection) = serde_json::from_value::<ThreadProjection>(payload) {
@@ -7265,7 +7649,35 @@ async fn forward_codex_events(
         if event.method.ends_with("/delta") {
             continue;
         }
+        // Lazily reload an evicted terminal projection from the durable row
+        // so a late event lands on the full history instead of an empty shell.
+        if let Some(thread_id) = event_thread_id(&event.params)
+            && projector.projection(thread_id).is_none()
+            && let Ok(Some((_, _, payload, _))) = store.thread_projection(thread_id)
+            && let Ok(projection) = serde_json::from_value::<ThreadProjection>(payload)
+        {
+            projector.restore(projection);
+        }
         let effect = projector.apply(&event);
+        // Lifecycle and turn transitions change `/sessions` rows; item-level
+        // updates do not, so the cached listing is only invalidated here.
+        if matches!(
+            event.method.as_str(),
+            "thread/started"
+                | "thread/created"
+                | "thread/updated"
+                | "thread/status/updated"
+                | "thread/status/changed"
+                | "turn/started"
+                | "turn/created"
+                | "turn/completed"
+                | "turn/failed"
+                | "turn/interrupted"
+        ) {
+            control_runtime
+                .sessions_dirty
+                .store(true, Ordering::Release);
+        }
         if event.method == "thread/settings/updated"
             && let Some(thread_id) = event_thread_id(&event.params)
         {
@@ -7281,13 +7693,33 @@ async fn forward_codex_events(
             {
                 projection.started_at_ms = Some(updated_at_ms);
             }
-            if let Ok(payload) = serde_json::to_value(&*projection) {
-                let _ = store.upsert_thread_projection(
-                    thread_id,
-                    i64::try_from(projection.generation).unwrap_or(i64::MAX),
-                    &payload,
-                    updated_at_ms,
-                );
+            let persist_due = last_persisted_ms.get(thread_id).is_none_or(|last| {
+                updated_at_ms.saturating_sub(*last) >= PROJECTION_PERSIST_INTERVAL_MS
+            });
+            let terminal = matches!(
+                effect,
+                ProjectionEffect::TurnCompleted | ProjectionEffect::Error
+            );
+            if (persist_due || terminal)
+                && let Ok(payload) = serde_json::to_value(&*projection)
+                && store
+                    .upsert_thread_projection(
+                        thread_id,
+                        i64::try_from(projection.generation).unwrap_or(i64::MAX),
+                        &payload,
+                        updated_at_ms,
+                    )
+                    .is_ok()
+            {
+                last_persisted_ms.insert(thread_id.to_owned(), updated_at_ms);
+            }
+        }
+        if last_eviction.elapsed() >= Duration::from_secs(PROJECTION_EVICTION_SWEEP_SECONDS) {
+            last_eviction = Instant::now();
+            let evicted = projector
+                .evict_finished_before(now_ms().saturating_sub(PROJECTION_TERMINAL_RETENTION_MS));
+            if evicted > 0 {
+                eprintln!("rust bridge evicted {evicted} terminal thread projections from memory");
             }
         }
         if effect == ProjectionEffect::None {
@@ -9640,6 +10072,36 @@ async fn update_status_message(
     force_refresh: bool,
     animation_frame: Option<u64>,
 ) -> Result<(), String> {
+    update_status_message_with_edit_timeout(
+        store,
+        bots_by_id,
+        config,
+        metrics,
+        totp,
+        space,
+        projection,
+        note,
+        force_refresh,
+        animation_frame,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn update_status_message_with_edit_timeout(
+    store: &SqliteStore,
+    bots_by_id: &HashMap<String, RuntimeBot>,
+    config: &RustConfig,
+    metrics: &MetricsRegistry,
+    totp: &TotpManager,
+    space: &RustSessionSpace,
+    projection: Option<&ThreadProjection>,
+    note: Option<&str>,
+    force_refresh: bool,
+    animation_frame: Option<u64>,
+    edit_timeout: Option<Duration>,
+) -> Result<(), String> {
     let Some(current) = ensure_status_message(
         store,
         bots_by_id,
@@ -9715,8 +10177,15 @@ async fn update_status_message(
             current.channel_post_id,
         )
         .map_err(|error| error.to_string())?;
-        if let Err(error) =
-            edit_rendered_with_markup(control, &reference, &dashboard_rendered, None, metrics).await
+        if let Err(error) = edit_rendered_with_markup(
+            control,
+            &reference,
+            &dashboard_rendered,
+            None,
+            metrics,
+            edit_timeout,
+        )
+        .await
         {
             eprintln!("rust bridge channel dashboard update failed: {error}");
         } else {
@@ -9767,6 +10236,7 @@ async fn update_status_message(
         &rendered,
         markup,
         metrics,
+        edit_timeout,
     )
     .await;
     if let Err(error) = edit_result {
@@ -11212,6 +11682,7 @@ async fn edit_rendered_with_markup(
     rendered: &StatusRendered,
     markup: Option<Value>,
     metrics: &MetricsRegistry,
+    timeout: Option<Duration>,
 ) -> Result<(), String> {
     let typed_markup = typed_markup_from_json(markup)?;
     let request = TelegramMessageRequest::markdown_v2(
@@ -11223,9 +11694,11 @@ async fn edit_rendered_with_markup(
     let token = bot.token.clone();
     let reference = message.clone();
     let started = Instant::now();
-    let result = tokio::task::spawn_blocking(move || api.edit_text(&token, &reference, &request))
-        .await
-        .map_err(|error| error.to_string())?;
+    let result = tokio::task::spawn_blocking(move || {
+        api.edit_text_with_timeout(&token, &reference, &request, timeout)
+    })
+    .await
+    .map_err(|error| error.to_string())?;
     match result {
         Ok(_) => {
             metrics.observe_delivery_duration_for(
@@ -12217,6 +12690,93 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn keyed_dispatcher_parallelizes_chats_and_preserves_same_chat_order() {
+        let log = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let handler = {
+            let log = log.clone();
+            move |(label, delay_ms): (&'static str, u64)| {
+                let log = log.clone();
+                async move {
+                    if delay_ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    }
+                    log.lock().expect("log lock poisoned").push(label);
+                }
+            }
+        };
+        let mut dispatcher = KeyedDispatcher::new(handler);
+        let key = |bot: &str, chat_id: i64| DispatchKey {
+            bot_instance_id: bot.to_owned(),
+            chat_id,
+        };
+        // A slow handler occupying one chat must not delay other chats of
+        // the same bot or of another bot, while a later update for the same
+        // chat still waits its turn.
+        dispatcher.dispatch(key("bot-a", 1), ("slow-a1", 300));
+        dispatcher.dispatch(key("bot-a", 2), ("fast-a2", 0));
+        dispatcher.dispatch(key("bot-b", 1), ("fast-b1", 0));
+        dispatcher.dispatch(key("bot-a", 1), ("after-a1", 0));
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let log = log.lock().expect("log lock poisoned").clone();
+        let position = |label| {
+            log.iter()
+                .position(|entry| *entry == label)
+                .unwrap_or_else(|| panic!("{label} missing from {log:?}"))
+        };
+        assert!(position("fast-a2") < position("slow-a1"));
+        assert!(position("fast-b1") < position("slow-a1"));
+        assert!(position("slow-a1") < position("after-a1"));
+        assert_eq!(log.len(), 4);
+        assert_eq!(dispatcher.worker_count(), 3);
+    }
+
+    #[test]
+    fn sessions_listing_maps_projections_sorted_by_recency() {
+        let projection_value = |thread_id: &str, title: Option<&str>, updated_at_ms: i64| {
+            serde_json::to_value(ThreadProjection {
+                thread_id: thread_id.to_owned(),
+                title: title.map(str::to_owned),
+                cwd: Some(format!("/tmp/{thread_id}")),
+                status: Some("idle".to_owned()),
+                turn_status: Some("completed".to_owned()),
+                last_error: Some("boom".to_owned()),
+                last_error_recoverable: true,
+                updated_at_ms,
+                ..ThreadProjection::default()
+            })
+            .unwrap()
+        };
+        let projections = vec![
+            (
+                "thread-a".to_owned(),
+                1,
+                projection_value("thread-a", Some("Alpha"), 20_000),
+                0,
+            ),
+            (
+                "thread-b".to_owned(),
+                1,
+                projection_value("thread-b", None, 40_000),
+                0,
+            ),
+        ];
+        let created_at_ms = HashMap::from([("thread-a".to_owned(), 1_700_000_000)]);
+        let sessions = control_sessions_from_projections(projections, &created_at_ms);
+        assert_eq!(sessions.len(), 2);
+        // Recency descending, matching the app-server `thread/list` order.
+        assert_eq!(sessions[0].thread_id, "thread-b");
+        assert_eq!(sessions[0].title, "Codex session");
+        assert_eq!(sessions[0].updated_at, Some(40));
+        assert_eq!(sessions[0].created_at, None);
+        assert_eq!(sessions[1].thread_id, "thread-a");
+        assert_eq!(sessions[1].title, "Alpha");
+        assert_eq!(sessions[1].created_at, Some(1_700_000_000));
+        assert_eq!(sessions[1].cwd, "/tmp/thread-a");
+        // A recoverable error is not surfaced as a session error row.
+        assert!(sessions[1].error.is_empty());
+    }
 
     #[test]
     fn workspace_artifact_path_is_bounded_and_hashed() {

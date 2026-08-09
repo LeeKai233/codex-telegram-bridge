@@ -13,7 +13,10 @@ use thiserror::Error;
 
 pub mod projector;
 
-pub use projector::{EventProjector, ProjectionEffect, ThreadProjection, project_item_subagents};
+pub use projector::{
+    EventProjector, MAX_PROJECTION_ITEMS, ProjectionEffect, ThreadProjection,
+    project_item_subagents, truncate_items,
+};
 
 pub struct Engine<'a> {
     clock: &'a dyn Clock,

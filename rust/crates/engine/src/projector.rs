@@ -58,12 +58,34 @@ pub struct EventProjector {
     threads: BTreeMap<String, ThreadProjection>,
 }
 
+/// Bounds the per-thread item history kept in memory and on disk. Full item
+/// JSON (command output, diffs) is the dominant projection cost, so only the
+/// most recent items are retained; the durable row keeps the same bound.
+pub const MAX_PROJECTION_ITEMS: usize = 200;
+
+/// Drops the oldest items beyond [`MAX_PROJECTION_ITEMS`], keeping the stable
+/// `item_order` tail that recent-activity rendering reads. Entries missing
+/// from `item_order` (legacy rows) are removed once the map exceeds the cap.
+pub fn truncate_items(projection: &mut ThreadProjection) {
+    while projection.item_order.len() > MAX_PROJECTION_ITEMS {
+        let oldest = projection.item_order.remove(0);
+        projection.items.remove(&oldest);
+    }
+    if projection.items.len() > MAX_PROJECTION_ITEMS {
+        projection
+            .items
+            .retain(|item_id, _| projection.item_order.contains(item_id));
+    }
+}
+
 impl EventProjector {
     /// Restores a projection persisted by the Rust daemon before new app
     /// server events arrive.  The caller owns schema validation and can skip
     /// corrupt rows without preventing the process from starting.
     pub fn restore(&mut self, projection: ThreadProjection) {
         if !projection.thread_id.trim().is_empty() {
+            let mut projection = projection;
+            truncate_items(&mut projection);
             self.threads
                 .insert(projection.thread_id.clone(), projection);
         }
@@ -75,6 +97,28 @@ impl EventProjector {
 
     pub fn projection_mut(&mut self, thread_id: &str) -> Option<&mut ThreadProjection> {
         self.threads.get_mut(thread_id)
+    }
+
+    /// Evicts projections whose turn finished before `cutoff_ms` from memory.
+    /// Durable rows are untouched; a later event for an evicted thread is
+    /// expected to trigger a lazy reload from the store by the caller.
+    pub fn evict_finished_before(&mut self, cutoff_ms: i64) -> usize {
+        let evictable = self
+            .threads
+            .iter()
+            .filter(|(_, projection)| {
+                projection
+                    .finished_at_ms
+                    .is_some_and(|finished| finished < cutoff_ms)
+                    && !matches!(projection.turn_status.as_deref(), Some("inProgress"))
+            })
+            .map(|(thread_id, _)| thread_id.clone())
+            .collect::<Vec<_>>();
+        let evicted = evictable.len();
+        for thread_id in evictable {
+            self.threads.remove(&thread_id);
+        }
+        evicted
     }
 
     pub fn apply(&mut self, event: &AgentEvent) -> ProjectionEffect {
@@ -224,6 +268,7 @@ impl EventProjector {
                         projection.items.insert(item_id.to_owned(), item.clone());
                     }
                     project_item_subagents(projection, item, false);
+                    truncate_items(projection);
                 }
                 ProjectionEffect::RefreshStatus
             }
@@ -967,6 +1012,73 @@ mod tests {
             true,
         );
         assert_eq!(projection.subagents["agent-9"]["status"], "interrupted");
+    }
+
+    #[test]
+    fn items_are_truncated_to_the_newest_bound() {
+        let mut projector = EventProjector::default();
+        for index in 0..(MAX_PROJECTION_ITEMS + 25) {
+            projector.apply(&event(
+                "item/completed",
+                serde_json::json!({
+                    "threadId":"thread-items",
+                    "item":{"id":format!("item-{index}"),"type":"command","output":"x"}
+                }),
+            ));
+        }
+        let projection = projector.projection("thread-items").unwrap();
+        assert_eq!(projection.items.len(), MAX_PROJECTION_ITEMS);
+        assert_eq!(projection.item_order.len(), MAX_PROJECTION_ITEMS);
+        assert!(!projection.items.contains_key("item-0"));
+        assert!(
+            projection
+                .items
+                .contains_key(&format!("item-{}", MAX_PROJECTION_ITEMS + 24))
+        );
+        assert_eq!(projection.item_order[0], "item-25");
+    }
+
+    #[test]
+    fn restore_truncates_legacy_oversized_projections() {
+        let mut projection = ThreadProjection {
+            thread_id: "thread-legacy".into(),
+            ..ThreadProjection::default()
+        };
+        for index in 0..(MAX_PROJECTION_ITEMS + 10) {
+            let item_id = format!("item-{index}");
+            projection.item_order.push(item_id.clone());
+            projection
+                .items
+                .insert(item_id, serde_json::json!({"type":"command"}));
+        }
+        let mut projector = EventProjector::default();
+        projector.restore(projection);
+        let restored = projector.projection("thread-legacy").unwrap();
+        assert_eq!(restored.items.len(), MAX_PROJECTION_ITEMS);
+        assert_eq!(restored.item_order.len(), MAX_PROJECTION_ITEMS);
+    }
+
+    #[test]
+    fn eviction_drops_old_finished_threads_and_keeps_active_ones() {
+        let mut projector = EventProjector::default();
+        for (thread_id, finished, turn_status) in [
+            ("thread-old", Some(1_000), Some("completed")),
+            ("thread-recent", Some(i64::MAX), Some("completed")),
+            ("thread-active", Some(1_000), Some("inProgress")),
+            ("thread-open", None, None),
+        ] {
+            projector.restore(ThreadProjection {
+                thread_id: thread_id.into(),
+                finished_at_ms: finished,
+                turn_status: turn_status.map(str::to_owned),
+                ..ThreadProjection::default()
+            });
+        }
+        assert_eq!(projector.evict_finished_before(60_000), 1);
+        assert!(projector.projection("thread-old").is_none());
+        assert!(projector.projection("thread-recent").is_some());
+        assert!(projector.projection("thread-active").is_some());
+        assert!(projector.projection("thread-open").is_some());
     }
 
     #[test]
