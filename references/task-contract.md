@@ -89,3 +89,11 @@ Release invariants:
 - Live `~/.config/codex-telegram-bridge/config.toml` is edited only by root at deploy time (ask_model -> gpt-5.6-terra, effort medium).
 - `gpt-5.6-terra` effort support for low/medium must be verified against live `model/list` before final rollout; a mismatch is reported to the user instead of silently substituting.
 - Final verification: cargo fmt/clippy/test, scoped pytest, contract fixtures green, GitNexus detect_changes, independent review, live SQLite backup, timed upgrade, service health checks.
+
+## Execution record (2026-08-09)
+
+- Wave 1 merged: `77a4897` (parity `b1be85f`) + `0b8e055` (models-ci `a3978bf`,`208c81e`); cargo 19 targets + pytest 671 green.
+- Wave 2 merged: `8d4fe83` (performance `ac53047`..`9087541`); cargo 137 tests green.
+- integration-review (bridge-reviewer, kimi primary): deployable, no blockers; M1 poller handshake negated per-chat parallelism, M2 CI paths gap, 12 minors.
+- Root follow-ups committed as `d400193`: M1 fire-and-forget poller with contiguous-prefix offset confirmation, M2 CI paths, sessions lifecycle join, turn-id duration dedup, moon-frame mode-header placement, WARNING plain track, backslash escape, UTF-8-safe id prefixes.
+- Deploy: live `config.toml`/`rust-vnext.toml` ask profile -> terra/medium; live SQLite backed up pre-upgrade; luna session-space rows left to daemon startup remap (terra/low).
