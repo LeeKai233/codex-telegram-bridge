@@ -3,6 +3,7 @@
 [Unit]
 Description=Codex Telegram Bridge (Rust full runtime live test)
 Documentation=file:///home/%u/PythonProjects/codex-telegram-bridge/docs/rust-vnext/full-testing.md
+Conflicts=codex-telegram-bridge.service
 Wants=network-online.target codex-managed-daemon-bootstrap.service
 After=network-online.target codex-managed-daemon-bootstrap.service
 StartLimitIntervalSec=900

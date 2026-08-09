@@ -2426,6 +2426,7 @@ fn projection_from_thread_read(thread_id: &str, response: &Value) -> ThreadProje
                 .get("error")
                 .or_else(|| latest_turn.and_then(|turn| turn.get("error"))),
         ),
+        last_error_recoverable: false,
         generation: source
             .get("generation")
             .or_else(|| response.get("generation"))

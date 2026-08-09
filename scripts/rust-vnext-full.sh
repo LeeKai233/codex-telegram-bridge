@@ -14,6 +14,7 @@ readonly BINARY_PATH="${HOME}/.local/bin/codex-telegram-cli-rust-full"
 readonly UNIT_PATH="${USER_UNIT_DIR}/${UNIT_NAME}"
 readonly CONFIG_TEMPLATE="${PROJECT_ROOT}/docs/rust-vnext/full-testing.config.example.toml"
 readonly UNIT_TEMPLATE="${PROJECT_ROOT}/systemd/${UNIT_NAME}"
+readonly SERVICE_SWITCH="${PROJECT_ROOT}/scripts/bridge-service.sh"
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 info() { printf '%s\n' "$*"; }
@@ -22,7 +23,7 @@ require_user() {
   [[ "${EUID}" -ne 0 ]] || die "run as the bridge user, not root"
   [[ -n "${HOME:-}" && "${HOME}" != "/" ]] || die "HOME must identify the bridge user"
   command -v systemctl >/dev/null || die "systemctl is required"
-  [[ -r "${CONFIG_TEMPLATE}" && -r "${UNIT_TEMPLATE}" ]] || die "run from a complete checkout"
+  [[ -r "${CONFIG_TEMPLATE}" && -r "${UNIT_TEMPLATE}" && -x "${SERVICE_SWITCH}" ]] || die "run from a complete checkout"
 }
 
 build_binary() {
@@ -80,12 +81,14 @@ install_full() {
   install -m 644 "${UNIT_TEMPLATE}" "${UNIT_PATH}"
   validate_config
   systemctl --user daemon-reload
-  info "installed ${UNIT_NAME}; service remains stopped until cutover"
+  systemctl --user disable codex-telegram-bridge.service >/dev/null 2>&1 || true
+  systemctl --user enable "${UNIT_NAME}" >/dev/null
+  info "installed ${UNIT_NAME}; Rust is enabled for the next user-session boot and Python is disabled"
 }
 
 start_rust() {
   require_user
-  systemctl --user enable --now "${UNIT_NAME}"
+  "${SERVICE_SWITCH}" rust "${@:1}"
   systemctl --user --no-pager --full status "${UNIT_NAME}"
 }
 
@@ -97,15 +100,8 @@ stop_rust() {
 
 cutover() {
   require_user
-  systemctl --user is-active --quiet codex-telegram-bridge.service \
-    || die "Python Bridge is not active; refusing automatic cutover"
-  systemctl --user stop codex-telegram-bridge.service
-  if ! start_rust; then
-    info "Rust full runtime did not start; restoring Python Bridge"
-    systemctl --user start codex-telegram-bridge.service || true
-    die "Rust cutover failed; Python restart was attempted"
-  fi
-  info "Rust full runtime is now the active Telegram owner; Python remains installed but stopped"
+  "${SERVICE_SWITCH}" rust --force
+  systemctl --user --no-pager --full status "${UNIT_NAME}"
 }
 
 upgrade() {
@@ -137,10 +133,9 @@ upgrade() {
 
 rollback() {
   require_user
-  stop_rust
-  systemctl --user start codex-telegram-bridge.service
+  "${SERVICE_SWITCH}" python --force
   systemctl --user --no-pager --full status codex-telegram-bridge.service
-  info "Python Bridge restored; Rust full runtime remains stopped"
+  info "Python Bridge restored as the active owner; Rust remains disabled"
 }
 
 restore_binary_from_latest() {
@@ -197,7 +192,7 @@ restore_files() {
 
 case "${1:-}" in
   install) install_full ;;
-  start) start_rust ;;
+  start) shift; start_rust "$@" ;;
   stop) stop_rust ;;
   cutover) cutover ;;
   rollback) rollback ;;

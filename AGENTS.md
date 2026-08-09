@@ -1,7 +1,7 @@
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **codex-telegram-bridge** (6238 symbols, 15073 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **codex-telegram-bridge** (6375 symbols, 15672 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > Index stale? Run `node .gitnexus/run.cjs analyze` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? `npx gitnexus analyze` (npm 11 crash → `npm i -g gitnexus`; #1939).
 
@@ -43,6 +43,10 @@ This project is indexed by GitNexus as **codex-telegram-bridge** (6238 symbols, 
 
 <!-- gitnexus:end -->
 
+# CAH Prohibition
+
+- Cross-Agent Handoff (CAH) is prohibited in this repository. Do not invoke the `cah` CLI, skills, plugins, hooks, contracts, or recovery workflows for this repository.
+
 # Multi-Agent Development
 
 - For tasks with independent lanes, use the project `bridge-parallel-development` skill and keep the root agent as the only coordinator.
@@ -53,9 +57,8 @@ This project is indexed by GitNexus as **codex-telegram-bridge** (6238 symbols, 
 - Read-only exploration and review are behavioral contracts verified by Git diff; they are not security boundaries.
 - Subagents must not control systemd, install packages, edit credentials, touch other worktrees, push, publish releases, or modify unrelated user files.
 - The root agent alone integrates commits, resolves cross-lane contracts, runs final review, performs deployment, and reports results.
-- If the primary model is `gpt-5.6-luna` with `max` effort, do not spawn or distribute any subagent; the root agent handles all lanes directly.
 - Before completing a Goal, the root must mark every Plan item `completed` and verify the visible counter is `N/N`. A complete Goal with pending or in-progress Plan items is an invalid final state.
 - Before completing a Goal, the root must confirm every subagent is completed, interrupted, or closed and that no child remains active.
 - Before spawning any lane, the root must select and record its agent role, model, effort, and routing reason. Do not treat implicit parent inheritance as a routing decision.
-- Default routing uses `gpt-5.6-luna/max` for `bridge-explorer`, `bridge-worker`, and `bridge-reviewer`; keep architecture, CRITICAL paths, and final integration with the root at `gpt-5.6-sol/xhigh` unless the user overrides it.
+- Default routing uses `gpt-5.6-terra/xhigh` for `bridge-explorer` and `bridge-worker`, `gpt-5.6-sol/max` for `bridge-reviewer` and the root coordinator, and `gpt-5.6-terra/max` for `modernizer`.
 - Keep the existing untracked `assets/` directory outside agent scope unless the user explicitly assigns it.

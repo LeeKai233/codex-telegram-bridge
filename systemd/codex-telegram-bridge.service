@@ -3,6 +3,7 @@
 [Unit]
 Description=Codex Telegram Bridge
 Documentation=https://github.com/LeeKai233/codex-telegram-bridge
+Conflicts=codex-telegram-rust-full.service
 Wants=network-online.target
 After=network-online.target codex-telegram-app-server.service
 StartLimitIntervalSec=900

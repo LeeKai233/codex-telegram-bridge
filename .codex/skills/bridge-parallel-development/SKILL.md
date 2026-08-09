@@ -9,7 +9,7 @@ Use this workflow when a task has at least two independent implementation or aud
 
 1. Freeze the baseline SHA and complete the task contract in `references/task-contract.md`.
 2. Route every lane before spawning it. Record the selected agent role, model, effort, and a short selection reason in the task contract.
-3. Use `bridge-explorer`, `bridge-worker`, and `bridge-reviewer` with `gpt-5.6-luna/max`. Keep architecture, CRITICAL paths, and final integration with the root coordinator (`gpt-5.6-sol/xhigh`) unless the user overrides the routing policy.
+3. Use `bridge-explorer` and `bridge-worker` with `gpt-5.6-terra/xhigh`, `bridge-reviewer` with `gpt-5.6-sol/max`, and the root coordinator with `gpt-5.6-sol/max`. Route deprecation audits and approved migrations to `modernizer` with `gpt-5.6-terra/max`.
 4. The root agent owns user communication, architecture decisions, model/effort routing, integration, deployment, and remote Git state.
 5. Create one `agent/<goal>/<lane>` branch and isolated worktree per writer. Never run two writers on the same file in the same phase.
 6. Spawn no more than three direct subagents. Subagents must not spawn descendants; the root coordinator enforces this behavioral contract.

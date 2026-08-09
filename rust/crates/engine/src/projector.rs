@@ -35,6 +35,8 @@ pub struct ThreadProjection {
     pub item_order: Vec<String>,
     pub subagents: BTreeMap<String, Value>,
     pub last_error: Option<String>,
+    #[serde(default)]
+    pub last_error_recoverable: bool,
     pub generation: u64,
     pub updated_at_ms: i64,
 }
@@ -88,6 +90,7 @@ impl EventProjector {
         match event.method.as_str() {
             "thread/started" | "thread/created" | "thread/updated" => {
                 merge_thread(projection, &event.params);
+                clear_recoverable_error_on_healthy_projection(projection);
                 ProjectionEffect::RefreshStatus
             }
             "thread/status/updated" | "thread/status/changed" => {
@@ -120,27 +123,27 @@ impl EventProjector {
                             .collect()
                     })
                     .unwrap_or_default();
+                if status_is_healthy(projection.status.as_deref()) {
+                    clear_recoverable_error(projection);
+                }
                 ProjectionEffect::RefreshStatus
             }
             "thread/settings/updated" | "thread/settings/update" => {
-                projection.desired_mode = string_at(
-                    &event.params,
-                    &[
-                        "collaborationMode",
-                        "collaboration_mode",
-                        "settings",
-                        "collaborationMode",
-                    ],
-                );
-                projection.observed_mode = string_at(
-                    &event.params,
-                    &["observedMode", "observed_mode", "settings", "observedMode"],
-                );
                 let settings = event
                     .params
                     .get("threadSettings")
                     .or_else(|| event.params.get("settings"))
                     .unwrap_or(&event.params);
+                let confirmed_mode = mode_from_fields(settings, &["collaborationMode", "collaboration_mode"])
+                    .or_else(|| mode_from_fields(&event.params, &["collaborationMode", "collaboration_mode"]));
+                let observed_mode = mode_from_fields(settings, &["observedMode", "observed_mode"])
+                    .or_else(|| mode_from_fields(&event.params, &["observedMode", "observed_mode"]));
+                if let Some(mode) = confirmed_mode.clone() {
+                    projection.desired_mode = Some(mode);
+                }
+                if let Some(mode) = observed_mode.or(confirmed_mode) {
+                    projection.observed_mode = Some(mode);
+                }
                 projection.model = settings
                     .get("model")
                     .and_then(Value::as_str)
@@ -155,6 +158,7 @@ impl EventProjector {
                 ProjectionEffect::RefreshStatus
             }
             "turn/started" | "turn/created" => {
+                clear_recoverable_error(projection);
                 projection.turn_id = string_at(&event.params, &["turnId", "turn", "id"]);
                 projection.turn_status = Some("inProgress".into());
                 projection.started_at_ms = Some(now_ms());
@@ -168,6 +172,9 @@ impl EventProjector {
                         .get("status")
                         .and_then(Value::as_str)
                         .map(str::to_owned);
+                }
+                if !matches!(projection.turn_status.as_deref(), Some("failed")) {
+                    clear_recoverable_error(projection);
                 }
                 ProjectionEffect::RefreshStatus
             }
@@ -233,16 +240,28 @@ impl EventProjector {
                 ProjectionEffect::RefreshStatus
             }
             "error" | "turn/error" => {
-                projection.last_error = event
+                let message = event
                     .params
                     .get("error")
                     .and_then(|error| error.get("message").or(Some(error)))
                     .and_then(Value::as_str)
                     .map(str::to_owned)
-                    .or_else(|| Some("Codex error".into()));
-                projection.turn_status = Some("failed".into());
-                projection.finished_at_ms = Some(now_ms());
-                ProjectionEffect::Error
+                    .unwrap_or_else(|| "Codex error".into());
+                let recoverable = event
+                    .params
+                    .get("willRetry")
+                    .or_else(|| event.params.get("will_retry"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or_else(|| recoverable_error_text(&message));
+                projection.last_error = Some(message);
+                projection.last_error_recoverable = recoverable;
+                if recoverable {
+                    ProjectionEffect::RefreshStatus
+                } else {
+                    projection.turn_status = Some("failed".into());
+                    projection.finished_at_ms = Some(now_ms());
+                    ProjectionEffect::Error
+                }
             }
             _ => ProjectionEffect::None,
         }
@@ -282,6 +301,43 @@ fn string_at(value: &Value, paths: &[&str]) -> Option<String> {
     })
 }
 
+fn normalized_mode(value: &Value) -> Option<String> {
+    let raw = value
+        .as_str()
+        .or_else(|| value.get("mode").and_then(Value::as_str))?
+        .trim()
+        .to_ascii_lowercase();
+    matches!(raw.as_str(), "plan" | "default").then_some(raw)
+}
+
+fn mode_from_fields(value: &Value, fields: &[&str]) -> Option<String> {
+    fields
+        .iter()
+        .find_map(|field| value.get(*field).and_then(normalized_mode))
+}
+
+fn recoverable_error_text(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("reconnecting") || normalized.contains("will retry")
+}
+
+fn clear_recoverable_error(projection: &mut ThreadProjection) {
+    if projection.last_error_recoverable {
+        projection.last_error = None;
+        projection.last_error_recoverable = false;
+    }
+}
+
+fn status_is_healthy(status: Option<&str>) -> bool {
+    status.is_some_and(|status| !matches!(status, "systemError" | "failed" | "error"))
+}
+
+fn clear_recoverable_error_on_healthy_projection(projection: &mut ThreadProjection) {
+    if status_is_healthy(projection.status.as_deref()) {
+        clear_recoverable_error(projection);
+    }
+}
+
 fn merge_thread(projection: &mut ThreadProjection, params: &Value) {
     let source = params.get("thread").unwrap_or(params);
     projection.title = ["title", "name", "naturalSummary", "summary"]
@@ -303,11 +359,15 @@ fn merge_thread(projection: &mut ThreadProjection, params: &Value) {
         })
         .map(str::to_owned)
         .or(projection.status.clone());
-    projection.desired_mode = source
-        .get("collaborationMode")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .or(projection.desired_mode.clone());
+    let confirmed_mode = mode_from_fields(source, &["collaborationMode", "collaboration_mode"]);
+    if let Some(mode) = confirmed_mode.clone() {
+        projection.desired_mode = Some(mode);
+    }
+    if let Some(mode) = mode_from_fields(source, &["observedMode", "observed_mode"])
+        .or(confirmed_mode)
+    {
+        projection.observed_mode = Some(mode);
+    }
     projection.model = source
         .get("model")
         .and_then(Value::as_str)
@@ -401,5 +461,67 @@ mod tests {
                 .as_deref(),
             Some("boom")
         );
+        assert!(!projector.projection("thread-1").unwrap().last_error_recoverable);
+    }
+
+    #[test]
+    fn reconnecting_error_clears_on_newer_healthy_status() {
+        let mut projector = EventProjector::default();
+        assert_eq!(
+            projector.apply(&event(
+                "error",
+                serde_json::json!({
+                    "threadId":"thread-recovery",
+                    "willRetry":true,
+                    "error":{"message":"Reconnecting... 1/5"}
+                })
+            )),
+            ProjectionEffect::RefreshStatus
+        );
+        assert!(projector.projection("thread-recovery").unwrap().last_error_recoverable);
+
+        projector.apply(&event(
+            "thread/status/changed",
+            serde_json::json!({"threadId":"thread-recovery","status":{"type":"idle"}}),
+        ));
+        let projection = projector.projection("thread-recovery").unwrap();
+        assert_eq!(projection.last_error, None);
+        assert!(!projection.last_error_recoverable);
+        assert_ne!(projection.turn_status.as_deref(), Some("failed"));
+    }
+
+    #[test]
+    fn terminal_error_is_not_cleared_by_healthy_status() {
+        let mut projector = EventProjector::default();
+        projector.apply(&event(
+            "error",
+            serde_json::json!({
+                "threadId":"thread-terminal",
+                "willRetry":false,
+                "error":{"message":"Reconnecting"}
+            }),
+        ));
+        projector.apply(&event(
+            "thread/status/changed",
+            serde_json::json!({"threadId":"thread-terminal","status":{"type":"idle"}}),
+        ));
+        let projection = projector.projection("thread-terminal").unwrap();
+        assert_eq!(projection.last_error.as_deref(), Some("Reconnecting"));
+        assert_eq!(projection.turn_status.as_deref(), Some("failed"));
+    }
+
+    #[test]
+    fn collaboration_mode_object_confirms_observed_mode() {
+        let mut projector = EventProjector::default();
+        projector.apply(&event(
+            "thread/settings/updated",
+            serde_json::json!({
+                "threadId":"thread-plan",
+                "settings":{"collaborationMode":{"mode":"plan"}}
+            }),
+        ));
+        let projection = projector.projection("thread-plan").unwrap();
+        assert_eq!(projection.desired_mode.as_deref(), Some("plan"));
+        assert_eq!(projection.observed_mode.as_deref(), Some("plan"));
     }
 }

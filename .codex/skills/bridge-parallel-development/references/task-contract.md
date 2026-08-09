@@ -19,7 +19,7 @@
 
 - One writer per file per phase.
 - The coordinator selects and records every lane's role, model, effort, and routing reason before spawn; implicit inheritance is not a routing decision.
-- Default routing is explorer=`gpt-5.6-luna/max`, worker=`gpt-5.6-luna/max`, reviewer=`gpt-5.6-luna/max`, root=`gpt-5.6-sol/xhigh`.
+- Default routing is explorer=`gpt-5.6-terra/xhigh`, worker=`gpt-5.6-terra/xhigh`, reviewer=`gpt-5.6-sol/max`, modernizer=`gpt-5.6-terra/max`, root=`gpt-5.6-sol/max`.
 - Existing symbols require GitNexus impact before edits.
 - HIGH or CRITICAL impact must be reported before editing.
 - No child may modify services, credentials, installed packages, other worktrees, user assets, releases, or remotes.
@@ -301,8 +301,7 @@ available read-only reviewer route if the configured reviewer route is likewise 
 - Root coordinator: `/root`, `gpt-5.6-sol/xhigh`; owns domain/ports contracts, the HIGH
   `handle_command` path, CRITICAL SQLite migration/import, daemon integration, cutover, and all
   user communication.
-- No `cross-agent-handoff`, `cah`, Goal Contract, push, tag, release, package installation, or
-  child service/credential control.
+- No push, tag, release, package installation, or child service/credential control.
 - In scope: Python golden parity for all three business Bot surfaces, Telegram adapter effects,
   Codex projection/server requests/approvals, native Rust persistence/recovery, read-only Python
   SQLite import, complete `codex-tg` CLI parity, and controlled cutover validation.
@@ -419,3 +418,57 @@ with the coordinator.
 - Root integrates one writer change at a time, reruns focused tests after each integration, closes
   every child before `rust-vnext-full.sh upgrade` or any service operation, and runs
   `detect_changes(compare main)` before Goal completion.
+
+## Active Goal Addendum: rust-runtime-ownership-parity-repair
+
+- Goal thread: `019fda1d-1809-74e3-a92c-3f940e28343f`.
+- Runtime baseline SHA: `2f499f4cd134f52418db7c2038945762d70f77f1`; this is the revision reported
+  by the live Rust metrics endpoint and already contains the per-bot pipeline and `follow_space`.
+- Integration branch/worktree: `agent/rust-parity-repair/integration` in
+  `/home/linuxie26/PythonProjects/codex-telegram-bridge-worktrees/rust-parity-repair-integration`.
+- Root coordinator: `/root`, `gpt-5.6-sol/max`; owns architecture, sequential integration,
+  HIGH/CRITICAL risk decisions, Goal/Plan state, systemd, state backups, deployment, rollback,
+  live Telegram acceptance, and all user communication.
+- Preserve the current dirty `main` worktree verbatim, including agent configuration, existing
+  candidate patches, `.playwright-cli/`, `target/`, and the untracked `assets/` directory.
+- In scope: canonical Rust service ownership and exclusive runtime switching; active-space handoff;
+  reliable TUI mode observation; recoverable error lifecycle; Python-equivalent discussion
+  `/planmode`; full Rust/Python visible-business audit, remediation, validation, and live cutover.
+- Out of scope: credentials, package installation, remote Git state, releases/tags, upstream Codex
+  changes, destructive cleanup of previous worktrees, and unrelated user files.
+
+| Lane | Agent role | Model | Effort | Selection reason | Worktree | Branch | Owned paths | Required gates | Integration order |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| service-ownership | bridge-worker | gpt-5.6-terra | xhigh | Isolates systemd naming, lifetime lock, transactional switching/handoff, installer/watchdog migration, and rollback from Rust daemon business paths. | `/home/linuxie26/PythonProjects/codex-telegram-bridge-worktrees/rust-parity-repair-service` | `agent/rust-parity-repair/service` | `systemd/**`, `scripts/bridge-service.sh`, new service/handoff helpers under `scripts/`, `scripts/rust-vnext-full.sh`, service-related `install.sh` and Python `cli.py` edits, service/installer tests, related docs | upstream impact for edited symbols, focused pytest, Ruff for Python edits, shell/static/systemd checks, scoped detect_changes, commit | 1 |
+| runtime-business | bridge-worker | gpt-5.6-terra | xhigh | Keeps projector, snapshot hydration, discussion interaction, app-server turn payload, persistence, renderers, Python oracle, and parity fixtures under one coherent owner because they converge in `daemon.rs`. | `/home/linuxie26/PythonProjects/codex-telegram-bridge-worktrees/rust-parity-repair-runtime` | `agent/rust-parity-repair/runtime` | Rust engine/app-server/storage/CLI/Telegram/component business sources and tests; Python projector/bridge/discussion/store/views oracle sources and tests; parity contracts/fixtures | upstream impact with HIGH/CRITICAL report, focused Rust/Python tests, fmt, Clippy, Ruff, scoped detect_changes, commit | 2 |
+| full-parity-audit | bridge-explorer | gpt-5.6-terra | xhigh | Independent read-only comparison of all four bot roles, exact Telegram effects, Codex calls, state transitions, persistence, recovery, and service-visible behavior after the four named fixes are mapped. | none (read-only) | none | none | evidence-backed finding IDs and missing-test matrix; zero diff | advisory before remediation |
+| integration-review | bridge-reviewer | gpt-5.6-sol | max | Independent final read-only review for correctness, concurrency, migration safety, runtime exclusivity, security, parity regressions, and test gaps. | none (read-only) | none | none | review integrated diff and verification/deployment evidence; zero diff | final |
+
+### Shared Contracts
+
+- `codex-telegram-bridge.service` is canonical Rust and boot-enabled;
+  `codex-telegram-bridge-python.service` is the disabled Python fallback; the old Rust unit name is
+  only an alias. Direct competing starts fail on one process-lifetime `flock`; `--force` performs a
+  verified switch and restores the exact prior owner/enabled state on failure.
+- TUI observed mode is evidence-based: explicit observed/settings notification, successful
+  collaboration turn, or the latest exact-thread rollout `turn_context`; desired snapshot state is
+  never promoted unconditionally.
+- New error retryability comes only from `willRetry`; legacy missing provenance may clear a textual
+  reconnect error only after explicit healthy evidence. Renderers consume normalized projection.
+- `/planmode` matches Python text, syntax, keyboard rows, 5-minute selection timeout, 30-second
+  first-prompt timeout, guards, durable revision/claim recovery, and one `turn/start` carrying
+  `collaborationMode`.
+- Python is the visible-business oracle except where this Goal's newer direct-mode and canonical-Rust
+  contracts explicitly supersede it. Exact text, parse mode, keyboard geometry, callback scope,
+  ordering, app-server requests, persistence, recovery, and error semantics are acceptance criteria.
+
+### Integration Rules
+
+- Before any existing symbol edit, the owning worker runs GitNexus upstream impact and immediately
+  reports HIGH or CRITICAL results to root. Root decides whether to continue before the edit.
+- Writers edit only owned paths, commit only those paths, and never operate services, credentials,
+  packages, remotes, other worktrees, or `assets/`. Root cherry-picks one lane at a time and resolves
+  cross-lane interfaces centrally.
+- All children must be completed/closed before root touches installed units or live state. Goal
+  completion requires Plan `8/8`, no active children, full validation, canonical Rust as the sole
+  owner, retained rollback artifacts, and reported local integration/deployment SHAs.
