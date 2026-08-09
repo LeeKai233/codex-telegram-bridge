@@ -1,7 +1,7 @@
 use ctg_domain::{AgentEvent, ThreadId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -32,6 +32,10 @@ pub struct ThreadProjection {
     /// `completed_turn_durations_ms` map so cross-turn totals survive restarts.
     #[serde(default)]
     pub completed_turns_duration_ms: i64,
+    /// Turn ids already folded into `completed_turns_duration_ms`; reconnect
+    /// replays of the same terminal turn must not double-count the total.
+    #[serde(default)]
+    pub completed_turn_ids: HashSet<String>,
     pub items: BTreeMap<String, Value>,
     /// Stable event order for rendering recent activity. `items` remains a
     /// map for idempotent updates and durable compatibility.
@@ -254,9 +258,24 @@ impl EventProjector {
                             .map(|started| now_ms().saturating_sub(started))
                             .unwrap_or_default()
                     });
-                projection.completed_turns_duration_ms = projection
-                    .completed_turns_duration_ms
-                    .saturating_add(duration_ms.max(0));
+                let turn_id = event
+                    .params
+                    .get("turn")
+                    .and_then(|turn| turn.get("id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .or_else(|| projection.turn_id.clone());
+                let already_counted = turn_id
+                    .as_deref()
+                    .is_some_and(|id| projection.completed_turn_ids.contains(id));
+                if !already_counted {
+                    if let Some(id) = turn_id {
+                        projection.completed_turn_ids.insert(id);
+                    }
+                    projection.completed_turns_duration_ms = projection
+                        .completed_turns_duration_ms
+                        .saturating_add(duration_ms.max(0));
+                }
                 ProjectionEffect::TurnCompleted
             }
             "item/started" | "item/updated" | "item/completed" | "item/failed" => {
@@ -580,7 +599,7 @@ fn project_collab_agent_tool_call(
             prompt.clone()
         } else {
             task_text(&current, "title")
-                .unwrap_or_else(|| format!("Agent {}", &task_id[..task_id.len().min(8)]))
+                .unwrap_or_else(|| format!("Agent {}", short_id_prefix(&task_id)))
         };
         let model = if is_spawn_receiver && !spawned_model.is_empty() {
             Some(spawned_model.to_owned())
@@ -667,7 +686,7 @@ fn project_subagent_activity(projection: &mut ThreadProjection, item: &Value, hi
         .unwrap_or(now);
     let title = task_text(&current, "title").unwrap_or_else(|| {
         if agent_path.is_empty() {
-            format!("Agent {}", &agent_thread_id[..agent_thread_id.len().min(8)])
+            format!("Agent {}", short_id_prefix(agent_thread_id))
         } else {
             format!("Agent {agent_path}")
         }
@@ -766,6 +785,16 @@ fn task_i64(task: &Option<Value>, key: &str) -> Option<i64> {
 fn compact_text(value: &str, limit: usize) -> String {
     let collapsed = value.split_whitespace().collect::<Vec<_>>().join(" ");
     collapsed.chars().take(limit).collect()
+}
+
+/// First up to 8 chars of an identifier, safe for non-ASCII values where
+/// byte slicing would panic.
+fn short_id_prefix(id: &str) -> &str {
+    let end = id
+        .char_indices()
+        .nth(8)
+        .map_or(id.len(), |(index, _)| index);
+    &id[..end]
 }
 
 fn now_secs() -> i64 {

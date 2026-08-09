@@ -128,7 +128,7 @@ struct RuntimeBot {
 struct InboundUpdate {
     bot_instance_id: String,
     update: codex_telegram_adapter::Update,
-    completion: std::sync::mpsc::SyncSender<bool>,
+    completion: std::sync::mpsc::Sender<(i64, bool)>,
 }
 
 #[derive(Clone, Debug)]
@@ -310,9 +310,10 @@ impl DispatchKey {
     }
 }
 
-/// Spawns one serial worker per [`DispatchKey`] on first use. A polling
-/// thread waits for each update's completion before sending the next, so a
-/// per-key queue holds at most one pending item and stays bounded.
+/// Spawns one serial worker per [`DispatchKey`] on first use.  The polling
+/// thread dispatches fire-and-forget and confirms the Telegram offset over
+/// the contiguous completed prefix, so a slow handler only queues its own
+/// key and never blocks other chats or bots.
 struct KeyedDispatcher<T, H> {
     workers: HashMap<DispatchKey, mpsc::UnboundedSender<T>>,
     handler: H,
@@ -369,8 +370,9 @@ struct DispatchContext {
 
 impl DispatchContext {
     async fn process(&self, inbound: InboundUpdate) {
+        let update_id = inbound.update.update_id;
         let Some(bot) = self.bots_by_id.get(&inbound.bot_instance_id).cloned() else {
-            let _ = inbound.completion.send(false);
+            let _ = inbound.completion.send((update_id, false));
             return;
         };
         let owner_user_id = self
@@ -405,7 +407,7 @@ impl DispatchContext {
             Ok(router) => router,
             Err(error) => {
                 eprintln!("rust bridge routing disabled: {error}");
-                let _ = inbound.completion.send(false);
+                let _ = inbound.completion.send((update_id, false));
                 return;
             }
         };
@@ -463,7 +465,7 @@ impl DispatchContext {
         // including harmless inline-button acknowledgements.  The
         // handler has already logged the durable failure; advance the
         // update cursor so the next update can still be delivered.
-        let _ = inbound.completion.send(true);
+        let _ = inbound.completion.send((update_id, true));
     }
 }
 
@@ -944,6 +946,14 @@ fn spawn_poller(
                 .next_update_offset(&bot.config.instance_id)
                 .ok()
                 .flatten();
+            // Updates are dispatched fire-and-forget into the keyed
+            // dispatcher so a slow handler never blocks the polling loop.
+            // The Telegram offset only advances once every update below it
+            // has reported completion (contiguous-prefix confirmation),
+            // which preserves the previous at-most-once record semantics.
+            let (done_tx, done_rx) = std::sync::mpsc::channel::<(i64, bool)>();
+            let mut pending: std::collections::BTreeMap<i64, bool> =
+                std::collections::BTreeMap::new();
             loop {
                 if shutdown.load(Ordering::Acquire) {
                     return;
@@ -973,18 +983,23 @@ fn spawn_poller(
                 metrics.set_queue_depth(updates.len() as u64);
                 for update in updates.into_iter().take(config.max_backlog) {
                     let update_id = update.update_id;
+                    if pending.contains_key(&update_id) {
+                        // Already dispatched in an earlier cycle and still
+                        // waiting on its completion (or on a lower update to
+                        // confirm first).
+                        continue;
+                    }
                     if store
                         .processed_update_exists(&bot.config.instance_id, update_id)
                         .unwrap_or(false)
                     {
-                        offset = Some(update_id.saturating_add(1));
+                        pending.insert(update_id, true);
                         continue;
                     }
-                    let (completion_tx, completion_rx) = std::sync::mpsc::sync_channel(0);
                     let mut inbound = InboundUpdate {
                         bot_instance_id: bot.config.instance_id.clone(),
                         update,
-                        completion: completion_tx,
+                        completion: done_tx.clone(),
                     };
                     loop {
                         match updates_tx.try_send(inbound) {
@@ -999,26 +1014,64 @@ fn spawn_poller(
                             Err(mpsc::error::TrySendError::Closed(_)) => return,
                         }
                     }
-                    let handled = loop {
-                        match completion_rx.recv_timeout(Duration::from_millis(250)) {
-                            Ok(handled) => break handled,
-                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                                if shutdown.load(Ordering::Acquire) {
-                                    return;
-                                }
+                    pending.insert(update_id, false);
+                }
+                // Drain completions.  When unconfirmed updates remain, pace
+                // the loop with a short wait so a stalled handler does not
+                // spin the poller against Telegram's getUpdates.
+                let wait = if pending.values().any(|confirmed| !confirmed) {
+                    Duration::from_millis(500)
+                } else {
+                    Duration::from_millis(0)
+                };
+                loop {
+                    let result = if wait.is_zero() {
+                        done_rx.try_recv().map_err(|error| match error {
+                            std::sync::mpsc::TryRecvError::Empty => {
+                                std::sync::mpsc::RecvTimeoutError::Timeout
                             }
-                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
-                        }
+                            std::sync::mpsc::TryRecvError::Disconnected => {
+                                std::sync::mpsc::RecvTimeoutError::Disconnected
+                            }
+                        })
+                    } else {
+                        done_rx.recv_timeout(wait)
                     };
-                    if !handled {
-                        break;
+                    match result {
+                        Ok((update_id, handled)) => {
+                            if handled {
+                                if let Some(confirmed) = pending.get_mut(&update_id) {
+                                    *confirmed = true;
+                                }
+                            } else {
+                                // Leave the update unconfirmed and
+                                // redeliverable: it stays below the
+                                // confirmation prefix and is re-fetched (and
+                                // re-dispatched) on a later cycle.
+                                pending.remove(&update_id);
+                            }
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
                     }
+                    if shutdown.load(Ordering::Acquire) {
+                        return;
+                    }
+                }
+                // Advance the offset over the confirmed prefix.  Pending
+                // ids iterate in ascending order; recording stops at the
+                // first unconfirmed update (or on a store error, which is
+                // retried on the next cycle).
+                for update_id in confirmed_update_prefix(&pending) {
                     match store.record_processed_update(
                         &bot.config.instance_id,
                         update_id,
                         now_ms(),
                     ) {
-                        Ok(true) | Ok(false) => offset = Some(update_id.saturating_add(1)),
+                        Ok(_) => {
+                            pending.remove(&update_id);
+                            offset = Some(update_id.saturating_add(1));
+                        }
                         Err(error) => {
                             eprintln!("rust bridge update state failed: {error}");
                             break;
@@ -1029,6 +1082,27 @@ fn spawn_poller(
             }
         })
         .expect("poller thread must start")
+}
+
+/// Leading run of confirmed update ids in ascending order.  The Telegram
+/// offset may only advance past a contiguous completed prefix, so polling
+/// stops confirming at the first update whose handler has not finished.
+fn confirmed_update_prefix(pending: &std::collections::BTreeMap<i64, bool>) -> Vec<i64> {
+    pending
+        .iter()
+        .take_while(|(_, done)| **done)
+        .map(|(id, _)| *id)
+        .collect()
+}
+
+/// First up to 8 chars of an identifier, safe for non-ASCII values where
+/// byte slicing would panic.
+fn short_id_prefix(id: &str) -> &str {
+    let end = id
+        .char_indices()
+        .nth(8)
+        .map_or(id.len(), |(index, _)| index);
+    &id[..end]
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2562,6 +2636,7 @@ fn projection_from_thread_read(thread_id: &str, response: &Value) -> ThreadProje
         ),
         last_error_recoverable: false,
         completed_turns_duration_ms: 0,
+        completed_turn_ids: Default::default(),
         generation: source
             .get("generation")
             .or_else(|| response.get("generation"))
@@ -2628,9 +2703,14 @@ fn projection_from_thread_read(thread_id: &str, response: &Value) -> ThreadProje
         if let Some(duration_ms) = duration_ms
             && turn_status.as_deref() != Some("inProgress")
         {
-            projection.completed_turns_duration_ms = projection
-                .completed_turns_duration_ms
-                .saturating_add(duration_ms.max(0));
+            let turn_id = turn.get("id").and_then(Value::as_str);
+            let newly_counted =
+                turn_id.is_none_or(|id| projection.completed_turn_ids.insert(id.to_owned()));
+            if newly_counted {
+                projection.completed_turns_duration_ms = projection
+                    .completed_turns_duration_ms
+                    .saturating_add(duration_ms.max(0));
+            }
         }
         let Some(items) = turn.get("items").and_then(Value::as_array) else {
             continue;
@@ -2761,6 +2841,7 @@ async fn list_control_sessions(agent: &AppServerClient) -> Result<Vec<ControlSes
 fn control_sessions_from_projections(
     projections: Vec<(String, i64, Value, i64)>,
     created_at_ms: &HashMap<String, i64>,
+    lifecycle_by_thread: &HashMap<String, String>,
 ) -> Vec<ControlSession> {
     let mut sessions = projections
         .into_iter()
@@ -2774,7 +2855,10 @@ fn control_sessions_from_projections(
                     .unwrap_or_else(|| "Codex session".to_owned()),
                 status: projection.status.unwrap_or_else(|| "unknown".to_owned()),
                 turn_status: projection.turn_status.unwrap_or_else(|| "idle".to_owned()),
-                lifecycle: String::new(),
+                lifecycle: lifecycle_by_thread
+                    .get(&thread_id)
+                    .cloned()
+                    .unwrap_or_default(),
                 active_flags: projection.active_flags,
                 error: if projection.last_error_recoverable {
                     String::new()
@@ -2825,6 +2909,16 @@ async fn list_control_sessions_cached(
         .store(false, Ordering::Release);
     let projection_rows = store.thread_projections().unwrap_or_default();
     let mut sessions = if !projection_rows.is_empty() {
+        let lifecycle_by_thread: HashMap<String, String> = store
+            .session_spaces()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|space| {
+                space
+                    .thread_id
+                    .map(|thread_id| (thread_id, space.lifecycle))
+            })
+            .collect();
         let created_at_ms = {
             let cache = control_runtime
                 .sessions_cache
@@ -2832,7 +2926,11 @@ async fn list_control_sessions_cached(
                 .map_err(|error| error.to_string())?;
             cache.created_at_ms.clone()
         };
-        let mut sessions = control_sessions_from_projections(projection_rows, &created_at_ms);
+        let mut sessions = control_sessions_from_projections(
+            projection_rows,
+            &created_at_ms,
+            &lifecycle_by_thread,
+        );
         let created_missing = sessions.iter().any(|session| session.created_at.is_none());
         let backfill_due = {
             let cache = control_runtime
@@ -6952,7 +7050,7 @@ async fn render_timeline_command(
             .map_or(0, Vec::len);
         lines.push(format!(
             "• {} · {} · items={}",
-            &id[..id.len().min(8)],
+            short_id_prefix(id),
             status,
             item_count
         ));
@@ -7317,15 +7415,15 @@ async fn run_status_heartbeat_worker(
                 .as_deref()
                 .and_then(|thread_id| projections.get(thread_id));
             // Python space_dashboard advances the moon-phase animation once
-            // per heartbeat while a Session is active; terminal Sessions pin
-            // the full moon inside the renderer instead.
-            let animation_frame = if status_is_animated(&space, projection) {
+            // per heartbeat while a Session is active; idle Sessions keep
+            // their current phase and terminal Sessions pin the full moon
+            // inside the renderer.
+            let animation_frame = {
                 let frame = animation_frames.get(&space.space_id).copied().unwrap_or(0);
-                animation_frames.insert(space.space_id.clone(), frame.wrapping_add(1));
+                if status_is_animated(&space, projection) {
+                    animation_frames.insert(space.space_id.clone(), frame.wrapping_add(1));
+                }
                 Some(frame)
-            } else {
-                animation_frames.remove(&space.space_id);
-                None
             };
             if let Err(error) = update_status_message_with_edit_timeout(
                 &store,
@@ -8726,7 +8824,8 @@ fn markdown_escape(value: &str) -> String {
         .flat_map(|character| {
             if matches!(
                 character,
-                '_' | '*'
+                '\\' | '_'
+                    | '*'
                     | '['
                     | ']'
                     | '('
@@ -8785,7 +8884,10 @@ fn status_animation_frame(
     if status_is_terminal(space, projection) {
         return Some(ANIMATION_FRAMES[TERMINAL_FRAME_INDEX as usize]);
     }
-    animation_frame.map(|frame| ANIMATION_FRAMES[(frame % ANIMATION_FRAMES.len() as u64) as usize])
+    // Python always renders the current phase in the mode header; an idle
+    // Session keeps its last phase (default 🌑).
+    let frame = animation_frame.unwrap_or(0);
+    Some(ANIMATION_FRAMES[(frame % ANIMATION_FRAMES.len() as u64) as usize])
 }
 
 fn format_duration_ms(total_ms: i64) -> String {
@@ -9050,11 +9152,8 @@ fn status_render(
         .unwrap_or_default();
     let mut lines: Vec<(String, String)> = vec![
         (
-            format!(
-                "{frame_prefix}*🤖 Codex · {}*",
-                markdown_escape(&truncate_text(title))
-            ),
-            format!("{frame_prefix}🤖 Codex · {}", truncate_text(title)),
+            format!("*🤖 Codex · {}*", markdown_escape(&truncate_text(title))),
+            format!("🤖 Codex · {}", truncate_text(title)),
         ),
         (
             format!(
@@ -9108,23 +9207,23 @@ fn status_render(
     ];
     if review_active {
         lines.push((
-            "*🔎 Review · 执行中*".to_owned(),
-            "🔎 Review · 执行中".to_owned(),
+            format!("{frame_prefix}*🔎 Review · 执行中*"),
+            format!("{frame_prefix}🔎 Review · 执行中"),
         ));
     } else if observed_mode == "plan" {
         lines.push((
-            "*🧭 TUI Plan mode*".to_owned(),
-            "🧭 TUI Plan mode".to_owned(),
+            format!("{frame_prefix}*🧭 TUI Plan mode*"),
+            format!("{frame_prefix}🧭 TUI Plan mode"),
         ));
     } else if observed_mode == "default" {
         lines.push((
-            "*⚙️ TUI Normal mode*".to_owned(),
-            "⚙️ TUI Normal mode".to_owned(),
+            format!("{frame_prefix}*⚙️ TUI Normal mode*"),
+            format!("{frame_prefix}⚙️ TUI Normal mode"),
         ));
     } else if desired_mode.is_some() {
         lines.push((
-            "*⚪ TUI mode 未确认*".to_owned(),
-            "⚪ TUI mode 未确认".to_owned(),
+            format!("{frame_prefix}*⚪ TUI mode 未确认*"),
+            format!("{frame_prefix}⚪ TUI mode 未确认"),
         ));
     }
     if review_active || desired_mode.is_some() || model.is_some() || effort.is_some() {
@@ -9225,7 +9324,7 @@ fn status_render(
         );
         lines.push((
             format!("⚠️ {}", markdown_escape(&warning)),
-            format!("⚠️ {warning}"),
+            format!("WARNING: {warning}"),
         ));
     }
     if goal_status == "complete" && active_tasks > 0 {
@@ -9233,7 +9332,7 @@ fn status_render(
             format!("Goal 已完成，但仍有 {active_tasks} 个 Subagent 运行中；请先等待或结束任务。");
         lines.push((
             format!("⚠️ {}", markdown_escape(&warning)),
-            format!("⚠️ {warning}"),
+            format!("WARNING: {warning}"),
         ));
     }
     lines.push((
@@ -9471,14 +9570,14 @@ fn subagent_task_lines(task: &Value, now_ms: i64) -> (String, String) {
         } else if !path.is_empty() {
             path
         } else if !thread_id.is_empty() {
-            &thread_id[..thread_id.len().min(8)]
+            short_id_prefix(thread_id)
         } else {
             "agent"
         };
         raw.chars().take(48).collect::<String>()
     };
     let short_id = if !thread_id.is_empty() {
-        thread_id[..thread_id.len().min(8)].to_owned()
+        short_id_prefix(thread_id).to_owned()
     } else if !path.is_empty() {
         path.to_owned()
     } else {
@@ -12733,6 +12832,32 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_update_prefix_stops_at_first_unconfirmed_update() {
+        let pending = |entries: &[(i64, bool)]| {
+            entries
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeMap<i64, bool>>()
+        };
+        assert_eq!(
+            confirmed_update_prefix(&pending(&[(1, true), (2, true), (3, false), (4, true)])),
+            vec![1, 2]
+        );
+        assert_eq!(
+            confirmed_update_prefix(&pending(&[(5, false), (6, true)])),
+            Vec::<i64>::new()
+        );
+        assert_eq!(
+            confirmed_update_prefix(&pending(&[(5, true), (7, true)])),
+            vec![5, 7]
+        );
+        assert_eq!(
+            confirmed_update_prefix(&std::collections::BTreeMap::new()),
+            Vec::<i64>::new()
+        );
+    }
+
+    #[test]
     fn sessions_listing_maps_projections_sorted_by_recency() {
         let projection_value = |thread_id: &str, title: Option<&str>, updated_at_ms: i64| {
             serde_json::to_value(ThreadProjection {
@@ -12763,17 +12888,22 @@ mod tests {
             ),
         ];
         let created_at_ms = HashMap::from([("thread-a".to_owned(), 1_700_000_000)]);
-        let sessions = control_sessions_from_projections(projections, &created_at_ms);
+        let lifecycle_by_thread =
+            HashMap::from([("thread-a".to_owned(), "repair_required".to_owned())]);
+        let sessions =
+            control_sessions_from_projections(projections, &created_at_ms, &lifecycle_by_thread);
         assert_eq!(sessions.len(), 2);
         // Recency descending, matching the app-server `thread/list` order.
         assert_eq!(sessions[0].thread_id, "thread-b");
         assert_eq!(sessions[0].title, "Codex session");
         assert_eq!(sessions[0].updated_at, Some(40));
         assert_eq!(sessions[0].created_at, None);
+        assert_eq!(sessions[0].lifecycle, "");
         assert_eq!(sessions[1].thread_id, "thread-a");
         assert_eq!(sessions[1].title, "Alpha");
         assert_eq!(sessions[1].created_at, Some(1_700_000_000));
         assert_eq!(sessions[1].cwd, "/tmp/thread-a");
+        assert_eq!(sessions[1].lifecycle, "repair_required");
         // A recoverable error is not surfaced as a session error row.
         assert!(sessions[1].error.is_empty());
     }
@@ -13450,17 +13580,21 @@ mod tests {
             thread_id: "thread-moon".into(),
             status: Some("active".into()),
             turn_status: Some("inProgress".into()),
+            observed_mode: Some("default".into()),
             started_at_ms: Some(now_ms()),
             ..ThreadProjection::default()
         };
         let rendered = status_render(&store, &space, Some(&projection), None, &totp, Some(3));
-        assert!(rendered.plain.starts_with("🌔 🤖 Codex"));
-        assert!(rendered.markdown.starts_with("🌔 *🤖 Codex"));
+        // The frame prefixes the mode header (Python `render_status_comment`),
+        // never the title line.
+        assert!(rendered.plain.contains("🌔 ⚙️ TUI Normal mode"));
+        assert!(rendered.markdown.contains("🌔 *⚙️ TUI Normal mode*"));
+        assert!(!rendered.plain.starts_with("🌔"));
 
         projection.turn_status = Some("completed".into());
         projection.goal = Some(json!({"status":"complete"}));
         let rendered = status_render(&store, &space, Some(&projection), None, &totp, Some(0));
-        assert!(rendered.plain.starts_with("🌕 "));
+        assert!(rendered.plain.contains("🌕 ⚙️ TUI Normal mode"));
         let channel = channel_status_render(&store, &space, Some(&projection), &totp, Some(0));
         assert!(channel.plain.starts_with("🌕 ") || channel.plain.contains("\n🌕 "));
     }
@@ -13553,9 +13687,13 @@ mod tests {
             ..ThreadProjection::default()
         };
         let rendered = status_render(&store, &space, Some(&projection), None, &totp, None);
+        // Python `views.py`: markdown keeps the ⚠️ icon, plain uses WARNING:.
+        assert!(rendered.plain.contains(
+            "WARNING: Goal 已完成，但 Plan 仍有 1 项未完成；状态不一致，请先同步 Plan。"
+        ));
         assert!(
             rendered
-                .plain
+                .markdown
                 .contains("⚠️ Goal 已完成，但 Plan 仍有 1 项未完成；状态不一致，请先同步 Plan。")
         );
     }

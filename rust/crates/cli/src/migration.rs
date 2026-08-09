@@ -665,9 +665,10 @@ fn projection_from_legacy_thread(
             }
         }
     }
-    let completed_turns_duration_ms = state
+    let completed_turn_durations = state
         .get("completed_turn_durations_ms")
-        .and_then(Value::as_object)
+        .and_then(Value::as_object);
+    let completed_turns_duration_ms = completed_turn_durations
         .map(|durations| {
             durations
                 .values()
@@ -676,6 +677,9 @@ fn projection_from_legacy_thread(
                 .sum()
         })
         .unwrap_or(0);
+    let completed_turn_ids = completed_turn_durations
+        .map(|durations| durations.keys().cloned().collect())
+        .unwrap_or_default();
     Some(ctg_engine::ThreadProjection {
         thread_id,
         title: text("title"),
@@ -707,6 +711,7 @@ fn projection_from_legacy_thread(
             .map(epoch_ms),
         finished_at_ms: None,
         completed_turns_duration_ms,
+        completed_turn_ids,
         items: Default::default(),
         item_order: Default::default(),
         subagents,

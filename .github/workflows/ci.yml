@@ -6,6 +6,8 @@ on:
     paths:
       - "src/**"
       - "tests/**"
+      - "fixtures/**"
+      - "references/**"
       - "install.sh"
       - "systemd/**"
       - "scripts/**"
@@ -15,6 +17,8 @@ on:
     paths:
       - "src/**"
       - "tests/**"
+      - "fixtures/**"
+      - "references/**"
       - "install.sh"
       - "systemd/**"
       - "scripts/**"
