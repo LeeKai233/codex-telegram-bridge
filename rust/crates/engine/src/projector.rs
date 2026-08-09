@@ -111,10 +111,14 @@ impl EventProjector {
             .threads
             .iter()
             .filter(|(_, projection)| {
-                projection
+                // Legacy rows often lack finished_at_ms/turn_status; treat any
+                // projection stale past the cutoff as evictable as long as no
+                // turn is live. The durable row stays for lazy reload.
+                let stale = projection
                     .finished_at_ms
                     .is_some_and(|finished| finished < cutoff_ms)
-                    && !matches!(projection.turn_status.as_deref(), Some("inProgress"))
+                    || (projection.updated_at_ms > 0 && projection.updated_at_ms < cutoff_ms);
+                stale && !matches!(projection.turn_status.as_deref(), Some("inProgress"))
             })
             .map(|(thread_id, _)| thread_id.clone())
             .collect::<Vec<_>>();

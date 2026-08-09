@@ -7446,8 +7446,22 @@ async fn run_status_heartbeat_worker(
     }
 }
 
-const HYDRATION_MAX_ATTEMPTS: u32 = 3;
+/// Periodic in-memory eviction of stale terminal projections, plus a
+/// `malloc_trim` so the freed arena is actually returned to the kernel and
+/// RSS tracks the bounded live set instead of the historic peak.
+fn run_projection_eviction_sweep(projector: &mut EventProjector, last_eviction: &mut Instant) {
+    *last_eviction = Instant::now();
+    let evicted =
+        projector.evict_finished_before(now_ms().saturating_sub(PROJECTION_TERMINAL_RETENTION_MS));
+    unsafe {
+        libc::malloc_trim(0);
+    }
+    if evicted > 0 {
+        eprintln!("rust bridge evicted {evicted} terminal thread projections from memory");
+    }
+}
 
+const HYDRATION_MAX_ATTEMPTS: u32 = 3;
 /// Startup hydration for threads that were created before the projection
 /// pipeline existed, mirroring the Python `Bridge.resync()` contract:
 /// `thread/resume` → `thread/read` → rebuild + persist the projection →
@@ -7744,8 +7758,20 @@ async fn forward_codex_events(
         }
     }
     loop {
-        let Some(event) = events.recv().await else {
-            return;
+        // Wake on a timer as well as on events: the eviction sweep must run
+        // even while the Codex app-server is completely idle.
+        let event = match tokio::time::timeout(
+            Duration::from_secs(PROJECTION_EVICTION_SWEEP_SECONDS),
+            events.recv(),
+        )
+        .await
+        {
+            Ok(Some(event)) => event,
+            Ok(None) => return,
+            Err(_) => {
+                run_projection_eviction_sweep(&mut projector, &mut last_eviction);
+                continue;
+            }
         };
         if event.method.ends_with("/delta") {
             continue;
@@ -7816,12 +7842,7 @@ async fn forward_codex_events(
             }
         }
         if last_eviction.elapsed() >= Duration::from_secs(PROJECTION_EVICTION_SWEEP_SECONDS) {
-            last_eviction = Instant::now();
-            let evicted = projector
-                .evict_finished_before(now_ms().saturating_sub(PROJECTION_TERMINAL_RETENTION_MS));
-            if evicted > 0 {
-                eprintln!("rust bridge evicted {evicted} terminal thread projections from memory");
-            }
+            run_projection_eviction_sweep(&mut projector, &mut last_eviction);
         }
         if effect == ProjectionEffect::None {
             continue;
