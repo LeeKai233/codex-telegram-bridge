@@ -387,6 +387,7 @@ async fn run_async(
                 .and_then(|thread_id| persisted_projections.get(thread_id)),
             None,
             true,
+            None,
         )
         .await
         {
@@ -1240,6 +1241,7 @@ async fn handle_action(
                     metrics,
                     totp.as_ref(),
                     &space,
+                    None,
                     None,
                 )
                 .await
@@ -2427,6 +2429,7 @@ fn projection_from_thread_read(thread_id: &str, response: &Value) -> ThreadProje
                 .or_else(|| latest_turn.and_then(|turn| turn.get("error"))),
         ),
         last_error_recoverable: false,
+        completed_turns_duration_ms: 0,
         generation: source
             .get("generation")
             .or_else(|| response.get("generation"))
@@ -2483,6 +2486,20 @@ fn projection_from_thread_read(thread_id: &str, response: &Value) -> ThreadProje
 
     let mut plan_from_item = None;
     for (turn_index, turn) in turns.iter().enumerate() {
+        let turn_status = turn
+            .get("status")
+            .map(|value| normalized_status(Some(value), ""));
+        let duration_ms = turn
+            .get("durationMs")
+            .or_else(|| turn.get("duration_ms"))
+            .and_then(Value::as_i64);
+        if let Some(duration_ms) = duration_ms
+            && turn_status.as_deref() != Some("inProgress")
+        {
+            projection.completed_turns_duration_ms = projection
+                .completed_turns_duration_ms
+                .saturating_add(duration_ms.max(0));
+        }
         let Some(items) = turn.get("items").and_then(Value::as_array) else {
             continue;
         };
@@ -2497,22 +2514,7 @@ fn projection_from_thread_read(thread_id: &str, response: &Value) -> ThreadProje
                 projection.item_order.push(item_id.clone());
             }
             projection.items.insert(item_id, item.clone());
-            if let Some(states) = item
-                .get("agentsStates")
-                .or_else(|| item.get("agents_states"))
-                .and_then(Value::as_object)
-            {
-                for (agent_id, state) in states {
-                    projection.subagents.insert(agent_id.clone(), state.clone());
-                }
-            }
-            for key in ["subagents", "subAgents"] {
-                if let Some(states) = item.get(key).and_then(Value::as_object) {
-                    for (agent_id, state) in states {
-                        projection.subagents.insert(agent_id.clone(), state.clone());
-                    }
-                }
-            }
+            ctg_engine::project_item_subagents(&mut projection, item, true);
             if let Some(task) = item
                 .get("task")
                 .or_else(|| item.get("subagent"))
@@ -2563,6 +2565,11 @@ fn synthetic_session_space(thread_id: &str, owner_chat_id: i64) -> RustSessionSp
         status_bot_instance: None,
         owner_chat_id: Some(owner_chat_id),
         plan_mode: false,
+        observed_mode: None,
+        normal_model: None,
+        normal_effort: None,
+        plan_model: None,
+        plan_effort: None,
         closed_at_ms: None,
         created_at_ms: 0,
         updated_at_ms: 0,
@@ -4841,6 +4848,15 @@ fn pending_space_payload(store: &SqliteStore, space_id: &str) -> Result<Value, S
     Ok(payload)
 }
 
+fn space_profile_text(payload: &Value, key: &str) -> Option<String> {
+    payload
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn create_pending_session_space(
     store: &SqliteStore,
@@ -4909,6 +4925,11 @@ async fn create_pending_session_space(
             status_bot_instance: None,
             owner_chat_id: Some(owner_chat_id),
             plan_mode: plan_model.is_some(),
+            observed_mode: None,
+            normal_model: space_profile_text(payload, "normal_model"),
+            normal_effort: space_profile_text(payload, "normal_effort"),
+            plan_model: plan_model.map(str::to_owned),
+            plan_effort: plan_effort.map(str::to_owned),
             closed_at_ms: None,
             created_at_ms: now_ms(),
             updated_at_ms: now_ms(),
@@ -4993,6 +5014,11 @@ async fn create_pending_session_space(
         status_bot_instance: None,
         owner_chat_id: Some(owner_chat_id),
         plan_mode: plan_model.is_some(),
+        observed_mode: None,
+        normal_model: space_profile_text(payload, "normal_model"),
+        normal_effort: space_profile_text(payload, "normal_effort"),
+        plan_model: plan_model.map(str::to_owned),
+        plan_effort: plan_effort.map(str::to_owned),
         closed_at_ms: None,
         created_at_ms: now,
         updated_at_ms: now,
@@ -5165,7 +5191,7 @@ async fn activate_pending_session(
             .delete_workflow_record("pending_space", &active.space_id)
             .map_err(|error| error.to_string())?;
         update_status_message(
-            store, bots_by_id, config, metrics, totp, &active, None, None, false,
+            store, bots_by_id, config, metrics, totp, &active, None, None, false, None,
         )
         .await?;
         let short_id = thread.id.as_str().chars().take(8).collect::<String>();
@@ -5285,7 +5311,7 @@ async fn activate_pending_session(
         .delete_workflow_record("pending_space", &active.space_id)
         .map_err(|error| error.to_string())?;
     update_status_message(
-        store, bots_by_id, config, metrics, totp, &active, None, None, false,
+        store, bots_by_id, config, metrics, totp, &active, None, None, false, None,
     )
     .await?;
     let short_id = thread.id.as_str().chars().take(8).collect::<String>();
@@ -6027,6 +6053,16 @@ async fn submit_prompt_intent_with_inputs(
                 thread_id: session.thread_id.clone(),
                 status: "inProgress".into(),
             })
+    } else if mode == "ask" {
+        agent
+            .start_turn_with_model(
+                &session.thread_id,
+                input,
+                Some(&client_message_id),
+                Some(config.ask_model.as_str()),
+                Some(config.ask_reasoning_effort.as_str()),
+            )
+            .await
     } else {
         agent
             .start_turn(&session.thread_id, input, Some(&client_message_id))
@@ -6872,6 +6908,7 @@ fn debounce_status_update(
             current_projection.as_ref().or(Some(&projection)),
             None,
             false,
+            None,
         )
         .await
         {
@@ -6888,6 +6925,7 @@ async fn run_status_heartbeat_worker(
     metrics: MetricsRegistry,
     totp: Arc<TotpManager>,
 ) {
+    let mut animation_frames: HashMap<String, u64> = HashMap::new();
     loop {
         tokio::time::sleep(Duration::from_secs(
             u64::try_from(HEARTBEAT_SECONDS.max(1)).unwrap_or(60),
@@ -6908,6 +6946,17 @@ async fn run_status_heartbeat_worker(
                 .thread_id
                 .as_deref()
                 .and_then(|thread_id| projections.get(thread_id));
+            // Python space_dashboard advances the moon-phase animation once
+            // per heartbeat while a Session is active; terminal Sessions pin
+            // the full moon inside the renderer instead.
+            let animation_frame = if status_is_animated(&space, projection) {
+                let frame = animation_frames.get(&space.space_id).copied().unwrap_or(0);
+                animation_frames.insert(space.space_id.clone(), frame.wrapping_add(1));
+                Some(frame)
+            } else {
+                animation_frames.remove(&space.space_id);
+                None
+            };
             if let Err(error) = update_status_message(
                 &store,
                 &bots_by_id,
@@ -6918,6 +6967,7 @@ async fn run_status_heartbeat_worker(
                 projection,
                 None,
                 false,
+                animation_frame,
             )
             .await
             {
@@ -6925,6 +6975,235 @@ async fn run_status_heartbeat_worker(
             }
         }
     }
+}
+
+const HYDRATION_MAX_ATTEMPTS: u32 = 3;
+
+/// Startup hydration for threads that were created before the projection
+/// pipeline existed, mirroring the Python `Bridge.resync()` contract:
+/// `thread/resume` → `thread/read` → rebuild + persist the projection →
+/// `thread/goal/get` backfill. Failures are retried with exponential backoff
+/// and never abort the remaining threads or the daemon startup path.
+async fn hydrate_thread_projections(
+    agent: &AppServerClient,
+    store: &Arc<SqliteStore>,
+    projector: &mut EventProjector,
+) -> Vec<(RustSessionSpace, ThreadProjection)> {
+    let mut hydrated = Vec::new();
+    for space in store.active_session_spaces().unwrap_or_default() {
+        let Some(thread_id) = space.thread_id.as_deref() else {
+            continue;
+        };
+        let Ok(thread_id) = ThreadId::new(thread_id) else {
+            continue;
+        };
+        let Some(projection) = hydrate_thread_with_retry(agent, &thread_id).await else {
+            continue;
+        };
+        let mut space = space;
+        if backfill_space_profile(&mut space, &projection) {
+            space.updated_at_ms = now_ms();
+            if let Err(error) = store.upsert_session_space(&space) {
+                eprintln!(
+                    "rust bridge hydration profile backfill failed for {}: {error}",
+                    space.space_id
+                );
+            }
+        }
+        if let Ok(payload) = serde_json::to_value(&projection) {
+            let _ = store.upsert_thread_projection(
+                thread_id.as_str(),
+                i64::try_from(projection.generation).unwrap_or(i64::MAX),
+                &payload,
+                now_ms(),
+            );
+        }
+        projector.restore(projection.clone());
+        hydrated.push((space, projection));
+    }
+    hydrated
+}
+
+async fn hydrate_thread_with_retry(
+    agent: &AppServerClient,
+    thread_id: &ThreadId,
+) -> Option<ThreadProjection> {
+    let mut delay = Duration::from_millis(500);
+    for attempt in 1..=HYDRATION_MAX_ATTEMPTS {
+        match hydrate_thread_once(agent, thread_id).await {
+            Ok(projection) => return Some(projection),
+            Err(error) => {
+                if attempt == HYDRATION_MAX_ATTEMPTS {
+                    eprintln!(
+                        "rust bridge hydration failed for {} after {HYDRATION_MAX_ATTEMPTS} attempts: {error}",
+                        thread_id.as_str()
+                    );
+                } else {
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_secs(8));
+                }
+            }
+        }
+    }
+    None
+}
+
+async fn hydrate_thread_once(
+    agent: &AppServerClient,
+    thread_id: &ThreadId,
+) -> Result<ThreadProjection, String> {
+    agent
+        .resume_thread(thread_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let response = agent
+        .request(
+            "thread/read",
+            json!({"threadId": thread_id.as_str(), "includeTurns": true}),
+            Duration::from_secs(30),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut projection = projection_from_thread_read(thread_id.as_str(), &response);
+    // Goal is not part of thread/read; Python resync pulls it separately.
+    if let Ok(goal_response) = agent
+        .request(
+            "thread/goal/get",
+            json!({"threadId": thread_id.as_str()}),
+            Duration::from_secs(30),
+        )
+        .await
+        && let Some(goal) = goal_response.get("goal").filter(|value| value.is_object())
+    {
+        projection.goal = Some(goal.clone());
+    }
+    if projection.updated_at_ms <= 0 {
+        projection.updated_at_ms = now_ms();
+    }
+    Ok(projection)
+}
+
+/// Mirrors the Python `_backfill_space_profiles`: a hydrated thread's model
+/// profile fills the space-level profile slots that are still empty.
+fn backfill_space_profile(space: &mut RustSessionSpace, projection: &ThreadProjection) -> bool {
+    if space.normal_model.is_some() && space.normal_effort.is_some() {
+        return false;
+    }
+    let (Some(model), Some(effort)) = (projection.model.as_deref(), projection.effort.as_deref())
+    else {
+        return false;
+    };
+    let mut changed = false;
+    if space.normal_model.is_none() {
+        space.normal_model = Some(model.to_owned());
+        changed = true;
+    }
+    if space.normal_effort.is_none() {
+        space.normal_effort = Some(effort.to_owned());
+        changed = true;
+    }
+    if space.plan_model.is_none() {
+        space.plan_model = Some(model.to_owned());
+        changed = true;
+    }
+    if space.plan_effort.is_none() {
+        space.plan_effort = Some(effort.to_owned());
+        changed = true;
+    }
+    changed
+}
+
+/// Persists `thread/settings/updated` into the SessionSpace, mirroring the
+/// Python projector's `_sync_space_settings`: the observed TUI mode and the
+/// per-mode model profile are durable, so a restart (or a legacy Session
+/// without projection data) still renders the mode header.
+fn sync_space_settings_from_event(store: &SqliteStore, thread_id: &str, params: &Value) {
+    let Some(thread_settings) = params
+        .get("threadSettings")
+        .or_else(|| params.get("settings"))
+    else {
+        return;
+    };
+    let Some(collaboration) = thread_settings
+        .get("collaborationMode")
+        .or_else(|| thread_settings.get("collaboration_mode"))
+    else {
+        return;
+    };
+    let mode = collaboration
+        .get("mode")
+        .and_then(Value::as_str)
+        .or_else(|| collaboration.as_str());
+    let Some(mode) = mode.filter(|mode| matches!(*mode, "default" | "plan")) else {
+        return;
+    };
+    let settings = collaboration.get("settings");
+    let model = settings
+        .and_then(|settings| settings.get("model"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let effort = settings
+        .and_then(|settings| {
+            settings
+                .get("reasoning_effort")
+                .or_else(|| settings.get("reasoningEffort"))
+        })
+        .or_else(|| thread_settings.get("effort"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    for space in store.session_spaces().unwrap_or_default() {
+        if space.thread_id.as_deref() != Some(thread_id) || space.lifecycle == "closed" {
+            continue;
+        }
+        let mut space = space;
+        space.observed_mode = Some(mode.to_owned());
+        if let (Some(model), Some(effort)) = (model, effort) {
+            if mode == "plan" {
+                space.plan_model = Some(model.to_owned());
+                space.plan_effort = Some(effort.to_owned());
+            } else {
+                space.normal_model = Some(model.to_owned());
+                space.normal_effort = Some(effort.to_owned());
+            }
+        }
+        space.updated_at_ms = now_ms();
+        if let Err(error) = store.upsert_session_space(&space) {
+            eprintln!(
+                "rust bridge space settings sync failed for {}: {error}",
+                space.space_id
+            );
+        }
+    }
+}
+
+const LEGACY_MODEL_REMAP_TARGET: &str = "gpt-5.6-terra";
+const LEGACY_MODEL_REMAP_EFFORT: &str = "low";
+
+/// Retired models (notably `gpt-5.6-luna`, but anything missing from the
+/// latest `model/list`) are remapped to the current default profile so stored
+/// SessionSpaces never point at a model Codex can no longer start.
+fn remap_legacy_session_models(space: &mut RustSessionSpace, available: &[ModelChoice]) -> bool {
+    let mut changed = false;
+    for (model, effort) in [
+        (&mut space.normal_model, &mut space.normal_effort),
+        (&mut space.plan_model, &mut space.plan_effort),
+    ] {
+        let Some(stored) = model.as_deref() else {
+            continue;
+        };
+        let known = available.iter().any(|entry| entry.model == stored);
+        if stored == "gpt-5.6-luna" || !known {
+            *model = Some(LEGACY_MODEL_REMAP_TARGET.to_owned());
+            *effort = Some(LEGACY_MODEL_REMAP_EFFORT.to_owned());
+            changed = true;
+        }
+    }
+    if changed {
+        space.updated_at_ms = now_ms();
+    }
+    changed
 }
 
 async fn forward_codex_events(
@@ -6946,6 +7225,39 @@ async fn forward_codex_events(
             }
         }
     }
+    // Hydrate legacy sessions before live events accumulate: the projector
+    // holds the only in-memory copy, so hydration must finish first to keep
+    // sparse live updates from clobbering the rebuilt projections.
+    if let Ok(models) = list_model_choices(&agent).await {
+        for mut space in store.active_session_spaces().unwrap_or_default() {
+            if remap_legacy_session_models(&mut space, &models.entries)
+                && let Err(error) = store.upsert_session_space(&space)
+            {
+                eprintln!(
+                    "rust bridge legacy model remap failed for {}: {error}",
+                    space.space_id
+                );
+            }
+        }
+    }
+    for (space, projection) in hydrate_thread_projections(&agent, &store, &mut projector).await {
+        if let Err(error) = update_status_message(
+            &store,
+            &bots_by_id,
+            &config,
+            &metrics,
+            totp.as_ref(),
+            &space,
+            Some(&projection),
+            None,
+            false,
+            None,
+        )
+        .await
+        {
+            eprintln!("rust bridge hydration status refresh failed: {error}");
+        }
+    }
     loop {
         let Some(event) = events.recv().await else {
             return;
@@ -6954,6 +7266,11 @@ async fn forward_codex_events(
             continue;
         }
         let effect = projector.apply(&event);
+        if event.method == "thread/settings/updated"
+            && let Some(thread_id) = event_thread_id(&event.params)
+        {
+            sync_space_settings_from_event(&store, thread_id, &event.params);
+        }
         if let Some(thread_id) = event_thread_id(&event.params)
             && let Some(projection) = projector.projection_mut(thread_id)
         {
@@ -7042,6 +7359,7 @@ async fn forward_codex_events(
                     Some(projection),
                     Some(&answer),
                     false,
+                    None,
                 )
                 .await
             {
@@ -7105,6 +7423,7 @@ async fn forward_codex_events(
                     Some(projection),
                     Some(message),
                     false,
+                    None,
                 )
                 .await;
             }
@@ -7955,16 +8274,118 @@ fn status_progress_bar(completed: usize, total: usize) -> String {
     format!("{}{}", "#".repeat(filled), "-".repeat(WIDTH - filled))
 }
 
-fn status_duration(started_at_ms: Option<i64>, now: i64) -> String {
-    let Some(started_at_ms) = started_at_ms.filter(|value| *value > 0) else {
-        return "N/A".to_owned();
+/// Python `views.py:ANIMATION_FRAMES` — the moon phase cycles once per
+/// heartbeat while a Session is active; terminal Sessions pin the full moon.
+const ANIMATION_FRAMES: [&str; 8] = ["🌑", "🌒", "🌓", "🌔", "🌕", "🌖", "🌗", "🌘"];
+const TERMINAL_FRAME_INDEX: u64 = 4;
+
+/// Dual-track status payload: Telegram receives MarkdownV2 first and the
+/// plain text on a 400 parse rejection, mirroring the Python
+/// `RenderedMessage(markdown, plain)` contract.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct StatusRendered {
+    markdown: String,
+    plain: String,
+}
+
+fn markdown_escape(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(|character| {
+            if matches!(
+                character,
+                '_' | '*'
+                    | '['
+                    | ']'
+                    | '('
+                    | ')'
+                    | '~'
+                    | '`'
+                    | '>'
+                    | '#'
+                    | '+'
+                    | '-'
+                    | '='
+                    | '|'
+                    | '{'
+                    | '}'
+                    | '.'
+                    | '!'
+            ) {
+                ['\\', character]
+            } else {
+                ['\0', character]
+            }
+        })
+        .filter(|character| *character != '\0')
+        .collect()
+}
+
+fn markdown_code(value: &str) -> String {
+    let escaped = value.replace('\\', "\\\\").replace('`', "\\`");
+    format!("`{escaped}`")
+}
+
+fn status_is_animated(space: &RustSessionSpace, projection: Option<&ThreadProjection>) -> bool {
+    if space.lifecycle != "active" {
+        return false;
+    }
+    let Some(projection) = projection else {
+        return false;
     };
-    let seconds = now.saturating_sub(started_at_ms).max(0).div_euclid(1_000);
+    if projection.turn_status.as_deref() == Some("inProgress")
+        || projection.review_status.as_deref() == Some("inProgress")
+    {
+        return true;
+    }
+    projection.status.as_deref() == Some("active")
+        && !matches!(
+            projection.turn_status.as_deref(),
+            Some("completed" | "failed" | "interrupted")
+        )
+}
+
+fn status_animation_frame(
+    space: &RustSessionSpace,
+    projection: Option<&ThreadProjection>,
+    animation_frame: Option<u64>,
+) -> Option<&'static str> {
+    if status_is_terminal(space, projection) {
+        return Some(ANIMATION_FRAMES[TERMINAL_FRAME_INDEX as usize]);
+    }
+    animation_frame.map(|frame| ANIMATION_FRAMES[(frame % ANIMATION_FRAMES.len() as u64) as usize])
+}
+
+fn format_duration_ms(total_ms: i64) -> String {
+    let seconds = total_ms.max(0).div_euclid(1_000);
     if seconds >= 3_600 {
         format!("{}h {:02}m", seconds / 3_600, seconds % 3_600 / 60)
     } else {
         format!("{}m {:02}s", seconds / 60, seconds % 60)
     }
+}
+
+/// Cross-turn cumulative execution time (Python `total_duration_ms`):
+/// completed turns plus the in-flight turn's elapsed time.
+fn status_total_duration(projection: Option<&ThreadProjection>, now: i64) -> String {
+    let Some(projection) = projection else {
+        return "N/A".to_owned();
+    };
+    let completed = projection.completed_turns_duration_ms.max(0);
+    let current = if projection.turn_status.as_deref() == Some("inProgress") {
+        projection
+            .started_at_ms
+            .filter(|value| *value > 0)
+            .map(|started| now.saturating_sub(started).max(0))
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let total = completed.saturating_add(current);
+    if total <= 0 {
+        return "N/A".to_owned();
+    }
+    format_duration_ms(total)
 }
 
 fn status_clock(epoch_ms: i64) -> String {
@@ -7984,6 +8405,18 @@ fn status_text(
     note: Option<&str>,
     totp: &TotpManager,
 ) -> String {
+    status_render(store, space, projection, note, totp, None).plain
+}
+
+#[allow(clippy::too_many_lines)]
+fn status_render(
+    store: &SqliteStore,
+    space: &RustSessionSpace,
+    projection: Option<&ThreadProjection>,
+    note: Option<&str>,
+    totp: &TotpManager,
+    animation_frame: Option<u64>,
+) -> StatusRendered {
     let thread_id = space.thread_id.as_deref().unwrap_or("-");
     let pending_payload = if space.lifecycle == "pending" || space.lifecycle == "repair_required" {
         store
@@ -8124,10 +8557,17 @@ fn status_text(
                 .flatten()
                 .map(status_clock)
                 .unwrap_or_else(|| "--:--:--".to_owned());
-            format!(
-                "🔓 TOTP 已认证 · 剩余 {} min · 到期 {}",
-                ((remaining_ms + 59_999) / 60_000).max(1),
-                expiry
+            (
+                format!(
+                    "🔓 TOTP 已认证 · 剩余 {} min · 到期 {}",
+                    markdown_code(&((remaining_ms + 59_999) / 60_000).max(1).to_string()),
+                    markdown_code(&expiry)
+                ),
+                format!(
+                    "🔓 TOTP 已认证 · 剩余 {} min · 到期 {}",
+                    ((remaining_ms + 59_999) / 60_000).max(1),
+                    expiry
+                ),
             )
         }
         Ok(_)
@@ -8137,68 +8577,152 @@ fn status_text(
                 .flatten()
                 .is_some_and(|expires_at| expires_at <= auth_now) =>
         {
-            "🔒 TOTP 已过期".to_owned()
+            ("🔒 TOTP 已过期".to_owned(), "🔒 TOTP 已过期".to_owned())
         }
-        _ => "🔒 TOTP 未认证".to_owned(),
+        _ => ("🔒 TOTP 未认证".to_owned(), "🔒 TOTP 未认证".to_owned()),
     };
-    let mode = projection
-        .and_then(|value| value.observed_mode.as_deref())
+    let desired_mode = projection.and_then(|value| value.desired_mode.as_deref());
+    let observed_mode = space
+        .observed_mode
+        .as_deref()
+        .filter(|mode| !matches!(*mode, "" | "unknown"))
+        .or_else(|| projection.and_then(|value| value.observed_mode.as_deref()))
         .unwrap_or("unknown");
     let review_active =
         projection.and_then(|value| value.review_status.as_deref()) == Some("inProgress");
-    let model = projection.and_then(|value| value.model.as_deref());
-    let effort = projection.and_then(|value| value.effort.as_deref());
+    let profile_mode = if observed_mode != "unknown" {
+        observed_mode
+    } else {
+        desired_mode.unwrap_or("default")
+    };
+    let model = if profile_mode == "plan" {
+        space.plan_model.as_deref()
+    } else {
+        space.normal_model.as_deref()
+    }
+    .or_else(|| projection.and_then(|value| value.model.as_deref()));
+    let effort = if profile_mode == "plan" {
+        space.plan_effort.as_deref()
+    } else {
+        space.normal_effort.as_deref()
+    }
+    .or_else(|| projection.and_then(|value| value.effort.as_deref()));
     let updated_at_ms = projection
         .map(|value| value.updated_at_ms)
         .filter(|value| *value > 0)
         .unwrap_or(space.updated_at_ms);
     let now = now_ms();
-    let mut lines = vec![
-        format!("🤖 Codex · {}", truncate_text(title)),
-        format!(
-            "{} · {} {} · Turn {} · 总执行 {}",
-            truncate_text(thread_id),
-            status_icon,
-            status_label,
-            turn_status,
-            status_duration(projection.and_then(|value| value.started_at_ms), now),
+    let duration = status_total_duration(projection, now);
+    let frame_prefix = status_animation_frame(space, projection, animation_frame)
+        .map(|frame| format!("{frame} "))
+        .unwrap_or_default();
+    let mut lines: Vec<(String, String)> = vec![
+        (
+            format!(
+                "{frame_prefix}*🤖 Codex · {}*",
+                markdown_escape(&truncate_text(title))
+            ),
+            format!("{frame_prefix}🤖 Codex · {}", truncate_text(title)),
         ),
-        format!("生命周期：{} · Mode：{}", lifecycle, mode),
-        format!(
-            "🎯 Goal · {} · {}",
-            goal_status,
-            truncate_text(goal_objective)
+        (
+            format!(
+                "{} · {} {} · Turn {} · 总执行 {}",
+                markdown_code(&truncate_text(thread_id)),
+                status_icon,
+                markdown_escape(status_label),
+                markdown_code(turn_status),
+                markdown_code(&duration),
+            ),
+            format!(
+                "{} · {} {} · Turn {} · 总执行 {}",
+                truncate_text(thread_id),
+                status_icon,
+                status_label,
+                turn_status,
+                duration,
+            ),
         ),
-        format!(
-            "🧭 Plan · {completed}/{plan_total} · [{}]",
-            status_progress_bar(completed, plan_total)
+        (
+            format!(
+                "生命周期：{} · Mode：{}",
+                markdown_escape(lifecycle),
+                markdown_escape(observed_mode)
+            ),
+            format!("生命周期：{lifecycle} · Mode：{observed_mode}"),
+        ),
+        (
+            format!(
+                "*🎯 Goal*  {} · {}",
+                markdown_code(goal_status),
+                markdown_escape(&truncate_text(goal_objective))
+            ),
+            format!(
+                "🎯 Goal · {} · {}",
+                goal_status,
+                truncate_text(goal_objective)
+            ),
+        ),
+        (
+            format!(
+                "*🧭 Plan*  {}  {}",
+                markdown_code(&format!("{completed}/{plan_total}")),
+                markdown_code(&status_progress_bar(completed, plan_total))
+            ),
+            format!(
+                "🧭 Plan · {completed}/{plan_total} · [{}]",
+                status_progress_bar(completed, plan_total)
+            ),
         ),
     ];
     if review_active {
-        lines.push("🔎 Review · 执行中".into());
-    } else if mode == "plan" {
-        lines.push("🧭 TUI Plan mode".into());
-    } else if mode == "default" {
-        lines.push("⚙️ TUI Normal mode".into());
+        lines.push((
+            "*🔎 Review · 执行中*".to_owned(),
+            "🔎 Review · 执行中".to_owned(),
+        ));
+    } else if observed_mode == "plan" {
+        lines.push((
+            "*🧭 TUI Plan mode*".to_owned(),
+            "🧭 TUI Plan mode".to_owned(),
+        ));
+    } else if observed_mode == "default" {
+        lines.push((
+            "*⚙️ TUI Normal mode*".to_owned(),
+            "⚙️ TUI Normal mode".to_owned(),
+        ));
+    } else if desired_mode.is_some() {
+        lines.push((
+            "*⚪ TUI mode 未确认*".to_owned(),
+            "⚪ TUI mode 未确认".to_owned(),
+        ));
     }
-    if model.is_some() || effort.is_some() {
-        lines.push(format!(
-            "🧠 Main · {} · Effort {}",
-            model.unwrap_or("N/A"),
-            effort.unwrap_or("N/A")
+    if review_active || desired_mode.is_some() || model.is_some() || effort.is_some() {
+        lines.push((
+            format!(
+                "*🧠 Main*  {} · Effort {}",
+                markdown_code(model.unwrap_or("N/A")),
+                markdown_code(effort.unwrap_or("N/A"))
+            ),
+            format!(
+                "🧠 Main · {} · Effort {}",
+                model.unwrap_or("N/A"),
+                effort.unwrap_or("N/A")
+            ),
         ));
     }
     if waiting_on_input {
-        lines.push("⏳ 等待用户输入".into());
+        lines.push(("⏳ 等待用户输入".to_owned(), "⏳ 等待用户输入".to_owned()));
     }
     if waiting_on_approval {
-        lines.push("🛂 等待审批".into());
+        lines.push(("🛂 等待审批".to_owned(), "🛂 等待审批".to_owned()));
     }
     if let Some(cwd) = projection
         .and_then(|value| value.cwd.as_deref())
         .filter(|value| !value.trim().is_empty())
     {
-        lines.push(format!("📁 项目 · {}", truncate_text(cwd)));
+        lines.push((
+            format!("📁 项目 · {}", markdown_code(&truncate_text(cwd))),
+            format!("📁 项目 · {}", truncate_text(cwd)),
+        ));
     }
     if let Some(pending) = pending_payload.as_ref() {
         if let Some(cwd) = pending
@@ -8206,46 +8730,119 @@ fn status_text(
             .or_else(|| pending.get("cwd"))
             .and_then(Value::as_str)
         {
-            lines.push(format!("📁 项目 · {}", truncate_text(cwd)));
+            lines.push((
+                format!("📁 项目 · {}", markdown_code(&truncate_text(cwd))),
+                format!("📁 项目 · {}", truncate_text(cwd)),
+            ));
         }
         if let Some(prompt) = pending
             .get("pending_prompt")
             .or_else(|| pending.get("prompt"))
             .and_then(Value::as_str)
         {
-            lines.push(format!("📝 首条 prompt · {}", truncate_text(prompt)));
+            lines.push((
+                format!(
+                    "📝 首条 prompt · {}",
+                    markdown_escape(&truncate_text(prompt))
+                ),
+                format!("📝 首条 prompt · {}", truncate_text(prompt)),
+            ));
         }
-        lines.push("🔐 待认证 · 在评论串发送 /totp <验证码>".into());
+        lines.push((
+            "🔐 待认证 · 在评论串发送 /totp <验证码>".to_owned(),
+            "🔐 待认证 · 在评论串发送 /totp <验证码>".to_owned(),
+        ));
+    }
+    if steps.is_empty() {
+        lines.push(("尚未创建计划".to_owned(), "尚未创建计划".to_owned()));
     }
     for (index, step) in steps.iter().take(14).enumerate() {
         let (step_text, step_status) = status_step_value(step);
-        let marker = match step_status.as_str() {
-            "completed" => "✅",
-            "inProgress" => "▶",
-            "blocked" => "⏸",
-            "failed" => "❌",
-            _ => "○",
-        };
-        lines.push(format!(
-            "{marker} {}. {}",
+        let plain = format!(
+            "{} {}. {}",
+            match step_status.as_str() {
+                "completed" => "✅",
+                "inProgress" => "▶",
+                "blocked" => "⏸",
+                "failed" => "❌",
+                _ => "○",
+            },
             index + 1,
             truncate_text(&step_text)
-        ));
+        );
+        let escaped_step = markdown_escape(&truncate_text(&step_text));
+        let markdown = match step_status.as_str() {
+            "completed" => format!("✅ ~{}\\. {escaped_step}~", index + 1),
+            "inProgress" => format!("▶ *{}\\. {escaped_step}*", index + 1),
+            "blocked" => format!("⏸ {}\\. {escaped_step}", index + 1),
+            "failed" => format!("❌ {}\\. {escaped_step}", index + 1),
+            _ => format!("○ {}\\. {escaped_step}", index + 1),
+        };
+        lines.push((markdown, plain));
     }
     if plan_total > 14 {
-        lines.push(format!("… 另有 {} 项，请使用 /plan 查看", plan_total - 14));
+        lines.push((
+            markdown_escape(&format!("… 另有 {} 项，请使用 /plan 查看", plan_total - 14)),
+            format!("… 另有 {} 项，请使用 /plan 查看", plan_total - 14),
+        ));
     }
-    lines.push(format!(
-        "🧩 Agent Tasks · {}/{} · Running {} · Failed {} · Interrupted {}",
-        tasks.saturating_sub(active_tasks),
-        tasks,
-        active_tasks,
-        failed_tasks,
-        interrupted_tasks
+    if goal_status == "complete" && plan_total > 0 && completed != plan_total {
+        let warning = format!(
+            "Goal 已完成，但 Plan 仍有 {} 项未完成；状态不一致，请先同步 Plan。",
+            plan_total - completed
+        );
+        lines.push((
+            format!("⚠️ {}", markdown_escape(&warning)),
+            format!("⚠️ {warning}"),
+        ));
+    }
+    if goal_status == "complete" && active_tasks > 0 {
+        let warning =
+            format!("Goal 已完成，但仍有 {active_tasks} 个 Subagent 运行中；请先等待或结束任务。");
+        lines.push((
+            format!("⚠️ {}", markdown_escape(&warning)),
+            format!("⚠️ {warning}"),
+        ));
+    }
+    lines.push((
+        format!(
+            "*🧩 Agent Tasks*  {} · Running {} · Failed {} · Interrupted {}",
+            markdown_code(&format!("{}/{}", tasks.saturating_sub(active_tasks), tasks)),
+            markdown_code(&active_tasks.to_string()),
+            markdown_code(&failed_tasks.to_string()),
+            markdown_code(&interrupted_tasks.to_string())
+        ),
+        format!(
+            "🧩 Agent Tasks · {}/{} · Running {} · Failed {} · Interrupted {}",
+            tasks.saturating_sub(active_tasks),
+            tasks,
+            active_tasks,
+            failed_tasks,
+            interrupted_tasks
+        ),
     ));
-    lines.push(format!("📥 Queue · {queue}"));
+    lines.push((
+        format!("*📥 Queue*  {}", markdown_code(&queue.to_string())),
+        format!("📥 Queue · {queue}"),
+    ));
+    let (visible_agents, hidden_agents) = visible_subagents(projection);
+    if !visible_agents.is_empty() {
+        lines.push(("*🤝 Subagents*".to_owned(), "🤝 Subagents".to_owned()));
+        for task in visible_agents {
+            lines.push(subagent_task_lines(task, now));
+        }
+        if hidden_agents > 0 {
+            lines.push((
+                markdown_escape(&format!("… 另有 {hidden_agents} 个已结束 Agent")),
+                format!("… 另有 {hidden_agents} 个已结束 Agent"),
+            ));
+        }
+    }
     if let Some(error) = last_error.filter(|value| !value.trim().is_empty()) {
-        lines.push(format!("❌ 错误 · {}", truncate_text(error)));
+        lines.push((
+            format!("*❌ 错误*  {}", markdown_escape(&truncate_text(error))),
+            format!("❌ 错误 · {}", truncate_text(error)),
+        ));
     }
     if let Some(projection) = projection {
         let completed = projection.turn_status.as_deref() != Some("inProgress");
@@ -8268,8 +8865,18 @@ fn status_text(
                 .collect::<Vec<_>>()
         };
         if !recent.is_empty() {
-            lines.push("🕘 近期事件".into());
-            lines.extend(recent);
+            lines.push(("*🕘 近期事件*".to_owned(), "🕘 近期事件".to_owned()));
+            lines.extend(recent.into_iter().map(|line| {
+                let (clock, text) = line.split_once(' ').unwrap_or(("--:--", line.as_str()));
+                if clock.chars().all(|c| c.is_ascii_digit() || c == ':') {
+                    (
+                        format!("{} {}", markdown_code(clock), markdown_escape(text)),
+                        line,
+                    )
+                } else {
+                    (markdown_escape(&line), line)
+                }
+            }));
         }
     }
     for (agent_id, task) in projection
@@ -8289,24 +8896,210 @@ fn status_text(
             .or_else(|| task.get("name"))
             .and_then(Value::as_str)
             .unwrap_or(agent_id);
-        lines.push(format!(
-            "↩️ Subagent interrupted · {}",
-            truncate_text(title)
+        lines.push((
+            format!(
+                "↩️ Subagent interrupted · {}",
+                markdown_escape(&truncate_text(title))
+            ),
+            format!("↩️ Subagent interrupted · {}", truncate_text(title)),
         ));
     }
     lines.push(auth);
-    lines.push(format!(
-        "🕒 更新 {} · 心跳 ≤{}s · generation {}",
-        status_clock(updated_at_ms.max(0)),
-        HEARTBEAT_SECONDS,
-        projection.map_or(0, |value| value.generation)
+    lines.push((
+        format!(
+            "🕒 更新 {} · 心跳 {} · generation {}",
+            markdown_code(&status_clock(updated_at_ms.max(0))),
+            markdown_code(&format!("≤{HEARTBEAT_SECONDS}s")),
+            markdown_code(&projection.map_or(0, |value| value.generation).to_string())
+        ),
+        format!(
+            "🕒 更新 {} · 心跳 ≤{}s · generation {}",
+            status_clock(updated_at_ms.max(0)),
+            HEARTBEAT_SECONDS,
+            projection.map_or(0, |value| value.generation)
+        ),
     ));
-    let mut text = lines.join("\n");
+    let mut markdown = lines
+        .iter()
+        .map(|(markdown, _)| markdown.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut plain = lines
+        .iter()
+        .map(|(_, plain)| plain.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     if let Some(note) = note.filter(|value| !value.trim().is_empty()) {
-        text.push_str("\n\n");
-        text.push_str(note);
+        markdown.push_str("\n\n");
+        markdown.push_str(&markdown_escape(note));
+        plain.push_str("\n\n");
+        plain.push_str(note);
     }
-    truncate_text(&text)
+    StatusRendered {
+        markdown: truncate_text(&markdown),
+        plain: truncate_text(&plain),
+    }
+}
+
+/// Python `views.py:_visible_agents` — active tasks first (oldest start
+/// first), then the three most recently finished terminal tasks.
+fn visible_subagents(projection: Option<&ThreadProjection>) -> (Vec<&Value>, usize) {
+    let Some(projection) = projection else {
+        return (Vec::new(), 0);
+    };
+    let mut active = Vec::new();
+    let mut terminal = Vec::new();
+    for task in projection.subagents.values() {
+        let (_, _, is_active) = subagent_task_status(task);
+        if is_active {
+            active.push(task);
+        } else {
+            terminal.push(task);
+        }
+    }
+    active.sort_by_key(|task| {
+        task_epoch_ms(task.get("started_at").or_else(|| task.get("updated_at")))
+    });
+    terminal.sort_by_key(|task| {
+        std::cmp::Reverse(task_epoch_ms(
+            task.get("finished_at").or_else(|| task.get("updated_at")),
+        ))
+    });
+    let total = projection.subagents.len();
+    let mut visible = active;
+    visible.extend(terminal.into_iter().take(3));
+    let hidden = total.saturating_sub(visible.len());
+    (visible, hidden)
+}
+
+fn subagent_task_status(task: &Value) -> (&'static str, String, bool) {
+    let status = task
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("pending");
+    match status {
+        "pending" | "pendingInit" => ("🟡", "初始化".to_owned(), true),
+        "active" | "running" | "inProgress" => ("🟢", "运行中".to_owned(), true),
+        "completed" => ("✅", "已完成".to_owned(), false),
+        "shutdown" => ("⚫", "已关闭".to_owned(), false),
+        "interrupted" | "cancelled" | "canceled" => ("⏸", "已中断".to_owned(), false),
+        "notFound" => ("❓", "未找到".to_owned(), false),
+        "errored" | "failed" => ("❌", "失败".to_owned(), false),
+        _ => ("⚪", "未知".to_owned(), false),
+    }
+}
+
+/// Task timestamps come from the Python `TaskState` contract (epoch seconds)
+/// while live Rust projections write milliseconds; accept either unit.
+fn task_epoch_ms(value: Option<&Value>) -> Option<i64> {
+    value
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0)
+        .map(|value| {
+            if value > 10_000_000_000 {
+                value
+            } else {
+                value.saturating_mul(1_000)
+            }
+        })
+}
+
+fn task_clip(task: Option<&Value>, limit: usize) -> String {
+    let text = task
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    text.chars().take(limit).collect()
+}
+
+fn subagent_task_lines(task: &Value, now_ms: i64) -> (String, String) {
+    let (icon, status_label, _) = subagent_task_status(task);
+    let thread_id = task
+        .get("agent_thread_id")
+        .or_else(|| task.get("task_id"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let path = task
+        .get("agent_path")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let nickname = task
+        .get("agent_nickname")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let role = task
+        .get("agent_role")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let label = {
+        let raw = if !nickname.is_empty() {
+            nickname
+        } else if !path.is_empty() {
+            path
+        } else if !thread_id.is_empty() {
+            &thread_id[..thread_id.len().min(8)]
+        } else {
+            "agent"
+        };
+        raw.chars().take(48).collect::<String>()
+    };
+    let short_id = if !thread_id.is_empty() {
+        thread_id[..thread_id.len().min(8)].to_owned()
+    } else if !path.is_empty() {
+        path.to_owned()
+    } else {
+        "unknown".to_owned()
+    };
+    let model = task
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let effort = task
+        .get("reasoning_effort")
+        .or_else(|| task.get("reasoningEffort"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let model_effort = [model, effort]
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join("/");
+    let started = task_epoch_ms(
+        task.get("started_at")
+            .or_else(|| task.get("startedAt"))
+            .or_else(|| task.get("updated_at")),
+    )
+    .unwrap_or(now_ms);
+    let finished = task_epoch_ms(task.get("finished_at").or_else(|| task.get("finishedAt")));
+    let elapsed = format_duration_ms(finished.unwrap_or(now_ms).saturating_sub(started).max(0));
+    let title = task_clip(task.get("title"), 64);
+    let title = if title.is_empty() {
+        "Agent task".to_owned()
+    } else {
+        title
+    };
+    let mut metadata = vec![status_label, short_id];
+    if !role.is_empty() {
+        metadata.push(role.chars().take(32).collect());
+    }
+    if !model_effort.is_empty() {
+        metadata.push(model_effort.chars().take(64).collect());
+    }
+    metadata.push(elapsed);
+    let markdown = format!(
+        "{icon} *{}* · {}\n└ {}",
+        markdown_escape(&label),
+        metadata
+            .iter()
+            .map(|value| markdown_code(value))
+            .collect::<Vec<_>>()
+            .join(" · "),
+        markdown_escape(&title)
+    );
+    let plain = format!("{icon} {label} · {}\n  {title}", metadata.join(" · "));
+    (markdown, plain)
 }
 
 fn status_bot_for<'a>(
@@ -8358,12 +9151,14 @@ fn status_semantic_fingerprint(
     format!("{:x}", digest.finalize())
 }
 
-fn channel_status_text(
+#[allow(clippy::too_many_lines)]
+fn channel_status_render(
     store: &SqliteStore,
     space: &RustSessionSpace,
     projection: Option<&ThreadProjection>,
     _totp: &TotpManager,
-) -> String {
+    animation_frame: Option<u64>,
+) -> StatusRendered {
     let thread_id = space.thread_id.as_deref().unwrap_or("Pending");
     let pending_title = store
         .workflow_record("pending_space", &space.space_id)
@@ -8488,76 +9283,176 @@ fn channel_status_text(
         })
         .count();
     let desired_mode = projection.and_then(|value| value.desired_mode.as_deref());
-    let observed_mode = projection
-        .and_then(|value| value.observed_mode.as_deref())
+    let observed_mode = space
+        .observed_mode
+        .as_deref()
+        .filter(|mode| !matches!(*mode, "" | "unknown"))
+        .or_else(|| projection.and_then(|value| value.observed_mode.as_deref()))
         .unwrap_or("unknown");
     let review_active =
         projection.and_then(|value| value.review_status.as_deref()) == Some("inProgress");
-    let model = projection
-        .and_then(|value| value.model.as_deref())
-        .unwrap_or("N/A");
-    let effort = projection
-        .and_then(|value| value.effort.as_deref())
-        .unwrap_or("N/A");
-    let mut lines = Vec::new();
+    let profile_mode = if observed_mode != "unknown" {
+        observed_mode
+    } else {
+        desired_mode.unwrap_or("default")
+    };
+    let model = if profile_mode == "plan" {
+        space.plan_model.as_deref()
+    } else {
+        space.normal_model.as_deref()
+    }
+    .or_else(|| projection.and_then(|value| value.model.as_deref()))
+    .unwrap_or("N/A");
+    let effort = if profile_mode == "plan" {
+        space.plan_effort.as_deref()
+    } else {
+        space.normal_effort.as_deref()
+    }
+    .or_else(|| projection.and_then(|value| value.effort.as_deref()))
+    .unwrap_or("N/A");
+    let frame_prefix = status_animation_frame(space, projection, animation_frame)
+        .map(|frame| format!("{frame} "))
+        .unwrap_or_default();
+    let mut lines: Vec<(String, String)> = Vec::new();
     if review_active {
-        lines.push("🔎 Review · 执行中".to_owned());
+        lines.push((
+            format!("{frame_prefix}*🔎 Review · 执行中*"),
+            format!("{frame_prefix}🔎 Review · 执行中"),
+        ));
     } else if desired_mode.is_some() || observed_mode != "unknown" {
         let mode_label = match observed_mode {
             "plan" => "🧭 TUI Plan mode",
             "default" => "⚙️ TUI Normal mode",
             _ => "⚪ TUI mode 未确认",
         };
-        lines.push(mode_label.to_owned());
+        lines.push((
+            format!("{frame_prefix}*{}*", markdown_escape(mode_label)),
+            format!("{frame_prefix}{mode_label}"),
+        ));
     }
+    let frame_prefix = if lines.is_empty() {
+        frame_prefix
+    } else {
+        String::new()
+    };
+    let duration = status_total_duration(projection, now_ms());
     lines.extend([
-        format!("🤖 Codex · {}", truncate_text(title)),
-        format!(
-            "{} · {} {} · 总执行 {}",
-            truncate_text(thread_id),
-            icon,
-            label,
-            status_duration(projection.and_then(|value| value.started_at_ms), now_ms()),
+        (
+            format!(
+                "{frame_prefix}*🤖 Codex · {}*",
+                markdown_escape(&truncate_text(title))
+            ),
+            format!("{frame_prefix}🤖 Codex · {}", truncate_text(title)),
+        ),
+        (
+            format!(
+                "{} · {} {} · 总执行 {}",
+                markdown_code(&truncate_text(thread_id)),
+                icon,
+                markdown_escape(label),
+                markdown_code(&duration),
+            ),
+            format!(
+                "{} · {} {} · 总执行 {}",
+                truncate_text(thread_id),
+                icon,
+                label,
+                duration,
+            ),
         ),
     ]);
     if review_active
         || desired_mode.is_some()
         || projection.is_some_and(|value| value.model.is_some() || value.effort.is_some())
+        || space.normal_model.is_some()
+        || space.plan_model.is_some()
     {
-        lines.push(format!("🧠 Main · {} · Effort {}", model, effort));
+        lines.push((
+            format!(
+                "*🧠 Main*  {} · Effort {}",
+                markdown_code(model),
+                markdown_code(effort)
+            ),
+            format!("🧠 Main · {model} · Effort {effort}"),
+        ));
     }
-    lines.push(format!("🎯 Goal {} {}", goal_icon, goal_status));
-    lines.push(format!(
-        "🧭 Plan {}/{} {}",
-        completed,
-        steps.len(),
-        status_progress_bar(completed, steps.len())
+    lines.push((
+        format!("🎯 Goal {} {}", goal_icon, markdown_code(goal_status)),
+        format!("🎯 Goal {goal_icon} {goal_status}"),
     ));
-    lines.push(format!(
-        "🧩 Tasks {}/{} · Active {} · Failed {} · Interrupted {} · Queue {}",
-        tasks.saturating_sub(active_tasks),
-        tasks,
-        active_tasks,
-        failed_tasks,
-        interrupted_tasks,
-        queue
+    lines.push((
+        format!(
+            "🧭 Plan {} {}",
+            markdown_code(&format!("{completed}/{}", steps.len())),
+            markdown_code(&status_progress_bar(completed, steps.len()))
+        ),
+        format!(
+            "🧭 Plan {}/{} {}",
+            completed,
+            steps.len(),
+            status_progress_bar(completed, steps.len())
+        ),
+    ));
+    lines.push((
+        format!(
+            "🧩 Tasks {} · Active {} · Failed {} · Interrupted {} · Queue {}",
+            markdown_code(&format!("{}/{}", tasks.saturating_sub(active_tasks), tasks)),
+            markdown_code(&active_tasks.to_string()),
+            markdown_code(&failed_tasks.to_string()),
+            markdown_code(&interrupted_tasks.to_string()),
+            markdown_code(&queue.to_string())
+        ),
+        format!(
+            "🧩 Tasks {}/{} · Active {} · Failed {} · Interrupted {} · Queue {}",
+            tasks.saturating_sub(active_tasks),
+            tasks,
+            active_tasks,
+            failed_tasks,
+            interrupted_tasks,
+            queue
+        ),
     ));
     if let Some(cwd) = projection
         .and_then(|value| value.cwd.as_deref())
         .filter(|value| !value.trim().is_empty())
     {
-        lines.push(format!("📁 {}", truncate_text(cwd)));
+        lines.push((
+            format!("📁 {}", markdown_code(&truncate_text(cwd))),
+            format!("📁 {}", truncate_text(cwd)),
+        ));
     }
     let updated_at_ms = projection
         .map(|value| value.updated_at_ms)
         .filter(|value| *value > 0)
         .unwrap_or(space.updated_at_ms);
-    lines.push(format!(
-        "🕒 更新 {} · 心跳 ≤{}s",
-        status_clock(updated_at_ms.max(0)),
-        HEARTBEAT_SECONDS
+    lines.push((
+        format!(
+            "🕒 更新 {} · 心跳 {}",
+            markdown_code(&status_clock(updated_at_ms.max(0))),
+            markdown_code(&format!("≤{HEARTBEAT_SECONDS}s"))
+        ),
+        format!(
+            "🕒 更新 {} · 心跳 ≤{}s",
+            status_clock(updated_at_ms.max(0)),
+            HEARTBEAT_SECONDS
+        ),
     ));
-    truncate_text(&lines.join("\n"))
+    StatusRendered {
+        markdown: truncate_text(
+            &lines
+                .iter()
+                .map(|(markdown, _)| markdown.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        plain: truncate_text(
+            &lines
+                .iter()
+                .map(|(_, plain)| plain.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+    }
 }
 
 fn status_is_terminal(space: &RustSessionSpace, projection: Option<&ThreadProjection>) -> bool {
@@ -8600,6 +9495,7 @@ fn status_is_terminal(space: &RustSessionSpace, projection: Option<&ThreadProjec
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn ensure_status_message(
     store: &SqliteStore,
     bots_by_id: &HashMap<String, RuntimeBot>,
@@ -8608,13 +9504,15 @@ async fn ensure_status_message(
     totp: &TotpManager,
     space: &RustSessionSpace,
     projection: Option<&ThreadProjection>,
+    animation_frame: Option<u64>,
 ) -> Result<Option<RustSessionSpace>, String> {
     if space.discussion_chat_id.is_none() || space.discussion_root_message_id.is_none() {
         return Ok(Some(space.clone()));
     }
     let terminal = status_is_terminal(space, projection);
-    let text = status_text(store, space, projection, None, totp);
-    let semantic = status_semantic_fingerprint(&text, &space.lifecycle, terminal, false);
+    let rendered = status_render(store, space, projection, None, totp, animation_frame);
+    let semantic =
+        status_semantic_fingerprint(&rendered.markdown, &space.lifecycle, terminal, false);
 
     if space.status_message_id.is_some() {
         let Some(preferred) = preferred_status_bot(bots_by_id) else {
@@ -8636,7 +9534,7 @@ async fn ensure_status_message(
         } else {
             status_callback_markup(store, space, &[("取消关注", "space_unwatch")])?
         };
-        let message = send_text_with_markup_message(
+        let message = send_rendered_with_markup(
             &preferred,
             &surface_for(
                 &preferred,
@@ -8644,7 +9542,7 @@ async fn ensure_status_message(
                 space.discussion_chat_id.expect("checked above"),
                 space.discussion_root_message_id,
             ),
-            &text,
+            &rendered,
             markup,
             metrics,
         )
@@ -8696,7 +9594,7 @@ async fn ensure_status_message(
     } else {
         status_callback_markup(store, space, &[("取消关注", "space_unwatch")])?
     };
-    let message = send_text_with_markup_message(
+    let message = send_rendered_with_markup(
         bot,
         &surface_for(
             bot,
@@ -8704,7 +9602,7 @@ async fn ensure_status_message(
             space.discussion_chat_id.expect("checked above"),
             space.discussion_root_message_id,
         ),
-        &text,
+        &rendered,
         markup,
         metrics,
     )
@@ -8740,9 +9638,19 @@ async fn update_status_message(
     projection: Option<&ThreadProjection>,
     note: Option<&str>,
     force_refresh: bool,
+    animation_frame: Option<u64>,
 ) -> Result<(), String> {
-    let Some(current) =
-        ensure_status_message(store, bots_by_id, config, metrics, totp, space, projection).await?
+    let Some(current) = ensure_status_message(
+        store,
+        bots_by_id,
+        config,
+        metrics,
+        totp,
+        space,
+        projection,
+        animation_frame,
+    )
+    .await?
     else {
         return Ok(());
     };
@@ -8753,8 +9661,9 @@ async fn update_status_message(
         return Ok(());
     };
     let terminal = status_is_terminal(&current, projection);
-    let text = status_text(store, &current, projection, note, totp);
-    let semantic = status_semantic_fingerprint(&text, &current.lifecycle, terminal, false);
+    let rendered = status_render(store, &current, projection, note, totp, animation_frame);
+    let semantic =
+        status_semantic_fingerprint(&rendered.markdown, &current.lifecycle, terminal, false);
     let discussion_chat_id = current
         .discussion_chat_id
         .unwrap_or(config.discussion_chat_id);
@@ -8769,9 +9678,14 @@ async fn update_status_message(
             .map_err(|error| error.to_string())?
             .as_deref()
             != Some(semantic.as_str());
-    let dashboard_text = channel_status_text(store, &current, projection, totp);
-    let dashboard_semantic =
-        status_semantic_fingerprint(&dashboard_text, &current.lifecycle, terminal, false);
+    let dashboard_rendered =
+        channel_status_render(store, &current, projection, totp, animation_frame);
+    let dashboard_semantic = status_semantic_fingerprint(
+        &dashboard_rendered.markdown,
+        &current.lifecycle,
+        terminal,
+        false,
+    );
     let control_bot = bots_by_id
         .values()
         .find(|candidate| candidate.role == RuntimeBotRole::Control);
@@ -8801,7 +9715,9 @@ async fn update_status_message(
             current.channel_post_id,
         )
         .map_err(|error| error.to_string())?;
-        if let Err(error) = edit_text_message(control, &reference, &dashboard_text, metrics).await {
+        if let Err(error) =
+            edit_rendered_with_markup(control, &reference, &dashboard_rendered, None, metrics).await
+        {
             eprintln!("rust bridge channel dashboard update failed: {error}");
         } else {
             store
@@ -8838,7 +9754,7 @@ async fn update_status_message(
     } else {
         status_callback_markup(store, &current, &[("取消关注", "space_unwatch")])?
     };
-    let edit_result = edit_text_with_markup(
+    let edit_result = edit_rendered_with_markup(
         bot,
         &TelegramMessageReference::new(
             current
@@ -8848,7 +9764,7 @@ async fn update_status_message(
             message_id,
         )
         .map_err(|error| error.to_string())?,
-        &text,
+        &rendered,
         markup,
         metrics,
     )
@@ -9011,6 +9927,7 @@ async fn handle_status_callback(
                 None,
                 Some("已从 Codex 刷新 Session 状态。"),
                 true,
+                None,
             )
             .await
         }
@@ -9066,6 +9983,7 @@ async fn handle_status_callback(
                 None,
                 Some(UNWATCH_CANCEL_MESSAGE),
                 true,
+                None,
             )
             .await
         }
@@ -10224,6 +11142,90 @@ async fn edit_text_with_markup(
     })
     .await
     .map_err(|error| error.to_string())?;
+    match result {
+        Ok(_) => {
+            metrics.observe_delivery_duration_for(
+                role_label(bot.role),
+                true,
+                started.elapsed().as_micros() as u64,
+            );
+            Ok(())
+        }
+        Err(error) => {
+            metrics.observe_delivery_duration_for(
+                role_label(bot.role),
+                false,
+                started.elapsed().as_micros() as u64,
+            );
+            Err(error.to_string())
+        }
+    }
+}
+
+/// Dual-track variant of `send_text_with_markup_message`: MarkdownV2 first,
+/// the plain fallback on a Telegram 400, reusing the adapter's rendered
+/// recovery path. The stored JSON keyboard is preserved through the typed
+/// markup conversion.
+async fn send_rendered_with_markup(
+    bot: &RuntimeBot,
+    surface: &TelegramSurfaceBinding,
+    rendered: &StatusRendered,
+    markup: Option<Value>,
+    metrics: &MetricsRegistry,
+) -> Result<SentMessage, String> {
+    let typed_markup = typed_markup_from_json(markup)?;
+    let request = TelegramMessageRequest::markdown_v2(
+        truncate_text(&rendered.markdown),
+        truncate_text(&rendered.plain),
+    )
+    .with_reply_markup_option(typed_markup);
+    let api = bot.api.clone();
+    let token = bot.token.clone();
+    let surface = surface.clone();
+    let started = Instant::now();
+    let result = tokio::task::spawn_blocking(move || api.send_rendered(&token, &surface, &request))
+        .await
+        .map_err(|error| error.to_string())?;
+    match result {
+        Ok(message) => {
+            metrics.observe_delivery_duration_for(
+                role_label(bot.role),
+                true,
+                started.elapsed().as_micros() as u64,
+            );
+            Ok(message)
+        }
+        Err(error) => {
+            metrics.observe_delivery_duration_for(
+                role_label(bot.role),
+                false,
+                started.elapsed().as_micros() as u64,
+            );
+            Err(error.to_string())
+        }
+    }
+}
+
+async fn edit_rendered_with_markup(
+    bot: &RuntimeBot,
+    message: &TelegramMessageReference,
+    rendered: &StatusRendered,
+    markup: Option<Value>,
+    metrics: &MetricsRegistry,
+) -> Result<(), String> {
+    let typed_markup = typed_markup_from_json(markup)?;
+    let request = TelegramMessageRequest::markdown_v2(
+        truncate_text(&rendered.markdown),
+        truncate_text(&rendered.plain),
+    )
+    .with_reply_markup_option(typed_markup);
+    let api = bot.api.clone();
+    let token = bot.token.clone();
+    let reference = message.clone();
+    let started = Instant::now();
+    let result = tokio::task::spawn_blocking(move || api.edit_text(&token, &reference, &request))
+        .await
+        .map_err(|error| error.to_string())?;
     match result {
         Ok(_) => {
             metrics.observe_delivery_duration_for(
@@ -11852,7 +12854,7 @@ mod tests {
         completed.turn_status = Some("completed".into());
         assert!(status_is_terminal(&space, Some(&completed)));
 
-        let channel = channel_status_text(&store, &space, Some(&completed), &totp);
+        let channel = channel_status_render(&store, &space, Some(&completed), &totp, None).plain;
         assert!(channel.contains("🤖 Codex"));
         assert!(channel.contains("🎯 Goal"));
         assert!(!channel.contains("生命周期："));
@@ -11877,5 +12879,187 @@ mod tests {
             Some(("space-queue".into(), 7))
         );
         assert_eq!(queue_callback_scope(&json!({}), None), None);
+    }
+
+    #[test]
+    fn moon_frame_appears_while_active_and_pins_full_moon_on_terminal() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let totp = TotpManager::new(store.clone(), "/tmp/nonexistent-rust-bridge-totp", 60);
+        let space = synthetic_session_space("thread-moon", 42);
+        let mut projection = ThreadProjection {
+            thread_id: "thread-moon".into(),
+            status: Some("active".into()),
+            turn_status: Some("inProgress".into()),
+            started_at_ms: Some(now_ms()),
+            ..ThreadProjection::default()
+        };
+        let rendered = status_render(&store, &space, Some(&projection), None, &totp, Some(3));
+        assert!(rendered.plain.starts_with("🌔 🤖 Codex"));
+        assert!(rendered.markdown.starts_with("🌔 *🤖 Codex"));
+
+        projection.turn_status = Some("completed".into());
+        projection.goal = Some(json!({"status":"complete"}));
+        let rendered = status_render(&store, &space, Some(&projection), None, &totp, Some(0));
+        assert!(rendered.plain.starts_with("🌕 "));
+        let channel = channel_status_render(&store, &space, Some(&projection), &totp, Some(0));
+        assert!(channel.plain.starts_with("🌕 ") || channel.plain.contains("\n🌕 "));
+    }
+
+    #[test]
+    fn mode_header_and_main_profile_prefer_space_persisted_values() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let totp = TotpManager::new(store.clone(), "/tmp/nonexistent-rust-bridge-totp", 60);
+        let mut space = synthetic_session_space("thread-mode", 42);
+        space.observed_mode = Some("default".into());
+        space.normal_model = Some("gpt-5.6-terra".into());
+        space.normal_effort = Some("low".into());
+        // A legacy session without any projection still renders the mode
+        // header from the durable space profile.
+        let rendered = status_render(&store, &space, None, None, &totp, None);
+        assert!(rendered.plain.contains("⚙️ TUI Normal mode"));
+        assert!(
+            rendered
+                .plain
+                .contains("🧠 Main · gpt-5.6-terra · Effort low")
+        );
+        assert!(rendered.markdown.contains("*⚙️ TUI Normal mode*"));
+
+        space.observed_mode = Some("plan".into());
+        space.plan_model = Some("gpt-5.6-sol".into());
+        space.plan_effort = Some("high".into());
+        let rendered = status_render(&store, &space, None, None, &totp, None);
+        assert!(rendered.plain.contains("🧭 TUI Plan mode"));
+        assert!(
+            rendered
+                .plain
+                .contains("🧠 Main · gpt-5.6-sol · Effort high")
+        );
+    }
+
+    #[test]
+    fn subagents_section_and_cross_turn_duration_match_python_views() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let totp = TotpManager::new(store.clone(), "/tmp/nonexistent-rust-bridge-totp", 60);
+        let space = synthetic_session_space("thread-agents", 42);
+        let mut subagents = std::collections::BTreeMap::new();
+        subagents.insert(
+            "agent-1".to_owned(),
+            json!({
+                "task_id": "agent-1",
+                "title": "调研 Rust 重写进度",
+                "status": "inProgress",
+                "agent_thread_id": "agent-1",
+                "agent_path": "worker/parity",
+                "model": "gpt-5.6-sol",
+                "reasoning_effort": "max",
+                "started_at": now_ms().div_euclid(1_000) - 90,
+                "finished_at": 0,
+                "updated_at": now_ms().div_euclid(1_000)
+            }),
+        );
+        let projection = ThreadProjection {
+            thread_id: "thread-agents".into(),
+            status: Some("idle".into()),
+            turn_status: Some("completed".into()),
+            completed_turns_duration_ms: 3_660_000,
+            subagents,
+            ..ThreadProjection::default()
+        };
+        let rendered = status_render(&store, &space, Some(&projection), None, &totp, None);
+        // Python models.py total_duration_ms: completed turns plus the
+        // in-flight turn, so a finished 61-minute session renders 1h 01m.
+        assert!(rendered.plain.contains("总执行 1h 01m"));
+        assert!(rendered.plain.contains("🤝 Subagents"));
+        assert!(rendered.plain.contains("🟢 worker/parity · 运行中"));
+        assert!(rendered.plain.contains("调研 Rust 重写进度"));
+        assert!(rendered.markdown.contains("*🤝 Subagents*"));
+        // No plan steps yet: the Python "尚未创建计划" placeholder shows.
+        assert!(rendered.plain.contains("尚未创建计划"));
+    }
+
+    #[test]
+    fn goal_plan_inconsistency_warning_matches_python_views() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let totp = TotpManager::new(store.clone(), "/tmp/nonexistent-rust-bridge-totp", 60);
+        let space = synthetic_session_space("thread-warning", 42);
+        let projection = ThreadProjection {
+            thread_id: "thread-warning".into(),
+            status: Some("idle".into()),
+            turn_status: Some("completed".into()),
+            goal: Some(json!({"status":"complete","objective":"Ship"})),
+            plan: Some(
+                json!([{"step":"Inspect","status":"completed"},{"step":"Deploy","status":"pending"}]),
+            ),
+            ..ThreadProjection::default()
+        };
+        let rendered = status_render(&store, &space, Some(&projection), None, &totp, None);
+        assert!(
+            rendered
+                .plain
+                .contains("⚠️ Goal 已完成，但 Plan 仍有 1 项未完成；状态不一致，请先同步 Plan。")
+        );
+    }
+
+    #[test]
+    fn markdown_track_escapes_entities_and_plain_track_stays_clean() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let totp = TotpManager::new(store.clone(), "/tmp/nonexistent-rust-bridge-totp", 60);
+        let space = synthetic_session_space("thread-markdown", 42);
+        let projection = ThreadProjection {
+            thread_id: "thread-markdown".into(),
+            title: Some("parity_(v2)".into()),
+            status: Some("idle".into()),
+            turn_status: Some("completed".into()),
+            plan: Some(
+                json!([{"step":"Inspect code","status":"completed"},{"step":"Deploy","status":"inProgress"}]),
+            ),
+            ..ThreadProjection::default()
+        };
+        let rendered = status_render(&store, &space, Some(&projection), None, &totp, None);
+        assert!(rendered.markdown.contains("*🤖 Codex · parity\\_\\(v2\\)*"));
+        assert!(rendered.markdown.contains("~1\\. Inspect code~"));
+        assert!(rendered.markdown.contains("▶ *2\\. Deploy*"));
+        assert!(!rendered.plain.contains('*'));
+        assert!(!rendered.plain.contains('\\'));
+    }
+
+    #[test]
+    fn legacy_luna_and_unknown_models_remap_to_terra_low() {
+        let mut space = synthetic_session_space("thread-remap", 42);
+        space.normal_model = Some("gpt-5.6-luna".into());
+        space.normal_effort = Some("max".into());
+        space.plan_model = Some("gpt-5.6-sol".into());
+        space.plan_effort = Some("high".into());
+        let available = vec![
+            ModelChoice {
+                model: "gpt-5.6-terra".into(),
+                display_name: "GPT 5.6 Terra".into(),
+                efforts: vec!["low".into(), "medium".into()],
+                default_effort: "medium".into(),
+            },
+            ModelChoice {
+                model: "gpt-5.6-sol".into(),
+                display_name: "GPT 5.6 Sol".into(),
+                efforts: vec!["high".into()],
+                default_effort: "high".into(),
+            },
+        ];
+        assert!(remap_legacy_session_models(&mut space, &available));
+        assert_eq!(space.normal_model.as_deref(), Some("gpt-5.6-terra"));
+        assert_eq!(space.normal_effort.as_deref(), Some("low"));
+        // A model that is still advertised by model/list is left untouched.
+        assert_eq!(space.plan_model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(space.plan_effort.as_deref(), Some("high"));
+        assert!(!remap_legacy_session_models(&mut space, &available));
+    }
+
+    #[test]
+    fn ask_model_profile_defaults_and_toml_override() {
+        let config = RustConfig::default();
+        assert_eq!(config.ask_model, "gpt-5.6-terra");
+        assert_eq!(config.ask_reasoning_effort, "medium");
+        let parsed: RustConfig = toml::from_str("ask_model = \"gpt-5.6-sol\"\n").unwrap();
+        assert_eq!(parsed.ask_model, "gpt-5.6-sol");
+        assert_eq!(parsed.ask_reasoning_effort, "medium");
     }
 }

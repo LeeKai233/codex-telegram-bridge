@@ -1307,6 +1307,35 @@ impl AppServerClient {
                 .map_err(PortError::from)?,
         )
     }
+    /// Starts a turn with an explicit per-request model profile, used by the
+    /// `/ask` flow whose model is configured independently of the Session's
+    /// collaboration mode. Mirrors the Python `CodexClient.start_turn` param
+    /// contract (`model`/`effort` top-level params).
+    pub async fn start_turn_with_model(
+        &self,
+        thread_id: &ThreadId,
+        input: Vec<PromptInput>,
+        client_message_id: Option<&str>,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> PortResult<AgentTurn> {
+        let mut params = json!({"threadId": thread_id.as_str(), "input": input});
+        if let Some(id) = client_message_id.filter(|value| !value.is_empty()) {
+            params["clientUserMessageId"] = Value::String(id.to_owned());
+        }
+        if let Some(model) = model.map(str::trim).filter(|value| !value.is_empty()) {
+            params["model"] = Value::String(model.to_owned());
+        }
+        if let Some(effort) = effort.map(str::trim).filter(|value| !value.is_empty()) {
+            params["effort"] = Value::String(effort.to_owned());
+        }
+        parse_turn(
+            thread_id,
+            self.request("turn/start", params, Duration::from_secs(60))
+                .await
+                .map_err(PortError::from)?,
+        )
+    }
 }
 
 #[async_trait]

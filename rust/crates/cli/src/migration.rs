@@ -168,7 +168,7 @@ pub fn import_python_database(
     let mut report = ImportReport {
         source_schema_version,
         source_path_sha256,
-        target_schema_version: 7,
+        target_schema_version: 8,
         dry_run,
         tables,
         reconciliation,
@@ -193,6 +193,7 @@ pub fn import_python_database(
             .find(|row| row.table == "owner")
             .and_then(|row| serde_json::from_str::<Value>(&row.row_json).ok())
             .and_then(|value| value.get("chat_id").and_then(Value::as_i64));
+        let mut projection_failures = 0u64;
         for row in &rows {
             transaction
                 .execute(
@@ -211,8 +212,17 @@ pub fn import_python_database(
                         params![format!("rust_workflow:{kind}"), key, source_schema_version, payload_json, row_sha256, imported_at_ms],
                     )
                     .map_err(|_| MigrationError::Target("workflow projection insert failed".into()))?;
-                import_typed_projection(&transaction, row, owner_chat_id, imported_at_ms)?;
             }
+            projection_failures +=
+                import_typed_projection(&transaction, row, owner_chat_id, imported_at_ms)?;
+        }
+        if projection_failures > 0 {
+            report.reconciliation.push(ReconciliationItem {
+                table: "threads".to_owned(),
+                state: "projection_failed".to_owned(),
+                rows: projection_failures,
+                action: "legacy ThreadState JSON could not be converted; rows are retained in rust_legacy_records".to_owned(),
+            });
         }
         report.imported_rows = rows.len() as u64;
         let report_json = serde_json::to_string(&report)
@@ -386,12 +396,15 @@ fn object_text(value: &Value, key: &str) -> Option<String> {
     value.get(key).and_then(Value::as_str).map(str::to_owned)
 }
 
+/// Returns the number of soft conversion failures (currently only legacy
+/// `threads` rows whose ThreadState JSON cannot be converted); hard database
+/// errors still abort the import.
 fn import_typed_projection(
     transaction: &rusqlite::Transaction<'_>,
     row: &LegacyRow,
     owner_chat_id: Option<i64>,
     imported_at_ms: i64,
-) -> Result<(), MigrationError> {
+) -> Result<u64, MigrationError> {
     let value: Value =
         serde_json::from_str(&row.row_json).map_err(|_| MigrationError::Unreadable)?;
     let object = value.as_object().ok_or(MigrationError::Unreadable)?;
@@ -432,7 +445,7 @@ fn import_typed_projection(
                     params![intent_id, client_message_id, state, payload_json, created_at_ms, updated_at_ms],
                 )
                 .map_err(|_| MigrationError::Target("prompt intent projection failed".into()))?;
-            return Ok(());
+            return Ok(0);
         }
         "plan_publications" => {
             let space_id = object_text(&value, "space_id").ok_or(MigrationError::Unreadable)?;
@@ -447,7 +460,7 @@ fn import_typed_projection(
                     params![space_id, generation, item_id, revision_key, status, row.row_json, updated_at_ms],
                 )
                 .map_err(|_| MigrationError::Target("plan publication projection failed".into()))?;
-            return Ok(());
+            return Ok(0);
         }
         "pending_inputs" => {
             let request_key =
@@ -462,12 +475,42 @@ fn import_typed_projection(
                     params![request_key, generation, status, row.row_json, created_at_ms, updated_at_ms],
                 )
                 .map_err(|_| MigrationError::Target("pending question projection failed".into()))?;
-            return Ok(());
+            return Ok(0);
         }
         _ => {}
     }
+    if row.table == "threads" {
+        let state_json = value
+            .get("state_json")
+            .and_then(Value::as_str)
+            .unwrap_or("{}");
+        let Some(projection) = serde_json::from_str::<Value>(state_json)
+            .ok()
+            .and_then(|state| {
+                projection_from_legacy_thread(&state, object_text(&value, "thread_id").as_deref())
+            })
+        else {
+            // Soft failure: the raw row remains in rust_legacy_records and the
+            // caller reports the count instead of silently dropping history.
+            return Ok(1);
+        };
+        let updated_at_ms = if projection.updated_at_ms > 0 {
+            projection.updated_at_ms
+        } else {
+            epoch_ms(object_i64(&value, "updated_at")).max(imported_at_ms)
+        };
+        let projection_json = serde_json::to_string(&projection)
+            .map_err(|_| MigrationError::Target("thread projection serialization failed".into()))?;
+        transaction
+            .execute(
+                "INSERT OR REPLACE INTO rust_thread_projections(thread_id, generation, projection_json, updated_at_ms) VALUES (?1, ?2, ?3, ?4)",
+                params![projection.thread_id, i64::try_from(projection.generation).unwrap_or(i64::MAX), projection_json, updated_at_ms],
+            )
+            .map_err(|_| MigrationError::Target("thread projection failed".into()))?;
+        return Ok(0);
+    }
     if row.table != "session_spaces" {
-        return Ok(());
+        return Ok(0);
     }
     let space_id = object_text(&value, "space_id").ok_or(MigrationError::Unreadable)?;
     let thread_id = object_text(&value, "thread_id");
@@ -492,6 +535,19 @@ fn import_typed_projection(
         .get("current_mode")
         .and_then(Value::as_str)
         .is_some_and(|mode| mode == "plan");
+    let profile_text = |key: &str| {
+        state_json
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    let observed_mode = profile_text("observed_mode").filter(|mode| mode != "unknown");
+    let normal_model = profile_text("normal_model");
+    let normal_effort = profile_text("normal_effort");
+    let plan_model = profile_text("plan_model");
+    let plan_effort = profile_text("plan_effort");
     let created_at_ms = epoch_ms(object_i64(&value, "created_at"));
     let updated_at_value = epoch_ms(object_i64(&value, "updated_at"));
     let updated_at_ms = if updated_at_value > 0 {
@@ -501,7 +557,7 @@ fn import_typed_projection(
     };
     transaction
         .execute(
-            "INSERT OR REPLACE INTO rust_session_spaces(space_id, thread_id, lifecycle, generation, channel_chat_id, channel_post_id, discussion_chat_id, discussion_root_message_id, status_message_id, status_bot_instance, owner_chat_id, plan_mode, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?11, ?12, ?13)",
+            "INSERT OR REPLACE INTO rust_session_spaces(space_id, thread_id, lifecycle, generation, channel_chat_id, channel_post_id, discussion_chat_id, discussion_root_message_id, status_message_id, status_bot_instance, owner_chat_id, plan_mode, observed_mode, normal_model, normal_effort, plan_model, plan_effort, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             rusqlite::params![
                 space_id,
                 thread_id,
@@ -514,25 +570,16 @@ fn import_typed_projection(
                 status_message_id,
                 owner_chat_id,
                 i64::from(plan_mode),
+                observed_mode,
+                normal_model,
+                normal_effort,
+                plan_model,
+                plan_effort,
                 created_at_ms,
                 updated_at_ms,
             ],
         )
         .map_err(|_| MigrationError::Target("session space projection failed".into()))?;
-    if let Some(thread_id) = thread_id.as_deref()
-        && let Some(state) = state_json.as_object()
-    {
-        let mut projection = state.clone();
-        projection.insert("thread_id".into(), Value::String(thread_id.to_owned()));
-        let projection_json = serde_json::to_string(&Value::Object(projection))
-            .map_err(|_| MigrationError::Target("thread projection serialization failed".into()))?;
-        transaction
-            .execute(
-                "INSERT OR REPLACE INTO rust_thread_projections(thread_id, generation, projection_json, updated_at_ms) VALUES (?1, ?2, ?3, ?4)",
-                params![thread_id, generation, projection_json, updated_at_ms],
-            )
-            .map_err(|_| MigrationError::Target("thread projection failed".into()))?;
-    }
     if matches!(lifecycle.as_str(), "pending" | "repair_required") {
         let mut pending = value.clone();
         if let Some(state) = pending
@@ -575,7 +622,106 @@ fn import_typed_projection(
                 .map_err(|_| MigrationError::Target("pending workflow projection failed".into()))?;
         }
     }
-    Ok(())
+    Ok(0)
+}
+
+/// Converts a Python `threads.state_json` payload (ThreadState shape) into the
+/// Rust thread projection persisted in `rust_thread_projections`. Subagent
+/// tasks already carry the Python `TaskState` shape and are kept verbatim so
+/// the status renderer sees the same fields the Python views consume.
+fn projection_from_legacy_thread(
+    state: &Value,
+    row_thread_id: Option<&str>,
+) -> Option<ctg_engine::ThreadProjection> {
+    if !state.is_object() {
+        return None;
+    }
+    let text = |key: &str| {
+        state
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    let thread_id = text("thread_id").or_else(|| {
+        row_thread_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    })?;
+    let mut subagents = BTreeMap::new();
+    if let Some(tasks) = state.get("tasks").and_then(Value::as_array) {
+        for task in tasks {
+            let Some(task_id) = task
+                .get("task_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            if task.is_object() {
+                subagents.insert(task_id.to_owned(), task.clone());
+            }
+        }
+    }
+    let completed_turns_duration_ms = state
+        .get("completed_turn_durations_ms")
+        .and_then(Value::as_object)
+        .map(|durations| {
+            durations
+                .values()
+                .filter_map(Value::as_i64)
+                .map(|value| value.max(0))
+                .sum()
+        })
+        .unwrap_or(0);
+    Some(ctg_engine::ThreadProjection {
+        thread_id,
+        title: text("title"),
+        cwd: text("cwd"),
+        status: text("status"),
+        turn_id: text("turn_id"),
+        turn_status: text("turn_status"),
+        goal: state.get("goal").filter(|value| value.is_object()).cloned(),
+        plan: state.get("plan").filter(|value| value.is_array()).cloned(),
+        review_status: text("review_status"),
+        desired_mode: None,
+        observed_mode: None,
+        active_flags: state
+            .get("active_flags")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        model: text("model"),
+        effort: text("reasoning_effort"),
+        started_at_ms: state
+            .get("turn_started_at")
+            .and_then(Value::as_i64)
+            .map(epoch_ms),
+        finished_at_ms: None,
+        completed_turns_duration_ms,
+        items: Default::default(),
+        item_order: Default::default(),
+        subagents,
+        last_error: text("last_error"),
+        last_error_recoverable: state
+            .get("last_error_recoverable")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        generation: 0,
+        updated_at_ms: state
+            .get("updated_at")
+            .and_then(Value::as_i64)
+            .map(epoch_ms)
+            .unwrap_or_default(),
+    })
 }
 
 fn reconcile_connection_bound_work(
@@ -878,6 +1024,103 @@ mod tests {
         let payload: Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(payload["pending_prompt"], "Build it");
         assert_eq!(payload["normal_effort"], "high");
+
+        for path in [source, target, report_path] {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn legacy_thread_state_is_projected_into_rust_thread_projections() {
+        let root =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../target/test-tmp");
+        std::fs::create_dir_all(&root).unwrap();
+        let suffix = std::process::id();
+        let source = root.join(format!("codex-threads-source-{suffix}.sqlite3"));
+        let target = root.join(format!("codex-threads-target-{suffix}.sqlite3"));
+        let report_path = root.join(format!("codex-threads-report-{suffix}.json"));
+        let connection = Connection::open(&source).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA user_version=11;
+                 CREATE TABLE threads (thread_id TEXT, state_json TEXT, updated_at INTEGER);
+                 INSERT INTO threads VALUES ('thread-legacy', '{\"thread_id\":\"thread-legacy\",\"title\":\"Legacy session\",\"cwd\":\"/workspace/demo\",\"status\":\"idle\",\"model\":\"gpt-5.6-luna\",\"reasoning_effort\":\"medium\",\"turn_id\":\"turn-1\",\"turn_status\":\"completed\",\"turn_started_at\":1700000000,\"goal\":{\"status\":\"complete\",\"objective\":\"Ship parity\"},\"plan\":[{\"step\":\"Inspect\",\"status\":\"completed\"},{\"step\":\"Deploy\",\"status\":\"pending\"}],\"tasks\":[{\"task_id\":\"agent-1\",\"title\":\"调研\",\"status\":\"completed\",\"started_at\":1700000000,\"finished_at\":1700000060}],\"completed_turn_durations_ms\":{\"turn-1\":61000},\"updated_at\":1700000100}', 1700000100);",
+            )
+            .unwrap();
+        drop(connection);
+
+        import_python_database(&source, &target, &report_path, false).unwrap();
+        let target_connection = Connection::open(&target).unwrap();
+        let payload: String = target_connection
+            .query_row(
+                "SELECT projection_json FROM rust_thread_projections WHERE thread_id='thread-legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let projection: ctg_engine::ThreadProjection = serde_json::from_str(&payload).unwrap();
+        assert_eq!(projection.title.as_deref(), Some("Legacy session"));
+        assert_eq!(projection.status.as_deref(), Some("idle"));
+        assert_eq!(projection.turn_status.as_deref(), Some("completed"));
+        assert_eq!(projection.completed_turns_duration_ms, 61_000);
+        assert_eq!(projection.updated_at_ms, 1_700_000_100_000);
+        let plan = projection.plan.expect("plan steps survive");
+        assert_eq!(plan.as_array().unwrap().len(), 2);
+        assert_eq!(
+            projection
+                .goal
+                .as_ref()
+                .and_then(|goal| goal.get("objective")),
+            Some(&Value::String("Ship parity".into()))
+        );
+        assert_eq!(projection.subagents["agent-1"]["status"], "completed");
+
+        for path in [source, target, report_path] {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn unconvertible_thread_state_is_counted_and_retained_as_legacy_row() {
+        let root =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../target/test-tmp");
+        std::fs::create_dir_all(&root).unwrap();
+        let suffix = std::process::id();
+        let source = root.join(format!("codex-threads-bad-source-{suffix}.sqlite3"));
+        let target = root.join(format!("codex-threads-bad-target-{suffix}.sqlite3"));
+        let report_path = root.join(format!("codex-threads-bad-report-{suffix}.json"));
+        let connection = Connection::open(&source).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA user_version=11;
+                 CREATE TABLE threads (thread_id TEXT, state_json TEXT, updated_at INTEGER);
+                 INSERT INTO threads VALUES ('thread-bad', 'not-json{', 1700000100);",
+            )
+            .unwrap();
+        drop(connection);
+
+        let report = import_python_database(&source, &target, &report_path, false).unwrap();
+        let failure = report
+            .reconciliation
+            .iter()
+            .find(|item| item.table == "threads" && item.state == "projection_failed")
+            .expect("thread projection failure is reported");
+        assert_eq!(failure.rows, 1);
+        let target_connection = Connection::open(&target).unwrap();
+        let legacy_rows: i64 = target_connection
+            .query_row(
+                "SELECT COUNT(*) FROM rust_legacy_records WHERE table_name='threads'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_rows, 1);
+        let projected: i64 = target_connection
+            .query_row("SELECT COUNT(*) FROM rust_thread_projections", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(projected, 0);
 
         for path in [source, target, report_path] {
             std::fs::remove_file(path).unwrap();

@@ -28,6 +28,10 @@ pub struct ThreadProjection {
     pub started_at_ms: Option<i64>,
     #[serde(default)]
     pub finished_at_ms: Option<i64>,
+    /// Sum of `durationMs` across terminal turns, mirroring the Python
+    /// `completed_turn_durations_ms` map so cross-turn totals survive restarts.
+    #[serde(default)]
+    pub completed_turns_duration_ms: i64,
     pub items: BTreeMap<String, Value>,
     /// Stable event order for rendering recent activity. `items` remains a
     /// map for idempotent updates and durable compatibility.
@@ -134,10 +138,18 @@ impl EventProjector {
                     .get("threadSettings")
                     .or_else(|| event.params.get("settings"))
                     .unwrap_or(&event.params);
-                let confirmed_mode = mode_from_fields(settings, &["collaborationMode", "collaboration_mode"])
-                    .or_else(|| mode_from_fields(&event.params, &["collaborationMode", "collaboration_mode"]));
+                let confirmed_mode =
+                    mode_from_fields(settings, &["collaborationMode", "collaboration_mode"])
+                        .or_else(|| {
+                            mode_from_fields(
+                                &event.params,
+                                &["collaborationMode", "collaboration_mode"],
+                            )
+                        });
                 let observed_mode = mode_from_fields(settings, &["observedMode", "observed_mode"])
-                    .or_else(|| mode_from_fields(&event.params, &["observedMode", "observed_mode"]));
+                    .or_else(|| {
+                        mode_from_fields(&event.params, &["observedMode", "observed_mode"])
+                    });
                 if let Some(mode) = confirmed_mode.clone() {
                     projection.desired_mode = Some(mode);
                 }
@@ -187,23 +199,38 @@ impl EventProjector {
                     .map(str::to_owned)
                     .or_else(|| Some(event.method.trim_start_matches("turn/").to_owned()));
                 projection.finished_at_ms = Some(now_ms());
+                let duration_ms = event
+                    .params
+                    .get("turn")
+                    .and_then(|turn| turn.get("durationMs").or_else(|| turn.get("duration_ms")))
+                    .and_then(Value::as_i64)
+                    .unwrap_or_else(|| {
+                        projection
+                            .started_at_ms
+                            .map(|started| now_ms().saturating_sub(started))
+                            .unwrap_or_default()
+                    });
+                projection.completed_turns_duration_ms = projection
+                    .completed_turns_duration_ms
+                    .saturating_add(duration_ms.max(0));
                 ProjectionEffect::TurnCompleted
             }
             "item/started" | "item/updated" | "item/completed" | "item/failed" => {
-                if let Some(item) = event.params.get("item")
-                    && let Some(item_id) = item.get("id").and_then(Value::as_str)
-                {
-                    if !projection.items.contains_key(item_id) {
-                        projection.item_order.push(item_id.to_owned());
+                if let Some(item) = event.params.get("item") {
+                    if let Some(item_id) = item.get("id").and_then(Value::as_str) {
+                        if !projection.items.contains_key(item_id) {
+                            projection.item_order.push(item_id.to_owned());
+                        }
+                        projection.items.insert(item_id.to_owned(), item.clone());
                     }
-                    projection.items.insert(item_id.to_owned(), item.clone());
+                    project_item_subagents(projection, item, false);
                 }
                 ProjectionEffect::RefreshStatus
             }
             "item/agentMessage/delta" | "item/plan/delta" | "item/reasoning/delta" => {
                 ProjectionEffect::RefreshStatus
             }
-            "thread/plan/updated" | "plan/updated" | "plan/published" => {
+            "turn/plan/updated" | "thread/plan/updated" | "plan/updated" | "plan/published" => {
                 projection.plan = event
                     .params
                     .get("plan")
@@ -363,8 +390,8 @@ fn merge_thread(projection: &mut ThreadProjection, params: &Value) {
     if let Some(mode) = confirmed_mode.clone() {
         projection.desired_mode = Some(mode);
     }
-    if let Some(mode) = mode_from_fields(source, &["observedMode", "observed_mode"])
-        .or(confirmed_mode)
+    if let Some(mode) =
+        mode_from_fields(source, &["observedMode", "observed_mode"]).or(confirmed_mode)
     {
         projection.observed_mode = Some(mode);
     }
@@ -397,6 +424,307 @@ fn merge_thread(projection: &mut ThreadProjection, params: &Value) {
 
 pub fn projection_thread_id(projection: &ThreadProjection) -> Option<ThreadId> {
     ThreadId::new(projection.thread_id.clone()).ok()
+}
+
+const MAX_SUBAGENT_TASKS: usize = 50;
+const ACTIVE_TASK_STATUSES: &[&str] =
+    &["pending", "pendingInit", "active", "running", "inProgress"];
+const TERMINAL_TASK_STATUSES: &[&str] = &[
+    "completed",
+    "shutdown",
+    "failed",
+    "errored",
+    "interrupted",
+    "notFound",
+];
+
+/// Derives normalized subagent task entries from `collabAgentToolCall` and
+/// `subAgentActivity` items, mirroring the Python projector's item state
+/// machine (`projector.py::_apply_item`). Task timestamps use epoch seconds
+/// to stay shape-compatible with the Python `TaskState` contract.
+pub fn project_item_subagents(projection: &mut ThreadProjection, item: &Value, historical: bool) {
+    match item.get("type").and_then(Value::as_str) {
+        Some("collabAgentToolCall") => project_collab_agent_tool_call(projection, item, historical),
+        Some("subAgentActivity") => project_subagent_activity(projection, item, historical),
+        _ => {}
+    }
+}
+
+fn normalize_task_status(status: &str) -> String {
+    match status {
+        "completed" => "completed",
+        "shutdown" => "shutdown",
+        "interrupted" => "interrupted",
+        "notFound" => "notFound",
+        "errored" => "failed",
+        "running" => "inProgress",
+        _ => "pending",
+    }
+    .to_owned()
+}
+
+fn project_collab_agent_tool_call(
+    projection: &mut ThreadProjection,
+    item: &Value,
+    historical: bool,
+) {
+    let Some(states) = item
+        .get("agentsStates")
+        .or_else(|| item.get("agents_states"))
+        .and_then(Value::as_object)
+    else {
+        return;
+    };
+    let now = now_secs();
+    let prompt = compact_text(
+        item.get("prompt")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        160,
+    );
+    let tool = item.get("tool").and_then(Value::as_str).unwrap_or_default();
+    let is_spawn = matches!(tool, "spawnAgent" | "spawn_agent");
+    let receivers = item
+        .get("receiverThreadIds")
+        .or_else(|| item.get("receiver_thread_ids"))
+        .and_then(Value::as_array)
+        .map(|values| values.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let spawned_model = item
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let spawned_effort = item
+        .get("reasoningEffort")
+        .or_else(|| item.get("reasoning_effort"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    for (agent_thread_id, value) in states {
+        if !value.is_object() {
+            continue;
+        }
+        let task_id = agent_thread_id.clone();
+        let current = projection.subagents.get(&task_id).cloned();
+        let raw_status = value
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("pendingInit");
+        let current_status = task_text(&current, "status");
+        let mut task_status = normalize_task_status(raw_status);
+        if historical
+            && current_status
+                .as_deref()
+                .is_some_and(|status| TERMINAL_TASK_STATUSES.contains(&status))
+            && ACTIVE_TASK_STATUSES.contains(&task_status.as_str())
+        {
+            task_status = current_status.clone().unwrap_or(task_status);
+        }
+        let mut started_at = task_i64(&current, "started_at").unwrap_or(0);
+        if started_at == 0 && matches!(task_status.as_str(), "pending" | "inProgress") {
+            started_at = now;
+        }
+        let mut finished_at = task_i64(&current, "finished_at").unwrap_or(0);
+        if TERMINAL_TASK_STATUSES.contains(&task_status.as_str()) {
+            finished_at = if finished_at == 0 { now } else { finished_at };
+        } else if matches!(task_status.as_str(), "pending" | "inProgress") {
+            finished_at = 0;
+        }
+        let is_spawn_receiver = is_spawn && receivers.contains(&task_id.as_str());
+        let use_prompt = !prompt.is_empty() && (is_spawn || current.is_none());
+        let title = if use_prompt {
+            prompt.clone()
+        } else {
+            task_text(&current, "title")
+                .unwrap_or_else(|| format!("Agent {}", &task_id[..task_id.len().min(8)]))
+        };
+        let model = if is_spawn_receiver && !spawned_model.is_empty() {
+            Some(spawned_model.to_owned())
+        } else {
+            task_text(&current, "model")
+        };
+        let effort = if is_spawn_receiver && !spawned_effort.is_empty() {
+            Some(spawned_effort.to_owned())
+        } else {
+            task_text(&current, "reasoning_effort")
+        };
+        let message = value
+            .get("message")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| task_text(&current, "message"))
+            .unwrap_or_default();
+        projection.subagents.insert(
+            task_id.clone(),
+            subagent_task_value(
+                &task_id,
+                &title,
+                &task_status,
+                task_text(&current, "agent_path"),
+                task_text(&current, "agent_nickname"),
+                task_text(&current, "agent_role"),
+                model,
+                effort,
+                message,
+                started_at,
+                finished_at,
+                now,
+            ),
+        );
+    }
+    trim_subagent_tasks(projection);
+}
+
+fn project_subagent_activity(projection: &mut ThreadProjection, item: &Value, historical: bool) {
+    let agent_thread_id = item
+        .get("agentThreadId")
+        .or_else(|| item.get("agent_thread_id"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if agent_thread_id.is_empty() {
+        return;
+    }
+    let agent_path = compact_text(
+        item.get("agentPath")
+            .or_else(|| item.get("agent_path"))
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        120,
+    );
+    let kind = item.get("kind").and_then(Value::as_str).unwrap_or_default();
+    let now = now_secs();
+    let current = projection.subagents.get(agent_thread_id).cloned();
+    let current_status = task_text(&current, "status");
+    let task_status = if kind == "interrupted" {
+        "interrupted".to_owned()
+    } else if matches!(kind, "started" | "interacted") {
+        if historical
+            && current_status
+                .as_deref()
+                .is_some_and(|status| TERMINAL_TASK_STATUSES.contains(&status))
+        {
+            current_status
+                .clone()
+                .unwrap_or_else(|| "inProgress".into())
+        } else {
+            "inProgress".to_owned()
+        }
+    } else {
+        current_status.clone().unwrap_or_else(|| "pending".into())
+    };
+    let finished_at = if TERMINAL_TASK_STATUSES.contains(&task_status.as_str()) {
+        let existing = task_i64(&current, "finished_at").unwrap_or(0);
+        if existing == 0 { now } else { existing }
+    } else {
+        0
+    };
+    let started_at = task_i64(&current, "started_at")
+        .filter(|value| *value > 0)
+        .unwrap_or(now);
+    let title = task_text(&current, "title").unwrap_or_else(|| {
+        if agent_path.is_empty() {
+            format!("Agent {}", &agent_thread_id[..agent_thread_id.len().min(8)])
+        } else {
+            format!("Agent {agent_path}")
+        }
+    });
+    let path = if agent_path.is_empty() {
+        task_text(&current, "agent_path")
+    } else {
+        Some(agent_path)
+    };
+    projection.subagents.insert(
+        agent_thread_id.to_owned(),
+        subagent_task_value(
+            agent_thread_id,
+            &title,
+            &task_status,
+            path,
+            task_text(&current, "agent_nickname"),
+            task_text(&current, "agent_role"),
+            task_text(&current, "model"),
+            task_text(&current, "reasoning_effort"),
+            task_text(&current, "message").unwrap_or_default(),
+            started_at,
+            finished_at,
+            now,
+        ),
+    );
+    trim_subagent_tasks(projection);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn subagent_task_value(
+    task_id: &str,
+    title: &str,
+    status: &str,
+    agent_path: Option<String>,
+    agent_nickname: Option<String>,
+    agent_role: Option<String>,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+    message: String,
+    started_at: i64,
+    finished_at: i64,
+    updated_at: i64,
+) -> Value {
+    serde_json::json!({
+        "task_id": task_id,
+        "title": title,
+        "status": status,
+        "agent_thread_id": task_id,
+        "agent_path": agent_path.unwrap_or_default(),
+        "agent_nickname": agent_nickname.unwrap_or_default(),
+        "agent_role": agent_role.unwrap_or_default(),
+        "model": model.unwrap_or_default(),
+        "reasoning_effort": reasoning_effort.unwrap_or_default(),
+        "message": message,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "updated_at": updated_at,
+    })
+}
+
+fn trim_subagent_tasks(projection: &mut ThreadProjection) {
+    while projection.subagents.len() > MAX_SUBAGENT_TASKS {
+        let oldest = projection
+            .subagents
+            .iter()
+            .map(|(task_id, task)| {
+                (
+                    task.get("updated_at").and_then(Value::as_i64).unwrap_or(0),
+                    task_id.clone(),
+                )
+            })
+            .min()
+            .map(|(_, task_id)| task_id);
+        let Some(oldest) = oldest else {
+            break;
+        };
+        projection.subagents.remove(&oldest);
+    }
+}
+
+fn task_text(task: &Option<Value>, key: &str) -> Option<String> {
+    task.as_ref()
+        .and_then(|task| task.get(key))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn task_i64(task: &Option<Value>, key: &str) -> Option<i64> {
+    task.as_ref()
+        .and_then(|task| task.get(key))
+        .and_then(Value::as_i64)
+}
+
+fn compact_text(value: &str, limit: usize) -> String {
+    let collapsed = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    collapsed.chars().take(limit).collect()
+}
+
+fn now_secs() -> i64 {
+    now_ms().div_euclid(1_000)
 }
 
 #[cfg(test)]
@@ -461,7 +789,12 @@ mod tests {
                 .as_deref(),
             Some("boom")
         );
-        assert!(!projector.projection("thread-1").unwrap().last_error_recoverable);
+        assert!(
+            !projector
+                .projection("thread-1")
+                .unwrap()
+                .last_error_recoverable
+        );
     }
 
     #[test]
@@ -478,7 +811,12 @@ mod tests {
             )),
             ProjectionEffect::RefreshStatus
         );
-        assert!(projector.projection("thread-recovery").unwrap().last_error_recoverable);
+        assert!(
+            projector
+                .projection("thread-recovery")
+                .unwrap()
+                .last_error_recoverable
+        );
 
         projector.apply(&event(
             "thread/status/changed",
@@ -523,5 +861,126 @@ mod tests {
         let projection = projector.projection("thread-plan").unwrap();
         assert_eq!(projection.desired_mode.as_deref(), Some("plan"));
         assert_eq!(projection.observed_mode.as_deref(), Some("plan"));
+    }
+
+    #[test]
+    fn turn_plan_updated_event_replaces_plan_steps() {
+        let mut projector = EventProjector::default();
+        assert_eq!(
+            projector.apply(&event(
+                "turn/plan/updated",
+                serde_json::json!({
+                    "threadId":"thread-plan-steps",
+                    "explanation":"调整后的计划",
+                    "plan":[
+                        {"step":"Inspect","status":"completed"},
+                        {"step":"Deploy","status":"inProgress"}
+                    ]
+                })
+            )),
+            ProjectionEffect::RefreshStatus
+        );
+        let plan = projector
+            .projection("thread-plan-steps")
+            .and_then(|projection| projection.plan.clone())
+            .expect("plan is projected");
+        let steps = plan.as_array().expect("plan is a step array");
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0]["step"], "Inspect");
+        assert_eq!(steps[1]["status"], "inProgress");
+    }
+
+    #[test]
+    fn collab_agent_tool_call_item_derives_normalized_subagent_tasks() {
+        let mut projector = EventProjector::default();
+        projector.apply(&event(
+            "item/started",
+            serde_json::json!({
+                "threadId":"thread-agents",
+                "item":{
+                    "id":"call-1",
+                    "type":"collabAgentToolCall",
+                    "tool":"spawnAgent",
+                    "prompt":"调研 Rust 重写进度",
+                    "receiverThreadIds":["agent-1"],
+                    "model":"gpt-5.6-sol",
+                    "reasoningEffort":"high",
+                    "agentsStates":{
+                        "agent-1":{"status":"running","message":"working"},
+                        "agent-2":{"status":"completed"}
+                    }
+                }
+            }),
+        ));
+        let projection = projector.projection("thread-agents").unwrap();
+        let running = &projection.subagents["agent-1"];
+        assert_eq!(running["status"], "inProgress");
+        assert_eq!(running["title"], "调研 Rust 重写进度");
+        assert_eq!(running["model"], "gpt-5.6-sol");
+        assert_eq!(running["reasoning_effort"], "high");
+        assert_eq!(running["agent_thread_id"], "agent-1");
+        assert!(running["started_at"].as_i64().unwrap() > 0);
+        let completed = &projection.subagents["agent-2"];
+        assert_eq!(completed["status"], "completed");
+        assert!(completed["finished_at"].as_i64().unwrap() > 0);
+    }
+
+    #[test]
+    fn sub_agent_activity_marks_interrupted_and_keeps_history_terminal_state() {
+        let mut projector = EventProjector::default();
+        projector.apply(&event(
+            "item/updated",
+            serde_json::json!({
+                "threadId":"thread-activity",
+                "item":{"id":"a1","type":"subAgentActivity","agentThreadId":"agent-9","agentPath":"worker/lane-a","kind":"started"}
+            }),
+        ));
+        assert_eq!(
+            projector.projection("thread-activity").unwrap().subagents["agent-9"]["status"],
+            "inProgress"
+        );
+        projector.apply(&event(
+            "item/updated",
+            serde_json::json!({
+                "threadId":"thread-activity",
+                "item":{"id":"a2","type":"subAgentActivity","agentThreadId":"agent-9","kind":"interrupted"}
+            }),
+        ));
+        let task = &projector.projection("thread-activity").unwrap().subagents["agent-9"];
+        assert_eq!(task["status"], "interrupted");
+        assert_eq!(task["agent_path"], "worker/lane-a");
+        assert!(task["finished_at"].as_i64().unwrap() > 0);
+
+        // A historical replay must not resurrect a terminal task back to active.
+        let mut projection = ThreadProjection {
+            thread_id: "thread-historical".into(),
+            ..ThreadProjection::default()
+        };
+        project_item_subagents(
+            &mut projection,
+            &serde_json::json!({"type":"subAgentActivity","agentThreadId":"agent-9","kind":"interrupted"}),
+            true,
+        );
+        project_item_subagents(
+            &mut projection,
+            &serde_json::json!({"type":"subAgentActivity","agentThreadId":"agent-9","kind":"started"}),
+            true,
+        );
+        assert_eq!(projection.subagents["agent-9"]["status"], "interrupted");
+    }
+
+    #[test]
+    fn terminal_turn_accumulates_cross_turn_duration() {
+        let mut projector = EventProjector::default();
+        projector.apply(&event(
+            "turn/started",
+            serde_json::json!({"threadId":"thread-duration","turnId":"turn-1"}),
+        ));
+        projector.apply(&event(
+            "turn/completed",
+            serde_json::json!({"threadId":"thread-duration","turn":{"id":"turn-1","status":"completed","durationMs":1500}}),
+        ));
+        let projection = projector.projection("thread-duration").unwrap();
+        assert_eq!(projection.completed_turns_duration_ms, 1500);
     }
 }
