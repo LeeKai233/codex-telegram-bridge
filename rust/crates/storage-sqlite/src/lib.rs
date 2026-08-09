@@ -14,8 +14,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// This is deliberately independent from the Python bridge schema. Rust
 /// deployments receive a new database path and never migrate Python state.
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 const DELETION_CLAIM_LEASE_MS: i64 = 60_000;
+/// Failed deletions back off exponentially (2^attempts seconds, capped) and
+/// are abandoned after this many attempts so one stuck message cannot block
+/// the queue behind it forever.
+const DELETION_MAX_ATTEMPTS: i64 = 8;
+const DELETION_BACKOFF_CAP_MS: i64 = 300_000;
 const CONTROL_CLAIM_LEASE_MS: i64 = 60_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -718,7 +723,7 @@ impl SqliteStore {
         let connection = self.connection.lock().map_err(lock_error)?;
         connection
             .execute(
-                "INSERT INTO rust_scheduled_deletions(bot_instance_id, chat_id, message_id, group_key, delete_at_ms, attempts, claimed_at_ms, last_error_class) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT(bot_instance_id, chat_id, message_id) DO UPDATE SET group_key=excluded.group_key, delete_at_ms=excluded.delete_at_ms, attempts=excluded.attempts, claimed_at_ms=excluded.claimed_at_ms, last_error_class=excluded.last_error_class",
+                "INSERT INTO rust_scheduled_deletions(bot_instance_id, chat_id, message_id, group_key, delete_at_ms, attempts, claimed_at_ms, last_error_class) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT(bot_instance_id, chat_id, message_id) DO UPDATE SET group_key=excluded.group_key, delete_at_ms=excluded.delete_at_ms, attempts=excluded.attempts, claimed_at_ms=excluded.claimed_at_ms, last_error_class=excluded.last_error_class, next_attempt_at_ms=0, abandoned_at_ms=NULL",
                 params![deletion.bot_instance_id, deletion.chat_id, deletion.message_id, deletion.group_key, deletion.delete_at_ms, deletion.attempts, deletion.claimed_at_ms, deletion.last_error_class],
             )
             .map_err(sql_error)?;
@@ -737,7 +742,7 @@ impl SqliteStore {
         let transaction = connection.transaction().map_err(sql_error)?;
         let mut statement = transaction
             .prepare(
-                "SELECT bot_instance_id, chat_id, message_id, group_key, delete_at_ms, attempts, claimed_at_ms, last_error_class FROM rust_scheduled_deletions WHERE delete_at_ms<=?1 AND (claimed_at_ms IS NULL OR claimed_at_ms<=?2) ORDER BY delete_at_ms, bot_instance_id, chat_id, message_id LIMIT ?3",
+                "SELECT bot_instance_id, chat_id, message_id, group_key, delete_at_ms, attempts, claimed_at_ms, last_error_class FROM rust_scheduled_deletions WHERE delete_at_ms<=?1 AND abandoned_at_ms IS NULL AND next_attempt_at_ms<=?1 AND (claimed_at_ms IS NULL OR claimed_at_ms<=?2) ORDER BY delete_at_ms, bot_instance_id, chat_id, message_id LIMIT ?3",
             )
             .map_err(sql_error)?;
         let rows = statement
@@ -792,12 +797,13 @@ impl SqliteStore {
         chat_id: i64,
         message_id: i64,
         error_class: &str,
+        now_ms: i64,
     ) -> PortResult<bool> {
         let connection = self.connection.lock().map_err(lock_error)?;
         let changed = connection
             .execute(
-                "UPDATE rust_scheduled_deletions SET attempts=attempts+1, claimed_at_ms=NULL, last_error_class=?4 WHERE bot_instance_id=?1 AND chat_id=?2 AND message_id=?3",
-                params![bot_instance_id, chat_id, message_id, error_class],
+                "UPDATE rust_scheduled_deletions SET attempts=attempts+1, claimed_at_ms=NULL, last_error_class=?4, next_attempt_at_ms=?1 + MIN(?6, (1 << MIN(attempts + 1, 20)) * 1000), abandoned_at_ms=CASE WHEN attempts + 1 >= ?7 THEN ?1 ELSE abandoned_at_ms END WHERE bot_instance_id=?2 AND chat_id=?3 AND message_id=?5",
+                params![now_ms, bot_instance_id, chat_id, error_class, message_id, DELETION_BACKOFF_CAP_MS, DELETION_MAX_ATTEMPTS],
             )
             .map_err(sql_error)?;
         Ok(changed == 1)
@@ -1621,6 +1627,27 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Single-thread variant of `thread_projections` used by the event loop
+    /// to lazily reload a projection that was evicted from memory.
+    pub fn thread_projection(
+        &self,
+        thread_id: &str,
+    ) -> PortResult<Option<(String, i64, serde_json::Value, i64)>> {
+        let connection = self.connection.lock().map_err(lock_error)?;
+        connection
+            .query_row(
+                "SELECT thread_id, generation, projection_json, updated_at_ms FROM rust_thread_projections WHERE thread_id=?1",
+                params![thread_id],
+                |row| {
+                    let payload: String = row.get(2)?;
+                    let value = serde_json::from_str(&payload).map_err(to_from_sql_error)?;
+                    Ok((row.get(0)?, row.get(1)?, value, row.get(3)?))
+                },
+            )
+            .optional()
+            .map_err(sql_error)
+    }
+
     pub fn thread_projections(&self) -> PortResult<Vec<(String, i64, serde_json::Value, i64)>> {
         let connection = self.connection.lock().map_err(lock_error)?;
         let mut statement = connection
@@ -1968,6 +1995,16 @@ impl SqliteStore {
                     ALTER TABLE rust_session_spaces ADD COLUMN normal_effort TEXT;
                     ALTER TABLE rust_session_spaces ADD COLUMN plan_model TEXT;
                     ALTER TABLE rust_session_spaces ADD COLUMN plan_effort TEXT;
+                    ",
+                )
+                .map_err(sql_error)?;
+        }
+        if version < 9 {
+            transaction
+                .execute_batch(
+                    "
+                    ALTER TABLE rust_scheduled_deletions ADD COLUMN next_attempt_at_ms INTEGER NOT NULL DEFAULT 0;
+                    ALTER TABLE rust_scheduled_deletions ADD COLUMN abandoned_at_ms INTEGER;
                     ",
                 )
                 .map_err(sql_error)?;
@@ -2752,10 +2789,61 @@ mod tests {
         assert_eq!(due[0].delete_at_ms, 1_500);
         assert!(store.claim_due_deletions(1_501, 10).unwrap().is_empty());
         assert_eq!(store.claim_due_deletions(61_501, 10).unwrap().len(), 1);
-        assert!(store.retry_deletion("control", 42, 101, "timeout").unwrap());
-        assert_eq!(store.claim_due_deletions(1_501, 10).unwrap().len(), 1);
+        assert!(
+            store
+                .retry_deletion("control", 42, 101, "timeout", 61_501)
+                .unwrap()
+        );
+        // The first failure backs off for 2^1 seconds before a reclaim.
+        assert!(store.claim_due_deletions(61_501, 10).unwrap().is_empty());
+        assert_eq!(store.claim_due_deletions(63_501, 10).unwrap().len(), 1);
         assert!(store.complete_deletion("control", 42, 101).unwrap());
-        assert!(store.claim_due_deletions(2_000, 10).unwrap().is_empty());
+        assert!(store.claim_due_deletions(64_000, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn scheduled_deletion_backoff_abandons_after_max_attempts_and_reschedule_revives() {
+        let store = SqliteStore::in_memory().unwrap();
+        let deletion = ScheduledDeletion {
+            bot_instance_id: "control".into(),
+            chat_id: 42,
+            message_id: 202,
+            group_key: "perf:1".into(),
+            delete_at_ms: 1_000,
+            attempts: 0,
+            claimed_at_ms: None,
+            last_error_class: None,
+        };
+        store.schedule_deletion(&deletion).unwrap();
+        let mut now = 1_000;
+        for attempt in 1..=DELETION_MAX_ATTEMPTS {
+            assert_eq!(
+                store.claim_due_deletions(now, 10).unwrap().len(),
+                1,
+                "attempt {attempt} must still be claimable"
+            );
+            assert!(
+                store
+                    .retry_deletion("control", 42, 202, "timeout", now)
+                    .unwrap()
+            );
+            now = now.saturating_add((1i64 << attempt.min(20)).min(300) * 1_000);
+        }
+        // An abandoned row is never claimed again, even long after its backoff.
+        assert!(
+            store
+                .claim_due_deletions(now.saturating_add(10_000_000), 10)
+                .unwrap()
+                .is_empty()
+        );
+        // Re-scheduling the same message resets attempts and revives it.
+        store
+            .schedule_deletion(&ScheduledDeletion {
+                attempts: 0,
+                ..deletion
+            })
+            .unwrap();
+        assert_eq!(store.claim_due_deletions(1_000, 10).unwrap().len(), 1);
     }
 
     #[test]
