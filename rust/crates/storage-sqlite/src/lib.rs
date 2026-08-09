@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// This is deliberately independent from the Python bridge schema. Rust
 /// deployments receive a new database path and never migrate Python state.
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 const DELETION_CLAIM_LEASE_MS: i64 = 60_000;
 /// Failed deletions back off exponentially (2^attempts seconds, capped) and
 /// are abandoned after this many attempts so one stuck message cannot block
@@ -2009,6 +2009,54 @@ impl SqliteStore {
                 )
                 .map_err(sql_error)?;
         }
+        if version < 10 {
+            // Repair pass for deployments where an earlier experimental build
+            // already stamped user_version 8/9 with a different column set:
+            // add every expected column that is actually missing instead of
+            // trusting the version marker alone.
+            ensure_column(
+                &transaction,
+                "rust_session_spaces",
+                "observed_mode",
+                "ALTER TABLE rust_session_spaces ADD COLUMN observed_mode TEXT",
+            )?;
+            ensure_column(
+                &transaction,
+                "rust_session_spaces",
+                "normal_model",
+                "ALTER TABLE rust_session_spaces ADD COLUMN normal_model TEXT",
+            )?;
+            ensure_column(
+                &transaction,
+                "rust_session_spaces",
+                "normal_effort",
+                "ALTER TABLE rust_session_spaces ADD COLUMN normal_effort TEXT",
+            )?;
+            ensure_column(
+                &transaction,
+                "rust_session_spaces",
+                "plan_model",
+                "ALTER TABLE rust_session_spaces ADD COLUMN plan_model TEXT",
+            )?;
+            ensure_column(
+                &transaction,
+                "rust_session_spaces",
+                "plan_effort",
+                "ALTER TABLE rust_session_spaces ADD COLUMN plan_effort TEXT",
+            )?;
+            ensure_column(
+                &transaction,
+                "rust_scheduled_deletions",
+                "next_attempt_at_ms",
+                "ALTER TABLE rust_scheduled_deletions ADD COLUMN next_attempt_at_ms INTEGER NOT NULL DEFAULT 0",
+            )?;
+            ensure_column(
+                &transaction,
+                "rust_scheduled_deletions",
+                "abandoned_at_ms",
+                "ALTER TABLE rust_scheduled_deletions ADD COLUMN abandoned_at_ms INTEGER",
+            )?;
+        }
         transaction
             .execute(
                 "UPDATE rust_session_spaces AS s SET discussion_chat_id=(SELECT r.discussion_chat_id FROM rust_native_comment_roots AS r WHERE r.channel_chat_id=s.channel_chat_id AND r.channel_post_id=s.channel_post_id), discussion_root_message_id=(SELECT r.root_message_id FROM rust_native_comment_roots AS r WHERE r.channel_chat_id=s.channel_chat_id AND r.channel_post_id=s.channel_post_id), updated_at_ms=MAX(s.updated_at_ms, (SELECT r.created_at_ms FROM rust_native_comment_roots AS r WHERE r.channel_chat_id=s.channel_chat_id AND r.channel_post_id=s.channel_post_id)) WHERE EXISTS (SELECT 1 FROM rust_native_comment_roots AS r WHERE r.channel_chat_id=s.channel_chat_id AND r.channel_post_id=s.channel_post_id)",
@@ -2328,6 +2376,30 @@ fn now_ms() -> i64 {
         .min(i64::MAX as u128) as i64
 }
 
+/// Runs `ddl` only when `table` does not already have `column`. SQLite has
+/// no `ADD COLUMN IF NOT EXISTS`, so migration repair paths introspect
+/// `PRAGMA table_info` first and stay idempotent across partially-applied
+/// schema versions.
+fn ensure_column(
+    connection: &rusqlite::Connection,
+    table: &str,
+    column: &str,
+    ddl: &str,
+) -> PortResult<()> {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(sql_error)?;
+    let exists = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(sql_error)?
+        .filter_map(Result::ok)
+        .any(|name| name == column);
+    if !exists {
+        connection.execute_batch(ddl).map_err(sql_error)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2463,6 +2535,57 @@ mod tests {
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))
             .unwrap();
         assert_eq!(journal_mode, "wal");
+        drop(store);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("sqlite-wal"));
+        let _ = fs::remove_file(path.with_extension("sqlite-shm"));
+    }
+
+    #[test]
+    fn migrate_repairs_columns_missing_from_a_prestamped_version() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-tmp")
+            .join(format!("ctg-storage-repair-{}.sqlite", std::process::id()));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let _ = fs::remove_file(&path);
+        {
+            let store = SqliteStore::open(&path).unwrap();
+            // Simulate a deployment whose earlier build stamped user_version
+            // 8/9 without adding the columns the current schema expects.
+            let connection = store.connection.lock().unwrap();
+            connection
+                .execute_batch(
+                    "
+                    ALTER TABLE rust_session_spaces DROP COLUMN observed_mode;
+                    ALTER TABLE rust_scheduled_deletions DROP COLUMN abandoned_at_ms;
+                    PRAGMA user_version = 9;
+                    ",
+                )
+                .unwrap();
+        }
+        let store = SqliteStore::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        let connection = store.connection.lock().unwrap();
+        let columns = |table: &str| {
+            connection
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .filter_map(Result::ok)
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            columns("rust_session_spaces")
+                .iter()
+                .any(|c| c == "observed_mode")
+        );
+        assert!(
+            columns("rust_scheduled_deletions")
+                .iter()
+                .any(|c| c == "abandoned_at_ms")
+        );
+        drop(connection);
         drop(store);
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(path.with_extension("sqlite-wal"));
