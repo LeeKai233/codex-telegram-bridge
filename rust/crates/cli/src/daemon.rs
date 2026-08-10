@@ -212,6 +212,19 @@ impl StoredApprovalAction {
 struct SessionRegistry {
     by_chat: Mutex<HashMap<i64, SessionRecord>>,
     by_thread: Mutex<HashMap<String, SessionRecord>>,
+    ask_threads: Mutex<HashMap<String, AskThreadContext>>,
+}
+
+/// Delivery context for an ephemeral `/ask` fork thread. Events of these
+/// threads are swallowed before the projection, mirroring the Python
+/// bridge's `_ephemeral_thread_ids` kill-switch.
+#[derive(Clone, Debug)]
+struct AskThreadContext {
+    chat_id: i64,
+    root_message_id: Option<i64>,
+    sender_instance_id: String,
+    turn_id: Option<String>,
+    created_at_ms: i64,
 }
 
 impl SessionRegistry {
@@ -281,6 +294,48 @@ impl SessionRegistry {
                 .remove(&record.chat_id);
         }
         removed
+    }
+
+    fn register_ask_thread(&self, thread_id: &str, context: AskThreadContext) {
+        self.ask_threads
+            .lock()
+            .expect("session registry poisoned")
+            .insert(thread_id.to_owned(), context);
+    }
+
+    fn contains_ask_thread(&self, thread_id: &str) -> bool {
+        self.ask_threads
+            .lock()
+            .expect("session registry poisoned")
+            .contains_key(thread_id)
+    }
+
+    fn set_ask_turn(&self, thread_id: &str, turn_id: &str) {
+        if let Some(context) = self
+            .ask_threads
+            .lock()
+            .expect("session registry poisoned")
+            .get_mut(thread_id)
+        {
+            context.turn_id = Some(turn_id.to_owned());
+        }
+    }
+
+    fn remove_ask_thread(&self, thread_id: &str) -> Option<AskThreadContext> {
+        self.ask_threads
+            .lock()
+            .expect("session registry poisoned")
+            .remove(thread_id)
+    }
+
+    fn expired_ask_threads(&self, now_ms: i64, max_age_ms: i64) -> Vec<(String, AskThreadContext)> {
+        self.ask_threads
+            .lock()
+            .expect("session registry poisoned")
+            .iter()
+            .filter(|(_, context)| now_ms.saturating_sub(context.created_at_ms) >= max_age_ms)
+            .map(|(thread_id, context)| (thread_id.clone(), context.clone()))
+            .collect()
     }
 }
 
@@ -6501,16 +6556,26 @@ async fn submit_prompt_intent_with_inputs(
     store
         .upsert_prompt_intent(&intent)
         .map_err(|error| error.to_string())?;
+    if mode == "ask" {
+        return submit_ask_fork(
+            store,
+            agent,
+            sessions,
+            bot,
+            config,
+            metrics,
+            session,
+            prompt,
+            intent,
+            client_message_id,
+            receipt.is_ok(),
+            surface,
+        )
+        .await;
+    }
     let input = match custom_inputs {
         Some(inputs) => inputs,
-        None => vec![
-            PromptInput::text(if mode == "ask" {
-                format!("请直接回答以下问题，并在回答中保留必要的上下文：\n\n{prompt}")
-            } else {
-                prompt.to_owned()
-            })
-            .map_err(|error| error.to_string())?,
-        ],
+        None => vec![PromptInput::text(prompt.to_owned()).map_err(|error| error.to_string())?],
     };
     let result = if let Some(turn_id) = session.turn_id.as_ref() {
         agent
@@ -6521,16 +6586,6 @@ async fn submit_prompt_intent_with_inputs(
                 thread_id: session.thread_id.clone(),
                 status: "inProgress".into(),
             })
-    } else if mode == "ask" {
-        agent
-            .start_turn_with_model(
-                &session.thread_id,
-                input,
-                Some(&client_message_id),
-                Some(config.ask_model.as_str()),
-                Some(config.ask_reasoning_effort.as_str()),
-            )
-            .await
     } else {
         agent
             .start_turn(&session.thread_id, input, Some(&client_message_id))
@@ -6590,6 +6645,211 @@ async fn submit_prompt_intent_with_inputs(
             .await
         }
     }
+}
+
+/// Side-question instructions for ephemeral `/ask` forks, mirroring the
+/// Python bridge's SIDE_QUESTION_INSTRUCTIONS (codex.py).
+const SIDE_QUESTION_INSTRUCTIONS: &str = "Answer this one-off side question using the inherited session context. Do not modify files, change the session goal, plan, tasks, or queue, contact the parent thread, use the network, or request interactive input or approval. Return only the answer to the side question.";
+
+/// `/ask` forks are abandoned after this age, matching the Python bridge's
+/// 300s side-question timeout.
+const ASK_THREAD_TIMEOUT_MS: i64 = 300_000;
+
+#[allow(clippy::too_many_arguments)]
+async fn submit_ask_fork(
+    store: &SqliteStore,
+    agent: &AppServerClient,
+    sessions: &SessionRegistry,
+    bot: &RuntimeBot,
+    config: &RustConfig,
+    metrics: &MetricsRegistry,
+    session: SessionRecord,
+    prompt: &str,
+    mut intent: PromptIntent,
+    client_message_id: String,
+    receipt_sent: bool,
+    surface: TelegramSurfaceBinding,
+) -> Result<(), String> {
+    match ask_fork_turn(
+        agent,
+        store,
+        sessions,
+        config,
+        &session,
+        prompt,
+        &client_message_id,
+    )
+    .await
+    {
+        Ok((fork_thread_id, turn_id)) => {
+            sessions.set_ask_turn(&fork_thread_id, &turn_id);
+            intent.state = PromptIntentState::Started;
+            intent.turn_id =
+                Some(TurnId::new(turn_id.as_str()).map_err(|error| error.to_string())?);
+            intent.updated_at_ms = now_ms();
+            store
+                .upsert_prompt_intent(&intent)
+                .map_err(|error| error.to_string())?;
+            let record = json!({
+                "intent_id": intent.intent_id,
+                "client_message_id": client_message_id,
+                "thread_id": fork_thread_id,
+                "turn_id": turn_id,
+                "chat_id": session.chat_id,
+                "receipt_sent": receipt_sent,
+                "state": "started",
+                "mode": "ask",
+            });
+            store
+                .upsert_workflow_record("prompt", &intent.client_message_id, &record, now_ms())
+                .map_err(|error| error.to_string())?;
+            send_text(bot, &surface, "▶️ 已开始执行。", metrics).await
+        }
+        Err(error) => {
+            intent.state = PromptIntentState::Uncertain;
+            intent.error = Some(error.clone());
+            intent.updated_at_ms = now_ms();
+            store
+                .upsert_prompt_intent(&intent)
+                .map_err(|error| error.to_string())?;
+            send_text(
+                bot,
+                &surface,
+                &format!("⚠️ /ask 提交失败：{error}"),
+                metrics,
+            )
+            .await
+        }
+    }
+}
+
+/// Forks the session thread into an ephemeral read-only thread and starts the
+/// ask turn there, mirroring the Python bridge's `ask_fork_question`. The
+/// question runs with the configured ask model instead of the session model,
+/// and the fork's events are swallowed by the ask kill-switch so they never
+/// reach the main session projection.
+async fn ask_fork_turn(
+    agent: &AppServerClient,
+    store: &SqliteStore,
+    sessions: &SessionRegistry,
+    config: &RustConfig,
+    session: &SessionRecord,
+    prompt: &str,
+    client_message_id: &str,
+) -> Result<(String, String), String> {
+    let cwd = ask_session_cwd(store, config, session)?;
+    let fork = agent
+        .request(
+            "thread/fork",
+            json!({
+                "threadId": session.thread_id.as_str(),
+                "cwd": cwd,
+                "ephemeral": true,
+                "excludeTurns": true,
+                "sandbox": "read-only",
+                "approvalPolicy": "never",
+                "developerInstructions": SIDE_QUESTION_INSTRUCTIONS,
+            }),
+            Duration::from_secs(60),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let fork_thread_id = fork
+        .pointer("/thread/id")
+        .or_else(|| fork.get("id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Codex 未返回 ephemeral fork 的 thread id。".to_owned())?
+        .to_owned();
+    sessions.register_ask_thread(
+        &fork_thread_id,
+        AskThreadContext {
+            chat_id: session.chat_id,
+            root_message_id: session.root_message_id,
+            sender_instance_id: session.sender_instance_id.clone(),
+            turn_id: None,
+            created_at_ms: now_ms(),
+        },
+    );
+    let turn = match agent
+        .request(
+            "turn/start",
+            json!({
+                "threadId": fork_thread_id,
+                "input": [{"type": "text", "text": prompt}],
+                "clientUserMessageId": client_message_id,
+                "model": config.ask_model.as_str(),
+                "effort": config.ask_reasoning_effort.as_str(),
+                "sandboxPolicy": {"type": "readOnly", "networkAccess": false},
+                "approvalPolicy": "never",
+            }),
+            Duration::from_secs(60),
+        )
+        .await
+    {
+        Ok(turn) => turn,
+        Err(error) => {
+            sessions.remove_ask_thread(&fork_thread_id);
+            cleanup_ask_thread(agent, &fork_thread_id, None).await;
+            return Err(error.to_string());
+        }
+    };
+    let turn_id = turn
+        .pointer("/turn/id")
+        .or_else(|| turn.get("id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Codex 未返回 ephemeral turn 的 id。".to_owned())?
+        .to_owned();
+    Ok((fork_thread_id, turn_id))
+}
+
+fn ask_session_cwd(
+    store: &SqliteStore,
+    config: &RustConfig,
+    session: &SessionRecord,
+) -> Result<String, String> {
+    let space = store
+        .session_space_for_thread(session.thread_id.as_str())
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "Session 缺少空间记录，无法发起 /ask。".to_owned())?;
+    let payload = pending_space_payload(store, &space.space_id)
+        .map_err(|_| "Session 缺少项目目录，无法发起 /ask。".to_owned())?;
+    let cwd = payload
+        .get("pending_cwd")
+        .or_else(|| payload.get("cwd"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Session 缺少项目目录，无法发起 /ask。".to_owned())?;
+    let root = fs::canonicalize(&config.workspace_root)
+        .map_err(|error| format!("workspace 根目录不可用: {error}"))?;
+    let cwd_path = fs::canonicalize(cwd).map_err(|error| format!("项目目录不可用: {error}"))?;
+    if !cwd_path.is_dir() || cwd_path.strip_prefix(&root).is_err() {
+        return Err("项目目录必须是 workspace 根目录内的现有目录。".into());
+    }
+    Ok(cwd_path.to_string_lossy().into_owned())
+}
+
+/// Best-effort cleanup of an ephemeral ask fork: interrupt a still-running
+/// turn when its id is known, then delete the thread.
+async fn cleanup_ask_thread(agent: &AppServerClient, thread_id: &str, turn_id: Option<&str>) {
+    if let Some(turn_id) = turn_id {
+        let _ = agent
+            .request(
+                "turn/interrupt",
+                json!({"threadId": thread_id, "turnId": turn_id}),
+                Duration::from_secs(5),
+            )
+            .await;
+    }
+    let _ = agent
+        .request(
+            "thread/delete",
+            json!({"threadId": thread_id}),
+            Duration::from_secs(5),
+        )
+        .await;
 }
 
 fn enqueue_prompt(
@@ -7698,6 +7958,76 @@ const PROJECTION_PERSIST_INTERVAL_MS: i64 = 2_000;
 const PROJECTION_TERMINAL_RETENTION_MS: i64 = 60 * 60 * 1000;
 const PROJECTION_EVICTION_SWEEP_SECONDS: u64 = 60;
 
+/// Kill-switch for ephemeral `/ask` fork threads: their events never reach
+/// the projection or the status card. Terminal turn events deliver the
+/// answer to the originating surface and clean the fork up.
+#[allow(clippy::too_many_arguments)]
+async fn handle_ask_thread_event(
+    agent: &AppServerClient,
+    sessions: &SessionRegistry,
+    bots_by_id: &HashMap<String, RuntimeBot>,
+    config: &RustConfig,
+    metrics: &MetricsRegistry,
+    thread_id: &str,
+    method: &str,
+    params: &Value,
+) {
+    if !matches!(
+        method,
+        "turn/completed" | "turn/failed" | "turn/interrupted"
+    ) {
+        return;
+    }
+    let Some(context) = sessions.remove_ask_thread(thread_id) else {
+        return;
+    };
+    let turn = params.get("turn").cloned().unwrap_or(Value::Null);
+    let turn_id = turn.get("id").and_then(Value::as_str).unwrap_or_default();
+    let answer = match method {
+        "turn/interrupted" => "Codex turn 已中断。".to_owned(),
+        "turn/failed" => extract_turn_error(&turn)
+            .map(|message| format!("Codex turn 失败：{message}"))
+            .unwrap_or_else(|| "Codex turn 失败。".to_owned()),
+        _ => extract_final_answer(&turn).unwrap_or_else(|| "Codex turn 已完成。".to_owned()),
+    };
+    if let Some(bot) = bots_by_id.get(&context.sender_instance_id) {
+        let _ = send_text(
+            bot,
+            &surface_for(bot, config, context.chat_id, context.root_message_id),
+            &format!("{answer}\n\nturn={turn_id}"),
+            metrics,
+        )
+        .await;
+    }
+    cleanup_ask_thread(agent, thread_id, None).await;
+}
+
+/// Abandons `/ask` forks that outlived ASK_THREAD_TIMEOUT_MS, matching the
+/// Python bridge's 300s side-question timeout.
+async fn sweep_expired_ask_threads(
+    agent: &AppServerClient,
+    sessions: &SessionRegistry,
+    bots_by_id: &HashMap<String, RuntimeBot>,
+    config: &RustConfig,
+    metrics: &MetricsRegistry,
+) {
+    for (thread_id, context) in sessions.expired_ask_threads(now_ms(), ASK_THREAD_TIMEOUT_MS) {
+        if sessions.remove_ask_thread(&thread_id).is_none() {
+            continue;
+        }
+        if let Some(bot) = bots_by_id.get(&context.sender_instance_id) {
+            let _ = send_text(
+                bot,
+                &surface_for(bot, config, context.chat_id, context.root_message_id),
+                "⏱️ Codex 回答超时，已结束此次询问。",
+                metrics,
+            )
+            .await;
+        }
+        cleanup_ask_thread(agent, &thread_id, context.turn_id.as_deref()).await;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn forward_codex_events(
     agent: AppServerClient,
@@ -7770,10 +8100,29 @@ async fn forward_codex_events(
             Ok(None) => return,
             Err(_) => {
                 run_projection_eviction_sweep(&mut projector, &mut last_eviction);
+                sweep_expired_ask_threads(&agent, &sessions, &bots_by_id, &config, &metrics).await;
                 continue;
             }
         };
         if event.method.ends_with("/delta") {
+            continue;
+        }
+        // Ephemeral /ask fork threads stay out of the session projection,
+        // mirroring the Python bridge's _ephemeral_thread_ids kill-switch.
+        if let Some(thread_id) = event_thread_id(&event.params)
+            && sessions.contains_ask_thread(thread_id)
+        {
+            handle_ask_thread_event(
+                &agent,
+                &sessions,
+                &bots_by_id,
+                &config,
+                &metrics,
+                thread_id,
+                &event.method,
+                &event.params,
+            )
+            .await;
             continue;
         }
         // Lazily reload an evicted terminal projection from the durable row
@@ -7843,6 +8192,7 @@ async fn forward_codex_events(
         }
         if last_eviction.elapsed() >= Duration::from_secs(PROJECTION_EVICTION_SWEEP_SECONDS) {
             run_projection_eviction_sweep(&mut projector, &mut last_eviction);
+            sweep_expired_ask_threads(&agent, &sessions, &bots_by_id, &config, &metrics).await;
         }
         if effect == ProjectionEffect::None {
             continue;
@@ -8798,6 +9148,7 @@ fn status_event_clock(item: &Value) -> Option<String> {
         .find_map(|key| item.get(*key)),
     )?
     .div_euclid(1000)
+    .saturating_add(local_utc_offset_seconds())
     .rem_euclid(86_400);
     Some(format!(
         "{:02}:{:02}",
@@ -8946,8 +9297,26 @@ fn status_total_duration(projection: Option<&ThreadProjection>, now: i64) -> Str
     format_duration_ms(total)
 }
 
+/// Host-local UTC offset in seconds, matching the Python bridge's
+/// `time.localtime()` rendering. Falls back to UTC when the C library
+/// cannot resolve the local zone.
+fn local_utc_offset_seconds() -> i64 {
+    unsafe {
+        let now = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&now, &mut tm).is_null() {
+            0
+        } else {
+            tm.tm_gmtoff
+        }
+    }
+}
+
 fn status_clock(epoch_ms: i64) -> String {
-    let seconds = epoch_ms.div_euclid(1_000).rem_euclid(86_400);
+    let seconds = epoch_ms
+        .div_euclid(1_000)
+        .saturating_add(local_utc_offset_seconds())
+        .rem_euclid(86_400);
     format!(
         "{:02}:{:02}:{:02}",
         seconds / 3_600,
@@ -9174,7 +9543,27 @@ fn status_render(
     let frame_prefix = status_animation_frame(space, projection, animation_frame)
         .map(|frame| format!("{frame} "))
         .unwrap_or_default();
-    let mut lines: Vec<(String, String)> = vec![
+    let mut lines: Vec<(String, String)> = Vec::new();
+    // Header parity with the Python status comment and channel_status_render:
+    // the animation frame + TUI mode line leads the card, and there is no
+    // 生命周期/Mode summary line.
+    if review_active {
+        lines.push((
+            format!("{frame_prefix}*🔎 Review · 执行中*"),
+            format!("{frame_prefix}🔎 Review · 执行中"),
+        ));
+    } else if desired_mode.is_some() || observed_mode != "unknown" {
+        let mode_label = match observed_mode {
+            "plan" => "🧭 TUI Plan mode",
+            "default" => "⚙️ TUI Normal mode",
+            _ => "⚪ TUI mode 未确认",
+        };
+        lines.push((
+            format!("{frame_prefix}*{}*", markdown_escape(mode_label)),
+            format!("{frame_prefix}{mode_label}"),
+        ));
+    }
+    lines.extend([
         (
             format!("*🤖 Codex · {}*", markdown_escape(&truncate_text(title))),
             format!("🤖 Codex · {}", truncate_text(title)),
@@ -9199,14 +9588,6 @@ fn status_render(
         ),
         (
             format!(
-                "生命周期：{} · Mode：{}",
-                markdown_escape(lifecycle),
-                markdown_escape(observed_mode)
-            ),
-            format!("生命周期：{lifecycle} · Mode：{observed_mode}"),
-        ),
-        (
-            format!(
                 "*🎯 Goal*  {} · {}",
                 markdown_code(goal_status),
                 markdown_escape(&truncate_text(goal_objective))
@@ -9228,28 +9609,7 @@ fn status_render(
                 status_progress_bar(completed, plan_total)
             ),
         ),
-    ];
-    if review_active {
-        lines.push((
-            format!("{frame_prefix}*🔎 Review · 执行中*"),
-            format!("{frame_prefix}🔎 Review · 执行中"),
-        ));
-    } else if observed_mode == "plan" {
-        lines.push((
-            format!("{frame_prefix}*🧭 TUI Plan mode*"),
-            format!("{frame_prefix}🧭 TUI Plan mode"),
-        ));
-    } else if observed_mode == "default" {
-        lines.push((
-            format!("{frame_prefix}*⚙️ TUI Normal mode*"),
-            format!("{frame_prefix}⚙️ TUI Normal mode"),
-        ));
-    } else if desired_mode.is_some() {
-        lines.push((
-            format!("{frame_prefix}*⚪ TUI mode 未确认*"),
-            format!("{frame_prefix}⚪ TUI mode 未确认"),
-        ));
-    }
+    ]);
     if review_active || desired_mode.is_some() || model.is_some() || effort.is_some() {
         lines.push((
             format!(
@@ -13546,8 +13906,61 @@ mod tests {
         projection.desired_mode = Some("plan".into());
         projection.observed_mode = Some("unknown".into());
         let rendered = status_text(&store, &space, Some(&projection), None, &totp);
-        assert!(rendered.contains("Mode：unknown"));
-        assert!(!rendered.contains("Mode：plan"));
+        let first_line = rendered.lines().next().unwrap_or_default();
+        assert!(first_line.ends_with("⚪ TUI mode 未确认"));
+        assert!(!rendered.contains("Mode："));
+        assert!(!rendered.contains("生命周期"));
+    }
+
+    #[test]
+    fn status_card_leads_with_tui_mode_line_like_python() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let totp = TotpManager::new(store.clone(), "/tmp/nonexistent-rust-bridge-totp", 60);
+        let mut space = synthetic_session_space("thread-header", 42);
+        space.observed_mode = Some("default".into());
+        let projection = ThreadProjection {
+            thread_id: "thread-header".into(),
+            status: Some("active".into()),
+            turn_status: Some("idle".into()),
+            ..ThreadProjection::default()
+        };
+        let rendered = status_text(&store, &space, Some(&projection), None, &totp);
+        let first_line = rendered.lines().next().unwrap_or_default();
+        assert!(first_line.ends_with("⚙️ TUI Normal mode"));
+        assert!(!rendered.contains("生命周期"));
+        assert!(!rendered.contains("Mode："));
+    }
+
+    #[test]
+    fn ask_thread_registry_tracks_membership_turn_and_expiry() {
+        let registry = SessionRegistry::default();
+        registry.register_ask_thread(
+            "fork-1",
+            AskThreadContext {
+                chat_id: 7,
+                root_message_id: Some(11),
+                sender_instance_id: "bot-a".into(),
+                turn_id: None,
+                created_at_ms: 1_000,
+            },
+        );
+        assert!(registry.contains_ask_thread("fork-1"));
+        assert!(!registry.contains_ask_thread("fork-2"));
+        assert!(
+            registry
+                .expired_ask_threads(1_000 + ASK_THREAD_TIMEOUT_MS - 1, ASK_THREAD_TIMEOUT_MS)
+                .is_empty()
+        );
+        assert_eq!(
+            registry
+                .expired_ask_threads(1_000 + ASK_THREAD_TIMEOUT_MS, ASK_THREAD_TIMEOUT_MS)
+                .len(),
+            1
+        );
+        registry.set_ask_turn("fork-1", "turn-1");
+        let removed = registry.remove_ask_thread("fork-1").expect("ask context");
+        assert_eq!(removed.turn_id.as_deref(), Some("turn-1"));
+        assert!(!registry.contains_ask_thread("fork-1"));
     }
 
     #[test]
@@ -13610,10 +14023,10 @@ mod tests {
         };
         let rendered = status_render(&store, &space, Some(&projection), None, &totp, Some(3));
         // The frame prefixes the mode header (Python `render_status_comment`),
-        // never the title line.
-        assert!(rendered.plain.contains("🌔 ⚙️ TUI Normal mode"));
-        assert!(rendered.markdown.contains("🌔 *⚙️ TUI Normal mode*"));
-        assert!(!rendered.plain.starts_with("🌔"));
+        // which leads the card; the title line never carries a frame.
+        assert!(rendered.plain.starts_with("🌔 ⚙️ TUI Normal mode"));
+        assert!(rendered.markdown.starts_with("🌔 *⚙️ TUI Normal mode*"));
+        assert!(rendered.plain.contains("\n🤖 Codex"));
 
         projection.turn_status = Some("completed".into());
         projection.goal = Some(json!({"status":"complete"}));
