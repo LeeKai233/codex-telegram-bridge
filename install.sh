@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly INSTALLER_VERSION="0.3.2"
+readonly INSTALLER_VERSION="0.3.10"
 readonly UV_VERSION="0.11.28"
 readonly PROJECT="codex-telegram-bridge"
 readonly REPOSITORY="LeeKai233/codex-telegram-bridge"

@@ -1,5 +1,5 @@
 # X-CodexTelegramBridge-Installer: managed
-# X-CodexTelegramBridge-Installer-Version: v0.3.2
+# X-CodexTelegramBridge-Installer-Version: v0.3.10
 [Unit]
 Description=Alertmanager for Codex Telegram Bridge (rootless local monitoring)
 Wants=network-online.target

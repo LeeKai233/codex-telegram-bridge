@@ -34,7 +34,7 @@ wheels = [
 
 [[package]]
 name = "codex-telegram-bridge"
-version = "0.3.2"
+version = "0.3.10"
 source = { editable = "." }
 dependencies = [
     { name = "markdown-it-py" },

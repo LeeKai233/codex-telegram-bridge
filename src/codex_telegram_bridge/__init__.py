@@ -1,3 +1,3 @@
 """Telegram bridge for local Codex sessions."""
 
-__version__ = "0.3.2"
+__version__ = "0.3.10"

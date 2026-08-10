@@ -6,14 +6,15 @@ from pathlib import Path
 
 import pytest
 
-
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "bridge-service.sh"
 RUST = "codex-telegram-rust-full.service"
 PYTHON = "codex-telegram-bridge.service"
 
 
-def run_switch(tmp_path: Path, *arguments: str, active: str = "", enabled: str = "") -> subprocess.CompletedProcess[str]:
+def run_switch(
+    tmp_path: Path, *arguments: str, active: str = "", enabled: str = ""
+) -> subprocess.CompletedProcess[str]:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     log = tmp_path / "systemctl.log"

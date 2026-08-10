@@ -14,6 +14,8 @@ import time
 from collections.abc import Callable, Mapping
 from contextlib import suppress
 
+from . import __version__
+
 
 def _loopback_address(bind: str) -> tuple[str, int]:
     try:
@@ -69,7 +71,7 @@ class MetricsHttpServer:
         now = time.time()
         lines = [
             "# TYPE codex_telegram_bridge_build_info gauge",
-            'codex_telegram_bridge_build_info{version="0.3.2",revision="python"} 1',
+            f'codex_telegram_bridge_build_info{{version="{__version__}",revision="python"}} 1',
             "# TYPE codex_telegram_bridge_component_healthy gauge",
             f'codex_telegram_bridge_component_healthy{{component="bridge"}} {healthy}',
             "# TYPE codex_telegram_bridge_process_start_time_seconds gauge",
