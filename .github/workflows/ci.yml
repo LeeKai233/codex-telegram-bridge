@@ -99,7 +99,21 @@ jobs:
         run: shellcheck install.sh
       - name: Verify systemd user units
         run: |
-          mkdir -p ~/.local/bin
-          touch ~/.local/bin/codex ~/.local/bin/codex-telegram-bridge
-          chmod +x ~/.local/bin/codex ~/.local/bin/codex-telegram-bridge
+          grep -h '^ExecStart=' systemd/*.service | while read -r line; do
+            command=""
+            for token in ${line#ExecStart=}; do
+              case "$token" in
+                /usr/bin/env | *=*) continue ;;
+                *)
+                  command="$token"
+                  break
+                  ;;
+              esac
+            done
+            [ -n "$command" ] || continue
+            path="${command//'%h'/"$HOME"}"
+            mkdir -p "$(dirname "$path")"
+            touch "$path"
+            chmod +x "$path"
+          done
           systemd-analyze --user verify systemd/*.service
