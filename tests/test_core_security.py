@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 import time
 from pathlib import Path
 
@@ -13,7 +14,9 @@ def enrolled_manager(tmp_path: Path) -> tuple[Store, SecurityManager, str, list[
     store = Store(tmp_path / "state.sqlite3")
     manager = SecurityManager(store, tmp_path / "config" / "totp_secret", unlock_seconds=60)
     enrollment = manager.begin_enrollment("tester")
-    code = pyotp.TOTP(enrollment.secret).now()
+    # Authenticators compute codes from the epoch; use the aware-time path so
+    # the test never depends on process-local timezone state.
+    code = pyotp.TOTP(enrollment.secret).at(datetime.datetime.now(datetime.UTC))
     assert manager.commit_enrollment(enrollment, code)
     store.set_meta("totp_last_timecode", -1)
     return store, manager, code, enrollment.recovery_codes
